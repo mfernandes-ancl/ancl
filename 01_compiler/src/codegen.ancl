@@ -1,0 +1,2288 @@
+# =====================================================================
+#  codegen.ancl  -  Code generation for anclc2
+#
+#  Walks the flat AST built by parser.ancl and emits x86-64 into the
+#  g_code buffer via emit.ancl.  Also emits the runtime helper routines
+#  (print_str, print_int, getch, etc.) that the generated code calls.
+#
+#  Import order: lexer.ancl -> parser.ancl -> emit.ancl -> codegen.ancl
+# =====================================================================
+import "emit.ancl";
+
+@DATA
+
+# --- Import table: flat list of (fn_name_pool_off, dll_name) pairs ---
+g_imp_fn:    buf = 4096;   # i64[512] - pool offset of function name
+g_imp_fnlen: buf = 4096;   # i64[512] - length of function name
+g_imp_dll:   buf = 4096;   # i64[512] - pool offset of dll name
+g_imp_dlllen:buf = 4096;   # i64[512] - length of dll name
+g_imp_count: buf = 8;
+
+# Fixed IAT slot indices (runtime helpers depend on these being first)
+IMP_GetStdHandle:  i64 = 0;
+IMP_WriteFile:     i64 = 1;
+IMP_ReadFile:      i64 = 2;
+IMP_ExitProcess:   i64 = 3;
+
+# --- Per-function code generation state ---
+g_cg_frame_n:       buf = 8;
+g_cg_frame_argbase: buf = 8;
+g_cg_scratch_base:  buf = 8;
+g_cg_scratch_top:   buf = 8;
+g_cg_ret_label:     buf = 8;
+g_cg_ret_float:     buf = 8;     # 1 if the current function returns f64 (Return converges to XMM0)
+g_cg_is_gui:        buf = 8;
+g_cg_data_size:     buf = 8;
+
+# --- f64 float-stamping pass state ---
+# Per-function "float local" name set (rebuilt for each function); seeded from
+# float params and grown by inference (an assignment with a float RHS).  512 names max.
+g_sf_off:   buf = 4096;
+g_sf_len:   buf = 4096;
+g_sf_count: buf = 8;
+
+# Local variable table: name pool offset + frame offset (2048 entries; no
+# overflow guard in cg_local_alloc, so sized well above any single function)
+g_cg_loc_name:  buf = 16384;   # i64[2048] - pool offset
+g_cg_loc_len:   buf = 16384;   # i64[2048] - name length
+g_cg_loc_off:   buf = 16384;   # i64[2048] - frame offset from RSP
+g_cg_loc_count: buf = 8;
+
+# Loop stack for break/continue (32 levels deep)
+g_loop_cont:  buf = 256;   # i64[32] - continue label
+g_loop_brk:   buf = 256;   # i64[32] - break label
+g_loop_depth: buf = 8;
+
+# Function label table
+g_fn_label:    buf = 4096;   # i64[512] - label id per function (raised 256->512 for the Linux self-host)
+g_fn_arity:    buf = 4096;   # i64[512] - param count per function
+
+# --- Runtime helper label IDs ---
+L_start:       buf = 8;
+L_print_str:   buf = 8;
+L_print_int:   buf = 8;
+L_getch:       buf = 8;
+L_read_char:   buf = 8;
+L_read_int:    buf = 8;
+L_int_to_str:  buf = 8;
+L_puts_cstr:   buf = 8;
+L_str_to_int:  buf = 8;
+L_str_copy:    buf = 8;
+L_memcpy:      buf = 8;
+L_memset:      buf = 8;
+L_strlen:      buf = 8;
+L_strcmp:      buf = 8;
+
+# .data layout constants
+DAT_INBUF:  i64 = 0;
+DAT_INLEN:  i64 = 256;
+DAT_INPOS:  i64 = 264;
+DAT_BASE:   i64 = 272;
+# DAT_ARGV aliases DAT_BASE (272): Linux-only slot holding the entry rsp (argc/argv).
+# Reserved at [272,280) ONLY under --target=linux; the Windows .data layout is unchanged.
+DAT_ARGV:   i64 = 272;
+# Target selection (set by main.ancl before cg_run). 0 = Windows PE (default, fixpoint-preserving);
+# 1 = Linux static ELF via raw syscalls. Every Linux codegen branch is `if load64(g_targetlinux)==1`.
+g_targetlinux:      buf = 8;
+# --target=linux-dyn: additionally emit a DYNAMIC ELF (dlopen/dlsym via .rela.plt/GOT under BIND_NOW).
+# Implies g_targetlinux. Inert (0) for PE and plain --target=linux -> their fixpoints stay byte-identical.
+g_targetlinuxdyn:   buf = 8;
+# dynamic imports (dlopen/dlsym/...) -- parallel to the g_imp_* IAT table; resolved by ld.so via .got.plt.
+# Each entry records the fn name + its extern soname (DT_NEEDED), both as g_str_pool offsets.
+g_dynimp_fn:        buf = 1024;   # g_str_pool offset of each dyn import fn name (128 slots)
+g_dynimp_fnlen:     buf = 1024;
+g_dynimp_so:        buf = 1024;   # g_str_pool offset of the soname
+g_dynimp_solen:     buf = 1024;
+g_dynimp_count:     buf = 8;
+cg_err_syscall_win: str = "[cg] syscall(...) requires --target=linux\n";
+cg_err_argv_win:    str = "[cg] __argv_base() requires --target=linux\n";
+cg_err_no_shim:     str = "[cg] --target=linux: Windows import with no Linux shim\n";
+
+# --- String table for intern'd dll/fn names used by importer ---
+# We store pool offsets for known built-in dlls
+cg_k32:    str = "kernel32.dll";
+cg_ws2:    str = "ws2_32.dll";
+cg_u32:    str = "user32.dll";
+
+# Error strings
+cg_err_imp: str = "[cg] import table full\n";
+cg_err_loc: str = "[cg] local table full\n";
+
+@CODE
+
+# ----------------------------------------------------------------
+#  cg_pool_cmp(off_a, len_a, off_b, len_b) -> 1 if equal
+#  Compares two names stored in g_str_pool
+# ----------------------------------------------------------------
+func cg_pool_cmp(oa: i64, la: i64, ob: i64, lb: i64) -> i64 {
+    if la != lb { return 0; }
+    i = 0;
+    while i < la {
+        if load8(g_str_pool + oa + i) != load8(g_str_pool + ob + i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_str_eq_lit(pool_off, pool_len, literal_ptr, lit_len) -> 1 if equal
+#  Compares pool text against an ANCL str constant (which is also
+#  stored as pool text after being interned by the lexer)
+# ----------------------------------------------------------------
+func cg_name_is(pool_off: i64, pool_len: i64, lit: i64, lit_len: i64) -> i64 {
+    if pool_len != lit_len { return 0; }
+    return strcmp(g_str_pool + pool_off, lit) == 0;
+}
+
+# ----------------------------------------------------------------
+#  cg_fname_is(name_off, name_len, lit) -> 1 if equal, else 0
+#  Length-aware comparison of a (NON null-terminated) pool name
+#  slice against a null-terminated C-string literal.  Does not rely
+#  on the pool slice being null-terminated -- the lexer stores
+#  identifier tokens back-to-back in g_str_pool with no separators,
+#  so plain strcmp would over-read past the name and mis-compare.
+# ----------------------------------------------------------------
+func cg_fname_is(name_off: i64, name_len: i64, lit: i64) -> i64 {
+    i = 0;
+    while i < name_len {
+        if load8(lit + i) == 0 { return 0; }   # literal is shorter than name
+        if load8(g_str_pool + name_off + i) != load8(lit + i) { return 0; }
+        i = i + 1;
+    }
+    if load8(lit + name_len) != 0 { return 0; }   # literal is longer than name
+    return 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_use_import(fn_off, fn_len, dll_off, dll_len) -> IAT index
+#  Returns existing slot or allocates a new one.
+# ----------------------------------------------------------------
+func cg_use_import(fn_off: i64, fn_len: i64, dll_off: i64, dll_len: i64) -> i64 {
+    n = load64(g_imp_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_imp_fn + i*8), load64(g_imp_fnlen + i*8), fn_off, fn_len) == 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    # not found - add new
+    if n >= 511 { syscall 1, cg_err_imp; return 0; }
+    store64(g_imp_fn     + n*8, fn_off);
+    store64(g_imp_fnlen  + n*8, fn_len);
+    store64(g_imp_dll    + n*8, dll_off);
+    store64(g_imp_dlllen + n*8, dll_len);
+    store64(g_imp_count, n + 1);
+    return n;
+}
+
+# ----------------------------------------------------------------
+#  cg_local_slot(name_off, name_len) -> frame offset or -1
+# ----------------------------------------------------------------
+func cg_local_slot(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_cg_loc_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_cg_loc_name + i*8), load64(g_cg_loc_len + i*8), name_off, name_len) == 1 {
+            return load64(g_cg_loc_off + i*8);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_local_alloc(name_off, name_len) -> frame offset
+#  Allocates a new local variable slot in the current frame.
+# ----------------------------------------------------------------
+func cg_local_alloc(name_off: i64, name_len: i64) -> i64 {
+    n   = load64(g_cg_loc_count);
+    off = load64(g_cg_frame_argbase) + n * 8;
+    store64(g_cg_loc_name + n*8, name_off);
+    store64(g_cg_loc_len  + n*8, name_len);
+    store64(g_cg_loc_off  + n*8, off);
+    store64(g_cg_loc_count, n + 1);
+    return off;
+}
+
+# ----------------------------------------------------------------
+#  cg_alloc_scratch() -> scratch slot frame offset
+# ----------------------------------------------------------------
+func cg_alloc_scratch() -> i64 {
+    top  = load64(g_cg_scratch_top);
+    base = load64(g_cg_scratch_base);
+    off  = base + top * 8;
+    store64(g_cg_scratch_top, top + 1);
+    return off;
+}
+
+func cg_free_scratch(n: i64) -> i64 {
+    top = load64(g_cg_scratch_top);
+    store64(g_cg_scratch_top, top - n);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  cg_dv_find(name_off, name_len) -> data-var index or -1
+# ----------------------------------------------------------------
+func cg_dv_find(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_dv_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_dv_name + i*8), load64(g_dv_namelen + i*8), name_off, name_len) == 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_fn_find(name_off, name_len) -> function index or -1
+# ----------------------------------------------------------------
+func cg_fn_find(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_fn_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_fn_name + i*8), load64(g_fn_namelen + i*8), name_off, name_len) == 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_imp_find(name_off, name_len) -> IAT index or -1
+# ----------------------------------------------------------------
+func cg_imp_find(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_imp_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_imp_fn + i*8), load64(g_imp_fnlen + i*8), name_off, name_len) == 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+#  cg_extend_ret(name_off, name_len)
+#  After a Win32 import call: sign-extend EAX->RAX unless it's
+#  a known 64-bit return (HANDLE, ptr, SOCKET etc.)
+# ----------------------------------------------------------------
+func cg_extend_ret(name_off: i64, name_len: i64) -> i64 {
+    # Check if it is declared as -> ptr in the extern table
+    n = load64(g_ext_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_ext_fn + i*8), load64(g_ext_fnlen + i*8), name_off, name_len) == 1 {
+            if load64(g_ext_ptr + i*8) == 1 { return 0; }
+        }
+        i = i + 1;
+    }
+    # Known 64-bit returns that do NOT need sign-extension
+    # GetStdHandle, GetModuleHandleA, GetProcessHeap, HeapAlloc, socket, accept, SetTimer
+    # We check via strcmp against literal names in g_str_pool
+    ptr = g_str_pool + name_off;
+    if cg_fname_is(name_off, name_len, "GetStdHandle") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "GetModuleHandleA") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "GetProcessHeap") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "HeapAlloc") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "socket") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "accept") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "SetTimer") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "CreateWindowExA") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "DefWindowProcA") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "DispatchMessageA") == 1 { return 0; }
+    if cg_fname_is(name_off, name_len, "LoadCursorA") == 1 { return 0; }
+    # Known unsigned 16/32-bit returns: zero-extend
+    if cg_fname_is(name_off, name_len, "htons") == 1 { em_zext_eax(); return 0; }
+    if cg_fname_is(name_off, name_len, "GetTickCount") == 1 { em_zext_eax(); return 0; }
+    if cg_fname_is(name_off, name_len, "RegisterClassExA") == 1 { em_zext_eax(); return 0; }
+    # default: sign-extend 32-bit int
+    em_movsxd_rax();
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  cg_is_import_name(name_off, name_len) -> 1 if in import table
+# ----------------------------------------------------------------
+func cg_is_import_name(name_off: i64, name_len: i64) -> i64 {
+    if cg_imp_find(name_off, name_len) != 0 - 1 { return 1; }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  cg_pool_off_for_lit(lit, lit_len) -> offset in g_str_pool
+#  Interns a C-string literal into g_str_pool if not already there.
+# ----------------------------------------------------------------
+func cg_pool_intern_cstr(lit: i64) -> i64 {
+    ln = strlen(lit);
+    off = load64(g_str_pool_off);
+    # copy
+    i = 0;
+    while i <= ln {
+        store8(g_str_pool + off + i, load8(lit + i));
+        i = i + 1;
+    }
+    store64(g_str_pool_off, off + ln + 1);
+    return off;
+}
+
+# ----------------------------------------------------------------
+#  cg_add_builtin_import(fn_cstr, dll_cstr) -> IAT index
+# ----------------------------------------------------------------
+func cg_add_builtin(fn_cstr: i64, dll_cstr: i64) -> i64 {
+    fn_len  = strlen(fn_cstr);
+    dll_len = strlen(dll_cstr);
+    fn_off  = cg_pool_intern_cstr(fn_cstr);
+    dll_off = cg_pool_intern_cstr(dll_cstr);
+    return cg_use_import(fn_off, fn_len, dll_off, dll_len);
+}
+
+# ================================================================
+#  f64 float-stamping pass (mirrors anclc.cpp stampFloats)
+#  Runs before codegen.  Walks every function body and sets
+#  g_nd_isfloat on each node (1 = value is an f64, lives in XMM0).
+#  Float-ness flows from f64 literals, f64 params/locals/@DATA consts,
+#  f64-returning calls (user fns / externs / sqrt|itof|ffrombits), and
+#  f64 arithmetic.  An assignment with a float RHS makes its target a
+#  float local (inference), grown to a fixpoint per function.
+# ================================================================
+
+# find an extern by name -> index, or -1
+func cg_ext_find(noff: i64, nlen: i64) -> i64 {
+    n = load64(g_ext_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_ext_fn + i*8), load64(g_ext_fnlen + i*8), noff, nlen) == 1 { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# --target=linux-dyn: intern a dynamic import (dlopen/dlsym/...) -> slot index (parallel to cg_use_import).
+# Dedup by fn name; records the fn name + its extern soname (g_ext_dll) so elf_write_dyn can build the
+# .dynstr / .dynsym / DT_NEEDED. Only reached from the SysV call branch under g_targetlinuxdyn.
+func cg_use_dynimport(fn_off: i64, fn_len: i64) -> i64 {
+    n = load64(g_dynimp_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_dynimp_fn + i*8), load64(g_dynimp_fnlen + i*8), fn_off, fn_len) == 1 { return i; }
+        i = i + 1;
+    }
+    ei = cg_ext_find(fn_off, fn_len);
+    so_off = 0;
+    so_len = 0;
+    if ei != 0 - 1 { so_off = load64(g_ext_dll + ei*8); so_len = load64(g_ext_dlllen + ei*8); }
+    store64(g_dynimp_fn    + n*8, fn_off);
+    store64(g_dynimp_fnlen + n*8, fn_len);
+    store64(g_dynimp_so    + n*8, so_off);
+    store64(g_dynimp_solen + n*8, so_len);
+    store64(g_dynimp_count, n + 1);
+    return n;
+}
+
+# does a callee (by name) return an f64?  intrinsic / user fn / extern
+func cg_callee_retfloat(noff: i64, nlen: i64) -> i64 {
+    if cg_fname_is(noff, nlen, "sqrt")      == 1 { return 1; }
+    if cg_fname_is(noff, nlen, "itof")      == 1 { return 1; }
+    if cg_fname_is(noff, nlen, "ffrombits") == 1 { return 1; }
+    if cg_fname_is(noff, nlen, "ftoi")      == 1 { return 0; }
+    if cg_fname_is(noff, nlen, "fbits")     == 1 { return 0; }
+    fi = cg_fn_find(noff, nlen);
+    if fi != 0 - 1 { return load64(g_fn_retfloat + fi * 8); }
+    ei = cg_ext_find(noff, nlen);
+    if ei != 0 - 1 { return load64(g_ext_float + ei * 8); }
+    return 0;
+}
+
+# is param k of user function fi an f64?
+func cg_fn_param_isfloat(fi: i64, k: i64) -> i64 {
+    if k >= 8 { return 0; }
+    return load64(g_fn_pfloat + fi * 64 + k * 8);
+}
+
+# --- per-function float-local name set ---
+func cg_sf_clear() -> i64 { store64(g_sf_count, 0); return 0; }
+func cg_sf_has(noff: i64, nlen: i64) -> i64 {
+    n = load64(g_sf_count);
+    i = 0;
+    while i < n {
+        if cg_pool_cmp(load64(g_sf_off + i*8), load64(g_sf_len + i*8), noff, nlen) == 1 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+func cg_sf_add(noff: i64, nlen: i64) -> i64 {     # returns 1 if newly added
+    if cg_sf_has(noff, nlen) == 1 { return 0; }
+    n = load64(g_sf_count);
+    store64(g_sf_off + n*8, noff);
+    store64(g_sf_len + n*8, nlen);
+    store64(g_sf_count, n + 1);
+    return 1;
+}
+
+# stamp one expression node; sets g_nd_isfloat[nd]; returns it
+func cg_sf_stamp_expr(nd: i64) -> i64 {
+    if nd == 0 { return 0; }
+    kind = load64(g_nd_kind + nd * 8);
+
+    if kind == ND_FLOAT { store64(g_nd_isfloat + nd*8, 1); return 1; }
+    if kind == ND_INT   { store64(g_nd_isfloat + nd*8, 0); return 0; }
+    if kind == ND_STR   { store64(g_nd_isfloat + nd*8, 0); return 0; }
+    if kind == ND_ADDR  { store64(g_nd_isfloat + nd*8, 0); return 0; }
+
+    if kind == ND_VAR {
+        noff = load64(g_nd_name + nd*8);
+        nlen = load64(g_nd_namelen + nd*8);
+        r = 0;
+        if cg_sf_has(noff, nlen) == 1 { r = 1; }
+        if r == 0 {
+            vi = cg_dv_find(noff, nlen);
+            if vi != 0 - 1 { if load64(g_dv_isfloat + vi*8) == 1 { r = 1; } }
+        }
+        store64(g_nd_isfloat + nd*8, r);
+        return r;
+    }
+
+    if kind == ND_CALL {
+        arg = load64(g_nd_a + nd*8);
+        while arg != 0 { cg_sf_stamp_expr(arg); arg = load64(g_nd_c + arg*8); }
+        r = cg_callee_retfloat(load64(g_nd_name + nd*8), load64(g_nd_namelen + nd*8));
+        store64(g_nd_isfloat + nd*8, r);
+        return r;
+    }
+
+    if kind == ND_BINARY {
+        op = load64(g_nd_ival + nd*8);
+        lf = cg_sf_stamp_expr(load64(g_nd_a + nd*8));
+        rf = cg_sf_stamp_expr(load64(g_nd_b + nd*8));
+        # comparisons (== != < <= > >=) and && || yield an int boolean, never f64
+        isint = 0;
+        if op == 101 { isint = 1; }
+        if op == 110 { isint = 1; }
+        if op == 108 { isint = 1; }
+        if op == 76  { isint = 1; }
+        if op == 103 { isint = 1; }
+        if op == 71  { isint = 1; }
+        if op == 97  { isint = 1; }
+        if op == 111 { isint = 1; }
+        r = 0;
+        if isint == 0 { if lf == 1 { r = 1; } if rf == 1 { r = 1; } }
+        store64(g_nd_isfloat + nd*8, r);
+        return r;
+    }
+
+    store64(g_nd_isfloat + nd*8, 0);
+    return 0;
+}
+
+# stamp one statement; returns 1 if the float-local set grew
+func cg_sf_stamp_stmt(nd: i64) -> i64 {
+    if nd == 0 { return 0; }
+    kind = load64(g_nd_kind + nd * 8);
+    grew = 0;
+
+    if kind == ST_ASSIGN {
+        rhs  = load64(g_nd_a + nd*8);
+        rf   = cg_sf_stamp_expr(rhs);
+        noff = load64(g_nd_name + nd*8);
+        nlen = load64(g_nd_namelen + nd*8);
+        if rf == 1 { if cg_sf_add(noff, nlen) == 1 { grew = 1; } }
+        tf = 0;
+        if cg_sf_has(noff, nlen) == 1 { tf = 1; }
+        store64(g_nd_isfloat + nd*8, tf);
+        return grew;
+    }
+    if kind == ST_EXPRSTMT { cg_sf_stamp_expr(load64(g_nd_a + nd*8)); return 0; }
+    if kind == ST_RETURN   { cg_sf_stamp_expr(load64(g_nd_a + nd*8)); return 0; }
+    if kind == ST_SYSCALL {
+        arg = load64(g_nd_a + nd*8);
+        while arg != 0 { cg_sf_stamp_expr(arg); arg = load64(g_nd_c + arg*8); }
+        return 0;
+    }
+    if kind == ST_IF {
+        cg_sf_stamp_expr(load64(g_nd_a + nd*8));
+        s = load64(g_nd_b + nd*8);
+        while s != 0 { if cg_sf_stamp_stmt(s) == 1 { grew = 1; } s = load64(g_nd_c + s*8); }
+        s = load64(g_nd_name + nd*8);
+        while s != 0 { if cg_sf_stamp_stmt(s) == 1 { grew = 1; } s = load64(g_nd_c + s*8); }
+        return grew;
+    }
+    if kind == ST_LOOP {
+        cg_sf_stamp_expr(load64(g_nd_a + nd*8));
+        s = load64(g_nd_b + nd*8);
+        while s != 0 { if cg_sf_stamp_stmt(s) == 1 { grew = 1; } s = load64(g_nd_c + s*8); }
+        return grew;
+    }
+    return 0;
+}
+
+# stamp one function to a fixpoint
+func cg_stamp_func(fi: i64) -> i64 {
+    cg_sf_clear();
+    np = load64(g_fn_nparams + fi*8);
+    i = 0;
+    while i < np {
+        if cg_fn_param_isfloat(fi, i) == 1 {
+            cg_sf_add(load64(g_fn_params + fi*128 + i*16 + 0), load64(g_fn_params + fi*128 + i*16 + 8));
+        }
+        i = i + 1;
+    }
+    changed = 1;
+    while changed == 1 {
+        changed = 0;
+        s = load64(g_fn_body + fi*8);
+        while s != 0 {
+            if cg_sf_stamp_stmt(s) == 1 { changed = 1; }
+            s = load64(g_nd_c + s*8);
+        }
+    }
+    return 0;
+}
+
+func cg_stamp_program() -> i64 {
+    n = load64(g_fn_count);
+    i = 0;
+    while i < n { cg_stamp_func(i); i = i + 1; }
+    return 0;
+}
+
+# ================================================================
+#  cg_gen_expr(nd) -> result in RAX  (or XMM0 if the node is an f64)
+# ================================================================
+func cg_gen_expr(nd: i64) -> i64 {
+    if nd == 0 { em_mov_ri(EM_RAX, 0); return 0; }
+    kind = load64(g_nd_kind + nd * 8);
+
+    # ND_INT
+    if kind == ND_INT {
+        em_mov_ri(EM_RAX, load64(g_nd_ival + nd * 8));
+        return 0;
+    }
+
+    # ND_FLOAT  -- materialize the IEEE-754 bits, move into XMM0
+    if kind == ND_FLOAT {
+        em_mov_ri(EM_RAX, load64(g_nd_ival + nd * 8));
+        em_movq_xr(0, EM_RAX);
+        return 0;
+    }
+
+    # ND_STR  -- lea rax,[rip+string_rdata]
+    if kind == ND_STR {
+        sid = load64(g_nd_ival + nd * 8);
+        em_lea_rip(EM_RAX, 1, sid);
+        return 0;
+    }
+
+    # ND_ADDR  -- address of a function or data variable
+    if kind == ND_ADDR {
+        noff = load64(g_nd_name    + nd * 8);
+        nlen = load64(g_nd_namelen + nd * 8);
+        # check function
+        fi = cg_fn_find(noff, nlen);
+        if fi != 0 - 1 {
+            lbl = load64(g_fn_label + fi * 8);
+            em_lea_rip(EM_RAX, 0, lbl);
+            return 0;
+        }
+        # check data var
+        vi = cg_dv_find(noff, nlen);
+        if vi != 0 - 1 {
+            vt = load64(g_dv_type + vi * 8);
+            if vt == DV_STR {
+                sid2 = load64(g_dv_strid + vi * 8);
+                em_lea_rip(EM_RAX, 1, sid2);
+                return 0;
+            }
+            if vt == DV_BUF {
+                # data offset stored at runtime in g_dv_ival after buffer layout
+                doff = load64(g_dv_ival + vi * 8);
+                em_lea_rip(EM_RAX, 2, doff);
+                return 0;
+            }
+        }
+        em_mov_ri(EM_RAX, 0);
+        return 0;
+    }
+
+    # ND_VAR
+    if kind == ND_VAR {
+        noff = load64(g_nd_name    + nd * 8);
+        nlen = load64(g_nd_namelen + nd * 8);
+        ndf  = load64(g_nd_isfloat + nd * 8);
+        # local?
+        loff = cg_local_slot(noff, nlen);
+        if loff != 0 - 1 {
+            if ndf == 1 { em_movsd_xm(0, EM_RSP, loff); return 0; }   # f64 local -> XMM0
+            em_mov_rm(EM_RAX, EM_RSP, loff);
+            return 0;
+        }
+        # data var?
+        vi = cg_dv_find(noff, nlen);
+        if vi != 0 - 1 {
+            vt = load64(g_dv_type + vi * 8);
+            if vt == DV_STR {
+                sid2 = load64(g_dv_strid + vi * 8);
+                em_lea_rip(EM_RAX, 1, sid2);
+                return 0;
+            }
+            if vt == DV_BUF {
+                doff2 = load64(g_dv_ival + vi * 8);
+                em_lea_rip(EM_RAX, 2, doff2);
+                return 0;
+            }
+            # f64 const -> raw bits -> XMM0
+            if ndf == 1 {
+                em_mov_ri(EM_RAX, load64(g_dv_ival + vi * 8));
+                em_movq_xr(0, EM_RAX);
+                return 0;
+            }
+            # integer constant
+            em_mov_ri(EM_RAX, load64(g_dv_ival + vi * 8));
+            return 0;
+        }
+        # unknown
+        em_mov_ri(EM_RAX, 0);
+        return 0;
+    }
+
+    # ND_BINARY
+    if kind == ND_BINARY {
+        op = load64(g_nd_ival + nd * 8);
+        la = load64(g_nd_a    + nd * 8);
+        rb = load64(g_nd_b    + nd * 8);
+
+        # short-circuit &&  ||
+        if op == 97 {   # 'a' = &&
+            lsc  = em_label_new();
+            lend2 = em_label_new();
+            cg_gen_expr(la);
+            em_test_rr(EM_RAX, EM_RAX);
+            em_jz(lsc);
+            cg_gen_expr(rb);
+            em_test_rr(EM_RAX, EM_RAX);
+            em_setcc(149);   # setne
+            em_jmp(lend2);
+            em_label_place(lsc);
+            em_mov_ri(EM_RAX, 0);
+            em_label_place(lend2);
+            return 0;
+        }
+        if op == 111 {  # 'o' = ||
+            lsc  = em_label_new();
+            lend2 = em_label_new();
+            cg_gen_expr(la);
+            em_test_rr(EM_RAX, EM_RAX);
+            em_jnz(lsc);
+            cg_gen_expr(rb);
+            em_test_rr(EM_RAX, EM_RAX);
+            em_setcc(149);   # setne
+            em_jmp(lend2);
+            em_label_place(lsc);
+            em_mov_ri(EM_RAX, 1);
+            em_label_place(lend2);
+            return 0;
+        }
+
+        # ---- f64 path: float arithmetic, or a comparison with a float operand ----
+        ndf = load64(g_nd_isfloat + nd * 8);
+        laf = load64(g_nd_isfloat + la * 8);
+        rbf = load64(g_nd_isfloat + rb * 8);
+        iscmp = 0;
+        if op == 101 { iscmp = 1; }
+        if op == 110 { iscmp = 1; }
+        if op == 108 { iscmp = 1; }
+        if op == 76  { iscmp = 1; }
+        if op == 103 { iscmp = 1; }
+        if op == 71  { iscmp = 1; }
+        dofl = 0;
+        if ndf == 1 { dofl = 1; }
+        if iscmp == 1 { if laf == 1 { dofl = 1; } if rbf == 1 { dofl = 1; } }
+        if dofl == 1 {
+            cg_gen_expr(la);                          # L -> XMM0 (if float) or RAX
+            if laf == 0 { em_cvtsi2sd(0, EM_RAX); }   # promote an int operand
+            svf = cg_alloc_scratch();
+            em_movsd_mx(EM_RSP, svf, 0);              # save L
+            cg_gen_expr(rb);                          # R
+            if rbf == 0 { em_cvtsi2sd(0, EM_RAX); }
+            em_movsd_xx(1, 0);                        # R -> XMM1
+            em_movsd_xm(0, EM_RSP, svf);              # reload L -> XMM0
+            cg_free_scratch(1);
+            if op == 43  { em_addsd(0, 1); return 0; }   # +
+            if op == 45  { em_subsd(0, 1); return 0; }   # -
+            if op == 42  { em_mulsd(0, 1); return 0; }   # *
+            if op == 47  { em_divsd(0, 1); return 0; }   # /
+            # comparisons: ucomisd sets CF/ZF -> UNSIGNED setcc (NaN ignored in v1)
+            if op == 101 { em_ucomisd(0, 1); em_setcc(148); return 0; }   # ==  sete
+            if op == 110 { em_ucomisd(0, 1); em_setcc(149); return 0; }   # !=  setne
+            if op == 108 { em_ucomisd(0, 1); em_setcc(146); return 0; }   # <   setb
+            if op == 76  { em_ucomisd(0, 1); em_setcc(150); return 0; }   # <=  setbe
+            if op == 103 { em_ucomisd(0, 1); em_setcc(151); return 0; }   # >   seta
+            if op == 71  { em_ucomisd(0, 1); em_setcc(147); return 0; }   # >=  setae
+            return 0;
+        }
+
+        # general binary: eval L -> save -> eval R -> combine
+        cg_gen_expr(la);
+        sv = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv, EM_RAX);
+        cg_gen_expr(rb);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_mov_rm(EM_RAX, EM_RSP, sv);
+        cg_free_scratch(1);
+
+        if op == 43  { em_add_rr(EM_RAX, EM_RCX); return 0; }   # '+'
+        if op == 45  { em_sub_rr(EM_RAX, EM_RCX); return 0; }   # '-'
+        if op == 42  { em_imul_rr(EM_RAX, EM_RCX); return 0; }  # '*'
+        if op == 47  { em_cqo(); em_idiv(EM_RCX); return 0; }   # '/'
+        if op == 109 { em_cqo(); em_idiv(EM_RCX); em_mov_rr(EM_RAX, EM_RDX); return 0; }  # 'm'=%
+        if op == 101 { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(148); return 0; }  # 'e'==  sete=0x94
+        if op == 110 { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(149); return 0; }  # 'n'!=  setne=0x95
+        if op == 108 { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(156); return 0; }  # 'l'<   setl=0x9C
+        if op == 76  { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(158); return 0; }  # 'L'<=  setle=0x9E
+        if op == 103 { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(159); return 0; }  # 'g'>   setg=0x9F
+        if op == 71  { em_cmp_rr(EM_RAX, EM_RCX); em_setcc(157); return 0; }  # 'G'>=  setge=0x9D
+        if op == 124 { em_or_rr(EM_RAX, EM_RCX);  return 0; }   # '|'  bitwise or  (== bor)
+        if op == 94  { em_xor_rr(EM_RAX, EM_RCX); return 0; }   # '^'  bitwise xor (== bxor)
+        if op == 38  { em_and_rr(EM_RAX, EM_RCX); return 0; }   # '&'  bitwise and (== band)
+        if op == 83  { em_shl_cl(EM_RAX);         return 0; }   # 'S'  shl (count in cl == shl)
+        if op == 82  { em_shr_cl(EM_RAX);         return 0; }   # 'R'  shr (== shr)
+        return 0;
+    }
+
+    # ND_CALL
+    if kind == ND_CALL {
+        return cg_gen_call(nd);
+    }
+
+    return 0;
+}
+
+# ================================================================
+#  cg_tool_index_accessor(nd, mode) -> ptr in RAX (0 if index oob)
+#  Emits an if-ladder for tool_name(i)/tool_schema(i)/tool_fn(i).
+#  mode 0 = name string, 1 = schema string, 2 = function address.
+# ================================================================
+func cg_tool_index_accessor(nd: i64, mode: i64) -> i64 {
+    cg_gen_expr(load64(g_nd_a + nd * 8));     # index -> RAX
+    sv = cg_alloc_scratch();
+    em_mov_mr(EM_RSP, sv, EM_RAX);            # save index
+    em_mov_ri(EM_RAX, 0);                     # default result (out of range)
+    lend = em_label_new();
+    nt = load64(g_tool_count);
+    k = 0;
+    while k < nt {
+        lnext = em_label_new();
+        em_mov_rm(EM_RCX, EM_RSP, sv);        # RCX = index
+        em_mov_ri(EM_RDX, k);                 # RDX = k
+        em_cmp_rr(EM_RCX, EM_RDX);
+        em_jne(lnext);
+        if mode == 0 { em_lea_rip(EM_RAX, 1, load64(g_tool_namesid   + k * 8)); }
+        if mode == 1 { em_lea_rip(EM_RAX, 1, load64(g_tool_schemasid + k * 8)); }
+        if mode == 2 {
+            fnidx = load64(g_tool_fnidx + k * 8);
+            em_lea_rip(EM_RAX, 0, load64(g_fn_label + fnidx * 8));
+        }
+        em_jmp(lend);
+        em_label_place(lnext);
+        k = k + 1;
+    }
+    em_label_place(lend);
+    cg_free_scratch(1);
+    return 0;
+}
+
+# ================================================================
+#  cg_gen_call(nd) -> result in RAX
+#  Handles builtin intrinsics, user functions, and Win32 imports.
+# ================================================================
+func cg_gen_call(nd: i64) -> i64 {
+    name_off = load64(g_nd_name    + nd * 8);
+    name_len = load64(g_nd_namelen + nd * 8);
+    fname    = g_str_pool + name_off;
+
+    # Count args + collect them
+    nargs = 0;
+    a = load64(g_nd_a + nd * 8);
+    tmp = a;
+    while tmp != 0 { nargs = nargs + 1; tmp = load64(g_nd_c + tmp * 8); }
+
+    # ---- Builtin: read_int ----
+    if cg_fname_is(name_off, name_len, "read_int") == 1 { em_call_label(load64(L_read_int));   return 0; }
+    if cg_fname_is(name_off, name_len, "read_char") == 1 { em_call_label(load64(L_read_char));  return 0; }
+
+    # ---- M5: raw Linux syscall(nr, a0..a5) -> RAX (Linux target only) ----
+    if cg_fname_is(name_off, name_len, "syscall") == 1 {
+        if load64(g_targetlinux) == 0 { syscall 1, cg_err_syscall_win; ExitProcess(1); }
+        # eval each arg into a scratch slot, then load into the SYSCALL reg order
+        # {RAX, RDI, RSI, RDX, R10, R8, R9} (R10 NOT RCX; 0F05 clobbers RCX+R11).
+        sc_slots = alloc(nargs * 8);
+        ai = load64(g_nd_a + nd * 8);
+        ns = 0;
+        while ai != 0 {
+            sv = cg_alloc_scratch();
+            store64(sc_slots + ns * 8, sv);
+            cg_gen_expr(ai);
+            em_mov_mr(EM_RSP, sv, EM_RAX);
+            ns = ns + 1;
+            ai = load64(g_nd_c + ai * 8);
+        }
+        k = 0;
+        while k < ns {
+            reg = EM_RAX;
+            if k == 1 { reg = EM_RDI; }
+            if k == 2 { reg = EM_RSI; }
+            if k == 3 { reg = EM_RDX; }
+            if k == 4 { reg = EM_R10; }
+            if k == 5 { reg = EM_R8; }
+            if k == 6 { reg = EM_R9; }
+            em_mov_rm(reg, EM_RSP, load64(sc_slots + k * 8));
+            k = k + 1;
+        }
+        em_syscall();
+        cg_free_scratch(ns);
+        return 0;
+    }
+    # ---- M5: __argv_base() -> entry rsp captured at _start (Linux target only) ----
+    if cg_fname_is(name_off, name_len, "__argv_base") == 1 {
+        if load64(g_targetlinux) == 0 { syscall 1, cg_err_argv_win; ExitProcess(1); }
+        em_mov_rip_load(EM_RAX, 2, DAT_ARGV);
+        return 0;
+    }
+
+    # ---- Builtin: puts_cstr(p) ----
+    if cg_fname_is(name_off, name_len, "puts_cstr") == 1 {
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_call_label(load64(L_puts_cstr));
+        return 0;
+    }
+
+    # ---- Builtin: str_to_int(p) ----
+    if cg_fname_is(name_off, name_len, "str_to_int") == 1 {
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_call_label(load64(L_str_to_int));
+        return 0;
+    }
+
+    # ---- Builtin: str_copy(dst, src) ----
+    if cg_fname_is(name_off, name_len, "str_copy") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        em_mov_rr(EM_RDX, EM_RAX);
+        em_mov_rm(EM_RCX, EM_RSP, sv0);
+        em_call_label(load64(L_str_copy));
+        cg_free_scratch(1);
+        return 0;
+    }
+
+    # ---- Builtin: int_to_str(buf, val) ----
+    if cg_fname_is(name_off, name_len, "int_to_str") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        sv1 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv1, EM_RAX);
+        em_mov_rm(EM_RCX, EM_RSP, sv0);
+        em_mov_rm(EM_RDX, EM_RSP, sv1);
+        em_call_label(load64(L_int_to_str));
+        cg_free_scratch(2);
+        return 0;
+    }
+
+    # ---- Builtin: alloc(n) = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n)  [Windows]
+    #                        = mmap-backed block with an 8-byte length header     [Linux, M5] ----
+    if cg_fname_is(name_off, name_len, "alloc") == 1 {
+        if load64(g_targetlinux) == 1 {
+            # mmap(0, n+16, PROT_RW=3, MAP_PRIVATE|ANON=0x22, fd=-1, 0) [sys 9]; store len header; ret base+16.
+            cg_gen_expr(load64(g_nd_a + nd * 8));   # RAX = n
+            em_add_ri(EM_RAX, 16);                  # len = n + 16
+            sv0 = cg_alloc_scratch();
+            em_mov_mr(EM_RSP, sv0, EM_RAX);         # save len
+            em_mov_rr(EM_RSI, EM_RAX);              # a1 = length
+            em_xor_rr(EM_RDI, EM_RDI);              # a0 = NULL
+            em_mov_ri(EM_RDX, 3);                   # a2 = PROT_READ|PROT_WRITE
+            em_mov_ri(EM_R10, 34);                  # a3 = MAP_PRIVATE|MAP_ANONYMOUS (0x22)
+            em_mov_ri(EM_R8, 0 - 1);                # a4 = fd = -1
+            em_xor_rr(EM_R9, EM_R9);                # a5 = offset = 0
+            em_mov_ri(EM_RAX, 9);                   # sys_mmap
+            em_syscall();                           # RAX = base addr or -errno
+            Lok2   = em_label_new();
+            Ldone2 = em_label_new();
+            em_test_rr(EM_RAX, EM_RAX);
+            em_jns(Lok2);                           # addr >= 0 -> success (errno is negative)
+            em_xor_rr(EM_RAX, EM_RAX); em_jmp(Ldone2);   # failure -> NULL
+            em_label_place(Lok2);
+            em_mov_rm(EM_RCX, EM_RSP, sv0);         # len
+            em_mov_mr(EM_RAX, 0, EM_RCX);           # store64(base, len)
+            em_add_ri(EM_RAX, 16);                  # user ptr = base + 16
+            em_label_place(Ldone2);
+            cg_free_scratch(1);
+            return 0;
+        }
+        # cg_add_builtin returns the already-registered IAT slot (idempotent).
+        heap_imp  = cg_add_builtin("GetProcessHeap", "kernel32.dll");
+        halloc_imp = cg_add_builtin("HeapAlloc",     "kernel32.dll");
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        em_call_import(heap_imp);            # rax = heap handle
+        em_mov_rr(EM_RCX, EM_RAX);           # rcx = heap
+        em_mov_ri(EM_RDX, 8);                # rdx = HEAP_ZERO_MEMORY
+        em_mov_rm(EM_R8, EM_RSP, sv0);       # r8  = n
+        em_call_import(halloc_imp);          # rax = zeroed ptr
+        cg_free_scratch(1);
+        return 0;
+    }
+
+    # ---- Builtin: free(p) = HeapFree(GetProcessHeap(), 0, p)  [Windows]
+    #                       = munmap(p-16, header_len)           [Linux, M5] ----
+    if cg_fname_is(name_off, name_len, "free") == 1 {
+        if load64(g_targetlinux) == 1 {
+            cg_gen_expr(load64(g_nd_a + nd * 8));   # RAX = p
+            Lfdone = em_label_new();
+            em_test_rr(EM_RAX, EM_RAX);
+            em_jz(Lfdone);                          # free(NULL) -> skip
+            em_sub_ri(EM_RAX, 16);                  # base = p - 16
+            em_mov_rm(EM_RSI, EM_RAX, 0);           # a1 = length = load64(base)
+            em_mov_rr(EM_RDI, EM_RAX);              # a0 = addr = base
+            em_mov_ri(EM_RAX, 11);                  # sys_munmap
+            em_syscall();
+            em_label_place(Lfdone);
+            return 0;
+        }
+        heap_imp  = cg_add_builtin("GetProcessHeap", "kernel32.dll");
+        hfree_imp = cg_add_builtin("HeapFree",       "kernel32.dll");
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        em_call_import(heap_imp);            # rax = heap handle
+        em_mov_rr(EM_RCX, EM_RAX);           # rcx = heap
+        em_xor_rr(EM_RDX, EM_RDX);           # rdx = 0 flags
+        em_mov_rm(EM_R8, EM_RSP, sv0);       # r8  = p
+        em_call_import(hfree_imp);
+        cg_free_scratch(1);
+        return 0;
+    }
+
+    # ---- Builtins: memcpy, memset, strlen, strcmp ----
+    is_helper = 0;
+    helper_lbl = 0;
+    if cg_fname_is(name_off, name_len, "memcpy") == 1 { is_helper = 1; helper_lbl = load64(L_memcpy);  }
+    if cg_fname_is(name_off, name_len, "memset") == 1 { is_helper = 1; helper_lbl = load64(L_memset);  }
+    if cg_fname_is(name_off, name_len, "strlen") == 1 { is_helper = 1; helper_lbl = load64(L_strlen);  }
+    if cg_fname_is(name_off, name_len, "strcmp") == 1 { is_helper = 1; helper_lbl = load64(L_strcmp);  }
+    if is_helper == 1 {
+        slots = alloc(nargs * 8);
+        ai = 0;
+        arg = load64(g_nd_a + nd * 8);
+        while arg != 0 {
+            cg_gen_expr(arg);
+            sv0 = cg_alloc_scratch();
+            em_mov_mr(EM_RSP, sv0, EM_RAX);
+            store64(slots + ai * 8, sv0);
+            ai = ai + 1;
+            arg = load64(g_nd_c + arg * 8);
+        }
+        arg_regs = alloc(4 * 8);
+        store64(arg_regs + 0, EM_RCX);
+        store64(arg_regs + 8, EM_RDX);
+        store64(arg_regs + 16, EM_R8);
+        store64(arg_regs + 24, EM_R9);
+        i = 0;
+        while i < nargs {
+            if i < 4 {
+                em_mov_rm(load64(arg_regs + i*8), EM_RSP, load64(slots + i*8));
+            }
+            i = i + 1;
+        }
+        em_call_label(helper_lbl);
+        cg_free_scratch(nargs);
+        free(slots);
+        free(arg_regs);
+        return 0;
+    }
+
+    # ---- Builtins: load8/16/32/64 ----
+    if cg_fname_is(name_off, name_len, "load8") == 1 { cg_gen_expr(load64(g_nd_a + nd*8)); em_movzx_rm8(EM_RAX, EM_RAX, 0); return 0; }
+    if cg_fname_is(name_off, name_len, "load64") == 1 { cg_gen_expr(load64(g_nd_a + nd*8)); em_mov_rm(EM_RAX, EM_RAX, 0); return 0; }
+    if cg_fname_is(name_off, name_len, "load32") == 1 {
+        cg_gen_expr(load64(g_nd_a + nd*8));
+        # mov eax,[rax]  zero-extends
+        em_b(139); em_b(0);   # MOV r32,[rax]
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "load16") == 1 {
+        cg_gen_expr(load64(g_nd_a + nd*8));
+        # movzx rax,word[rax]
+        em_rex(1,0,0,0); em_b(15); em_b(183); em_b(0);
+        return 0;
+    }
+
+    # ---- Builtins: store8/16/32/64 ----
+    if cg_fname_is(name_off, name_len, "store8") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1);
+        em_mov_mr8(EM_RAX, 0, EM_RCX);
+        em_mov_rr(EM_RAX, EM_RCX);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "store64") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1);
+        em_mov_mr(EM_RAX, 0, EM_RCX);
+        em_mov_rr(EM_RAX, EM_RCX);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "store32") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1);
+        # mov dword[rax],ecx
+        em_b(137); em_b(8);
+        em_mov_rr(EM_RAX, EM_RCX);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "store16") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0);
+        sv0 = cg_alloc_scratch();
+        em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1);
+        # mov word[rax],cx
+        em_b(102); em_b(137); em_b(8);
+        em_mov_rr(EM_RAX, EM_RCX);
+        return 0;
+    }
+
+    # ---- Bitwise/shift ----
+    if cg_fname_is(name_off, name_len, "shl") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0); sv0 = cg_alloc_scratch(); em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1); em_mov_rr(EM_RCX, EM_RAX); em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1); em_shl_cl(EM_RAX); return 0;
+    }
+    if cg_fname_is(name_off, name_len, "shr") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0); sv0 = cg_alloc_scratch(); em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1); em_mov_rr(EM_RCX, EM_RAX); em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1); em_shr_cl(EM_RAX); return 0;
+    }
+    if cg_fname_is(name_off, name_len, "band") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0); sv0 = cg_alloc_scratch(); em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1); em_mov_rr(EM_RCX, EM_RAX); em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1); em_and_rr(EM_RAX, EM_RCX); return 0;
+    }
+    if cg_fname_is(name_off, name_len, "bor") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0); sv0 = cg_alloc_scratch(); em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1); em_mov_rr(EM_RCX, EM_RAX); em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1); em_or_rr(EM_RAX, EM_RCX); return 0;
+    }
+    if cg_fname_is(name_off, name_len, "bxor") == 1 {
+        arg0 = load64(g_nd_a + nd * 8);
+        arg1 = load64(g_nd_c + arg0 * 8);
+        cg_gen_expr(arg0); sv0 = cg_alloc_scratch(); em_mov_mr(EM_RSP, sv0, EM_RAX);
+        cg_gen_expr(arg1); em_mov_rr(EM_RCX, EM_RAX); em_mov_rm(EM_RAX, EM_RSP, sv0);
+        cg_free_scratch(1); em_xor_rr(EM_RAX, EM_RCX); return 0;
+    }
+
+    # ---- f64 intrinsics (SSE2, no DLL) ----
+    # sqrt(x)->f64 ; ftoi(x) f64->i64 trunc ; itof(n) i64->f64 ;
+    # fbits(x) f64 raw IEEE-754 bits->i64 ; ffrombits(n) i64 bits->f64.
+    # Int args to sqrt/itof promote; float args to ftoi/fbits pass through.
+    if cg_fname_is(name_off, name_len, "sqrt") == 1 {
+        a0 = load64(g_nd_a + nd * 8);
+        cg_gen_expr(a0);
+        if load64(g_nd_isfloat + a0 * 8) == 0 { em_cvtsi2sd(0, EM_RAX); }
+        em_sqrtsd(0, 0);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "ftoi") == 1 {
+        a0 = load64(g_nd_a + nd * 8);
+        cg_gen_expr(a0);
+        if load64(g_nd_isfloat + a0 * 8) == 1 { em_cvttsd2si(EM_RAX, 0); }
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "itof") == 1 {
+        a0 = load64(g_nd_a + nd * 8);
+        cg_gen_expr(a0);
+        if load64(g_nd_isfloat + a0 * 8) == 0 { em_cvtsi2sd(0, EM_RAX); }
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "fbits") == 1 {
+        a0 = load64(g_nd_a + nd * 8);
+        cg_gen_expr(a0);
+        if load64(g_nd_isfloat + a0 * 8) == 1 { em_movq_rx(EM_RAX, 0); }
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "ffrombits") == 1 {
+        a0 = load64(g_nd_a + nd * 8);
+        cg_gen_expr(a0);
+        if load64(g_nd_isfloat + a0 * 8) == 0 { em_movq_xr(0, EM_RAX); }
+        return 0;
+    }
+
+    # ---- ExitProcess(n) ----
+    # Windows-only fast path (direct import). Under --target=linux, fall through to the general
+    # dispatch so the call resolves to the liblinux ExitProcess shim (exit_group) -- otherwise this
+    # would emit a kind-3 import fixup that the ELF writer rejects (anclc's own error paths call it).
+    if cg_fname_is(name_off, name_len, "ExitProcess") == 1 {
+        if load64(g_targetlinux) == 0 {
+            cg_gen_expr(load64(g_nd_a + nd * 8));
+            em_mov_rr(EM_RCX, EM_RAX);
+            em_call_import(IMP_ExitProcess);
+            return 0;
+        }
+    }
+
+    # ---- callp(fnptr, args...) : indirect call through a RUNTIME pointer (COM vtable / GetProcAddress) ----
+    # arg0 = target address; arg1.. are passed by the Win64 ABI (RCX/RDX/R8/R9 + stack). The 32-bit
+    # return is sign-extended (HRESULTs are 32-bit, so FAILED(hr) == hr < 0 works). Mirrors anclc.cpp.
+    if cg_fname_is(name_off, name_len, "callp") == 1 {
+        slotsp = alloc(nargs * 8 + 8);
+        ap = 0;
+        argp = load64(g_nd_a + nd * 8);
+        while argp != 0 {
+            cg_gen_expr(argp);
+            svp = cg_alloc_scratch();
+            em_mov_mr(EM_RSP, svp, EM_RAX);
+            store64(slotsp + ap * 8, svp);
+            ap = ap + 1;
+            argp = load64(g_nd_c + argp * 8);
+        }
+        # outgoing args = slots 1..ap-1 -> RCX/RDX/R8/R9, then stack [rsp + 8*j]
+        if ap >= 2 { em_mov_rm(EM_RCX, EM_RSP, load64(slotsp + 1 * 8)); }
+        if ap >= 3 { em_mov_rm(EM_RDX, EM_RSP, load64(slotsp + 2 * 8)); }
+        if ap >= 4 { em_mov_rm(EM_R8,  EM_RSP, load64(slotsp + 3 * 8)); }
+        if ap >= 5 { em_mov_rm(EM_R9,  EM_RSP, load64(slotsp + 4 * 8)); }
+        j = 4;
+        while j + 1 < ap {                                   # outgoing arg j (0-based) for j>=4 -> [rsp+8*j]
+            em_mov_rm(EM_RAX, EM_RSP, load64(slotsp + (1 + j) * 8));
+            em_mov_mr(EM_RSP, 8 * j, EM_RAX);
+            j = j + 1;
+        }
+        em_mov_rm(EM_RAX, EM_RSP, load64(slotsp + 0 * 8));   # target pointer -> RAX
+        em_call_rax();
+        em_movsxd_rax();                                     # 32-bit / HRESULT return -> sign-extended
+        cg_free_scratch(ap);
+        free(slotsp);
+        return 0;
+    }
+
+    # ---- callpp(fnptr, args...) : callp but the return is a full 64-bit POINTER/handle ----
+    # Identical dispatch, NO sign-extension - for indirect calls that return a pointer the
+    # caller must keep intact (e.g. GetProcAddress'd pcap_open_live/pcap_next). Mirrors anclc.cpp.
+    if cg_fname_is(name_off, name_len, "callpp") == 1 {
+        slotsq = alloc(nargs * 8 + 8);
+        aq = 0;
+        argq = load64(g_nd_a + nd * 8);
+        while argq != 0 {
+            cg_gen_expr(argq);
+            svq = cg_alloc_scratch();
+            em_mov_mr(EM_RSP, svq, EM_RAX);
+            store64(slotsq + aq * 8, svq);
+            aq = aq + 1;
+            argq = load64(g_nd_c + argq * 8);
+        }
+        # outgoing args = slots 1..aq-1 -> RCX/RDX/R8/R9, then stack [rsp + 8*j]
+        if aq >= 2 { em_mov_rm(EM_RCX, EM_RSP, load64(slotsq + 1 * 8)); }
+        if aq >= 3 { em_mov_rm(EM_RDX, EM_RSP, load64(slotsq + 2 * 8)); }
+        if aq >= 4 { em_mov_rm(EM_R8,  EM_RSP, load64(slotsq + 3 * 8)); }
+        if aq >= 5 { em_mov_rm(EM_R9,  EM_RSP, load64(slotsq + 4 * 8)); }
+        jq = 4;
+        while jq + 1 < aq {                                  # outgoing arg j (0-based) for j>=4 -> [rsp+8*j]
+            em_mov_rm(EM_RAX, EM_RSP, load64(slotsq + (1 + jq) * 8));
+            em_mov_mr(EM_RSP, 8 * jq, EM_RAX);
+            jq = jq + 1;
+        }
+        em_mov_rm(EM_RAX, EM_RSP, load64(slotsq + 0 * 8));   # target pointer -> RAX
+        em_call_rax();                                       # RAX = full 64-bit return, kept as-is
+        cg_free_scratch(aq);
+        free(slotsq);
+        return 0;
+    }
+
+    # ---- tool registry accessors (feature #2) ----
+    if cg_fname_is(name_off, name_len, "tool_count") == 1 {
+        em_mov_ri(EM_RAX, load64(g_tool_count));
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "tools_json") == 1 {
+        em_lea_rip(EM_RAX, 1, load64(g_tools_json_sid));
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "tool_name") == 1 {
+        cg_tool_index_accessor(nd, 0);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "tool_schema") == 1 {
+        cg_tool_index_accessor(nd, 1);
+        return 0;
+    }
+    if cg_fname_is(name_off, name_len, "tool_fn") == 1 {
+        cg_tool_index_accessor(nd, 2);
+        return 0;
+    }
+
+    # ---- General Win32 import or user function ----
+    # Resolve the callee first so we know its declared param kinds (f64 convergence).
+    fi2    = cg_fn_find(name_off, name_len);
+    isusr2 = 0;
+    if fi2 != 0 - 1 { isusr2 = 1; }
+    isimp2 = 0;
+    if cg_imp_find(name_off, name_len) != 0 - 1 { isimp2 = 1; }
+
+    # Evaluate all args into scratch slots, converging each onto the param's kind:
+    # int -> f64 param promotes (cvtsi2sd); f64 -> int param (user fn) truncates (cvttsd2si).
+    # An import declares no param types, so a float arg stays float (placed in XMM below).
+    slots2 = alloc(nargs * 8 + 8);
+    argf2  = alloc(nargs * 8 + 8);
+    ai2 = 0;
+    arg2 = load64(g_nd_a + nd * 8);
+    while arg2 != 0 {
+        cg_gen_expr(arg2);                                # arg -> XMM0 (if float) or RAX
+        af2 = load64(g_nd_isfloat + arg2 * 8);
+        pf2 = 0;
+        if isusr2 == 1 { if cg_fn_param_isfloat(fi2, ai2) == 1 { pf2 = 1; } }
+        if pf2 == 1 { if af2 == 0 { em_cvtsi2sd(0, EM_RAX); af2 = 1; } }
+        if pf2 == 0 { if af2 == 1 { if isusr2 == 1 { em_cvttsd2si(EM_RAX, 0); af2 = 0; } } }
+        sv2 = cg_alloc_scratch();
+        if af2 == 1 { em_movsd_mx(EM_RSP, sv2, 0); }
+        if af2 == 0 { em_mov_mr(EM_RSP, sv2, EM_RAX); }
+        store64(slots2 + ai2 * 8, sv2);
+        store64(argf2  + ai2 * 8, af2);
+        ai2 = ai2 + 1;
+        arg2 = load64(g_nd_c + arg2 * 8);
+    }
+    # --target=linux-dyn: a user `extern "libX.so" fn` (dlopen/dlsym/...) is a DYNAMIC import. Marshal
+    # System V (RDI/RSI/RDX/RCX/R8/R9, NO shadow space; overflow at [rsp+0..]) + call via .got.plt
+    # (BIND_NOW). rsp is 16-aligned here (the genFunc frame invariant), matching the SysV rule. Inert
+    # unless --target=linux-dyn AND the name is a user extern -> PE/static-ELF output is byte-identical.
+    cdyn = 0;
+    if load64(g_targetlinuxdyn) == 1 { if isusr2 == 0 { if cg_ext_find(name_off, name_len) != 0 - 1 { cdyn = 1; } } }
+    if cdyn == 1 {
+        sysv = alloc(6 * 8);
+        store64(sysv + 0,  EM_RDI); store64(sysv + 8,  EM_RSI); store64(sysv + 16, EM_RDX);
+        store64(sysv + 24, EM_RCX); store64(sysv + 32, EM_R8);  store64(sysv + 40, EM_R9);
+        kd = 0;
+        while kd < ai2 {
+            if kd < 6 { em_mov_rm(load64(sysv + kd * 8), EM_RSP, load64(slots2 + kd * 8)); }
+            if kd >= 6 { em_mov_rm(EM_RAX, EM_RSP, load64(slots2 + kd * 8)); em_mov_mr(EM_RSP, (kd - 6) * 8, EM_RAX); }
+            kd = kd + 1;
+        }
+        free(sysv);
+        em_xor_rr(EM_RAX, EM_RAX);                                   # AL=0: no vector args (SysV varargs rule)
+        em_call_dynimport(cg_use_dynimport(name_off, name_len));
+        cg_extend_ret(name_off, name_len);                           # '-> ptr' externs keep the full 64-bit RAX
+        cg_free_scratch(ai2);
+        free(slots2);
+        free(argf2);
+        return 0;
+    }
+    # Place args positionally: float arg k -> XMMk (+ GP-reg mirror for imports/varargs);
+    # int arg k -> RCX/RDX/R8/R9; args 5+ -> stack at [rsp + 8*k] as raw bits.
+    arg_regs2 = alloc(4 * 8);
+    store64(arg_regs2 + 0,  EM_RCX);
+    store64(arg_regs2 + 8,  EM_RDX);
+    store64(arg_regs2 + 16, EM_R8);
+    store64(arg_regs2 + 24, EM_R9);
+    kk = 0;
+    while kk < ai2 {
+        if kk < 4 {
+            if load64(argf2 + kk * 8) == 1 {
+                em_movsd_xm(kk, EM_RSP, load64(slots2 + kk * 8));
+                if isimp2 == 1 { em_mov_rm(load64(arg_regs2 + kk * 8), EM_RSP, load64(slots2 + kk * 8)); }
+            }
+            if load64(argf2 + kk * 8) == 0 {
+                em_mov_rm(load64(arg_regs2 + kk * 8), EM_RSP, load64(slots2 + kk * 8));
+            }
+        }
+        if kk >= 4 {
+            em_mov_rm(EM_RAX, EM_RSP, load64(slots2 + kk * 8));
+            em_mov_mr(EM_RSP, kk * 8, EM_RAX);
+        }
+        kk = kk + 1;
+    }
+    free(arg_regs2);
+    cg_free_scratch(ai2);
+    free(slots2);
+    free(argf2);
+
+    # Dispatch: user function or import?
+    if isusr2 == 1 {
+        em_call_label(load64(g_fn_label + fi2 * 8));
+        return 0;
+    }
+    ii = cg_imp_find(name_off, name_len);
+    if ii != 0 - 1 {
+        # M5: under --target=linux there are no Windows imports; a builtin-import name with no
+        # user shim (the user-func branch above already handled shims) is a clean compile error.
+        if load64(g_targetlinux) == 1 { syscall 1, cg_err_no_shim; ExitProcess(1); }
+        em_call_import(ii);
+        cg_extend_ret(name_off, name_len);   # '-> f64' externs set g_ext_ptr=1, so this skips sign-extend
+        return 0;
+    }
+    # Unknown call -- emit call to label 0 (will fail to link gracefully)
+    em_mov_ri(EM_RAX, 0);
+    return 0;
+}
+
+# ================================================================
+#  cg_gen_stmt(nd)
+# ================================================================
+func cg_gen_stmt(nd: i64) -> i64 {
+    if nd == 0 { return 0; }
+    kind = load64(g_nd_kind + nd * 8);
+
+    # ST_ASSIGN
+    if kind == ST_ASSIGN {
+        noff = load64(g_nd_name    + nd * 8);
+        nlen = load64(g_nd_namelen + nd * 8);
+        rhs  = load64(g_nd_a + nd * 8);
+        cg_gen_expr(rhs);                            # RHS -> XMM0 (if float) or RAX
+        loff = cg_local_slot(noff, nlen);
+        if loff == 0 - 1 {
+            loff = cg_local_alloc(noff, nlen);
+        }
+        tf = load64(g_nd_isfloat + nd  * 8);         # target is an f64 slot?
+        rf = load64(g_nd_isfloat + rhs * 8);         # RHS produced an f64?
+        if tf == 1 {
+            if rf == 0 { em_cvtsi2sd(0, EM_RAX); }   # int RHS -> f64 slot
+            em_movsd_mx(EM_RSP, loff, 0);
+            return 0;
+        }
+        if rf == 1 { em_cvttsd2si(EM_RAX, 0); }      # f64 RHS -> int slot (truncate)
+        em_mov_mr(EM_RSP, loff, EM_RAX);
+        return 0;
+    }
+
+    # ST_EXPRSTMT
+    if kind == ST_EXPRSTMT {
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        return 0;
+    }
+
+    # ST_RETURN
+    if kind == ST_RETURN {
+        rexpr = load64(g_nd_a + nd * 8);
+        cg_gen_expr(rexpr);
+        ef  = load64(g_nd_isfloat + rexpr * 8);
+        crf = load64(g_cg_ret_float);
+        if crf == 1 { if ef == 0 { em_cvtsi2sd(0, EM_RAX); } }    # int expr -> f64 return (XMM0)
+        if crf == 0 { if ef == 1 { em_cvttsd2si(EM_RAX, 0); } }   # f64 expr -> int return (RAX)
+        em_jmp(load64(g_cg_ret_label));
+        return 0;
+    }
+
+    # ST_IF
+    if kind == ST_IF {
+        lelse = em_label_new();
+        lend  = em_label_new();
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        em_test_rr(EM_RAX, EM_RAX);
+        em_jz(lelse);
+        # then-body: linked via g_nd_c chain
+        s = load64(g_nd_b + nd * 8);
+        while s != 0 {
+            cg_gen_stmt(s);
+            s = load64(g_nd_c + s * 8);
+        }
+        em_jmp(lend);
+        em_label_place(lelse);
+        # else-body: head is in g_nd_name (see parser note); siblings via g_nd_c
+        s = load64(g_nd_name + nd * 8);
+        while s != 0 {
+            cg_gen_stmt(s);
+            s = load64(g_nd_c + s * 8);
+        }
+        em_label_place(lend);
+        return 0;
+    }
+
+    # ST_LOOP
+    if kind == ST_LOOP {
+        ltop = em_label_new();
+        lend = em_label_new();
+        em_label_place(ltop);
+        cg_gen_expr(load64(g_nd_a + nd * 8));
+        em_test_rr(EM_RAX, EM_RAX);
+        em_jz(lend);
+        # push loop stack
+        depth = load64(g_loop_depth);
+        store64(g_loop_cont + depth * 8, ltop);
+        store64(g_loop_brk  + depth * 8, lend);
+        store64(g_loop_depth, depth + 1);
+        s = load64(g_nd_b + nd * 8);
+        while s != 0 {
+            cg_gen_stmt(s);
+            s = load64(g_nd_c + s * 8);
+        }
+        depth = load64(g_loop_depth);
+        store64(g_loop_depth, depth - 1);
+        em_jmp(ltop);
+        em_label_place(lend);
+        return 0;
+    }
+
+    # ST_BREAK
+    if kind == ST_BREAK {
+        depth = load64(g_loop_depth);
+        if depth > 0 {
+            em_jmp(load64(g_loop_brk + (depth - 1) * 8));
+        }
+        return 0;
+    }
+
+    # ST_CONTINUE
+    if kind == ST_CONTINUE {
+        depth = load64(g_loop_depth);
+        if depth > 0 {
+            em_jmp(load64(g_loop_cont + (depth - 1) * 8));
+        }
+        return 0;
+    }
+
+    # ST_SYSCALL (syscall 1 = print)
+    if kind == ST_SYSCALL {
+        sysno = load64(g_nd_ival + nd * 8);
+        if sysno == 1 {
+            arg = load64(g_nd_a + nd * 8);
+            while arg != 0 {
+                akind = load64(g_nd_kind + arg * 8);
+                # string literal -> print as text
+                if akind == ND_STR {
+                    sid = load64(g_nd_ival + arg * 8);
+                    slen = load64(g_str_len + sid * 8);
+                    em_lea_rip(EM_RCX, 1, sid);
+                    em_mov_ri(EM_RDX, slen);
+                    em_call_label(load64(L_print_str));
+                    arg = load64(g_nd_c + arg * 8);
+                    akind = 0 - 1;   # handled
+                }
+                if akind == ND_VAR {
+                    # check if it's a data str
+                    anoff = load64(g_nd_name    + arg * 8);
+                    anlen = load64(g_nd_namelen + arg * 8);
+                    vi3   = cg_dv_find(anoff, anlen);
+                    if vi3 != 0 - 1 {
+                        if load64(g_dv_type + vi3 * 8) == DV_STR {
+                            sid2  = load64(g_dv_strid + vi3 * 8);
+                            slen2 = load64(g_str_len  + sid2 * 8);
+                            em_lea_rip(EM_RCX, 1, sid2);
+                            em_mov_ri(EM_RDX, slen2);
+                            em_call_label(load64(L_print_str));
+                            arg = load64(g_nd_c + arg * 8);
+                            akind = 0 - 1;
+                        }
+                    }
+                }
+                if akind != 0 - 1 {
+                    # integer expression -> print decimal
+                    cg_gen_expr(arg);
+                    em_mov_rr(EM_RCX, EM_RAX);
+                    em_call_label(load64(L_print_int));
+                    arg = load64(g_nd_c + arg * 8);
+                }
+            }
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+# ================================================================
+#  cg_max_call_args -- scan a function body to find the maximum
+#  outgoing argument count of any call, so the prologue can reserve
+#  a big-enough outgoing-argument area at [rsp, argbase).
+#
+#  Without this, a function with <=4 params that CALLS a function
+#  taking >4 args would write stack args 5+ at [rsp+32], [rsp+40], ...
+#  which overlaps the caller's own locals (locals start at argbase=32)
+#  -> the caller's locals get clobbered.  Mirrors the C++ bootstrap's
+#  scanExprArgs/scanStmtArgs (compiler/anclc.cpp).
+#
+#  We count EVERY call's arg count (including intrinsics); over-
+#  reserving the outgoing area is always safe, only slightly larger.
+# ================================================================
+func cg_count_call_args(nd: i64) -> i64 {
+    n = 0;
+    a = load64(g_nd_a + nd * 8);
+    while a != 0 {
+        n = n + 1;
+        a = load64(g_nd_c + a * 8);
+    }
+    return n;
+}
+
+func cg_max_call_args_expr(e: i64) -> i64 {
+    if e == 0 { return 0; }
+    k = load64(g_nd_kind + e * 8);
+    mx = 0;
+    if k == ND_CALL {
+        mx = cg_count_call_args(e);
+        # recurse into each argument expression
+        a = load64(g_nd_a + e * 8);
+        while a != 0 {
+            m2 = cg_max_call_args_expr(a);
+            if m2 > mx { mx = m2; }
+            a = load64(g_nd_c + a * 8);
+        }
+    }
+    if k == ND_BINARY {
+        ml = cg_max_call_args_expr(load64(g_nd_a + e * 8));
+        mr = cg_max_call_args_expr(load64(g_nd_b + e * 8));
+        if ml > mx { mx = ml; }
+        if mr > mx { mx = mr; }
+    }
+    if k == ND_ADDR {
+        ma = cg_max_call_args_expr(load64(g_nd_a + e * 8));
+        if ma > mx { mx = ma; }
+    }
+    return mx;
+}
+
+func cg_max_call_args_body(s: i64) -> i64 {
+    mx = 0;
+    while s != 0 {
+        sk = load64(g_nd_kind + s * 8);
+        if sk == ST_ASSIGN   { m2 = cg_max_call_args_expr(load64(g_nd_a + s * 8)); if m2 > mx { mx = m2; } }
+        if sk == ST_EXPRSTMT { m2 = cg_max_call_args_expr(load64(g_nd_a + s * 8)); if m2 > mx { mx = m2; } }
+        if sk == ST_RETURN   { m2 = cg_max_call_args_expr(load64(g_nd_a + s * 8)); if m2 > mx { mx = m2; } }
+        if sk == ST_IF {
+            mc = cg_max_call_args_expr(load64(g_nd_a + s * 8)); if mc > mx { mx = mc; }
+            mt = cg_max_call_args_body(load64(g_nd_b    + s * 8)); if mt > mx { mx = mt; }
+            me = cg_max_call_args_body(load64(g_nd_name + s * 8)); if me > mx { mx = me; }
+        }
+        if sk == ST_LOOP {
+            mc = cg_max_call_args_expr(load64(g_nd_a + s * 8)); if mc > mx { mx = mc; }
+            mb = cg_max_call_args_body(load64(g_nd_b + s * 8)); if mb > mx { mx = mb; }
+        }
+        if sk == ST_SYSCALL {
+            a = load64(g_nd_a + s * 8);
+            while a != 0 {
+                m2 = cg_max_call_args_expr(a); if m2 > mx { mx = m2; }
+                a = load64(g_nd_c + a * 8);
+            }
+        }
+        s = load64(g_nd_c + s * 8);
+    }
+    return mx;
+}
+
+# ================================================================
+#  cg_collect_locals -- pre-scan a function body to find all
+#  assignment targets so we can size the frame correctly
+# ================================================================
+func cg_collect_locals_body(s: i64) -> i64 {
+    while s != 0 {
+        sk = load64(g_nd_kind + s * 8);
+        if sk == ST_ASSIGN {
+            noff = load64(g_nd_name    + s * 8);
+            nlen = load64(g_nd_namelen + s * 8);
+            if cg_local_slot(noff, nlen) == 0 - 1 {
+                cg_local_alloc(noff, nlen);
+            }
+        }
+        if sk == ST_IF {
+            cg_collect_locals_body(load64(g_nd_b    + s * 8));   # then-head
+            cg_collect_locals_body(load64(g_nd_name + s * 8));   # else-head (see parser note)
+        }
+        if sk == ST_LOOP {
+            cg_collect_locals_body(load64(g_nd_b + s * 8));
+        }
+        s = load64(g_nd_c + s * 8);
+    }
+    return 0;
+}
+
+# ================================================================
+#  cg_gen_func(fi) -- generate code for function index fi
+# ================================================================
+func cg_gen_func(fi: i64) -> i64 {
+    # Place function label
+    lbl = load64(g_fn_label + fi * 8);
+    em_label_place(lbl);
+
+    # Reset per-function state
+    store64(g_cg_loc_count, 0);
+    store64(g_cg_scratch_top, 0);
+    store64(g_loop_depth, 0);
+    store64(g_cg_ret_float, load64(g_fn_retfloat + fi * 8));   # f64 return -> Return/fallthrough use XMM0
+
+    np = load64(g_fn_nparams + fi * 8);
+    # Frame: outgoing-arg area + locals + scratch.
+    # The outgoing-arg area at [rsp, argbase) must hold the shadow space
+    # (>=32B) AND any stack-passed args (5th+) of calls THIS function makes.
+    # So argbase = max(4, nparams, max_outgoing_call_args) * 8.
+    # (Previously argbase ignored callee arity, so calling a >4-arg function
+    #  clobbered this function's own locals -> e.g. the lexer broke.)
+    max_args = cg_max_call_args_body(load64(g_fn_body + fi * 8));
+    slots = 4;
+    if np > slots       { slots = np; }
+    if max_args > slots { slots = max_args; }
+    argbase = slots * 8;
+    store64(g_cg_frame_argbase, argbase);
+
+    # Spill params into locals first
+    i = 0;
+    while i < np {
+        ptoff = load64(g_fn_params + fi * 128 + i * 16 + 0);
+        ptlen = load64(g_fn_params + fi * 128 + i * 16 + 8);
+        cg_local_alloc(ptoff, ptlen);
+        i = i + 1;
+    }
+
+    # Scan function body to discover all local names
+    cg_collect_locals_body(load64(g_fn_body + fi * 8));
+
+    nloc = load64(g_cg_loc_count);
+
+    # scratch area starts after locals
+    scratch_base = argbase + nloc * 8;
+    store64(g_cg_scratch_base, scratch_base);
+
+    SCRATCH_SLOTS = 48;
+    frame_n = argbase + nloc * 8 + SCRATCH_SLOTS * 8;
+    # Ensure rsp % 16 == 0 after the call (which pushes 8-byte return addr)
+    if frame_n % 16 == 0 { frame_n = frame_n + 8; }
+    store64(g_cg_frame_n, frame_n);
+
+    ret_lbl = em_label_new();
+    store64(g_cg_ret_label, ret_lbl);
+
+    # Prologue: sub rsp, frame_n
+    em_sub_ri(EM_RSP, frame_n);
+
+    # Spill incoming params from registers / caller stack
+    arg_regs = alloc(4 * 8);
+    store64(arg_regs + 0,  EM_RCX);
+    store64(arg_regs + 8,  EM_RDX);
+    store64(arg_regs + 16, EM_R8);
+    store64(arg_regs + 24, EM_R9);
+    i = 0;
+    while i < np {
+        loff = cg_local_slot(load64(g_fn_params + fi * 128 + i * 16 + 0),
+                             load64(g_fn_params + fi * 128 + i * 16 + 8));
+        pflt2 = cg_fn_param_isfloat(fi, i);
+        if i < 4 {
+            if pflt2 == 1 { em_movsd_mx(EM_RSP, loff, i); }                        # f64 param arrives in XMMi
+            if pflt2 == 0 { em_mov_mr(EM_RSP, loff, load64(arg_regs + i * 8)); }
+        }
+        if i >= 4 {
+            # param came from caller stack at [rsp + frame_n + 8 + 8*i] (raw bits, float or int)
+            em_mov_rm(EM_RAX, EM_RSP, frame_n + 8 + 8 * i);
+            em_mov_mr(EM_RSP, loff, EM_RAX);
+        }
+        i = i + 1;
+    }
+    free(arg_regs);
+
+    # Generate function body
+    s = load64(g_fn_body + fi * 8);
+    while s != 0 {
+        cg_gen_stmt(s);
+        s = load64(g_nd_c + s * 8);
+    }
+
+    # Fallthrough return 0 (an f64 function zeroes XMM0 too)
+    em_mov_ri(EM_RAX, 0);
+    if load64(g_cg_ret_float) == 1 { em_movq_xr(0, EM_RAX); }
+    em_label_place(ret_lbl);
+    em_add_ri(EM_RSP, frame_n);
+    em_ret();
+    return 0;
+}
+
+# ================================================================
+#  Runtime helpers  (hand-encoded, matching anclc.cpp exactly)
+# ================================================================
+
+# __print_str(rcx=ptr, rdx=len)
+func cg_emit_print_str() -> i64 {
+    em_label_place(load64(L_print_str));
+    if load64(g_targetlinux) == 1 {
+        # Linux: write(rdi=1 stdout, rsi=ptr, rdx=len) ; entered with RCX=ptr, RDX=len
+        em_mov_rr(EM_RSI, EM_RCX);
+        em_mov_ri(EM_RDI, 1);
+        em_mov_ri(EM_RAX, 1);          # sys_write (rdx already = len)
+        em_syscall();
+        em_ret();
+        return 0;
+    }
+    em_sub_ri(EM_RSP, 72);
+    em_mov_mr(EM_RSP, 48, EM_RCX);
+    em_mov_mr(EM_RSP, 56, EM_RDX);
+    em_mov_ri(EM_RCX, 0 - 11);
+    em_call_import(IMP_GetStdHandle);
+    em_mov_rr(EM_RCX, EM_RAX);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_mov_rm(EM_RDX, EM_RSP, 48);
+    em_mov_rm(EM_R8,  EM_RSP, 56);
+    em_lea_mem(EM_R9, EM_RSP, 40);
+    em_call_import(IMP_WriteFile);
+    em_add_ri(EM_RSP, 72);
+    em_ret();
+    return 0;
+}
+
+# __print_int(rcx=value) -- itoa then print_str
+func cg_emit_print_int() -> i64 {
+    em_label_place(load64(L_print_int));
+    # frame: [0..32) shadow, [32..64) buffer, [64..72) value, [72..80) p, [80..88) isNeg
+    em_sub_ri(EM_RSP, 88);
+    em_mov_mr(EM_RSP, 64, EM_RCX);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_mov_mr(EM_RSP, 80, EM_RAX);
+    em_lea_mem(EM_RAX, EM_RSP, 64);
+    em_mov_mr(EM_RSP, 72, EM_RAX);
+    em_mov_rm(EM_RAX, EM_RSP, 64);
+    em_test_rr(EM_RAX, EM_RAX);
+    Lpos = em_label_new();
+    em_jns(Lpos);
+    em_mov_ri(EM_RCX, 1); em_mov_mr(EM_RSP, 80, EM_RCX);
+    em_mov_rm(EM_RAX, EM_RSP, 64); em_neg(EM_RAX); em_mov_mr(EM_RSP, 64, EM_RAX);
+    em_label_place(Lpos);
+    Lloop = em_label_new();
+    em_label_place(Lloop);
+    em_mov_rm(EM_RAX, EM_RSP, 64);
+    em_mov_ri(EM_RCX, 10);
+    em_cqo(); em_idiv(EM_RCX);
+    em_mov_mr(EM_RSP, 64, EM_RAX);
+    em_add_ri(EM_RDX, 48);
+    em_mov_rm(EM_RAX, EM_RSP, 72); em_sub_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 72, EM_RAX);
+    em_mov_mr8(EM_RAX, 0, EM_RDX);
+    em_mov_rm(EM_RAX, EM_RSP, 64); em_test_rr(EM_RAX, EM_RAX);
+    em_jnz(Lloop);
+    em_mov_rm(EM_RAX, EM_RSP, 80); em_test_rr(EM_RAX, EM_RAX);
+    Lprint = em_label_new();
+    em_jz(Lprint);
+    em_mov_rm(EM_RAX, EM_RSP, 72); em_sub_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 72, EM_RAX);
+    # '-' = 45
+    em_mov_ri(EM_RCX, 45);
+    em_mov_mr8(EM_RAX, 0, EM_RCX);
+    em_label_place(Lprint);
+    em_mov_rm(EM_RDX, EM_RSP, 72);
+    em_lea_mem(EM_RAX, EM_RSP, 64);
+    em_sub_rr(EM_RAX, EM_RDX);
+    em_mov_rr(EM_RCX, EM_RDX);
+    em_mov_rr(EM_RDX, EM_RAX);
+    em_call_label(load64(L_print_str));
+    em_add_ri(EM_RSP, 88);
+    em_ret();
+    return 0;
+}
+
+# __getch() -> rax
+func cg_emit_getch() -> i64 {
+    em_label_place(load64(L_getch));
+    em_sub_ri(EM_RSP, 56);
+    Lcheck = em_label_new();
+    Lhave  = em_label_new();
+    Leof   = em_label_new();
+    em_label_place(Lcheck);
+    # load inpos
+    em_mov_rip_load(EM_RAX, 2, DAT_INPOS);
+    em_mov_rip_load(EM_RCX, 2, DAT_INLEN);
+    em_cmp_rr(EM_RAX, EM_RCX);
+    em_jl(Lhave);
+    # refill: read 256 bytes into inbuf -> RAX = bytesRead
+    if load64(g_targetlinux) == 1 {
+        em_mov_ri(EM_RDI, 0);               # fd = stdin
+        em_lea_rip(EM_RSI, 2, DAT_INBUF);   # buffer
+        em_mov_ri(EM_RDX, 256);             # count
+        em_mov_ri(EM_RAX, 0);               # sys_read -> RAX = bytesRead
+        em_syscall();
+    }
+    if load64(g_targetlinux) == 0 {
+        em_mov_ri(EM_RCX, 0 - 10);
+        em_call_import(IMP_GetStdHandle);
+        em_mov_rr(EM_RCX, EM_RAX);
+        em_lea_rip(EM_RDX, 2, DAT_INBUF);
+        em_mov_ri(EM_R8, 256);
+        em_lea_mem(EM_R9, EM_RSP, 40);
+        em_xor_rr(EM_RAX, EM_RAX);
+        em_mov_mr(EM_RSP, 32, EM_RAX);
+        em_mov_mr(EM_RSP, 40, EM_RAX);
+        em_call_import(IMP_ReadFile);
+        em_mov_rm(EM_RAX, EM_RSP, 40);
+    }
+    em_mov_rip_store(EM_RAX, 2, DAT_INLEN);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_mov_rip_store(EM_RAX, 2, DAT_INPOS);
+    em_mov_rip_load(EM_RAX, 2, DAT_INLEN); em_test_rr(EM_RAX, EM_RAX);
+    em_jz(Leof);
+    em_jmp(Lcheck);
+    em_label_place(Leof);
+    em_mov_ri(EM_RAX, 0 - 1);
+    em_add_ri(EM_RSP, 56); em_ret();
+    em_label_place(Lhave);
+    em_mov_rip_load(EM_RAX, 2, DAT_INPOS);
+    em_lea_rip(EM_RCX, 2, DAT_INBUF);
+    em_add_rr(EM_RCX, EM_RAX);
+    em_movzx_rm8(EM_RDX, EM_RCX, 0);
+    em_add_ri(EM_RAX, 1);
+    em_mov_rip_store(EM_RAX, 2, DAT_INPOS);
+    em_mov_rr(EM_RAX, EM_RDX);
+    em_add_ri(EM_RSP, 56); em_ret();
+    return 0;
+}
+
+# __read_char() -> rax (first non-whitespace char, 0 on EOF)
+func cg_emit_read_char() -> i64 {
+    em_label_place(load64(L_read_char));
+    em_sub_ri(EM_RSP, 40);
+    Lloop = em_label_new(); Leof2 = em_label_new(); Ldone = em_label_new();
+    em_label_place(Lloop);
+    em_call_label(load64(L_getch));
+    em_cmp_ri(EM_RAX, 0 - 1); em_je(Leof2);
+    em_cmp_ri(EM_RAX, 32); em_je(Lloop);
+    em_cmp_ri(EM_RAX, 10); em_je(Lloop);
+    em_cmp_ri(EM_RAX, 13); em_je(Lloop);
+    em_cmp_ri(EM_RAX, 9);  em_je(Lloop);
+    em_jmp(Ldone);
+    em_label_place(Leof2);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_label_place(Ldone);
+    em_add_ri(EM_RSP, 40); em_ret();
+    return 0;
+}
+
+# __read_int() -> rax
+func cg_emit_read_int() -> i64 {
+    em_label_place(load64(L_read_int));
+    em_sub_ri(EM_RSP, 56);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_mov_mr(EM_RSP, 40, EM_RAX);
+    Lskip  = em_label_new(); Ldone0 = em_label_new(); Lchk = em_label_new();
+    Ldloop = em_label_new(); Lend   = em_label_new(); Lpos2 = em_label_new();
+    em_label_place(Lskip);
+    em_call_label(load64(L_getch));
+    em_cmp_ri(EM_RAX, 0 - 1); em_je(Ldone0);
+    em_cmp_ri(EM_RAX, 32); em_je(Lskip);
+    em_cmp_ri(EM_RAX, 10); em_je(Lskip);
+    em_cmp_ri(EM_RAX, 13); em_je(Lskip);
+    em_cmp_ri(EM_RAX, 9);  em_je(Lskip);
+    em_cmp_ri(EM_RAX, 45); em_jne(Lchk);
+    em_mov_ri(EM_RCX, 1); em_mov_mr(EM_RSP, 40, EM_RCX);
+    em_call_label(load64(L_getch));
+    em_label_place(Lchk);
+    em_label_place(Ldloop);
+    em_mov_mr(EM_RSP, 48, EM_RAX);
+    em_mov_rr(EM_RCX, EM_RAX);
+    em_cmp_ri(EM_RCX, 48); em_jl(Lend);
+    em_cmp_ri(EM_RCX, 57); em_jg(Lend);
+    em_mov_rm(EM_RAX, EM_RSP, 32);
+    em_mov_ri(EM_RCX, 10); em_imul_rr(EM_RAX, EM_RCX);
+    em_mov_rm(EM_RCX, EM_RSP, 48); em_sub_ri(EM_RCX, 48);
+    em_add_rr(EM_RAX, EM_RCX);
+    em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_call_label(load64(L_getch));
+    em_jmp(Ldloop);
+    em_label_place(Lend);
+    em_mov_rm(EM_RAX, EM_RSP, 32);
+    em_mov_rm(EM_RCX, EM_RSP, 40); em_test_rr(EM_RCX, EM_RCX); em_jz(Lpos2);
+    em_neg(EM_RAX);
+    em_label_place(Lpos2);
+    em_add_ri(EM_RSP, 56); em_ret();
+    em_label_place(Ldone0);
+    em_xor_rr(EM_RAX, EM_RAX);
+    em_add_ri(EM_RSP, 56); em_ret();
+    return 0;
+}
+
+# __int_to_str(rcx=dest, rdx=value)
+func cg_emit_int_to_str() -> i64 {
+    em_label_place(load64(L_int_to_str));
+    em_sub_ri(EM_RSP, 64);
+    em_mov_mr(EM_RSP, 48, EM_RCX);
+    em_mov_mr(EM_RSP, 32, EM_RDX);
+    em_xor_rr(EM_RAX, EM_RAX); em_mov_mr(EM_RSP, 56, EM_RAX);
+    em_lea_mem(EM_RAX, EM_RSP, 32); em_mov_mr(EM_RSP, 40, EM_RAX);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_test_rr(EM_RAX, EM_RAX);
+    Lpos3 = em_label_new();
+    em_jns(Lpos3);
+    em_mov_ri(EM_RCX, 1); em_mov_mr(EM_RSP, 56, EM_RCX);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_neg(EM_RAX); em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_label_place(Lpos3);
+    Lloop2 = em_label_new();
+    em_label_place(Lloop2);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_mov_ri(EM_RCX, 10); em_cqo(); em_idiv(EM_RCX);
+    em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_add_ri(EM_RDX, 48);
+    em_mov_rm(EM_RAX, EM_RSP, 40); em_sub_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 40, EM_RAX);
+    em_mov_mr8(EM_RAX, 0, EM_RDX);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_test_rr(EM_RAX, EM_RAX); em_jnz(Lloop2);
+    em_mov_rm(EM_RAX, EM_RSP, 56); em_test_rr(EM_RAX, EM_RAX);
+    Lcopy = em_label_new();
+    em_jz(Lcopy);
+    em_mov_rm(EM_RAX, EM_RSP, 40); em_sub_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 40, EM_RAX);
+    em_mov_ri(EM_RCX, 45); em_mov_mr8(EM_RAX, 0, EM_RCX);
+    em_label_place(Lcopy);
+    Lcl = em_label_new(); Ldone2 = em_label_new();
+    em_label_place(Lcl);
+    em_mov_rm(EM_RAX, EM_RSP, 40);
+    em_lea_mem(EM_RCX, EM_RSP, 32);
+    em_cmp_rr(EM_RAX, EM_RCX); em_jge(Ldone2);
+    em_movzx_rm8(EM_RDX, EM_RAX, 0);
+    em_mov_rm(EM_RCX, EM_RSP, 48);
+    em_mov_mr8(EM_RCX, 0, EM_RDX);
+    em_add_ri(EM_RCX, 1); em_mov_mr(EM_RSP, 48, EM_RCX);
+    em_mov_rm(EM_RAX, EM_RSP, 40); em_add_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 40, EM_RAX);
+    em_jmp(Lcl);
+    em_label_place(Ldone2);
+    em_mov_rm(EM_RCX, EM_RSP, 48); em_xor_rr(EM_RAX, EM_RAX); em_mov_mr8(EM_RCX, 0, EM_RAX);
+    em_add_ri(EM_RSP, 64); em_ret();
+    return 0;
+}
+
+# __puts_cstr(rcx=addr)
+func cg_emit_puts_cstr() -> i64 {
+    em_label_place(load64(L_puts_cstr));
+    em_sub_ri(EM_RSP, 40);
+    em_mov_mr(EM_RSP, 32, EM_RCX);
+    em_mov_rr(EM_RAX, EM_RCX);
+    Llen = em_label_new(); Lend2 = em_label_new();
+    em_label_place(Llen);
+    em_movzx_rm8(EM_RDX, EM_RAX, 0); em_test_rr(EM_RDX, EM_RDX); em_jz(Lend2);
+    em_add_ri(EM_RAX, 1); em_jmp(Llen);
+    em_label_place(Lend2);
+    em_mov_rm(EM_RCX, EM_RSP, 32);
+    em_sub_rr(EM_RAX, EM_RCX);
+    em_mov_rr(EM_RDX, EM_RAX);
+    em_call_label(load64(L_print_str));
+    em_add_ri(EM_RSP, 40); em_ret();
+    return 0;
+}
+
+# __str_to_int(rcx=addr) -> rax
+func cg_emit_str_to_int() -> i64 {
+    em_label_place(load64(L_str_to_int));
+    em_sub_ri(EM_RSP, 56);
+    em_mov_mr(EM_RSP, 48, EM_RCX);
+    em_xor_rr(EM_RAX, EM_RAX); em_mov_mr(EM_RSP, 32, EM_RAX); em_mov_mr(EM_RSP, 40, EM_RAX);
+    Lskip2 = em_label_new(); Lsign = em_label_new(); Ldl = em_label_new();
+    Lend3  = em_label_new(); Lpos4 = em_label_new();
+    em_label_place(Lskip2);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_movzx_rm8(EM_RDX, EM_RAX, 0);
+    em_cmp_ri(EM_RDX, 32); em_jne(Lsign);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_add_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 48, EM_RAX); em_jmp(Lskip2);
+    em_label_place(Lsign);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_movzx_rm8(EM_RDX, EM_RAX, 0);
+    em_cmp_ri(EM_RDX, 45); em_jne(Ldl);
+    em_mov_ri(EM_RCX, 1); em_mov_mr(EM_RSP, 40, EM_RCX);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_add_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 48, EM_RAX);
+    em_label_place(Ldl);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_movzx_rm8(EM_RDX, EM_RAX, 0);
+    em_cmp_ri(EM_RDX, 48); em_jl(Lend3);
+    em_cmp_ri(EM_RDX, 57); em_jg(Lend3);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_mov_ri(EM_RCX, 10); em_imul_rr(EM_RAX, EM_RCX);
+    em_sub_ri(EM_RDX, 48); em_add_rr(EM_RAX, EM_RDX);
+    em_mov_mr(EM_RSP, 32, EM_RAX);
+    em_mov_rm(EM_RAX, EM_RSP, 48); em_add_ri(EM_RAX, 1); em_mov_mr(EM_RSP, 48, EM_RAX);
+    em_jmp(Ldl);
+    em_label_place(Lend3);
+    em_mov_rm(EM_RAX, EM_RSP, 32); em_mov_rm(EM_RCX, EM_RSP, 40); em_test_rr(EM_RCX, EM_RCX); em_jz(Lpos4);
+    em_neg(EM_RAX);
+    em_label_place(Lpos4);
+    em_add_ri(EM_RSP, 56); em_ret();
+    return 0;
+}
+
+# __str_copy(rcx=dst, rdx=src) -> rax=ptr to NUL in dst
+func cg_emit_str_copy() -> i64 {
+    em_label_place(load64(L_str_copy));
+    Lcs = em_label_new(); Lend4 = em_label_new();
+    em_label_place(Lcs);
+    em_movzx_rm8(EM_RAX, EM_RDX, 0);
+    em_mov_mr8(EM_RCX, 0, EM_RAX);
+    em_test_rr(EM_RAX, EM_RAX); em_jz(Lend4);
+    em_add_ri(EM_RCX, 1); em_add_ri(EM_RDX, 1); em_jmp(Lcs);
+    em_label_place(Lend4);
+    em_mov_rr(EM_RAX, EM_RCX); em_ret();
+    return 0;
+}
+
+# __memcpy(rcx=dst, rdx=src, r8=n) -> rax=dst
+func cg_emit_memcpy() -> i64 {
+    em_label_place(load64(L_memcpy));
+    em_mov_rr(EM_R9, EM_RCX);
+    Lmc = em_label_new(); Ldmc = em_label_new();
+    em_label_place(Lmc);
+    em_test_rr(EM_R8, EM_R8); em_jz(Ldmc);
+    em_movzx_rm8(EM_RAX, EM_RDX, 0); em_mov_mr8(EM_RCX, 0, EM_RAX);
+    em_add_ri(EM_RCX, 1); em_add_ri(EM_RDX, 1); em_sub_ri(EM_R8, 1); em_jmp(Lmc);
+    em_label_place(Ldmc); em_mov_rr(EM_RAX, EM_R9); em_ret();
+    return 0;
+}
+
+# __memset(rcx=dst, rdx=val, r8=n) -> rax=dst
+func cg_emit_memset() -> i64 {
+    em_label_place(load64(L_memset));
+    em_mov_rr(EM_R9, EM_RCX);
+    Lms = em_label_new(); Ldms = em_label_new();
+    em_label_place(Lms);
+    em_test_rr(EM_R8, EM_R8); em_jz(Ldms);
+    em_mov_mr8(EM_RCX, 0, EM_RDX);
+    em_add_ri(EM_RCX, 1); em_sub_ri(EM_R8, 1); em_jmp(Lms);
+    em_label_place(Ldms); em_mov_rr(EM_RAX, EM_R9); em_ret();
+    return 0;
+}
+
+# __strlen(rcx=s) -> rax=len
+func cg_emit_strlen() -> i64 {
+    em_label_place(load64(L_strlen));
+    em_mov_rr(EM_RAX, EM_RCX);
+    Lsl = em_label_new(); Ldsl = em_label_new();
+    em_label_place(Lsl);
+    em_movzx_rm8(EM_RDX, EM_RAX, 0); em_test_rr(EM_RDX, EM_RDX); em_jz(Ldsl);
+    em_add_ri(EM_RAX, 1); em_jmp(Lsl);
+    em_label_place(Ldsl); em_sub_rr(EM_RAX, EM_RCX); em_ret();
+    return 0;
+}
+
+# __strcmp(rcx=a, rdx=b) -> rax  (0 if equal)
+func cg_emit_strcmp() -> i64 {
+    em_label_place(load64(L_strcmp));
+    Lsx = em_label_new(); Ldsx = em_label_new();
+    em_label_place(Lsx);
+    em_movzx_rm8(EM_R8, EM_RCX, 0); em_movzx_rm8(EM_R9, EM_RDX, 0);
+    em_mov_rr(EM_RAX, EM_R8); em_sub_rr(EM_RAX, EM_R9);
+    em_test_rr(EM_RAX, EM_RAX); em_jnz(Ldsx);
+    em_test_rr(EM_R8, EM_R8); em_jz(Ldsx);
+    em_add_ri(EM_RCX, 1); em_add_ri(EM_RDX, 1); em_jmp(Lsx);
+    em_label_place(Ldsx); em_ret();
+    return 0;
+}
+
+# _start  -- entry point
+func cg_emit_start() -> i64 {
+    em_label_place(load64(L_start));
+    if load64(g_targetlinux) == 1 {
+        # System V: argc at [rsp], argv[] at [rsp+8..], NO return addr. Save the entry rsp into
+        # DAT_ARGV (for GetCommandLineA) -- MUST be the FIRST emitted instruction (the find-main
+        # loop below emits no code). No shadow space on Linux.
+        em_mov_rip_store(EM_RSP, 2, DAT_ARGV);
+    }
+    if load64(g_targetlinux) == 0 {
+        em_sub_ri(EM_RSP, 40);
+    }
+    # find main function
+    main_fi = cg_fn_find(0, 0);   # 0,0 won't match - we'll look properly below
+    main_fi = 0 - 1;
+    i = 0;
+    n = load64(g_fn_count);
+    while i < n {
+        noff = load64(g_fn_name    + i * 8);
+        nlen = load64(g_fn_namelen + i * 8);
+        if nlen == 4 {
+            if load8(g_str_pool + noff + 0) == 109 {   # 'm'
+                if load8(g_str_pool + noff + 1) == 97  {   # 'a'
+                    if load8(g_str_pool + noff + 2) == 105 {   # 'i'
+                        if load8(g_str_pool + noff + 3) == 110 {   # 'n'
+                            main_fi = i;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if main_fi != 0 - 1 {
+        em_call_label(load64(g_fn_label + main_fi * 8));
+    }
+    if main_fi == 0 - 1 { em_xor_rr(EM_RAX, EM_RAX); }
+    if load64(g_targetlinux) == 1 {
+        em_mov_rr(EM_RDI, EM_RAX);     # exit code = main()'s return
+        em_mov_ri(EM_RAX, 231);        # exit_group(231)
+        em_syscall();
+        return 0;                       # never returns
+    }
+    em_mov_rr(EM_RCX, EM_RAX);
+    em_call_import(IMP_ExitProcess);
+    em_ret();
+    return 0;
+}
+
+# ================================================================
+#  cg_init() -- reset all codegen state, register built-in imports
+# ================================================================
+func cg_init() -> i64 {
+    em_init();
+    store64(g_imp_count, 0);
+    store64(g_cg_data_size, DAT_BASE);
+    if load64(g_targetlinux) == 1 { store64(g_cg_data_size, DAT_BASE + 8); }   # reserve [DAT_ARGV,+8) (Linux only)
+    store64(g_cg_is_gui, 0);
+
+    # Register fixed-slot imports (must be slots 0,1,2,3)
+    cg_add_builtin("GetStdHandle",  "kernel32.dll");
+    cg_add_builtin("WriteFile",     "kernel32.dll");
+    cg_add_builtin("ReadFile",      "kernel32.dll");
+    cg_add_builtin("ExitProcess",   "kernel32.dll");
+
+    # Register remaining built-in kernel32
+    cg_add_builtin("GetModuleHandleA", "kernel32.dll");
+    cg_add_builtin("GetTickCount",     "kernel32.dll");
+    cg_add_builtin("GetProcessHeap",   "kernel32.dll");
+    cg_add_builtin("HeapAlloc",        "kernel32.dll");
+    cg_add_builtin("HeapFree",         "kernel32.dll");
+    cg_add_builtin("Sleep",            "kernel32.dll");
+    cg_add_builtin("GetLastError",     "kernel32.dll");
+
+    # ws2_32 built-ins
+    cg_add_builtin("WSAStartup",   "ws2_32.dll");
+    cg_add_builtin("socket",       "ws2_32.dll");
+    cg_add_builtin("bind",         "ws2_32.dll");
+    cg_add_builtin("listen",       "ws2_32.dll");
+    cg_add_builtin("accept",       "ws2_32.dll");
+    cg_add_builtin("recv",         "ws2_32.dll");
+    cg_add_builtin("send",         "ws2_32.dll");
+    cg_add_builtin("closesocket",  "ws2_32.dll");
+    cg_add_builtin("htons",        "ws2_32.dll");
+
+    # Register user extern declarations
+    n = load64(g_ext_count);
+    i = 0;
+    while i < n {
+        fn_off  = load64(g_ext_fn     + i * 8);
+        fn_len  = load64(g_ext_fnlen  + i * 8);
+        dll_off = load64(g_ext_dll    + i * 8);
+        dll_len = load64(g_ext_dlllen + i * 8);
+        cg_use_import(fn_off, fn_len, dll_off, dll_len);
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+# ================================================================
+#  cg_assign_data_offsets() -- assign .data offsets to buf vars
+# ================================================================
+func cg_assign_data_offsets() -> i64 {
+    off = DAT_BASE;
+    if load64(g_targetlinux) == 1 { off = DAT_BASE + 8; }   # reserve [DAT_ARGV,+8) (Linux only)
+    n   = load64(g_dv_count);
+    i   = 0;
+    while i < n {
+        if load64(g_dv_type + i * 8) == DV_BUF {
+            # align to 8
+            if off % 8 != 0 { off = off + (8 - off % 8); }
+            store64(g_dv_ival + i * 8, off);
+            bufsz = load64(g_dv_bufsize + i * 8);
+            # round up to 8
+            if bufsz % 8 != 0 { bufsz = bufsz + (8 - bufsz % 8); }
+            off = off + bufsz;
+        }
+        i = i + 1;
+    }
+    store64(g_cg_data_size, off);
+    return 0;
+}
+
+# ================================================================
+#  cg_run() -- main codegen entry point
+# ================================================================
+func cg_run() -> i64 {
+    cg_init();
+    cg_assign_data_offsets();
+
+    # Allocate function labels
+    n = load64(g_fn_count);
+    i = 0;
+    while i < n {
+        lbl = em_label_new();
+        store64(g_fn_label  + i * 8, lbl);
+        store64(g_fn_arity  + i * 8, load64(g_fn_nparams + i * 8));
+        i = i + 1;
+    }
+
+    # Allocate runtime helper labels
+    store64(L_start,      em_label_new());
+    store64(L_print_str,  em_label_new());
+    store64(L_print_int,  em_label_new());
+    store64(L_getch,      em_label_new());
+    store64(L_read_char,  em_label_new());
+    store64(L_read_int,   em_label_new());
+    store64(L_int_to_str, em_label_new());
+    store64(L_puts_cstr,  em_label_new());
+    store64(L_str_to_int, em_label_new());
+    store64(L_str_copy,   em_label_new());
+    store64(L_memcpy,     em_label_new());
+    store64(L_memset,     em_label_new());
+    store64(L_strlen,     em_label_new());
+    store64(L_strcmp,     em_label_new());
+
+    # Emit entry point
+    cg_emit_start();
+
+    # f64 float-stamping pass: set g_nd_isfloat on every node before codegen
+    cg_stamp_program();
+
+    # Emit user functions
+    i = 0;
+    while i < n {
+        cg_gen_func(i);
+        i = i + 1;
+    }
+
+    # Emit runtime helpers
+    cg_emit_print_str();
+    cg_emit_print_int();
+    cg_emit_getch();
+    cg_emit_read_char();
+    cg_emit_read_int();
+    cg_emit_int_to_str();
+    cg_emit_puts_cstr();
+    cg_emit_str_to_int();
+    cg_emit_str_copy();
+    cg_emit_memcpy();
+    cg_emit_memset();
+    cg_emit_strlen();
+    cg_emit_strcmp();
+
+    return load64(g_code_len);
+}

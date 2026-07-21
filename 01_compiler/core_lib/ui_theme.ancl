@@ -1,0 +1,157 @@
+# =====================================================================
+#  ui_theme.ancl  -  Reusable, palette-parameterized GUI theme (core_lib).
+#
+#  A palette + GDI-object toolkit for native ANCL Win32 apps. Unlike the
+#  project-local themes (Aether Studio theme.ancl / multi_tester common.ancl,
+#  both hardcoded dark), this ships a settable palette so a caller picks a
+#  LIGHT theme (the "Aether" corporate look: purple chrome, white cards) or a
+#  DARK theme, then calls theme_init() once to build the shared GDI objects.
+#
+#  Colors are COLORREF (0x00BBGGRR — BGR byte order, NOT RGB).
+#  theme_init() is idempotent; call it once before creating controls.
+#  Sister library: ui_kit.ancl (glow button, cards, tabs, grid) reads these.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" CreateFontA -> ptr;          # HFONT CreateFontA(h,w,esc,ori,weight,ital,und,so,cs,op,cp,q,pf,face)
+
+@DATA
+# ---- Aether LIGHT palette (BGR COLORREF) — the default -------------
+#   role                 #hex        BGR COLORREF
+NADL_TOPBAR:  i64 = 0x00622070;   # #702062  purple top bar + menu chrome
+NADL_CANVAS:  i64 = 0x00F4F1F2;   # #F2F1F4  light body behind cards
+NADL_CARD:    i64 = 0x00FFFFFF;   # #FFFFFF  card / grid background
+NADL_TEXT:    i64 = 0x00333333;   # #333333  primary card/body text
+NADL_TEXTDIM: i64 = 0x00726B6B;   # #6B6B72  secondary/muted text
+NADL_ONBAR:   i64 = 0x00FFFFFF;   # #FFFFFF  text on the purple bar
+NADL_BARDIM:  i64 = 0x00C7A4CF;   # #CFA4C7  dim text/tint on the purple bar
+NADL_BORDER:  i64 = 0x00E8DEE3;   # #E3DEE8  soft light separators
+NADL_HOVER:   i64 = 0x00EBE2ED;   # #EDE2EB  light purple hover
+NADL_SEL:     i64 = 0x00C7A4CF;   # #CFA4C7  selection / active-tab tint
+NADL_NORMAL:  i64 = 0x0045A728;   # #28A745  ok / connected / running
+NADL_WARN:    i64 = 0x004EADF0;   # #F0AD4E  warning / connecting
+NADL_ALARM:   i64 = 0x004535DC;   # #DC3545  alarm / error / stopped
+NADL_OFFLINE: i64 = 0x00808080;   # #808080  disabled / offline
+
+# ---- DARK palette (charcoal + purple accent) — optional ------------
+NADD_TOPBAR:  i64 = 0x00171414;
+NADD_CANVAS:  i64 = 0x00221E1E;
+NADD_CARD:    i64 = 0x002B2626;
+NADD_TEXT:    i64 = 0x00CEC8C8;
+NADD_TEXTDIM: i64 = 0x00887E7E;
+NADD_ONBAR:   i64 = 0x00FFFFFF;
+NADD_BARDIM:  i64 = 0x00FA8BA7;
+NADD_BORDER:  i64 = 0x003A3030;
+NADD_HOVER:   i64 = 0x00362E2E;
+NADD_SEL:     i64 = 0x00FA8BA7;
+NADD_NORMAL:  i64 = 0x0080DE4A;
+NADD_WARN:    i64 = 0x0024BFFB;
+NADD_ALARM:   i64 = 0x007171F8;
+NADD_OFFLINE: i64 = 0x00808080;
+
+# ---- ACTIVE palette (filled by theme_init from light/dark) ---------
+nad_mode:     buf = 8;      # 0 = light (default), 1 = dark
+nad_c_topbar: buf = 8;
+nad_c_canvas: buf = 8;
+nad_c_card:   buf = 8;
+nad_c_text:   buf = 8;
+nad_c_textdim:buf = 8;
+nad_c_onbar:  buf = 8;
+nad_c_bardim: buf = 8;
+nad_c_border: buf = 8;
+nad_c_hover:  buf = 8;
+nad_c_sel:    buf = 8;
+nad_c_normal: buf = 8;
+nad_c_warn:   buf = 8;
+nad_c_alarm:  buf = 8;
+nad_c_offline:buf = 8;
+
+# ---- Shared GDI handles (created once by theme_init) ---------------
+nad_theme_done: buf = 8;
+nad_b_topbar:  buf = 8;     # brushes
+nad_b_canvas:  buf = 8;
+nad_b_card:    buf = 8;
+nad_b_hover:   buf = 8;
+nad_b_sel:     buf = 8;
+nad_b_normal:  buf = 8;
+nad_b_warn:    buf = 8;
+nad_b_alarm:   buf = 8;
+nad_b_offline: buf = 8;
+nad_p_border:  buf = 8;     # pens
+nad_p_sel:     buf = 8;
+nad_p_bar:     buf = 8;     # 1px in topbar tone (hide seams on the bar)
+nad_f_ui:      buf = 8;     # fonts
+nad_f_small:   buf = 8;
+nad_f_hdr:     buf = 8;
+nad_f_big:     buf = 8;     # large card value
+nad_f_mark:    buf = 8;     # wordmark
+
+nad_face_ui: str = "Segoe UI";
+
+@CODE
+# Select the dark palette (call BEFORE theme_init). Default is light.
+func theme_set_dark() -> i64 { store64(nad_mode, 1); return 0; }
+func theme_set_light() -> i64 { store64(nad_mode, 0); return 0; }
+
+# Load the active color globals from the chosen palette constants.
+func nad_load_palette() -> i64 {
+    if load64(nad_mode) == 1 {
+        store64(nad_c_topbar, NADD_TOPBAR); store64(nad_c_canvas, NADD_CANVAS);
+        store64(nad_c_card, NADD_CARD);     store64(nad_c_text, NADD_TEXT);
+        store64(nad_c_textdim, NADD_TEXTDIM); store64(nad_c_onbar, NADD_ONBAR);
+        store64(nad_c_bardim, NADD_BARDIM); store64(nad_c_border, NADD_BORDER);
+        store64(nad_c_hover, NADD_HOVER);   store64(nad_c_sel, NADD_SEL);
+        store64(nad_c_normal, NADD_NORMAL); store64(nad_c_warn, NADD_WARN);
+        store64(nad_c_alarm, NADD_ALARM);   store64(nad_c_offline, NADD_OFFLINE);
+        return 0;
+    }
+    store64(nad_c_topbar, NADL_TOPBAR); store64(nad_c_canvas, NADL_CANVAS);
+    store64(nad_c_card, NADL_CARD);     store64(nad_c_text, NADL_TEXT);
+    store64(nad_c_textdim, NADL_TEXTDIM); store64(nad_c_onbar, NADL_ONBAR);
+    store64(nad_c_bardim, NADL_BARDIM); store64(nad_c_border, NADL_BORDER);
+    store64(nad_c_hover, NADL_HOVER);   store64(nad_c_sel, NADL_SEL);
+    store64(nad_c_normal, NADL_NORMAL); store64(nad_c_warn, NADL_WARN);
+    store64(nad_c_alarm, NADL_ALARM);   store64(nad_c_offline, NADL_OFFLINE);
+    return 0;
+}
+
+# Build the shared brushes / pens / fonts. Idempotent.
+func theme_init() -> i64 {
+    if load64(nad_theme_done) == 1 { return 0; }
+    nad_load_palette();
+    store64(nad_b_topbar,  CreateSolidBrush(load64(nad_c_topbar)));
+    store64(nad_b_canvas,  CreateSolidBrush(load64(nad_c_canvas)));
+    store64(nad_b_card,    CreateSolidBrush(load64(nad_c_card)));
+    store64(nad_b_hover,   CreateSolidBrush(load64(nad_c_hover)));
+    store64(nad_b_sel,     CreateSolidBrush(load64(nad_c_sel)));
+    store64(nad_b_normal,  CreateSolidBrush(load64(nad_c_normal)));
+    store64(nad_b_warn,    CreateSolidBrush(load64(nad_c_warn)));
+    store64(nad_b_alarm,   CreateSolidBrush(load64(nad_c_alarm)));
+    store64(nad_b_offline, CreateSolidBrush(load64(nad_c_offline)));
+    store64(nad_p_border, CreatePen(0, 1, load64(nad_c_border)));
+    store64(nad_p_sel,    CreatePen(0, 2, load64(nad_c_sel)));
+    store64(nad_p_bar,    CreatePen(0, 1, load64(nad_c_topbar)));
+    store64(nad_f_ui,    CreateFontA(0 - 15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, nad_face_ui));
+    store64(nad_f_small, CreateFontA(0 - 13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, nad_face_ui));
+    store64(nad_f_hdr,   CreateFontA(0 - 17, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, nad_face_ui));
+    store64(nad_f_big,   CreateFontA(0 - 32, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, nad_face_ui));
+    store64(nad_f_mark,  CreateFontA(0 - 22, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, nad_face_ui));
+    store64(nad_theme_done, 1);
+    return 0;
+}
+
+# Map a source/tag state code to a status COLORREF.
+#   0 = offline/disabled, 1 = normal/good/running, 2 = warning/connecting, 3 = alarm/error
+func nad_state_color(code: i64) -> i64 {
+    if code == 1 { return load64(nad_c_normal); }
+    if code == 2 { return load64(nad_c_warn); }
+    if code == 3 { return load64(nad_c_alarm); }
+    return load64(nad_c_offline);
+}
+# Same mapping, but returns the matching status HBRUSH (for nad_dot / fills).
+func nad_state_brush(code: i64) -> i64 {
+    if code == 1 { return load64(nad_b_normal); }
+    if code == 2 { return load64(nad_b_warn); }
+    if code == 3 { return load64(nad_b_alarm); }
+    return load64(nad_b_offline);
+}

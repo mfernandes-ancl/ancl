@@ -1,0 +1,256 @@
+# =====================================================================
+#  ai_bridge.ancl  -  native WinHttp connector to the Claude Messages API.
+#
+#  CRT-free HTTPS (TLS over 443) via winhttp.dll. ai_request(prompt, out)
+#  POSTs a non-streaming /v1/messages request and extracts the assistant
+#  text (or, on an error status, the error "message"). The API key is
+#  passed in at runtime (ai_key) - NEVER embedded in source. Designed to
+#  run on a worker thread (the call blocks during the round-trip).
+#
+#  Wide-string note: WinHttp takes UTF-16 for host/verb/path/headers;
+#  ai_a2w widens our ASCII. The JSON body + response are raw bytes.
+# =====================================================================
+extern "winhttp.dll" WinHttpOpen -> ptr;          # HINTERNET WinHttpOpen(ua, accessType, proxy, bypass, flags)
+extern "winhttp.dll" WinHttpConnect -> ptr;       # HINTERNET WinHttpConnect(hSession, serverW, port, 0)
+extern "winhttp.dll" WinHttpOpenRequest -> ptr;   # HINTERNET WinHttpOpenRequest(hConnect, verbW, pathW, ver, ref, accept, flags)
+extern "winhttp.dll" WinHttpAddRequestHeaders;    # BOOL (hRequest, headersW, len, modifiers)
+extern "winhttp.dll" WinHttpSendRequest;          # BOOL (hRequest, hdrsW, hdrLen, body, bodyLen, totalLen, ctx)
+extern "winhttp.dll" WinHttpReceiveResponse;      # BOOL (hRequest, 0)
+extern "winhttp.dll" WinHttpQueryHeaders;         # BOOL (hRequest, infoLevel, nameW, buf, &buflen, &idx)
+extern "winhttp.dll" WinHttpReadData;             # BOOL (hRequest, buf, toRead, &read)
+extern "winhttp.dll" WinHttpCloseHandle;          # BOOL (hInternet)
+
+@DATA
+ai_key:    buf = 512;        # API key (ANSI, runtime-filled; NEVER a literal)
+ai_model:  str = "claude-haiku-4-5-20251001";   # change to taste (e.g. claude-sonnet-4-6)
+
+ai_host_a: str = "api.anthropic.com";
+ai_verb_a: str = "POST";
+ai_path_a: str = "/v1/messages";
+ai_ua_a:   str = "AetherStudio/1.0";
+ai_host_w: buf = 128;
+ai_verb_w: buf = 32;
+ai_path_w: buf = 64;
+ai_ua_w:   buf = 64;
+
+hdr_p1:    str = "x-api-key: ";
+hdr_p2:    str = "\r\nanthropic-version: 2023-06-01\r\ncontent-type: application/json";
+ai_hdr_a:  buf = 1024;
+ai_hdr_w:  buf = 2048;
+
+b1:        str = "{\"model\":\"";
+b2:        str = "\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":\"";
+b3:        str = "\"}]}";
+# vision: the caller sets these pointers before ai_request when an image is attached; one-shot
+# (ai_request clears ai_img_b64 after building). Kept self-contained here so ai_bridge compiles
+# standalone (tests/test_winhttp.ancl imports it without agent.ancl's vision globals).
+ai_img_b64:  buf = 8;        # ptr to base64 image data, 0 = text-only
+ai_img_mime: buf = 8;        # ptr to mime string ("image/png" etc.)
+bi2:  str = "\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"";
+bi3:  str = "\",\"data\":\"";
+bi4:  str = "\"}},{\"type\":\"text\",\"text\":\"";
+bi5:  str = "\"}]}]}";
+ai_body:   buf = 4194304;    # 4MB JSON request (room for an inlined base64 image content block, 2MB raw cap)
+ai_resp:   buf = 524288;     # response bytes
+
+mk_text:   str = "\"text\":\"";
+mk_msg:    str = "\"message\":\"";
+err_open:  str = "[ai] WinHttpOpen failed";
+err_conn:  str = "[ai] WinHttpConnect failed";
+err_req:   str = "[ai] WinHttpOpenRequest failed";
+err_send:  str = "[ai] WinHttpSendRequest failed (no network / TLS?)";
+err_recv:  str = "[ai] WinHttpReceiveResponse failed";
+err_empty: str = "[ai] empty response";
+
+ai_status: buf = 8;          # HTTP status (DWORD)
+ai_slen:   buf = 8;
+ai_nread:  buf = 8;
+
+@CODE
+# ANSI -> UTF-16LE into dst (wide NUL-terminated). Returns wide byte length.
+func ai_a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i * 2, c);
+        store8(dst + i * 2 + 1, 0);
+        if c == 0 { return i * 2; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Append JSON-escaped `src` into dst at offset j0. Returns the new offset.
+func ai_json_escape_into(dst: i64, j0: i64, src: i64) -> i64 {
+    j = j0;
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { return j; }
+        if c == 34 { store8(dst + j, 92); store8(dst + j + 1, 34);  j = j + 2; }   # \"
+        if c == 92 { store8(dst + j, 92); store8(dst + j + 1, 92);  j = j + 2; }   # \\
+        if c == 10 { store8(dst + j, 92); store8(dst + j + 1, 110); j = j + 2; }   # \n
+        if c == 13 { store8(dst + j, 92); store8(dst + j + 1, 114); j = j + 2; }   # \r
+        if c == 9  { store8(dst + j, 92); store8(dst + j + 1, 116); j = j + 2; }   # \t
+        if c != 34 { if c != 92 { if c != 10 { if c != 13 { if c != 9 {
+            store8(dst + j, c); j = j + 1;                                          # literal
+        } } } } }
+        i = i + 1;
+    }
+    return j;
+}
+
+# Vision request: content becomes [{image base64}, {text}] (Anthropic order: image first).
+# The mime + base64 are controlled/JSON-safe -> spliced raw; only the prompt is escaped.
+func ai_build_body_img(prompt: i64) -> i64 {
+    e = str_copy(ai_body, b1);
+    e = str_copy(e, ai_model);
+    e = str_copy(e, bi2);
+    e = str_copy(e, load64(ai_img_mime));
+    e = str_copy(e, bi3);
+    e = str_copy(e, load64(ai_img_b64));
+    e = str_copy(e, bi4);
+    off = ai_json_escape_into(ai_body, e - ai_body, prompt);
+    store8(ai_body + off, 0);
+    str_copy(ai_body + off, bi5);
+    return 0;
+}
+
+func ai_build_body(prompt: i64) -> i64 {
+    if load64(ai_img_b64) != 0 { ai_build_body_img(prompt); return 0; }   # vision turn
+    e = str_copy(ai_body, b1);
+    e = str_copy(e, ai_model);
+    e = str_copy(e, b2);
+    off = ai_json_escape_into(ai_body, e - ai_body, prompt);
+    store8(ai_body + off, 0);
+    str_copy(ai_body + off, b3);
+    return 0;
+}
+
+# index in hay right AFTER the first occurrence of ndl, or -1.
+func ai_find_after(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0 - 1; }
+        j = 0;
+        matched = 1;
+        while matched == 1 {
+            cn = load8(ndl + j);
+            if cn == 0 { return i + j; }
+            if load8(hay + i + j) != cn { matched = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Extract a JSON string value starting at resp+s (un-escaping) into dst,
+# stopping at the first unescaped '"'. Returns dst length.
+func aib_hexdig(c: i64) -> i64 {        # one hex char -> 0..15
+    if c >= 48 { if c <= 57  { return c - 48; } }
+    if c >= 65 { if c <= 70  { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0;
+}
+func aib_emitu(dst: i64, j: i64, cp: i64) -> i64 {   # codepoint -> UTF-8, return new j
+    if cp < 128 { store8(dst + j, cp); return j + 1; }
+    if cp < 2048 {
+        store8(dst + j,     bor(192, shr(cp, 6)));
+        store8(dst + j + 1, bor(128, band(cp, 63)));
+        return j + 2;
+    }
+    store8(dst + j,     bor(224, shr(cp, 12)));
+    store8(dst + j + 1, bor(128, band(shr(cp, 6), 63)));
+    store8(dst + j + 2, bor(128, band(cp, 63)));
+    return j + 3;
+}
+func ai_unescape_to(resp: i64, s: i64, dst: i64) -> i64 {
+    i = s;
+    j = 0;
+    while 1 {
+        c = load8(resp + i);
+        if c == 0 { break; }
+        if c == 34 { break; }                    # closing quote
+        if c == 92 {                             # escape
+            d = load8(resp + i + 1);
+            if d == 110 { store8(dst + j, 10); j = j + 1; i = i + 2; }        # \n
+            if d == 116 { store8(dst + j, 9);  j = j + 1; i = i + 2; }        # \t
+            if d == 114 { store8(dst + j, 13); j = j + 1; i = i + 2; }        # \r
+            if d == 117 {                                                    # \uXXXX -> UTF-8
+                cp = shl(aib_hexdig(load8(resp+i+2)), 12) + shl(aib_hexdig(load8(resp+i+3)), 8) + shl(aib_hexdig(load8(resp+i+4)), 4) + aib_hexdig(load8(resp+i+5));
+                j = aib_emitu(dst, j, cp); i = i + 6;
+            }
+            if d != 110 { if d != 116 { if d != 114 { if d != 117 {
+                store8(dst + j, d); j = j + 1; i = i + 2;                     # \" \\ \/ ...
+            } } } }
+        } else {
+            store8(dst + j, c); j = j + 1; i = i + 1;
+        }
+    }
+    store8(dst + j, 0);
+    return j;
+}
+
+func ai_extract(resp: i64, dst: i64) -> i64 {
+    s = ai_find_after(resp, mk_text);            # assistant content[].text
+    if s < 0 { s = ai_find_after(resp, mk_msg); }   # else an error "message"
+    if s < 0 { str_copy(dst, resp); return 0; }     # else dump raw response
+    ai_unescape_to(resp, s, dst);
+    return 0;
+}
+
+func ai_close3(a: i64, b: i64, c: i64) -> i64 {
+    WinHttpCloseHandle(a); WinHttpCloseHandle(b); WinHttpCloseHandle(c);
+    return 0;
+}
+
+# POST `prompt` to Claude; write the reply (or error message) into `out`.
+# Returns the HTTP status code (0 on a transport failure; check `out`).
+func ai_request(prompt: i64, out: i64) -> i64 {
+    ai_a2w(ai_host_w, ai_host_a);
+    ai_a2w(ai_verb_w, ai_verb_a);
+    ai_a2w(ai_path_w, ai_path_a);
+    ai_a2w(ai_ua_w, ai_ua_a);
+
+    e = str_copy(ai_hdr_a, hdr_p1);
+    e = str_copy(e, ai_key);
+    str_copy(e, hdr_p2);
+    ai_a2w(ai_hdr_w, ai_hdr_a);
+
+    ai_build_body(prompt);
+    store64(ai_img_b64, 0);                                                   # one-shot: don't re-attach on the next request
+    blen = strlen(ai_body);
+
+    hs = WinHttpOpen(ai_ua_w, 0, 0, 0, 0);
+    if hs == 0 { str_copy(out, err_open); return 0; }
+    hc = WinHttpConnect(hs, ai_host_w, 443, 0);
+    if hc == 0 { WinHttpCloseHandle(hs); str_copy(out, err_conn); return 0; }
+    hr = WinHttpOpenRequest(hc, ai_verb_w, ai_path_w, 0, 0, 0, 0x00800000);   # WINHTTP_FLAG_SECURE
+    if hr == 0 { WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); str_copy(out, err_req); return 0; }
+
+    WinHttpAddRequestHeaders(hr, ai_hdr_w, 0 - 1, 0x20000000);                # ADD, count the wide string
+    sok = WinHttpSendRequest(hr, 0, 0, ai_body, blen, blen, 0);
+    if sok == 0 { ai_close3(hr, hc, hs); str_copy(out, err_send); return 0; }
+    rok = WinHttpReceiveResponse(hr, 0);
+    if rok == 0 { ai_close3(hr, hc, hs); str_copy(out, err_recv); return 0; }
+
+    store32(ai_slen, 4);
+    WinHttpQueryHeaders(hr, 0x20000013, 0, ai_status, ai_slen, 0);            # STATUS_CODE | FLAG_NUMBER
+
+    total = 0;
+    while 1 {
+        rd = WinHttpReadData(hr, ai_resp + total, 65536, ai_nread);
+        if rd == 0 { break; }
+        n = load32(ai_nread);
+        if n == 0 { break; }
+        total = total + n;
+        if total > 458752 { break; }
+    }
+    store8(ai_resp + total, 0);
+    ai_close3(hr, hc, hs);
+
+    if total == 0 { str_copy(out, err_empty); return load32(ai_status); }
+    ai_extract(ai_resp, out);
+    return load32(ai_status);
+}

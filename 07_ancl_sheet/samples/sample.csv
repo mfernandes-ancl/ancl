@@ -1,0 +1,6 @@
+"Item","Owner","Status","Qty","Unit","Due","Notes","Total"
+"Pump rebuild","Rita","In Progress","3","sets","2026-07-02","seal kits quoted",""
+"Sensor audit","Mika","Open","18","tags","2026-07-05","CSV import check",""
+"Valve report","Noah","Done","7","loops","2026-06-28","exported from ANCL Sheet",""
+"Line flush","Ada","Open","2","lines","2026-07-09","requires permit",""
+"Calibration","Sofia","In Progress","11","meters","2026-07-12","quote-safe, comma-safe cell",""

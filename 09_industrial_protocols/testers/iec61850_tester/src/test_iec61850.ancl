@@ -1,0 +1,228 @@
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+import "../../../core_lib/iec61850_compat.ancl";
+
+
+@DATA
+g_mms_val_offset: buf = 8;
+g_val_str:  buf = 256;
+g_type_str: buf = 64;
+g_err:      buf = 8;
+g_numbuf:   buf = 32;
+
+# Test parameters
+host_ip:    str = "127.0.0.1";
+port_num:   i64 = 10102;
+ref_float:  str = "simpleIOGenericIO/GGIO1.AnIn1.mag.f";
+ref_ctl:    str = "simpleIOGenericIO/GGIO1.SPCSO1";
+ref_status: str = "simpleIOGenericIO/GGIO1.SPCSO1.stVal";
+
+@CODE
+
+func log_append(text: i64) -> i64 {
+    puts_cstr(text);
+    return 0;
+}
+
+func detect_mms_alignment() -> i64 {
+    val1 = MmsValue_newBoolean(1);
+    val0 = MmsValue_newBoolean(0);
+    
+    offset = 8; # default aligned
+    
+    # check offset 5
+    if load8(val1 + 5) == 1 {
+        if load8(val0 + 5) == 0 {
+            offset = 5;
+        }
+    }
+    
+    MmsValue_delete(val1);
+    MmsValue_delete(val0);
+    
+    store64(g_mms_val_offset, offset);
+    return offset;
+}
+
+func decode_mms_value(val_ptr: i64) -> i64 {
+    type = MmsValue_getType(val_ptr);
+    offset = load64(g_mms_val_offset);
+    
+    store8(g_val_str, 0);
+    store8(g_type_str, 0);
+    
+    if type == 2 { # MMS_BOOLEAN
+        str_copy(g_type_str, "Boolean");
+        b_val = load8(val_ptr + offset);
+        if b_val != 0 { str_copy(g_val_str, "True"); }
+        else { str_copy(g_val_str, "False"); }
+        return 0;
+    }
+    
+    if type == 4 { # MMS_INTEGER
+        str_copy(g_type_str, "Integer");
+        int_val = MmsValue_toInt64(val_ptr);
+        int_to_str(g_val_str, int_val);
+        return 0;
+    }
+    
+    if type == 5 { # MMS_UNSIGNED
+        str_copy(g_type_str, "Unsigned");
+        int_val = MmsValue_toInt64(val_ptr);
+        int_to_str(g_val_str, int_val);
+        return 0;
+    }
+    
+    if type == 6 { # MMS_FLOAT
+        format_width = load8(val_ptr + offset + 1);
+        if format_width == 32 {
+            str_copy(g_type_str, "Float32");
+            f_bits = load32(val_ptr + offset + 2);
+            nf_ftoa(f_bits, g_val_str);
+        } else {
+            str_copy(g_type_str, "Float64");
+            d_bits = load64(val_ptr + offset + 2);
+            nf_dtoa(d_bits, g_val_str);
+        }
+        return 0;
+    }
+    
+    if type == 8 { # MMS_VISIBLE_STRING
+        str_copy(g_type_str, "VisibleString");
+        str_copy(g_val_str, MmsValue_toString(val_ptr));
+        return 0;
+    }
+    
+    if type == 14 { # MMS_UTC_TIME
+        str_copy(g_type_str, "UtcTime");
+        time_ms = MmsValue_getUtcTimeInMs(val_ptr);
+        int_to_str(g_val_str, time_ms);
+        return 0;
+    }
+    
+    if type == 15 { # MMS_DATA_ACCESS_ERROR
+        str_copy(g_type_str, "DataAccessError");
+        err_code = load32(val_ptr + offset);
+        str_copy(g_val_str, "Access Error Code: ");
+        int_to_str(g_val_str + strlen(g_val_str), err_code);
+        return 0;
+    }
+    
+    # Fallback / other structures
+    str_copy(g_type_str, "Structure/Other");
+    int_to_str(g_val_str, type);
+    return 0;
+}
+
+func main() -> i32 {
+    log_append("[TEST] Detecting MMS struct alignment...\n");
+    offset = detect_mms_alignment();
+    log_append("      -> Alignment offset detected: ");
+    int_to_str(g_numbuf, offset);
+    log_append(g_numbuf);
+    log_append("\n");
+    
+    log_append("[TEST] Creating IedConnection...\n");
+    con = IedConnection_create();
+    if con == 0 {
+        log_append("      -> FAILED to create IedConnection.\n");
+        return 1;
+    }
+    
+    log_append("[TEST] Connecting to 127.0.0.1:10102...\n");
+    store32(g_err, 0);
+    IedConnection_connect(con, g_err, host_ip, port_num);
+    err_val = load32(g_err);
+    if err_val != 0 {
+        log_append("      -> FAILED to connect. Error: ");
+        int_to_str(g_numbuf, err_val);
+        log_append(g_numbuf);
+        log_append("\n");
+        IedConnection_destroy(con);
+        return 1;
+    }
+    log_append("      -> Connected successfully!\n");
+    
+    # Test Read Float
+    log_append("[TEST] Reading MX object: ");
+    log_append(ref_float);
+    log_append("\n");
+    
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_float, 1); # FC: MX = 1
+    err_val = load32(g_err);
+    if err_val != 0 {
+        log_append("      -> Read FAILED. Error: ");
+        int_to_str(g_numbuf, err_val);
+        log_append(g_numbuf);
+        log_append("\n");
+    } else {
+        if val == 0 {
+            log_append("      -> Read returned NULL value.\n");
+        } else {
+            decode_mms_value(val);
+            log_append("      -> Read SUCCESS! Value = ");
+            log_append(g_val_str);
+            log_append(" (Type: ");
+            log_append(g_type_str);
+            log_append(")\n");
+            MmsValue_delete(val);
+        }
+    }
+    
+    # Test Write Control
+    log_append("[TEST] Direct operate control object: ");
+    log_append(ref_ctl);
+    log_append(" -> True\n");
+    
+    control = ControlObjectClient_create(ref_ctl, con);
+    if control == 0 {
+        log_append("      -> ControlObjectClient_create FAILED.\n");
+    } else {
+        ctlVal = MmsValue_newBoolean(1);
+        ControlObjectClient_setOrigin(control, 0, 3);
+        res = ControlObjectClient_operate(control, ctlVal, 0);
+        
+        if res != 0 {
+            log_append("      -> Direct operate SUCCESS!\n");
+        } else {
+            log_append("      -> Direct operate FAILED.\n");
+        }
+        MmsValue_delete(ctlVal);
+        ControlObjectClient_destroy(control);
+    }
+    
+    # Read Status Back
+    log_append("[TEST] Reading ST object: ");
+    log_append(ref_status);
+    log_append("\n");
+    
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_status, 0); # FC: ST = 0
+    err_val = load32(g_err);
+    if err_val != 0 {
+        log_append("      -> Read FAILED. Error: ");
+        int_to_str(g_numbuf, err_val);
+        log_append(g_numbuf);
+        log_append("\n");
+    } else {
+        if val == 0 {
+            log_append("      -> Read returned NULL value.\n");
+        } else {
+            decode_mms_value(val);
+            log_append("      -> Read SUCCESS! Value = ");
+            log_append(g_val_str);
+            log_append(" (Type: ");
+            log_append(g_type_str);
+            log_append(")\n");
+            MmsValue_delete(val);
+        }
+    }
+    
+    log_append("[TEST] Closing connection...\n");
+    IedConnection_close(con);
+    IedConnection_destroy(con);
+    log_append("[TEST] Completed.\n");
+    return 0;
+}

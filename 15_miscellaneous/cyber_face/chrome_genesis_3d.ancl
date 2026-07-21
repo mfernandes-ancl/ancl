@@ -1,0 +1,1015 @@
+# =====================================================================
+#  chrome_genesis_3d.ancl  -  Gouraud-Shaded 3D Cyborg Face Engine
+#
+#  Open-Source Technical Showcase Engine (Chrome-Genesis)
+#  100% CRT-free, native 3D software-rasterized animation engine.
+#  Features: Gouraud scanline shading, Z-buffer, skeletal animation,
+#            Win32 DIB pixel blasting, and telemetry overlay.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" StretchDIBits;
+extern "kernel32.dll" GetTickCount;
+extern "shell32.dll" DragQueryFileA -> i64;
+extern "shell32.dll" DragFinish;
+extern "shell32.dll" DragAcceptFiles;
+
+@DATA
+clsname:      str = "CYBERFACE3DWND";
+title:        str = "ANCL Project Chrome-Genesis: 3D Cyborg Face Engine";
+g_obj_path:   str = "models/cyber_face.obj";
+g_drop_path:  buf = 260;
+
+# Trigonometry LUT Buffers (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# Framebuffer (320x240 pixels * 4 bytes per pixel = 307200 bytes)
+g_framebuffer: buf = 307200;
+
+# Z-buffer (320x240 pixels * 4 bytes per pixel = 307200 bytes)
+g_zbuffer: buf = 307200;
+
+# BITMAPINFO structure (48 bytes)
+g_bitmapinfo: buf = 48;
+
+# Vertices (25 vertices * 3 coords * 8 bytes = 600 bytes)
+g_vertices: buf = 1024;
+
+# Normals (25 vertices * 3 coords * 8 bytes = 600 bytes)
+g_normals: buf = 1024;
+
+# Projected coordinates & shade (25 vertices * 6 values * 8 bytes = 1200 bytes)
+g_projected: buf = 2048;
+
+# Triangles (128 triangles * 3 indices * 8 bytes = 3072 bytes)
+g_triangles: buf = 3072;
+
+# Triangle colors/assembly types (128 triangles * 8 bytes = 1024 bytes)
+g_triangle_colors: buf = 1024;
+
+# Rotated normal coordinates (8 bytes each)
+g_rot_nx: buf = 8;
+g_rot_ny: buf = 8;
+g_rot_nz: buf = 8;
+
+# Dynamic counters & OBJ parser states
+g_num_vertices:   buf = 8;
+g_num_triangles:  buf = 8;
+g_obj_file_buf:   buf = 65536;
+g_parsed_val:     buf = 8;
+g_parse_ptr:      buf = 8;
+g_io_bytes:       buf = 8;
+
+# Game state / frame parameters
+g_frame:         buf = 8;
+g_last_time:     buf = 8;
+g_angleX:        buf = 8;
+g_angleY:        buf = 8;
+g_eye_scale_y:   buf = 8;
+g_jaw_offset_y:  buf = 8;
+
+# Win32 structures & brushes
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+# Telemetry temporary string buffer
+g_txt_buf:    buf = 128;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Math & String Utilities
+# ---------------------------------------------------------------------
+
+func isqrt(val: i64) -> i64 {
+    if val <= 0 { return 0; }
+    x = val;
+    y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + val / x) / 2;
+    }
+    return x;
+}
+
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        # bhaskara formula for sin(x) where x is in [0, pi] mapped to [0, 512]
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    
+    # Cosine is Sine shifted by 90 degrees (256 units)
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+func get_sin(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_sin + idx * 8);
+}
+
+func get_cos(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_cos + idx * 8);
+}
+
+func strcpy(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i, c);
+        if c == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func itoa(val: i64, buf: i64) -> i64 {
+    if val == 0 {
+        store8(buf, 48); # '0'
+        store8(buf + 1, 0);
+        return 1;
+    }
+    
+    negative = 0;
+    temp = val;
+    if temp < 0 {
+        negative = 1;
+        temp = 0 - temp;
+    }
+    
+    p = buf;
+    if negative == 1 {
+        store8(p, 45); # '-'
+        p = p + 1;
+    }
+    
+    start_digits = p;
+    while temp > 0 {
+        digit = temp % 10;
+        store8(p, 48 + digit); # '0' + digit
+        p = p + 1;
+        temp = temp / 10;
+    }
+    store8(p, 0); # Null terminator
+    
+    # Reverse digits
+    end_digits = p - 1;
+    while start_digits < end_digits {
+        c1 = load8(start_digits);
+        c2 = load8(end_digits);
+        store8(start_digits, c2);
+        store8(end_digits, c1);
+        start_digits = start_digits + 1;
+        end_digits = end_digits - 1;
+    }
+    
+    return p - buf;
+}
+
+# ---------------------------------------------------------------------
+# Mesh Storage Setters
+# ---------------------------------------------------------------------
+
+func set_vertex(idx: i64, x: i64, y: i64, z: i64, nx: i64, ny: i64, nz: i64) -> i64 {
+    store64(g_vertices + idx * 24, x);
+    store64(g_vertices + idx * 24 + 8, y);
+    store64(g_vertices + idx * 24 + 16, z);
+    
+    store64(g_normals + idx * 24, nx);
+    store64(g_normals + idx * 24 + 8, ny);
+    store64(g_normals + idx * 24 + 16, nz);
+    return 0;
+}
+
+func set_triangle(idx: i64, v0: i64, v1: i64, v2: i64, color_type: i64) -> i64 {
+    store64(g_triangles + idx * 24, v0);
+    store64(g_triangles + idx * 24 + 8, v1);
+    store64(g_triangles + idx * 24 + 16, v2);
+    store64(g_triangle_colors + idx * 8, color_type);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Mesh Loader & Standalone .OBJ Parser
+# ---------------------------------------------------------------------
+
+func parse_integer(p: i64) -> i64 {
+    # Skip spaces and tabs
+    while load8(p) == 32 || load8(p) == 9 {
+        p = p + 1;
+    }
+    
+    sign = 1;
+    if load8(p) == 45 { # '-'
+        sign = 0 - 1;
+        p = p + 1;
+    }
+    
+    val = 0;
+    while load8(p) >= 48 && load8(p) <= 57 {
+        val = val * 10 + (load8(p) - 48);
+        p = p + 1;
+    }
+    
+    # Skip decimal fraction if any (e.g. .0 or .000)
+    if load8(p) == 46 { # '.'
+        p = p + 1;
+        while load8(p) >= 48 && load8(p) <= 57 {
+            p = p + 1;
+        }
+    }
+    
+    store64(g_parsed_val, val * sign);
+    store64(g_parse_ptr, p);
+    return 0;
+}
+
+func parse_float_as_fixed(p: i64) -> i64 {
+    # Skip spaces and tabs
+    while load8(p) == 32 || load8(p) == 9 {
+        p = p + 1;
+    }
+    
+    sign = 1;
+    if load8(p) == 45 { # '-'
+        sign = 0 - 1;
+        p = p + 1;
+    }
+    
+    int_val = 0;
+    while load8(p) >= 48 && load8(p) <= 57 {
+        int_val = int_val * 10 + (load8(p) - 48);
+        p = p + 1;
+    }
+    
+    frac_val = 0;
+    frac_digits = 0;
+    if load8(p) == 46 { # '.'
+        p = p + 1;
+        if load8(p) >= 48 && load8(p) <= 57 {
+            frac_val = frac_val * 10 + (load8(p) - 48);
+            frac_digits = frac_digits + 1;
+            p = p + 1;
+        }
+        if load8(p) >= 48 && load8(p) <= 57 {
+            frac_val = frac_val * 10 + (load8(p) - 48);
+            frac_digits = frac_digits + 1;
+            p = p + 1;
+        }
+        # Skip trailing digits
+        while load8(p) >= 48 && load8(p) <= 57 {
+            p = p + 1;
+        }
+    }
+    
+    val = 0;
+    if frac_digits == 0 {
+        val = int_val * 100;
+    } else if frac_digits == 1 {
+        val = int_val * 100 + frac_val * 10;
+    } else {
+        val = int_val * 100 + frac_val;
+    }
+    
+    store64(g_parsed_val, val * sign);
+    store64(g_parse_ptr, p);
+    return 0;
+}
+
+func parse_obj_file(path: str) -> i64 {
+    # Open file
+    h = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 {
+        return 0;
+    }
+    
+    # Read up to 65536 bytes
+    ReadFile(h, g_obj_file_buf, 65536, g_io_bytes, 0);
+    bytes_read = load64(g_io_bytes);
+    CloseHandle(h);
+    
+    p = g_obj_file_buf;
+    p_end = g_obj_file_buf + bytes_read;
+    
+    store64(g_num_vertices, 0);
+    store64(g_num_triangles, 0);
+    
+    while p < p_end {
+        c = load8(p);
+        
+        # Check if line starts with 'v '
+        is_v = 0;
+        if c == 118 { # 'v'
+            if load8(p + 1) == 32 { # ' '
+                is_v = 1;
+            }
+        }
+        
+        # Check if line starts with 'f '
+        is_f = 0;
+        if c == 102 { # 'f'
+            if load8(p + 1) == 32 { # ' '
+                is_f = 1;
+            }
+        }
+        
+        if is_v == 1 {
+            p = p + 2; # Skip 'v '
+            
+            # Parse X
+            parse_float_as_fixed(p);
+            x = load64(g_parsed_val);
+            p = load64(g_parse_ptr);
+            
+            # Parse Y
+            parse_float_as_fixed(p);
+            y = load64(g_parsed_val);
+            p = load64(g_parse_ptr);
+            
+            # Parse Z
+            parse_float_as_fixed(p);
+            z = load64(g_parsed_val);
+            p = load64(g_parse_ptr);
+            
+            # Save vertex index
+            v_idx = load64(g_num_vertices);
+            if v_idx < 42 {
+                # Pre-compute normal vectors pointing out from origin
+                len_sq = x * x + y * y + z * z;
+                len = isqrt(len_sq);
+                if len < 1 { len = 1; }
+                nx = (x * 65536) / len;
+                ny = (y * 65536) / len;
+                nz = (z * 65536) / len;
+                
+                # Store vertex
+                set_vertex(v_idx, x / 100, y / 100, z / 100, nx, ny, nz);
+                store64(g_num_vertices, v_idx + 1);
+            }
+        } else if is_f == 1 {
+            p = p + 2; # Skip 'f '
+            
+            # Parse v0 index
+            parse_integer(p);
+            v0 = load64(g_parsed_val) - 1; # OBJ is 1-indexed
+            p = load64(g_parse_ptr);
+            
+            # Parse v1 index
+            parse_integer(p);
+            v1 = load64(g_parsed_val) - 1;
+            p = load64(g_parse_ptr);
+            
+            # Parse v2 index
+            parse_integer(p);
+            v2 = load64(g_parsed_val) - 1;
+            p = load64(g_parse_ptr);
+            
+            t_idx = load64(g_num_triangles);
+            if t_idx < 128 {
+                # Assign color type based on vertical height or indices
+                color_type = 1;
+                if t_idx % 2 == 1 { color_type = 2; }
+                
+                set_triangle(t_idx, v0, v1, v2, color_type);
+                store64(g_num_triangles, t_idx + 1);
+            }
+        }
+        
+        # Skip to end of line
+        while p < p_end && load8(p) != 10 && load8(p) != 13 {
+            p = p + 1;
+        }
+        # Skip newline characters
+        while p < p_end && (load8(p) == 10 || load8(p) == 13) {
+            p = p + 1;
+        }
+    }
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# 3D Facial Mesh Fallback Configuration
+# ---------------------------------------------------------------------
+
+func init_geometry() -> i64 {
+    # Face skin/mesh vertices (Forehead, Cheekplanes, Nosebridge)
+    set_vertex(0, 0-40, 60, 20, 0-32768, 32768, 46340);
+    set_vertex(1, 0, 70, 30, 0, 38269, 53018);
+    set_vertex(2, 40, 60, 20, 32768, 32768, 46340);
+    set_vertex(3, 0-30, 30, 25, 0-32768, 0, 56755);
+    set_vertex(4, 0, 30, 40, 0, 0, 65536);
+    set_vertex(5, 30, 30, 25, 32768, 0, 56755);
+    set_vertex(6, 0, 0, 60, 0, 0, 65536);
+    set_vertex(7, 0, 0-15, 50, 0, 0-32768, 56755);
+    set_vertex(8, 0-50, 0, 10, 0-59049, 0-10000, 26000);
+    set_vertex(9, 50, 0, 10, 59049, 0-10000, 26000);
+    set_vertex(10, 0-20, 0-10, 30, 0-32768, 0-20000, 53000);
+    set_vertex(11, 20, 0-10, 30, 32768, 0-20000, 53000);
+    
+    # Movable mechanical Jaw vertices baseline
+    set_vertex(12, 0-30, 0-30, 15, 0-32768, 0-46340, 32768);
+    set_vertex(13, 0, 0-50, 35, 0, 0-56755, 32768);
+    set_vertex(14, 30, 0-30, 15, 32768, 0-46340, 32768);
+    
+    # Eye centers
+    set_vertex(15, 0-15, 15, 32, 0, 0, 65536);
+    set_vertex(16, 15, 15, 32, 0, 0, 65536);
+    
+    store64(g_num_vertices, 25);
+    return 0;
+}
+
+func init_triangles() -> i64 {
+    # Forehead (type 1: Silver)
+    set_triangle(0, 0, 3, 1, 1);
+    set_triangle(1, 1, 3, 4, 1);
+    set_triangle(2, 1, 4, 2, 1);
+    set_triangle(3, 2, 4, 5, 1);
+    
+    # Nose (type 1)
+    set_triangle(4, 4, 6, 10, 1);
+    set_triangle(5, 4, 11, 6, 1);
+    set_triangle(6, 6, 7, 10, 1);
+    set_triangle(7, 6, 11, 7, 1);
+    
+    # Cheeks (type 1)
+    set_triangle(8, 3, 10, 4, 1);
+    set_triangle(9, 4, 5, 11, 1);
+    set_triangle(10, 3, 8, 10, 1);
+    set_triangle(11, 5, 11, 9, 1);
+    
+    # Movable Jaw Assembly (type 2: Copper)
+    set_triangle(12, 10, 12, 13, 2);
+    set_triangle(13, 11, 13, 14, 2);
+    set_triangle(14, 7, 10, 13, 2);
+    set_triangle(15, 7, 13, 11, 2);
+    
+    # Left Eye (type 3)
+    set_triangle(16, 17, 18, 19, 3);
+    set_triangle(17, 17, 19, 20, 3);
+    
+    # Right Eye (type 4)
+    set_triangle(18, 21, 22, 23, 4);
+    set_triangle(19, 21, 23, 24, 4);
+    
+    store64(g_num_triangles, 20);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Dynamic Skeletal Mesh Assembly Updates
+# ---------------------------------------------------------------------
+
+func update_skeletal_components() -> i64 {
+    # 1. Update mechanical jaw vertices Y offsets
+    jaw_y = load64(g_jaw_offset_y);
+    set_vertex(12, 0-30, 0-30 + jaw_y, 15, 0-32768, 0-46340, 32768);
+    set_vertex(13, 0, 0-50 + jaw_y, 35, 0, 0-56755, 32768);
+    set_vertex(14, 30, 0-30 + jaw_y, 15, 32768, 0-46340, 32768);
+    
+    # 2. Update eyelids vertices scaling (V17 to V24)
+    eye_scale = load64(g_eye_scale_y); # scale value out of 65536
+    
+    # Left Eye Center V15
+    lx = load64(g_vertices + 15 * 24);
+    ly = load64(g_vertices + 15 * 24 + 8);
+    lz = load64(g_vertices + 15 * 24 + 16);
+    
+    # V17: Left corner
+    set_vertex(17, lx - 8, ly, lz + 2, 0, 0, 65536);
+    # V18: Top eyelid
+    set_vertex(18, lx, ly + (5 * eye_scale) / 65536, lz + 2, 0, 0, 65536);
+    # V19: Right corner
+    set_vertex(19, lx + 8, ly, lz + 2, 0, 0, 65536);
+    # V20: Bottom eyelid
+    set_vertex(20, lx, ly - (5 * eye_scale) / 65536, lz + 2, 0, 0, 65536);
+    
+    # Right Eye Center V16
+    rx = load64(g_vertices + 16 * 24);
+    ry = load64(g_vertices + 16 * 24 + 8);
+    rz = load64(g_vertices + 16 * 24 + 16);
+    
+    # V21: Left corner
+    set_vertex(21, rx - 8, ry, rz + 2, 0, 0, 65536);
+    # V22: Top eyelid
+    set_vertex(22, rx, ry + (5 * eye_scale) / 65536, rz + 2, 0, 0, 65536);
+    # V23: Right corner
+    set_vertex(23, rx + 8, ry, rz + 2, 0, 0, 65536);
+    # V24: Bottom eyelid
+    set_vertex(24, rx, ry - (5 * eye_scale) / 65536, rz + 2, 0, 0, 65536);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Matrix Rotations, Lighting, & Perspective Projection Pass
+# ---------------------------------------------------------------------
+
+func project_and_shade_vertices() -> i64 {
+    ax = load64(g_angleX);
+    ay = load64(g_angleY);
+    
+    cosX = load64(g_cos + ax * 8);
+    sinX = load64(g_sin + ax * 8);
+    
+    cosY = load64(g_cos + ay * 8);
+    sinY = load64(g_sin + ay * 8);
+    
+    # Directional light source (50, 80, -100) normalized (Lx=23918, Ly=38269, Lz=-47836)
+    lx = 23918;
+    ly = 38269;
+    lz = 0 - 47836;
+    
+    num_v = load64(g_num_vertices);
+    i = 0;
+    while i < num_v {
+        vx = load64(g_vertices + i * 24);
+        vy = load64(g_vertices + i * 24 + 8);
+        vz = load64(g_vertices + i * 24 + 16);
+        
+        # Rotate coordinates around Y axis
+        x1 = (vx * cosY + vz * sinY) / 65536;
+        z1 = (0 - vx * sinY + vz * cosY) / 65536;
+        
+        # Rotate coordinates around X axis
+        rx = x1;
+        ry = (vy * cosX - z1 * sinX) / 65536;
+        rz = (vy * sinX + z1 * cosX) / 65536;
+        
+        # Rotate normal vector around Y axis
+        nx = load64(g_normals + i * 24);
+        ny = load64(g_normals + i * 24 + 8);
+        nz = load64(g_normals + i * 24 + 16);
+        
+        nx1 = (nx * cosY + nz * sinY) / 65536;
+        nz1 = (0 - nx * sinY + nz * cosY) / 65536;
+        
+        # Rotate normal vector around X axis
+        rnx = nx1;
+        rny = (ny * cosX - nz1 * sinX) / 65536;
+        rnz = (ny * sinX + nz1 * cosX) / 65536;
+        
+        # Compute Lambertian directional lighting dot intensity
+        dot = (rnx * lx + rny * ly + rnz * lz) / 65536;
+        if dot < 0 { dot = 0; }
+        
+        # Calculate final shade: Ambient component (40) + Specular highlight
+        shade = 40 + (dot * 215) / 65536;
+        if shade > 255 { shade = 255; }
+        
+        # Perspective projection to 320x240 screen viewport (Zoom=250, distance offset=180)
+        denom = rz + 180;
+        if denom < 1 { denom = 1; }
+        
+        projX = 160 + (rx * 250) / denom;
+        projY = 120 + (ry * 250) / denom;
+        
+        # Store parameters (X, Y, Z, Shade, 0, 0)
+        addr = g_projected + i * 48;
+        store64(addr + 0, projX);
+        store64(addr + 8, projY);
+        store64(addr + 16, rz);
+        store64(addr + 24, shade);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Software Gouraud Scanline Rasterizer with Per-Pixel Z-Buffer
+# ---------------------------------------------------------------------
+
+func draw_triangle(v0: i64, v1: i64, v2: i64, color_type: i64) -> i64 {
+    # 1. Fetch vertex parameters
+    addr0 = g_projected + v0 * 48;
+    x0 = load64(addr0 + 0);
+    y0 = load64(addr0 + 8);
+    z0 = load64(addr0 + 16);
+    s0 = load64(addr0 + 24);
+    
+    addr1 = g_projected + v1 * 48;
+    x1 = load64(addr1 + 0);
+    y1 = load64(addr1 + 8);
+    z1 = load64(addr1 + 16);
+    s1 = load64(addr1 + 24);
+    
+    addr2 = g_projected + v2 * 48;
+    x2 = load64(addr2 + 0);
+    y2 = load64(addr2 + 8);
+    z2 = load64(addr2 + 16);
+    s2 = load64(addr2 + 24);
+    
+    # 2. Map shades to base color channels depending on triangle type
+    if color_type == 1 { # Silver/Chrome skin
+        r0 = (180 * s0) / 255; g0 = (190 * s0) / 255; b0 = (200 * s0) / 255;
+        r1 = (180 * s1) / 255; g1 = (190 * s1) / 255; b1 = (200 * s1) / 255;
+        r2 = (180 * s2) / 255; g2 = (190 * s2) / 255; b2 = (200 * s2) / 255;
+    } else if color_type == 2 { # Copper/Orange Jaw
+        r0 = (220 * s0) / 255; g0 = (120 * s0) / 255; b0 = (40 * s0) / 255;
+        r1 = (220 * s1) / 255; g1 = (120 * s1) / 255; b1 = (40 * s1) / 255;
+        r2 = (220 * s2) / 255; g2 = (120 * s2) / 255; b2 = (40 * s2) / 255;
+    } else { # Eye: Glowing Cyan
+        r0 = 0; g0 = (255 * s0) / 255; b0 = (255 * s0) / 255;
+        r1 = 0; g1 = (255 * s1) / 255; b1 = (255 * s1) / 255;
+        r2 = 0; g2 = (255 * s2) / 255; b2 = (255 * s2) / 255;
+    }
+    
+    # 3. Sort vertices by Y: y0 <= y1 <= y2
+    if y0 > y1 {
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+        t = z0; z0 = z1; z1 = t;
+        t = r0; r0 = r1; r1 = t;
+        t = g0; g0 = g1; g1 = t;
+        t = b0; b0 = b1; b1 = t;
+    }
+    if y0 > y2 {
+        t = x0; x0 = x2; x2 = t;
+        t = y0; y0 = y2; y2 = t;
+        t = z0; z0 = z2; z2 = t;
+        t = r0; r0 = r2; r2 = t;
+        t = g0; g0 = g2; g2 = t;
+        t = b0; b0 = b2; b2 = t;
+    }
+    if y1 > y2 {
+        t = x1; x1 = x2; x2 = t;
+        t = y1; y1 = y2; y2 = t;
+        t = z1; z1 = z2; z2 = t;
+        t = r1; r1 = r2; r2 = t;
+        t = g1; g1 = g2; g2 = t;
+        t = b1; b1 = b2; b2 = t;
+    }
+    
+    dy_total = y2 - y0;
+    if dy_total == 0 { return 0; } # Skip degenerate triangles
+    
+    # 4. Loop scanlines
+    y = y0;
+    while y <= y2 {
+        if y >= 0 && y < 240 {
+            # Interpolation on long edge 0-2
+            f02 = ((y - y0) * 65536) / dy_total;
+            x_02 = x0 + ((x2 - x0) * f02) / 65536;
+            z_02 = z0 + ((z2 - z0) * f02) / 65536;
+            r_02 = r0 + ((r2 - r0) * f02) / 65536;
+            g_02 = g0 + ((g2 - g0) * f02) / 65536;
+            b_02 = b0 + ((b2 - b0) * f02) / 65536;
+            
+            # Interpolation on short edge (0-1 or 1-2)
+            if y < y1 {
+                dy_short = y1 - y0;
+                if dy_short > 0 {
+                    f_short = ((y - y0) * 65536) / dy_short;
+                    x_short = x0 + ((x1 - x0) * f_short) / 65536;
+                    z_short = z0 + ((z1 - z0) * f_short) / 65536;
+                    r_short = r0 + ((r1 - r0) * f_short) / 65536;
+                    g_short = g0 + ((g1 - g0) * f_short) / 65536;
+                    b_short = b0 + ((b1 - b0) * f_short) / 65536;
+                } else {
+                    x_short = x0; z_short = z0; r_short = r0; g_short = g0; b_short = b0;
+                }
+            } else {
+                dy_short = y2 - y1;
+                if dy_short > 0 {
+                    f_short = ((y - y1) * 65536) / dy_short;
+                    x_short = x1 + ((x2 - x1) * f_short) / 65536;
+                    z_short = z1 + ((z2 - z1) * f_short) / 65536;
+                    r_short = r1 + ((r2 - r1) * f_short) / 65536;
+                    g_short = g1 + ((g2 - g1) * f_short) / 65536;
+                    b_short = b1 + ((b2 - b1) * f_short) / 65536;
+                } else {
+                    x_short = x1; z_short = z1; r_short = r1; g_short = g1; b_short = b1;
+                }
+            }
+            
+            # Order left vs right endpoints
+            x_l = x_02; z_l = z_02; r_l = r_02; g_l = g_02; b_l = b_02;
+            x_r = x_short; z_r = z_short; r_r = r_short; g_r = g_short; b_r = b_short;
+            if x_l > x_r {
+                t = x_l; x_l = x_r; x_r = t;
+                t = z_l; z_l = z_r; z_r = t;
+                t = r_l; r_l = r_r; r_r = t;
+                t = g_l; g_l = g_r; g_r = t;
+                t = b_l; b_l = b_r; b_r = t;
+            }
+            
+            # Fill scanline pixels
+            x_start = x_l;
+            x_end = x_r;
+            if x_start < 0 { x_start = 0; }
+            if x_end > 319 { x_end = 319; }
+            
+            dx_line = x_r - x_l;
+            if dx_line > 0 {
+                x_idx = x_start;
+                while x_idx <= x_end {
+                    # Linear scanline interpolation factor
+                    f_line = ((x_idx - x_l) * 65536) / dx_line;
+                    
+                    z_pixel = z_l + ((z_r - z_l) * f_line) / 65536;
+                    
+                    offset = y * 320 + x_idx;
+                    z_buffered = load32(g_zbuffer + offset * 4);
+                    
+                    # 32-bit Per-Pixel Z-buffer depth test
+                    if z_pixel < z_buffered {
+                        r_pixel = r_l + ((r_r - r_l) * f_line) / 65536;
+                        g_pixel = g_l + ((g_r - g_l) * f_line) / 65536;
+                        b_pixel = b_l + ((b_r - b_l) * f_line) / 65536;
+                        
+                        if r_pixel < 0 { r_pixel = 0; }
+                        if r_pixel > 255 { r_pixel = 255; }
+                        if g_pixel < 0 { g_pixel = 0; }
+                        if g_pixel > 255 { g_pixel = 255; }
+                        if b_pixel < 0 { b_pixel = 0; }
+                        if b_pixel > 255 { b_pixel = 255; }
+                        
+                        pixel_color = shl(r_pixel, 16) + shl(g_pixel, 8) + b_pixel;
+                        
+                        store32(g_framebuffer + offset * 4, pixel_color);
+                        store32(g_zbuffer + offset * 4, z_pixel);
+                    }
+                    x_idx = x_idx + 1;
+                }
+            }
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Frame Rendering Core
+# ---------------------------------------------------------------------
+
+func render_scene() -> i64 {
+    # 1. Clear color and Z-depth buffers
+    i = 0;
+    while i < 76800 {
+        store32(g_framebuffer + i * 4, 0x000B0B0D); # Dark background
+        store32(g_zbuffer + i * 4, 0x7FFFFFFF);     # Max depth value
+        i = i + 1;
+    }
+    
+    # 2. Dynamic vertex offsets & skeletal animation positioning (Skip for small objects like pyramid)
+    if load64(g_num_vertices) >= 25 {
+        update_skeletal_components();
+    }
+    
+    # 3. Apply 3D coordinate transformations
+    project_and_shade_vertices();
+    
+    # 4. Rasterize triangles
+    num_t = load64(g_num_triangles);
+    t_idx = 0;
+    while t_idx < num_t {
+        v_idx0 = load64(g_triangles + t_idx * 24);
+        v_idx1 = load64(g_triangles + t_idx * 24 + 8);
+        v_idx2 = load64(g_triangles + t_idx * 24 + 16);
+        col_type = load64(g_triangle_colors + t_idx * 8);
+        
+        draw_triangle(v_idx0, v_idx1, v_idx2, col_type);
+        t_idx = t_idx + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Telemetry Overlay Printing
+# ---------------------------------------------------------------------
+
+func draw_telemetry(hdc: i64, fps: i64, angX: i64, angY: i64, jaw: i64, eye: i64, w: i64, h: i64) -> i64 {
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, 0x0000FFFF); # Bright Cyber Cyan
+    
+    # Frame clock / FPS
+    strcpy(g_txt_buf, "FPS: ");
+    len = itoa(fps, g_txt_buf + 5);
+    TextOutA(hdc, 20, 20, g_txt_buf, 5 + len);
+    
+    # Angles
+    strcpy(g_txt_buf, "ROTATION: X=");
+    len = itoa(angX, g_txt_buf + 12);
+    strcpy(g_txt_buf + 12 + len, " Y=");
+    len2 = itoa(angY, g_txt_buf + 15 + len);
+    TextOutA(hdc, 20, 45, g_txt_buf, 15 + len + len2);
+    
+    # Jaw offset
+    strcpy(g_txt_buf, "JAW DEVIATION: ");
+    len = itoa(jaw, g_txt_buf + 15);
+    TextOutA(hdc, 20, 70, g_txt_buf, 15 + len);
+    
+    # Blink multiplier
+    strcpy(g_txt_buf, "EYE BLINK SCALE: ");
+    len = itoa(eye, g_txt_buf + 17);
+    TextOutA(hdc, 20, 95, g_txt_buf, 17 + len);
+    
+    # Technical Branding
+    SetTextColor(hdc, 0x0000FF95); # Glowing Mint Green
+    strcpy(g_txt_buf, "PROJECT CHROME-GENESIS // NATIVE MESH LOADER");
+    TextOutA(hdc, 20, h - 40, g_txt_buf, 44);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 WndProc
+# ---------------------------------------------------------------------
+
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetTimer(hwnd, 1, 16, 0); # Lock execution pump to ~60 FPS
+        store64(g_last_time, GetTickCount());
+        DragAcceptFiles(hwnd, 1);
+        return 0;
+    }
+    
+    if msg == 563 { # WM_DROPFILES
+        store64(g_num_vertices, 0);
+        store64(g_num_triangles, 0);
+        
+        DragQueryFileA(wParam, 0, g_drop_path, 260);
+        parse_obj_file(g_drop_path);
+        DragFinish(wParam);
+        
+        InvalidateRect(hwnd, 0, 0);
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Progress dynamic skeletal timeline
+        frame = load64(g_frame) + 1;
+        store64(g_frame, frame);
+        
+        # 1. Slow orbit angles progress
+        store64(g_angleY, band(frame * 3, 1023));
+        
+        # Slightly nod up and down
+        sin_nod = get_sin(frame * 2);
+        store64(g_angleX, band(150 + (sin_nod * 10) / 65536, 1023));
+        
+        # 2. Mouth jaw animation (Open/Close range: -12 to 0 Y displacement)
+        sin_jaw = get_sin(frame * 4);
+        if sin_jaw < 0 {
+            # Clamp mouth closing
+            store64(g_jaw_offset_y, (sin_jaw * 12) / 65536);
+        } else {
+            store64(g_jaw_offset_y, 0);
+        }
+        
+        # 3. Eyelid blinking scale (every 180 frames = ~3 seconds)
+        blink_frame = frame % 180;
+        if blink_frame >= 0 && blink_frame <= 8 {
+            # Eyelids completely closed
+            store64(g_eye_scale_y, 0);
+        } else if blink_frame == 9 || blink_frame == 10 {
+            # Half open transition
+            store64(g_eye_scale_y, 32768);
+        } else {
+            # Fully open
+            store64(g_eye_scale_y, 65536);
+        }
+        
+        InvalidateRect(hwnd, 0, 0); # Redraw frame buffer natively without background erase
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Render 3D Gouraud scene into buffer
+        render_scene();
+        
+        # Blast pixel buffer via StretchDIBits
+        StretchDIBits(hdc, 0, 0, w, h, 0, 0, 320, 240, g_framebuffer, g_bitmapinfo, 0, 0x00CC0020);
+        
+        # Compute FPS
+        t_now = GetTickCount();
+        dt = t_now - load64(g_last_time);
+        store64(g_last_time, t_now);
+        if dt < 1 { dt = 1; }
+        fps = 1000 / dt;
+        
+        # Render telemetry HUD
+        angX = load64(g_angleX);
+        angY = load64(g_angleY);
+        jaw = load64(g_jaw_offset_y);
+        eye = load64(g_eye_scale_y);
+        draw_telemetry(hdc, fps, angX, angY, jaw, eye, w, h);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Program Loop
+# ---------------------------------------------------------------------
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize Sine/Cosine lookup tables
+    init_lut();
+    
+    # Try parsing external .obj model file
+    r = parse_obj_file(g_obj_path);
+    if r == 0 {
+        # Fallback to hardcoded geometry if file is missing
+        init_geometry();
+        init_triangles();
+    }
+    
+    # Initialize timeline variables
+    store64(g_frame, 0);
+    store64(g_angleX, 150);
+    store64(g_angleY, 0);
+    store64(g_eye_scale_y, 65536);
+    store64(g_jaw_offset_y, 0);
+    
+    # Setup BITMAPINFO Header values
+    store32(g_bitmapinfo + 0, 40);      # biSize = 40
+    store32(g_bitmapinfo + 4, 320);     # biWidth = 320
+    store32(g_bitmapinfo + 8, 0 - 240); # biHeight = -240 (top-down)
+    store16(g_bitmapinfo + 12, 1);      # biPlanes = 1
+    store16(g_bitmapinfo + 14, 32);     # biBitCount = 32
+    store32(g_bitmapinfo + 16, 0);      # biCompression = BI_RGB
+    store32(g_bitmapinfo + 20, 0);
+    store32(g_bitmapinfo + 24, 0);
+    store32(g_bitmapinfo + 28, 0);
+    store32(g_bitmapinfo + 32, 0);
+    store32(g_bitmapinfo + 36, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F));
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA
+    # WS_OVERLAPPEDWINDOW | WS_VISIBLE = 0x10CF0000 = 282001408
+    # dwExStyle = WS_EX_ACCEPTFILES = 16
+    hwnd = CreateWindowExA(16, clsname, title, 282001408, 150, 150, 640, 480, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Windows FFI message pump loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

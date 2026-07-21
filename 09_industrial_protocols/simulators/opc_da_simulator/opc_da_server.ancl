@@ -1,0 +1,1309 @@
+# =====================================================================
+#  opc_da_server.ancl  -  REAL OPC DA 2.05 COM server + Win32 control GUI
+#
+#  ONE program that is BOTH:
+#    * a genuine OPC DA server (IClassFactory -> IOPCServer ->
+#      IOPCItemMgt::AddItems + IOPCSyncIO::Read, QI-able to
+#      IOPCGroupStateMgt) an OPC client tester can CoCreateInstance + read, AND
+#    * a control panel: Start/Stop the auto data-pump, hand-edit each tag,
+#      watch values live + a "clients connected" counter.
+#
+#  Tags (served from tag_data):
+#    "Substation.Status"     VT_I4   "Substation.Frequency"  VT_R8
+#    "Substation.Voltage"    VT_R8
+#  CLSID {00112233-4455-6677-8899-AABBCCDDEEFF}  ProgID ANCL.OPCDASim.1
+#
+#  COM runs in the MTA (client calls serviced on COM RPC threads); the main
+#  thread runs the GUI message loop; a WM_TIMER tick drives the pump. Register
+#  with opc_da_register.reg (admin) so OpcEnum lists it + clients bind by ProgID.
+#  Build: bin\anclc.exe showcase\opc_da_simulator\opc_da_server.ancl showcase\opc_da_simulator\opc_da_server.exe
+# =====================================================================
+
+@DATA
+# ---- GUIDs ----
+clsid:        buf = 16;
+iid_unk:      buf = 16;
+iid_server:   buf = 16;   # IID_IOPCServer        {39C13A4D-...}
+iid_itemmgt:  buf = 16;   # IID_IOPCItemMgt       {39C13A54-...}
+iid_syncio:   buf = 16;   # IID_IOPCSyncIO        {39C13A52-...}
+iid_groupst:  buf = 16;   # IID_IOPCGroupStateMgt {39C13A50-...}
+iid_cf:       buf = 16;   # IID_IClassFactory     {00000001-...}
+iid_browse:   buf = 16;   # IID_IOPCBrowseServerAddressSpace {39C13A4F-...}
+iid_enumstr:  buf = 16;   # IID_IEnumString {00000101-...}
+iid_props:    buf = 16;   # IID_IOPCItemProperties {39C13A72-...}
+iid_cpc:      buf = 16;   # IID_IConnectionPointContainer {B196B284-...}
+iid_cp:       buf = 16;   # IID_IConnectionPoint {B196B286-...}
+iid_async:    buf = 16;   # IID_IOPCAsyncIO2 {39C13A71-...}
+iid_datacb:   buf = 16;   # IID_IOPCDataCallback {39C13A70-...}  (client implements; we call it)
+
+# ---- COM vtables (shared) + singletons ----
+cf_vt:     buf = 40;
+srv_vt:    buf = 72;
+grp_im_vt: buf = 80;
+grp_sio_vt:buf = 40;
+grp_gs_vt: buf = 56;
+brw_vt:    buf = 64;       # IOPCBrowseServerAddressSpace (8)
+enum_vt:   buf = 56;       # IEnumString (7)
+prop_vt:   buf = 48;       # IOPCItemProperties (6)
+cpc_vt:    buf = 40;       # IConnectionPointContainer (5)
+cp_vt:     buf = 56;       # IConnectionPoint (7)
+async_vt:  buf = 72;       # IOPCAsyncIO2 (9)
+cf_obj:    buf = 16;
+srv_obj:   buf = 32;       # [vtbl_server][vtbl_browse][vtbl_props][refcnt]
+cookie:    buf = 8;
+g_grphandle: buf = 8;
+
+# ---- live tag data: +0 status(i64) +8 freq(f64 bits) +16 volt(f64 bits) ----
+tag_data:  buf = 40;       # +0 status(i64,I4) +8 freq(f64) +16 volt(f64) +24 breaker(i64,BOOL) +32 setpoint(f64) -- last 2 are WRITABLE
+ft_buf:    buf = 16;
+
+# ---- async subscription state (one subscribed group; pump pushes OnDataChange) ----
+g_sub_group: buf = 8;      # group ptr with an active data subscription (0 = none)
+g_qitmp:     buf = 8;      # scratch for QI out-param
+g_cb_h: buf = 128;         # OnDataChange [in] arrays, sized for <=16 items
+g_cb_v: buf = 384;         # 16 VARIANTs * 24 bytes (x64)
+g_cb_q: buf = 64;
+g_cb_t: buf = 256;
+g_cb_e: buf = 128;
+# ---- Global Interface Table: marshal the client's STA callback so the MTA pump thread can call it ----
+git_clsid:  buf = 16;      # CLSID_StdGlobalInterfaceTable
+git_iid:    buf = 16;      # IID_IGlobalInterfaceTable
+g_git:      buf = 8;       # IGlobalInterfaceTable*
+g_cbtmp:    buf = 8;       # scratch: GetInterfaceFromGlobal out
+g_cookietmp:buf = 8;       # scratch: RegisterInterfaceInGlobal cookie out
+
+# ---- tag ids + vendor ----
+t_status: str = "Substation.Status";
+t_freq:   str = "Substation.Frequency";
+t_volt:   str = "Substation.Voltage";
+t_breaker: str = "Substation.Breaker";      # VT_BOOL, writable
+t_setpoint:str = "Substation.Setpoint";     # VT_R8, writable
+vendor:   str = "ANCL OPC DA Simulator";
+
+# ---- GUI strings ----
+clsname:  str = "ANCLOPCDAWND";
+title:    str = "ANCL OPC DA Simulator - live COM server + control panel";
+cls_stat: str = "STATIC";
+cls_btn:  str = "BUTTON";
+cls_edit: str = "EDIT";
+txt_hdr:  str = "OPC DA COM Server LIVE  -  ProgID ANCL.OPCDASim.1   CLSID {00112233-...-AABBCCDDEEFF}";
+txt_sub:  str = "A client can CoCreateInstance + AddGroup + AddItems(Substation.Status/Frequency/Voltage) + Read.";
+lbl_st:   str = "Substation_Status:";
+lbl_fr:   str = "Frequency_Hz (e.g. 50.00):";
+lbl_vl:   str = "Voltage_kV (e.g. 220.00):";
+txt_set:  str = "Set";
+txt_start:str = "Start Auto";
+txt_stop: str = "Stop Auto";
+dash:     str = "----";
+s_opc:    str = "OPC server: registered     Auto: ";
+s_run:    str = "RUNNING";
+s_stop:   str = "STOPPED";
+s_conns:  str = "     Clients connected: ";
+s_cyc:    str = "Cycle: ";
+
+# ---- GUI handles / structs ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_wndclass: buf = 96;
+g_msg:      buf = 64;
+g_lbl_st:   buf = 8;
+g_lbl_fr:   buf = 8;
+g_lbl_vl:   buf = 8;
+g_lbl_cyc:  buf = 8;
+g_hstatus:  buf = 8;
+g_ed_st:    buf = 8;
+g_ed_fr:    buf = 8;
+g_ed_vl:    buf = 8;
+
+# ---- simulator state ----
+g_running: buf = 8;
+g_counter: buf = 8;
+g_cycle:   buf = 8;
+g_st:      buf = 8;     # status bitmask
+g_fi:      buf = 8;     # frequency centi-Hz
+g_vi:      buf = 8;     # voltage centi-kV
+g_conns:   buf = 8;     # client CreateInstance count
+
+# ---- scratch ----
+g_buf:       buf = 64;
+g_inbuf:     buf = 64;
+g_statusbuf: buf = 192;
+g_cyclebuf:  buf = 48;
+
+# ---- self-registration (Register/Unregister buttons + /regserver CLI) ----
+g_phk:     buf = 8;        # HKEY out from RegCreateKeyExA
+g_exepath: buf = 528;      # this exe's own path -> LocalServer32
+g_lbl_reg: buf = 8;        # reg-status label HWND
+txt_reg:   str = "Register";
+txt_unreg: str = "Unregister";
+rs_idle:   str = "(not registered yet - click Register)";
+rs_hklm:   str = "Registered: machine-wide (HKLM) - discoverable via OpcEnum";
+rs_hkcu:   str = "Registered: per-user (HKCU) - run elevated for the OpcEnum list";
+rs_fail:   str = "Register FAILED";
+rs_unreg:  str = "Unregistered";
+s_reg_arg:   str = "regserver";
+s_unreg_arg: str = "unregserver";
+s_embed_arg: str = "Embedding";    # COM passes /Embedding when it launches us for a client
+g_embedding: buf = 8;              # 1 = COM-launched (auto-close when client done); 0 = user-launched (persistent)
+# value data
+v_friendly: str = "ANCL OPC DA Simulator";
+v_clsidstr: str = "{00112233-4455-6677-8899-AABBCCDDEEFF}";
+v_progidstr:str = "ANCL.OPCDASim.1";
+# subkey paths (under HKLM or HKCU); "\\" -> one backslash (verified)
+rk_progid:       str = "Software\\Classes\\ANCL.OPCDASim.1";
+rk_progid_clsid: str = "Software\\Classes\\ANCL.OPCDASim.1\\CLSID";
+rk_clsid:        str = "Software\\Classes\\CLSID\\{00112233-4455-6677-8899-AABBCCDDEEFF}";
+rk_clsid_progid: str = "Software\\Classes\\CLSID\\{00112233-4455-6677-8899-AABBCCDDEEFF}\\ProgID";
+rk_clsid_ls32:   str = "Software\\Classes\\CLSID\\{00112233-4455-6677-8899-AABBCCDDEEFF}\\LocalServer32";
+rk_clsid_cat:    str = "Software\\Classes\\CLSID\\{00112233-4455-6677-8899-AABBCCDDEEFF}\\Implemented Categories\\{63D5F432-CFE4-11D1-B2C8-0060083BA1FB}";
+
+# ---- debug log (diagnose client connect sequence) ----
+logpath:  str = "opc_da_server.log";
+g_nio:    buf = 8;
+g_logbuf: buf = 32;
+d_boot:   str = "=== server boot ===\n";
+d_cfci:   str = "CF_CreateInstance riid0=";
+d_srvqi:  str = "Srv_QI iid0=";
+d_ok:     str = "  OK\n";
+d_no:     str = "  E_NOINTERFACE\n";
+d_status: str = "Srv_GetStatus\n";
+d_addgrp: str = "Srv_AddGroup active=";
+d_agrate: str = " rate=";
+d_agriid: str = " riid=";
+d_agdb:   str = " dbPtr=";
+d_agtb:   str = " tbPtr=";
+d_agret:  str = "  AddGroup ret=";
+d_exit:   str = "check_exit -> WM_CLOSE (server refcount hit 0)\n";
+d_geterr: str = "Srv_GetErrorString\n";
+d_getgrp: str = "Srv_GetGroupByName [STUB E_NOTIMPL]\n";
+d_crenum: str = "Srv_CreateGroupEnumerator [STUB E_NOTIMPL]\n";
+d_qorg:   str = "brw_QueryOrganization\n";
+d_bids:   str = "brw_BrowseOPCItemIDs filter=";
+d_gid:    str = "brw_GetItemID\n";
+d_nl:     str = "\n";
+d_fetch:  str = " fetched=";
+d_qap:    str = "  prop_QueryAvailableProperties\n";
+d_gip:    str = "  prop_GetItemProperties\n";
+d_fcp:    str = "  cpc_FindConnectionPoint\n";
+d_adv:    str = "  cp_Advise (callback stored)\n";
+d_sete:   str = "  async_SetEnable\n";
+pd_dt:    str = "Item Canonical DataType";
+pd_val:   str = "Item Value";
+pd_q:     str = "Item Quality";
+pd_ar:    str = "Item Access Rights";
+d_bap:    str = "brw_BrowseAccessPaths [STUB E_NOTIMPL]\n";
+d_grpqi:  str = "  Grp_QI iid0=";
+d_addit:  str = "  im_AddItems\n";
+d_read:   str = "  sio_Read\n";
+d_write:  str = "  sio_Write h=";
+d_wval:   str = " idx=";
+d_next:   str = "  es_Next celt=";
+d_gsget:  str = "  gs_GetState\n";
+d_gsset:  str = "  gs_SetState rate=";
+d_valid:  str = "  im_ValidateItems\n";
+d_setact: str = "  im_SetActiveState active=";
+d_setch:  str = "  im_SetClientHandles\n";
+d_errmsg: str = "ANCL OPC DA Simulator error";
+s_grpname: str = "ANCLGroup";
+d_git:    str = "GIT init hr=";
+d_push:   str = "  push OnDataChange ic=";
+d_pushhr: str = " hr=";
+
+extern "ole32.dll"    CoInitializeEx;
+extern "ole32.dll"    CoRegisterClassObject;
+extern "ole32.dll"    CoResumeClassObjects;
+extern "ole32.dll"    CoTaskMemAlloc -> ptr;
+extern "ole32.dll"    CoCreateInstance;
+extern "kernel32.dll" VirtualAlloc -> ptr;
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+extern "kernel32.dll" GetModuleFileNameA;
+extern "kernel32.dll" GetCommandLineA -> ptr;
+extern "advapi32.dll" RegCreateKeyExA;
+extern "advapi32.dll" RegSetValueExA;
+extern "advapi32.dll" RegCloseKey;
+extern "advapi32.dll" RegDeleteTreeA;
+extern "kernel32.dll" CreateFileA -> ptr;
+extern "kernel32.dll" WriteFile;
+extern "kernel32.dll" CloseHandle;
+extern "kernel32.dll" SetFilePointer;
+extern "ole32.dll"    CoRevokeClassObject;
+extern "ole32.dll"    CoUninitialize;
+extern "user32.dll"   PostMessageA;
+
+@CODE
+# =====================================================================
+# COM helpers + interfaces (validated cross-process in Stage A)
+# =====================================================================
+func compare_guid(a: ptr, b: ptr) -> i64 {
+    if load64(a) != load64(b) { return 1; }
+    if load64(a + 8) != load64(b + 8) { return 1; }
+    return 0;
+}
+# method pointer for vtable slot idx of a COM object (for calling the client's IOPCDataCallback)
+func vmeth(obj: i64, idx: i64) -> i64 { return load64(load64(obj) + idx * 8); }
+# append a string to the debug log (open/seek-end/write/close per call)
+func dbg(s: i64) -> i64 {
+    h = CreateFileA(logpath, 0x40000000, 1, 0, 4, 0x80, 0);   # GENERIC_WRITE, SHARE_READ, OPEN_ALWAYS
+    if h == 0 - 1 { return 0; }
+    SetFilePointer(h, 0, 0, 2);                                # FILE_END (append)
+    WriteFile(h, s, strlen(s), g_nio, 0);
+    CloseHandle(h);
+    return 0;
+}
+func dbgn(v: i64) -> i64 { int_to_str(g_logbuf, v); dbg(g_logbuf); return 0; }
+# COM-launched instance: when the last client releases the server, close the window (-> clean exit).
+# User-launched instance (g_embedding==0): no-op, stays open until the user closes it.
+func check_exit() -> i64 {
+    if load64(g_embedding) == 1 { dbg(d_exit); PostMessageA(load64(g_hwnd), 16, 0, 0); }   # WM_CLOSE = 0x10
+    return 0;
+}
+func init_iids() -> i64 {
+    store64(iid_unk + 0, 0x0000000000000000); store64(iid_unk + 8, 0x46000000000000C0);
+    store64(iid_server + 0,  0x11D0011E39C13A4D); store64(iid_server + 8,  0xB3ADD8AF20007596);
+    store64(iid_itemmgt + 0, 0x11D0011E39C13A54); store64(iid_itemmgt + 8, 0xB3ADD8AF20007596);
+    store64(iid_syncio + 0,  0x11D0011E39C13A52); store64(iid_syncio + 8,  0xB3ADD8AF20007596);
+    store64(iid_groupst + 0, 0x11D0011E39C13A50); store64(iid_groupst + 8, 0xB3ADD8AF20007596);
+    store64(iid_cf + 0, 0x0000000000000001); store64(iid_cf + 8, 0x46000000000000C0);
+    store64(iid_browse + 0, 0x11D0011E39C13A4F); store64(iid_browse + 8, 0xB3ADD8AF20007596);
+    store64(iid_enumstr + 0, 0x0000000000000101); store64(iid_enumstr + 8, 0x46000000000000C0);
+    store64(iid_props + 0, 0x11D0011E39C13A72); store64(iid_props + 8, 0xB3ADD8AF20007596);
+    store64(iid_cpc + 0, 0x101ABAB4B196B284); store64(iid_cpc + 8, 0x071D3400AA009CB6);
+    store64(iid_cp + 0,  0x101ABAB4B196B286); store64(iid_cp + 8,  0x071D3400AA009CB6);
+    store64(iid_async + 0, 0x11D0011E39C13A71); store64(iid_async + 8, 0xB3ADD8AF20007596);
+    store64(iid_datacb + 0, 0x11D0011E39C13A70); store64(iid_datacb + 8, 0xB3ADD8AF20007596);
+    return 0;
+}
+func widen_taskmem(a: i64) -> i64 {
+    n = strlen(a);
+    w = CoTaskMemAlloc((n + 1) * 2);
+    if w == 0 { return 0; }
+    i = 0;
+    while i <= n { store16(w + i * 2, load8(a + i)); i = i + 1; }
+    return w;
+}
+func weq_a(w: i64, a: i64) -> i64 {
+    i = 0;
+    while 1 {
+        ca = load8(a + i);
+        cw = load16(w + i * 2);
+        if cw != ca { return 0; }
+        if ca == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+func tag_match(w: i64) -> i64 {
+    if weq_a(w, t_status) == 1 { return 0; }
+    if weq_a(w, t_freq) == 1 { return 1; }
+    if weq_a(w, t_volt) == 1 { return 2; }
+    if weq_a(w, t_breaker) == 1 { return 3; }
+    if weq_a(w, t_setpoint) == 1 { return 4; }
+    return 0 - 1;
+}
+func tag_vt(idx: i64) -> i64 {
+    if idx == 0 { return 3; }       # VT_I4
+    if idx == 3 { return 11; }      # VT_BOOL
+    return 5;                       # VT_R8 (freq, volt, setpoint)
+}
+func tag_access(idx: i64) -> i64 {
+    if idx < 3 { return 1; }        # OPC_READABLE (live simulated values)
+    return 3;                       # OPC_READABLE | OPC_WRITEABLE (breaker, setpoint)
+}
+func tag_id(idx: i64) -> i64 {
+    if idx == 0 { return t_status; }
+    if idx == 1 { return t_freq; }
+    if idx == 2 { return t_volt; }
+    if idx == 3 { return t_breaker; }
+    return t_setpoint;
+}
+# Fill a 24-byte VARIANT (vt@0, data@8) with tag idx's current value + canonical type.
+func fill_variant(v: ptr, idx: i64) -> i64 {
+    store64(v + 0, 0); store64(v + 8, 0); store64(v + 16, 0);   # clear full 24-byte VARIANT
+    vt = tag_vt(idx);
+    store16(v + 0, vt);
+    if vt == 3 { store32(v + 8, load64(tag_data + idx * 8)); }                  # VT_I4
+    else { if vt == 11 {                                                        # VT_BOOL (TRUE = 0xFFFF)
+        if load64(tag_data + idx * 8) != 0 { store16(v + 8, 0xFFFF); }
+    } else { store64(v + 8, load64(tag_data + idx * 8)); } }                    # VT_R8 (raw f64 bits)
+    return 0;
+}
+# Apply a client-written VARIANT v into tag idx's storage (with light type coercion).
+func write_tag(idx: i64, v: ptr) -> i64 {
+    vt = load16(v + 0);
+    tvt = tag_vt(idx);
+    if tvt == 11 {                                                             # BOOL tag
+        b = 0;
+        if vt == 11 { if load16(v + 8) != 0 { b = 1; } }
+        else { if load64(v + 8) != 0 { b = 1; } }
+        store64(tag_data + idx * 8, b);
+    } else { if tvt == 5 {                                                     # R8 tag
+        if vt == 3 { store64(tag_data + idx * 8, fbits(itof(load32(v + 8)))); }  # VT_I4 -> double
+        else { store64(tag_data + idx * 8, load64(v + 8)); }                     # VT_R8 (or copy bits)
+    } else {                                                                   # I4 tag
+        store64(tag_data + idx * 8, load32(v + 8));
+    } }
+    return 0;
+}
+# copy a wide (UTF-16) string into a fresh CoTaskMemAlloc'd buffer (client frees it)
+func wcopy_taskmem(w: i64) -> i64 {
+    n = 0;
+    while load16(w + n * 2) != 0 { n = n + 1; }
+    out = CoTaskMemAlloc((n + 1) * 2);
+    if out == 0 { return 0; }
+    i = 0;
+    while i <= n { store16(out + i * 2, load16(w + i * 2)); i = i + 1; }
+    return out;
+}
+
+# ---- IClassFactory ----
+func CF_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    if compare_guid(riid, iid_unk) == 0 { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    if compare_guid(riid, iid_cf) == 0  { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    return 0x80004002;
+}
+func CF_AddRef(this: ptr) -> i64 { store64(this + 8, load64(this + 8) + 1); return load64(this + 8); }
+func CF_Release(this: ptr) -> i64 { store64(this + 8, load64(this + 8) - 1); return load64(this + 8); }
+func CF_CreateInstance(this: ptr, outer: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    if outer != 0 { return 0x80040110; }
+    dbg(d_cfci); dbgn(load64(riid)); dbg(d_ok);
+    store64(g_conns, load64(g_conns) + 1);          # show client connections on the panel
+    return Srv_QI(srv_obj, riid, ppv);
+}
+func CF_LockServer(this: ptr, flock: i64) -> i64 { return 0; }
+
+# ---- IOPCServer ----
+func Srv_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    dbg(d_srvqi); dbgn(load64(riid));
+    if compare_guid(riid, iid_unk) == 0    { dbg(d_ok); store64(ppv, this); Srv_AddRef(this); return 0; }
+    if compare_guid(riid, iid_server) == 0 { dbg(d_ok); store64(ppv, this); Srv_AddRef(this); return 0; }
+    if compare_guid(riid, iid_browse) == 0 { dbg(d_ok); store64(ppv, this + 8); Srv_AddRef(this); return 0; }   # IOPCBrowseServerAddressSpace
+    if compare_guid(riid, iid_props) == 0  { dbg(d_ok); store64(ppv, this + 16); Srv_AddRef(this); return 0; }  # IOPCItemProperties
+    dbg(d_no);
+    return 0x80004002;
+}
+func Srv_AddRef(this: ptr) -> i64 { store64(this + 24, load64(this + 24) + 1); return load64(this + 24); }
+func Srv_Release(this: ptr) -> i64 { n = load64(this + 24) - 1; store64(this + 24, n); if n == 0 { check_exit(); } return n; }
+func Srv_AddGroup(this: ptr, szName: ptr, bActive: i64, dwReqRate: i64, hClientGroup: i64,
+                  pTimeBias: ptr, pPctDeadband: ptr, dwLCID: i64,
+                  phServerGroup: ptr, pRevisedRate: ptr, riid: ptr, ppUnk: ptr) -> i64 {
+    dbg(d_addgrp); dbgn(bActive); dbg(d_agrate); dbgn(dwReqRate);
+    dbg(d_agriid); dbgn(load64(riid)); dbg(d_agdb); dbgn(pPctDeadband); dbg(d_agtb); dbgn(pTimeBias); dbg(d_nl);
+    g = VirtualAlloc(0, 2048, 0x3000, 4);
+    if g == 0 { return 0x8007000E; }
+    store64(g + 0, grp_im_vt);
+    store64(g + 8, grp_sio_vt);
+    store64(g + 16, grp_gs_vt);
+    store64(g + 24, cpc_vt);
+    store64(g + 32, cp_vt);
+    store64(g + 40, async_vt);
+    store64(g + 48, 0);                # refcnt (Grp_QI brings it to 1)
+    store64(g + 56, hClientGroup);
+    store64(g + 64, 0);                # callback (IOPCDataCallback*)
+    store64(g + 72, 0);                # enable
+    store64(g + 80, 0);                # itemCount
+    # group state lives high (above the item array at g+88..; items capped in im_AddItems)
+    store64(g + 1024, dwReqRate);      # dwUpdateRate (revised == requested)
+    store64(g + 1032, bActive);        # group active flag
+    h = load64(g_grphandle) + 1;
+    store64(g_grphandle, h);
+    store64(g + 1040, h);              # server group handle (for gs_GetState)
+    if phServerGroup != 0 { store32(phServerGroup, h); }
+    if pRevisedRate != 0 { store32(pRevisedRate, dwReqRate); }
+    Srv_AddRef(srv_obj);                  # the group keeps the server alive (released in Grp_Release at refcount 0)
+    ret = Grp_QI(g, riid, ppUnk);
+    dbg(d_agret); dbgn(ret); dbg(d_nl);
+    return ret;
+}
+func Srv_GetErrorString(this: ptr, hr: i64, lcid: i64, ppString: ptr) -> i64 {
+    dbg(d_geterr);
+    if ppString == 0 { return 0x80004003; }
+    store64(ppString, widen_taskmem(d_errmsg));   # any HRESULT -> a real message (not the generic "Unspecified error")
+    return 0;
+}
+func Srv_GetGroupByName(this: ptr, szName: ptr, riid: ptr, ppUnk: ptr) -> i64 { dbg(d_getgrp); return 0x80004001; }
+func Srv_GetStatus(this: ptr, ppStatus: ptr) -> i64 {
+    dbg(d_status);
+    if ppStatus == 0 { return 0x80004003; }
+    s = CoTaskMemAlloc(56);
+    if s == 0 { return 0x8007000E; }
+    GetSystemTimeAsFileTime(ft_buf);
+    store64(s + 0, load64(ft_buf));
+    store64(s + 8, load64(ft_buf));
+    store64(s + 16, load64(ft_buf));
+    store32(s + 24, 1);
+    store32(s + 28, 0);
+    store32(s + 32, 0);
+    store16(s + 36, 2);
+    store16(s + 38, 5);
+    store16(s + 40, 1);
+    store16(s + 42, 0);
+    store64(s + 48, widen_taskmem(vendor));
+    store64(ppStatus, s);
+    return 0;
+}
+func Srv_RemoveGroup(this: ptr, hServerGroup: i64, bForce: i64) -> i64 { return 0; }
+func Srv_CreateGroupEnumerator(this: ptr, dwScope: i64, riid: ptr, ppUnk: ptr) -> i64 { dbg(d_crenum); return 0x80004001; }
+
+# ---- group object (multi-interface) ----
+func Grp_QI(base: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    dbg(d_grpqi); dbgn(load64(riid));
+    if compare_guid(riid, iid_unk) == 0     { dbg(d_ok); store64(ppv, base + 0);  store64(base + 48, load64(base + 48) + 1); return 0; }
+    if compare_guid(riid, iid_itemmgt) == 0 { dbg(d_ok); store64(ppv, base + 0);  store64(base + 48, load64(base + 48) + 1); return 0; }
+    if compare_guid(riid, iid_syncio) == 0  { dbg(d_ok); store64(ppv, base + 8);  store64(base + 48, load64(base + 48) + 1); return 0; }
+    if compare_guid(riid, iid_groupst) == 0 { dbg(d_ok); store64(ppv, base + 16); store64(base + 48, load64(base + 48) + 1); return 0; }
+    if compare_guid(riid, iid_cpc) == 0     { dbg(d_ok); store64(ppv, base + 24); store64(base + 48, load64(base + 48) + 1); return 0; }   # IConnectionPointContainer
+    if compare_guid(riid, iid_cp) == 0      { dbg(d_ok); store64(ppv, base + 32); store64(base + 48, load64(base + 48) + 1); return 0; }   # IConnectionPoint
+    if compare_guid(riid, iid_async) == 0   { dbg(d_ok); store64(ppv, base + 40); store64(base + 48, load64(base + 48) + 1); return 0; }   # IOPCAsyncIO2
+    dbg(d_no);
+    return 0x80004002;
+}
+func Grp_AddRef(base: ptr) -> i64 { store64(base + 48, load64(base + 48) + 1); return load64(base + 48); }
+func Grp_Release(base: ptr) -> i64 {
+    n = load64(base + 48) - 1;
+    store64(base + 48, n);
+    if n == 0 { Srv_Release(srv_obj); }     # group destroyed -> drop the server ref it took in AddGroup
+    return n;
+}
+
+func im_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this, riid, ppv); }
+func im_AddRef(this: ptr) -> i64 { return Grp_AddRef(this); }
+func im_Release(this: ptr) -> i64 { return Grp_Release(this); }
+func im_AddItems(this: ptr, dwCount: i64, pItemArray: ptr, ppResults: ptr, ppErrors: ptr) -> i64 {
+    dbg(d_addit);
+    g = this;
+    results = CoTaskMemAlloc(dwCount * 24);
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if results == 0 { return 0x8007000E; }
+    if errors == 0 { return 0x8007000E; }
+    anyfail = 0;
+    i = 0;
+    while i < dwCount {
+        def = pItemArray + i * 48;
+        wItem = load64(def + 8);
+        hClient = load32(def + 20);
+        idx = tag_match(wItem);
+        res = results + i * 24;
+        err = errors + i * 4;
+        if idx < 0 {
+            store32(res + 0, 0); store16(res + 4, 0); store16(res + 6, 0);
+            store32(res + 8, 0); store32(res + 12, 0); store64(res + 16, 0);
+            store32(err, 0xC0040007);
+            anyfail = 1;
+        } else {
+            ic = load64(g + 80);
+            if ic >= 58 {                                       # protect group-state fields at g+1024
+                store32(res + 0, 0); store16(res + 4, 0); store16(res + 6, 0);
+                store32(res + 8, 0); store32(res + 12, 0); store64(res + 16, 0);
+                store32(err, 0x8007000E); anyfail = 1;
+            } else {
+                slot = g + 88 + ic * 16;
+                store64(slot, idx);
+                store64(slot + 8, hClient);
+                store64(g + 80, ic + 1);
+                store32(res + 0, ic + 1);
+                store16(res + 4, tag_vt(idx));
+                store16(res + 6, 0);
+                store32(res + 8, tag_access(idx));
+                store32(res + 12, 0);
+                store64(res + 16, 0);
+                store32(err, 0);
+            }
+        }
+        i = i + 1;
+    }
+    store64(ppResults, results);
+    store64(ppErrors, errors);
+    if anyfail == 1 { return 1; }
+    return 0;
+}
+# Validate item IDs WITHOUT adding them (hServer=0). dOPC calls this before AddItems.
+func im_ValidateItems(this: ptr, dwCount: i64, pItemArray: ptr, bBlobUpdate: i64, ppResults: ptr, ppErrors: ptr) -> i64 {
+    dbg(d_valid);
+    results = CoTaskMemAlloc(dwCount * 24);
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if results == 0 { return 0x8007000E; }
+    if errors == 0 { return 0x8007000E; }
+    anyfail = 0;
+    i = 0;
+    while i < dwCount {
+        def = pItemArray + i * 48;
+        wItem = load64(def + 8);
+        idx = tag_match(wItem);
+        res = results + i * 24;
+        err = errors + i * 4;
+        store32(res + 0, 0); store16(res + 6, 0); store32(res + 12, 0); store64(res + 16, 0);
+        if idx < 0 {
+            store16(res + 4, 0); store32(res + 8, 0);
+            store32(err, 0xC0040007); anyfail = 1;
+        } else {
+            store16(res + 4, tag_vt(idx)); store32(res + 8, tag_access(idx)); store32(err, 0);
+        }
+        i = i + 1;
+    }
+    store64(ppResults, results);
+    store64(ppErrors, errors);
+    if anyfail == 1 { return 1; }
+    return 0;
+}
+func im_RemoveItems(this: ptr, dwCount: i64, phServer: ptr, ppErrors: ptr) -> i64 {
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if errors == 0 { return 0x8007000E; }
+    i = 0; while i < dwCount { store32(errors + i * 4, 0); i = i + 1; }   # accept (group is freed on disconnect)
+    store64(ppErrors, errors);
+    return 0;
+}
+# Activate items for monitoring. The sim pushes ALL items, so accept all as S_OK.
+func im_SetActiveState(this: ptr, dwCount: i64, phServer: ptr, bActive: i64, ppErrors: ptr) -> i64 {
+    dbg(d_setact); dbgn(bActive); dbg(d_nl);
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if errors == 0 { return 0x8007000E; }
+    i = 0; while i < dwCount { store32(errors + i * 4, 0); i = i + 1; }
+    store64(ppErrors, errors);
+    return 0;
+}
+# Update each item's client handle (used in the OnDataChange push as phClientItems).
+func im_SetClientHandles(this: ptr, dwCount: i64, phServer: ptr, phClient: ptr, ppErrors: ptr) -> i64 {
+    dbg(d_setch);
+    g = this;
+    ic = load64(g + 80);
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if errors == 0 { return 0x8007000E; }
+    i = 0;
+    while i < dwCount {
+        h = load32(phServer + i * 4);
+        if h >= 1 { if h <= ic { store64(g + 88 + (h - 1) * 16 + 8, load32(phClient + i * 4)); } }
+        store32(errors + i * 4, 0);
+        i = i + 1;
+    }
+    store64(ppErrors, errors);
+    return 0;
+}
+func im_SetDatatypes(this: ptr, c: i64, p: ptr, pv: ptr, pe: ptr) -> i64 { return 0x80004001; }
+func im_CreateEnumerator(this: ptr, riid: ptr, ppUnk: ptr) -> i64 { return 0x80004001; }
+
+func sio_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this - 8, riid, ppv); }
+func sio_AddRef(this: ptr) -> i64 { return Grp_AddRef(this - 8); }
+func sio_Release(this: ptr) -> i64 { return Grp_Release(this - 8); }
+func sio_Read(this: ptr, dwSource: i64, dwCount: i64, phServer: ptr, ppValues: ptr, ppErrors: ptr) -> i64 {
+    dbg(d_read);
+    g = this - 8;
+    values = CoTaskMemAlloc(dwCount * 40);    # OPCITEMSTATE is 40 bytes on x64 (embeds a 24-byte VARIANT @ +16), NOT 32
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if values == 0 { return 0x8007000E; }
+    if errors == 0 { return 0x8007000E; }
+    GetSystemTimeAsFileTime(ft_buf);
+    ftlo = load32(ft_buf + 0);
+    fthi = load32(ft_buf + 4);
+    ic = load64(g + 80);
+    i = 0;
+    while i < dwCount {
+        h = load32(phServer + i * 4);
+        st = values + i * 40;
+        err = errors + i * 4;
+        store16(st + 18, 0); store16(st + 20, 0); store16(st + 22, 0);
+        if h < 1 {
+            store32(st + 0, 0); store32(st + 4, 0); store32(st + 8, 0);
+            store16(st + 12, 0); store16(st + 14, 0); store16(st + 16, 0); store64(st + 24, 0);
+            store32(err, 0xC0040007);
+        } else {
+            if h > ic {
+                store32(st + 0, 0); store32(st + 4, 0); store32(st + 8, 0);
+                store16(st + 12, 0); store16(st + 14, 0); store16(st + 16, 0); store64(st + 24, 0);
+                store32(err, 0xC0040007);
+            } else {
+                slot = g + 88 + (h - 1) * 16;
+                idx = load64(slot);
+                hClient = load64(slot + 8);
+                store32(st + 0, hClient);
+                store32(st + 4, ftlo); store32(st + 8, fthi);
+                store16(st + 12, 192);
+                store16(st + 14, 0);
+                fill_variant(st + 16, idx);          # VARIANT @ st+16 (vt + value, any tag type)
+                store32(err, 0);
+            }
+        }
+        i = i + 1;
+    }
+    store64(ppValues, values);
+    store64(ppErrors, errors);
+    return 0;
+}
+func sio_Write(this: ptr, dwCount: i64, phServer: ptr, pItemValues: ptr, ppErrors: ptr) -> i64 {
+    g = this - 8;
+    ic = load64(g + 80);
+    errors = CoTaskMemAlloc(dwCount * 4);
+    if errors == 0 { return 0x8007000E; }
+    anyfail = 0;
+    i = 0;
+    while i < dwCount {
+        h = load32(phServer + i * 4);
+        v = pItemValues + i * 24;                  # VARIANT array (24 bytes each on x64)
+        err = errors + i * 4;
+        dbg(d_write); dbgn(h);
+        if h < 1 { store32(err, 0xC0040007); anyfail = 1; dbg(d_nl); }       # OPC_E_INVALIDHANDLE
+        else { if h > ic { store32(err, 0xC0040007); anyfail = 1; dbg(d_nl); }
+        else {
+            slot = g + 88 + (h - 1) * 16;
+            idx = load64(slot);
+            dbg(d_wval); dbgn(idx); dbg(d_nl);
+            if band(tag_access(idx), 2) == 0 { store32(err, 0xC0040004); anyfail = 1; }   # OPC_E_BADRIGHTS (read-only)
+            else { write_tag(idx, v); store32(err, 0); }
+        } }
+        i = i + 1;
+    }
+    store64(ppErrors, errors);
+    if anyfail == 1 { return 1; }                  # S_FALSE (one or more failed)
+    return 0;
+}
+
+func gs_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this - 16, riid, ppv); }
+func gs_AddRef(this: ptr) -> i64 { return Grp_AddRef(this - 16); }
+func gs_Release(this: ptr) -> i64 { return Grp_Release(this - 16); }
+# IOPCGroupStateMgt::GetState — 8 [out] params. Report the group's stored rate/active/handles.
+func gs_GetState(this: ptr, pUpdateRate: ptr, pActive: ptr, ppName: ptr, pTimeBias: ptr, pDeadband: ptr, pLCID: ptr, phClientGroup: ptr, phServerGroup: ptr) -> i64 {
+    dbg(d_gsget);
+    g = this - 16;
+    if pUpdateRate != 0 { store32(pUpdateRate, load64(g + 1024)); }
+    if pActive != 0 { store32(pActive, load64(g + 1032)); }
+    if ppName != 0 { store64(ppName, widen_taskmem(s_grpname)); }
+    if pTimeBias != 0 { store32(pTimeBias, 0); }
+    if pDeadband != 0 { store32(pDeadband, 0); }                    # FLOAT 0.0
+    if pLCID != 0 { store32(pLCID, 0); }
+    if phClientGroup != 0 { store32(phClientGroup, load64(g + 56)); }
+    if phServerGroup != 0 { store32(phServerGroup, load64(g + 1040)); }
+    return 0;
+}
+# IOPCGroupStateMgt::SetState — 7 params. Honor the requested update rate + active flag.
+func gs_SetState(this: ptr, pReqRate: ptr, pRevRate: ptr, pActive: ptr, pTimeBias: ptr, pDeadband: ptr, pLCID: ptr, phClientGroup: ptr) -> i64 {
+    g = this - 16;
+    rate = load64(g + 1024);
+    if pReqRate != 0 { rate = load32(pReqRate); store64(g + 1024, rate); }
+    if pActive != 0 { store64(g + 1032, load32(pActive)); }
+    if phClientGroup != 0 { store64(g + 56, load32(phClientGroup)); }
+    if pRevRate != 0 { store32(pRevRate, rate); }                   # revised == requested (we honor it)
+    dbg(d_gsset); dbgn(rate); dbg(d_nl);
+    return 0;
+}
+func gs_SetName(this: ptr, sz: ptr) -> i64 { return 0x80004001; }
+func gs_CloneGroup(this: ptr, sz: ptr, riid: ptr, ppUnk: ptr) -> i64 { return 0x80004001; }
+
+# ---- IOPCBrowseServerAddressSpace (2nd interface on the server object: this = srv_obj+8) ----
+func brw_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Srv_QI(this - 8, riid, ppv); }
+func brw_AddRef(this: ptr) -> i64 { return Srv_AddRef(this - 8); }
+func brw_Release(this: ptr) -> i64 { return Srv_Release(this - 8); }
+func brw_QueryOrganization(this: ptr, pType: ptr) -> i64 { dbg(d_qorg); if pType != 0 { store32(pType, 2); } return 0; }  # OPC_NS_FLAT
+func brw_ChangeBrowsePosition(this: ptr, dir: i64, sz: ptr) -> i64 { return 0; }
+func brw_BrowseOPCItemIDs(this: ptr, filterType: i64, szFilter: ptr, vtFilter: i64, accessFilter: i64, ppEnum: ptr) -> i64 {
+    dbg(d_bids); dbgn(filterType); dbg(d_nl);
+    if ppEnum == 0 { return 0x80004003; }
+    store64(ppEnum, 0);
+    e = VirtualAlloc(0, 64, 0x3000, 4);
+    if e == 0 { return 0x8007000E; }
+    store64(e + 0, enum_vt);
+    store64(e + 8, 1);                  # refcnt (client owns this ref)
+    store64(e + 16, 0);                 # position
+    if filterType == 1 { store64(e + 24, 0); } else { store64(e + 24, 5); }   # OPC_BRANCH -> none; LEAF/FLAT -> 5 tags
+    store64(ppEnum, e);
+    return 0;
+}
+func brw_GetItemID(this: ptr, szItemDataID: ptr, ppItemID: ptr) -> i64 {
+    dbg(d_gid);
+    if ppItemID == 0 { return 0x80004003; }
+    store64(ppItemID, wcopy_taskmem(szItemDataID));   # flat namespace: fully-qualified id == the browse name
+    return 0;
+}
+func brw_BrowseAccessPaths(this: ptr, szItemID: ptr, ppEnum: ptr) -> i64 { dbg(d_bap); return 0x80004001; }
+
+# ---- IEnumString (item-id enumerator); layout [vt][refcnt][pos][count] ----
+func es_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    if compare_guid(riid, iid_unk) == 0     { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    if compare_guid(riid, iid_enumstr) == 0 { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    return 0x80004002;
+}
+func es_AddRef(this: ptr) -> i64 { store64(this + 8, load64(this + 8) + 1); return load64(this + 8); }
+func es_Release(this: ptr) -> i64 { store64(this + 8, load64(this + 8) - 1); return load64(this + 8); }
+func es_Next(this: ptr, celt: i64, rgelt: ptr, pceltFetched: ptr) -> i64 {
+    pos = load64(this + 16);
+    cnt = load64(this + 24);
+    fetched = 0;
+    while fetched < celt {
+        if pos >= cnt { break; }
+        store64(rgelt + fetched * 8, widen_taskmem(tag_id(pos)));   # client frees each LPOLESTR
+        pos = pos + 1;
+        fetched = fetched + 1;
+    }
+    store64(this + 16, pos);
+    dbg(d_next); dbgn(celt); dbg(d_fetch); dbgn(fetched); dbg(d_nl);
+    if pceltFetched != 0 { store32(pceltFetched, fetched); }
+    if fetched == celt { return 0; }
+    return 1;                          # S_FALSE (fewer than requested)
+}
+func es_Skip(this: ptr, celt: i64) -> i64 {
+    pos = load64(this + 16) + celt;
+    cnt = load64(this + 24);
+    if pos > cnt { store64(this + 16, cnt); return 1; }
+    store64(this + 16, pos);
+    return 0;
+}
+func es_Reset(this: ptr) -> i64 { store64(this + 16, 0); return 0; }
+func es_Clone(this: ptr, ppenum: ptr) -> i64 {
+    if ppenum == 0 { return 0x80004003; }
+    e = VirtualAlloc(0, 64, 0x3000, 4);
+    if e == 0 { return 0x8007000E; }
+    store64(e + 0, enum_vt);
+    store64(e + 8, 1);
+    store64(e + 16, load64(this + 16));
+    store64(e + 24, load64(this + 24));
+    store64(ppenum, e);
+    return 0;
+}
+
+# ---- IOPCItemProperties (3rd interface on the server object: this = srv_obj+16) ----
+func prop_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Srv_QI(this - 16, riid, ppv); }
+func prop_AddRef(this: ptr) -> i64 { return Srv_AddRef(this - 16); }
+func prop_Release(this: ptr) -> i64 { return Srv_Release(this - 16); }
+func prop_QueryAvailableProperties(this: ptr, szItemID: ptr, pdwCount: ptr, ppPropIDs: ptr, ppDescs: ptr, ppvtTypes: ptr) -> i64 {
+    dbg(d_qap);
+    idx = tag_match(szItemID);
+    if idx < 0 { return 0xC0040007; }                 # OPC_E_UNKNOWNITEMID
+    ids = CoTaskMemAlloc(4 * 4);
+    descs = CoTaskMemAlloc(4 * 8);
+    vts = CoTaskMemAlloc(4 * 2);
+    if ids == 0 { return 0x8007000E; }
+    store32(ids + 0, 1); store32(ids + 4, 2); store32(ids + 8, 3); store32(ids + 12, 5);   # DataType, Value, Quality, AccessRights
+    store64(descs + 0,  widen_taskmem(pd_dt));
+    store64(descs + 8,  widen_taskmem(pd_val));
+    store64(descs + 16, widen_taskmem(pd_q));
+    store64(descs + 24, widen_taskmem(pd_ar));
+    store16(vts + 0, 2);                # prop1 DataType -> VT_I2
+    store16(vts + 2, tag_vt(idx));      # prop2 Value -> tag canonical type
+    store16(vts + 4, 2);               # prop3 Quality -> VT_I2
+    store16(vts + 6, 3);               # prop5 AccessRights -> VT_I4
+    store32(pdwCount, 4);
+    store64(ppPropIDs, ids);
+    store64(ppDescs, descs);
+    store64(ppvtTypes, vts);
+    return 0;
+}
+func prop_GetItemProperties(this: ptr, szItemID: ptr, dwCount: i64, pdwPropIDs: ptr, ppvData: ptr, ppErrors: ptr) -> i64 {
+    dbg(d_gip);
+    idx = tag_match(szItemID);
+    vdata = CoTaskMemAlloc(dwCount * 24);          # VARIANT is 24 bytes on x64 (vt@0, data@8), NOT 16
+    errs = CoTaskMemAlloc(dwCount * 4);
+    if vdata == 0 { return 0x8007000E; }
+    if errs == 0 { return 0x8007000E; }
+    i = 0;
+    while i < dwCount {
+        pid = load32(pdwPropIDs + i * 4);
+        v = vdata + i * 24;
+        store64(v + 0, 0); store64(v + 8, 0); store64(v + 16, 0);   # clear the full 24-byte VARIANT
+        e = errs + i * 4;
+        if idx < 0 {
+            store32(e, 0xC0040007);
+        } else {
+            if pid == 1 { store16(v + 0, 2); store16(v + 8, tag_vt(idx)); store32(e, 0); }            # canonical datatype (VT_I2)
+            else { if pid == 2 {
+                       fill_variant(v, idx);                                                            # value (canonical type, any tag)
+                       store32(e, 0);
+                   } else { if pid == 3 { store16(v + 0, 2); store16(v + 8, 192); store32(e, 0); }      # quality VT_I2 = GOOD
+                   else { if pid == 5 { store16(v + 0, 3); store32(v + 8, tag_access(idx)); store32(e, 0); }   # access rights VT_I4
+                   else { store32(e, 0xC0040004); } } }                                                 # OPC_E_INVALIDPID
+            }
+        }
+        i = i + 1;
+    }
+    store64(ppvData, vdata);
+    store64(ppErrors, errs);
+    return 0;
+}
+func prop_LookupItemIDs(this: ptr, szItemID: ptr, dwCount: i64, pdwPropIDs: ptr, ppNewIDs: ptr, ppErrors: ptr) -> i64 { return 0x80004001; }
+
+# ---- IConnectionPointContainer (group +24) ----
+func cpc_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this - 24, riid, ppv); }
+func cpc_AddRef(this: ptr) -> i64 { return Grp_AddRef(this - 24); }
+func cpc_Release(this: ptr) -> i64 { return Grp_Release(this - 24); }
+func cpc_EnumConnectionPoints(this: ptr, ppEnum: ptr) -> i64 { return 0x80004001; }
+func cpc_FindConnectionPoint(this: ptr, riid: ptr, ppCP: ptr) -> i64 {
+    dbg(d_fcp);
+    base = this - 24;
+    if ppCP == 0 { return 0x80004003; }
+    store64(ppCP, 0);
+    if compare_guid(riid, iid_datacb) == 0 { store64(ppCP, base + 32); Grp_AddRef(base); return 0; }   # the group's IConnectionPoint
+    return 0x80040200;   # CONNECT_E_NOCONNECTION
+}
+
+# ---- IConnectionPoint (group +32); sink = client's IOPCDataCallback ----
+func cp_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this - 32, riid, ppv); }
+func cp_AddRef(this: ptr) -> i64 { return Grp_AddRef(this - 32); }
+func cp_Release(this: ptr) -> i64 { return Grp_Release(this - 32); }
+func cp_GetConnectionInterface(this: ptr, pIID: ptr) -> i64 {
+    store64(pIID + 0, load64(iid_datacb + 0)); store64(pIID + 8, load64(iid_datacb + 8));
+    return 0;
+}
+func cp_GetConnectionPointContainer(this: ptr, ppCPC: ptr) -> i64 {
+    base = this - 32;
+    store64(ppCPC, base + 24); Grp_AddRef(base);
+    return 0;
+}
+func cp_Advise(this: ptr, pUnkSink: ptr, pdwCookie: ptr) -> i64 {
+    dbg(d_adv);
+    base = this - 32;
+    store64(g_qitmp, 0);
+    callp(vmeth(pUnkSink, 0), pUnkSink, iid_datacb, g_qitmp);   # pUnkSink->QueryInterface(IID_IOPCDataCallback)
+    cb = load64(g_qitmp);
+    if cb == 0 { return 0x80040202; }                          # CONNECT_E_CANNOTCONNECT
+    # Register in the GIT: the client's sink lives in ITS apartment (dOPC = STA). The pump thread
+    # must get a thread-valid proxy per call; a raw cross-apartment pointer call never delivers.
+    git = load64(g_git);
+    store64(g_cookietmp, 0);
+    hr = callp(vmeth(git, 3), git, cb, iid_datacb, g_cookietmp);   # IGlobalInterfaceTable::RegisterInterfaceInGlobal
+    callp(vmeth(cb, 2), cb);                                    # release our QI ref (GIT keeps its own)
+    if hr != 0 { return 0x80040202; }
+    store64(base + 64, load64(g_cookietmp));                    # store the GIT cookie (NOT the raw pointer)
+    store64(base + 72, 1);                                      # enabled
+    store64(g_sub_group, base);                                 # pump pushes OnDataChange to this group
+    if pdwCookie != 0 { store32(pdwCookie, 1); }
+    return 0;
+}
+func cp_Unadvise(this: ptr, dwCookie: i64) -> i64 {
+    base = this - 32;
+    cookie = load64(base + 64);
+    if cookie != 0 {
+        git = load64(g_git);
+        callp(vmeth(git, 4), git, cookie);                     # IGlobalInterfaceTable::RevokeInterfaceFromGlobal
+    }
+    store64(base + 64, 0);
+    store64(base + 72, 0);
+    store64(g_sub_group, 0);
+    return 0;
+}
+func cp_EnumConnections(this: ptr, ppEnum: ptr) -> i64 { return 0x80004001; }
+
+# ---- push current values to the subscribed client. Called from the PUMP (our timer
+#      thread), never synchronously inside a client call -> no STA reentrancy/deadlock. ----
+func push_datachange(group: i64, transid: i64) -> i64 {
+    cookie = load64(group + 64);
+    if cookie == 0 { return 0; }
+    if load64(group + 72) == 0 { return 0; }                   # not enabled
+    ic = load64(group + 80);
+    if ic == 0 { return 0; }
+    if ic > 16 { ic = 16; }
+    # get a proxy valid on THIS (pump) thread from the GIT
+    git = load64(g_git);
+    store64(g_cbtmp, 0);
+    callp(vmeth(git, 5), git, cookie, iid_datacb, g_cbtmp);    # IGlobalInterfaceTable::GetInterfaceFromGlobal
+    cb = load64(g_cbtmp);
+    if cb == 0 { return 0; }
+    GetSystemTimeAsFileTime(ft_buf);
+    ftlo = load32(ft_buf + 0);
+    fthi = load32(ft_buf + 4);
+    i = 0;
+    while i < ic {
+        slot = group + 88 + i * 16;
+        idx = load64(slot);
+        hc = load64(slot + 8);
+        store32(g_cb_h + i * 4, hc);                            # phClientItems
+        fill_variant(g_cb_v + i * 24, idx);                     # pvValues (VARIANT, 24B on x64, any tag type)
+        store16(g_cb_q + i * 2, 192);                           # pwQualities = GOOD
+        store32(g_cb_t + i * 8, ftlo); store32(g_cb_t + i * 8 + 4, fthi);   # pftTimeStamps
+        store32(g_cb_e + i * 4, 0);                             # pErrors = S_OK
+        i = i + 1;
+    }
+    hr = callp(vmeth(cb, 3), cb, transid, load64(group + 56), 0, 0, ic, g_cb_h, g_cb_v, g_cb_q, g_cb_t, g_cb_e);   # OnDataChange
+    callp(vmeth(cb, 2), cb);                                   # release the per-call GIT proxy
+    dbg(d_push); dbgn(ic); dbg(d_pushhr); dbgn(hr); dbg(d_nl);
+    return 0;
+}
+
+# ---- IOPCAsyncIO2 (group +40) ----
+func async_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 { return Grp_QI(this - 40, riid, ppv); }
+func async_AddRef(this: ptr) -> i64 { return Grp_AddRef(this - 40); }
+func async_Release(this: ptr) -> i64 { return Grp_Release(this - 40); }
+func async_Read(this: ptr, dwCount: i64, phServer: ptr, transid: i64, pdwCancelID: ptr, ppErrors: ptr) -> i64 {
+    errs = CoTaskMemAlloc(dwCount * 4);
+    if errs == 0 { return 0x8007000E; }
+    i = 0; while i < dwCount { store32(errs + i * 4, 0); i = i + 1; }
+    store64(ppErrors, errs);
+    if pdwCancelID != 0 { store32(pdwCancelID, 1); }
+    return 0;                                                   # data arrives via the periodic OnDataChange push
+}
+func async_Write(this: ptr, dwCount: i64, phServer: ptr, pItemValues: ptr, transid: i64, pdwCancelID: ptr, ppErrors: ptr) -> i64 { return 0x80004001; }
+func async_Refresh2(this: ptr, dwSource: i64, transid: i64, pdwCancelID: ptr) -> i64 {
+    if pdwCancelID != 0 { store32(pdwCancelID, 1); }
+    return 0;                                                   # initial values arrive on the next pump tick (avoids STA reentrancy)
+}
+func async_Cancel2(this: ptr, dwCancelID: i64) -> i64 { return 0; }
+func async_SetEnable(this: ptr, bEnable: i64) -> i64 { dbg(d_sete); base = this - 40; store64(base + 72, bEnable); return 0; }
+func async_GetEnable(this: ptr, pbEnable: ptr) -> i64 { base = this - 40; store32(pbEnable, load64(base + 72)); return 0; }
+
+func build_vtables() -> i64 {
+    store64(cf_vt + 0,  &CF_QI);
+    store64(cf_vt + 8,  &CF_AddRef);
+    store64(cf_vt + 16, &CF_Release);
+    store64(cf_vt + 24, &CF_CreateInstance);
+    store64(cf_vt + 32, &CF_LockServer);
+    store64(srv_vt + 0,  &Srv_QI);
+    store64(srv_vt + 8,  &Srv_AddRef);
+    store64(srv_vt + 16, &Srv_Release);
+    store64(srv_vt + 24, &Srv_AddGroup);
+    store64(srv_vt + 32, &Srv_GetErrorString);
+    store64(srv_vt + 40, &Srv_GetGroupByName);
+    store64(srv_vt + 48, &Srv_GetStatus);
+    store64(srv_vt + 56, &Srv_RemoveGroup);
+    store64(srv_vt + 64, &Srv_CreateGroupEnumerator);
+    store64(grp_im_vt + 0,  &im_QI);
+    store64(grp_im_vt + 8,  &im_AddRef);
+    store64(grp_im_vt + 16, &im_Release);
+    store64(grp_im_vt + 24, &im_AddItems);
+    store64(grp_im_vt + 32, &im_ValidateItems);
+    store64(grp_im_vt + 40, &im_RemoveItems);
+    store64(grp_im_vt + 48, &im_SetActiveState);
+    store64(grp_im_vt + 56, &im_SetClientHandles);
+    store64(grp_im_vt + 64, &im_SetDatatypes);
+    store64(grp_im_vt + 72, &im_CreateEnumerator);
+    store64(grp_sio_vt + 0,  &sio_QI);
+    store64(grp_sio_vt + 8,  &sio_AddRef);
+    store64(grp_sio_vt + 16, &sio_Release);
+    store64(grp_sio_vt + 24, &sio_Read);
+    store64(grp_sio_vt + 32, &sio_Write);
+    store64(grp_gs_vt + 0,  &gs_QI);
+    store64(grp_gs_vt + 8,  &gs_AddRef);
+    store64(grp_gs_vt + 16, &gs_Release);
+    store64(grp_gs_vt + 24, &gs_GetState);
+    store64(grp_gs_vt + 32, &gs_SetState);
+    store64(grp_gs_vt + 40, &gs_SetName);
+    store64(grp_gs_vt + 48, &gs_CloneGroup);
+    store64(brw_vt + 0,  &brw_QI);
+    store64(brw_vt + 8,  &brw_AddRef);
+    store64(brw_vt + 16, &brw_Release);
+    store64(brw_vt + 24, &brw_QueryOrganization);
+    store64(brw_vt + 32, &brw_ChangeBrowsePosition);
+    store64(brw_vt + 40, &brw_BrowseOPCItemIDs);
+    store64(brw_vt + 48, &brw_GetItemID);
+    store64(brw_vt + 56, &brw_BrowseAccessPaths);
+    store64(enum_vt + 0,  &es_QI);
+    store64(enum_vt + 8,  &es_AddRef);
+    store64(enum_vt + 16, &es_Release);
+    store64(enum_vt + 24, &es_Next);
+    store64(enum_vt + 32, &es_Skip);
+    store64(enum_vt + 40, &es_Reset);
+    store64(enum_vt + 48, &es_Clone);
+    store64(prop_vt + 0,  &prop_QI);
+    store64(prop_vt + 8,  &prop_AddRef);
+    store64(prop_vt + 16, &prop_Release);
+    store64(prop_vt + 24, &prop_QueryAvailableProperties);
+    store64(prop_vt + 32, &prop_GetItemProperties);
+    store64(prop_vt + 40, &prop_LookupItemIDs);
+    store64(cpc_vt + 0,  &cpc_QI);
+    store64(cpc_vt + 8,  &cpc_AddRef);
+    store64(cpc_vt + 16, &cpc_Release);
+    store64(cpc_vt + 24, &cpc_EnumConnectionPoints);
+    store64(cpc_vt + 32, &cpc_FindConnectionPoint);
+    store64(cp_vt + 0,  &cp_QI);
+    store64(cp_vt + 8,  &cp_AddRef);
+    store64(cp_vt + 16, &cp_Release);
+    store64(cp_vt + 24, &cp_GetConnectionInterface);
+    store64(cp_vt + 32, &cp_GetConnectionPointContainer);
+    store64(cp_vt + 40, &cp_Advise);
+    store64(cp_vt + 48, &cp_Unadvise);
+    store64(cp_vt + 56, &cp_EnumConnections);
+    store64(async_vt + 0,  &async_QI);
+    store64(async_vt + 8,  &async_AddRef);
+    store64(async_vt + 16, &async_Release);
+    store64(async_vt + 24, &async_Read);
+    store64(async_vt + 32, &async_Write);
+    store64(async_vt + 40, &async_Refresh2);
+    store64(async_vt + 48, &async_Cancel2);
+    store64(async_vt + 56, &async_SetEnable);
+    store64(async_vt + 64, &async_GetEnable);
+    return 0;
+}
+
+# =====================================================================
+# GUI control panel
+# =====================================================================
+func fmt_centi(buf: ptr, v: i64) -> i64 {
+    whole = v / 100;
+    frac = v - whole * 100;
+    int_to_str(buf, whole);
+    e = buf + strlen(buf);
+    store8(e, 46);
+    e = e + 1;
+    if frac < 10 { store8(e, 48); e = e + 1; }
+    int_to_str(e, frac);
+    return 0;
+}
+func parse_centi(s: ptr) -> i64 {
+    i = 0; whole = 0;
+    while 1 {
+        c = load8(s + i);
+        if c < 48 { break; }
+        if c > 57 { break; }
+        whole = whole * 10 + (c - 48);
+        i = i + 1;
+    }
+    frac = 0; digits = 0;
+    if load8(s + i) == 46 {
+        i = i + 1;
+        while digits < 2 {
+            c = load8(s + i);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            frac = frac * 10 + (c - 48);
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits == 1 { frac = frac * 10; }
+    if digits == 0 { frac = 0; }
+    return whole * 100 + frac;
+}
+func apply_tags() -> i64 {
+    store64(tag_data + 0, load64(g_st));
+    store64(tag_data + 8, fbits(itof(load64(g_fi)) / itof(100)));
+    store64(tag_data + 16, fbits(itof(load64(g_vi)) / itof(100)));
+    return 0;
+}
+func refresh_labels() -> i64 {
+    int_to_str(g_buf, load64(g_st));
+    SetWindowTextA(load64(g_lbl_st), g_buf);
+    fmt_centi(g_buf, load64(g_fi));
+    SetWindowTextA(load64(g_lbl_fr), g_buf);
+    fmt_centi(g_buf, load64(g_vi));
+    SetWindowTextA(load64(g_lbl_vl), g_buf);
+    e = str_copy(g_cyclebuf, s_cyc);
+    int_to_str(e, load64(g_cycle));
+    SetWindowTextA(load64(g_lbl_cyc), g_cyclebuf);
+    e = str_copy(g_statusbuf, s_opc);
+    if load64(g_running) == 1 { e = str_copy(e, s_run); } else { e = str_copy(e, s_stop); }
+    e = str_copy(e, s_conns);
+    int_to_str(e, load64(g_conns));
+    SetWindowTextA(load64(g_hstatus), g_statusbuf);
+    return 0;
+}
+func pump_tick() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+    counter = load64(g_counter);
+    cycle = load64(g_cycle);
+    if counter <= 100 { fi = 4900 + counter * 2; } else { t = counter - 100; fi = 5100 - t * 2; }
+    if counter <= 100 { vi = 21500 + counter * 10; } else { t = counter - 100; vi = 22500 - t * 10; }
+    m = cycle % 4;
+    if m == 0 { st = 1; } else { if m == 1 { st = 3; } else { if m == 2 { st = 5; } else { st = 7; } } }
+    store64(g_fi, fi); store64(g_vi, vi); store64(g_st, st);
+    counter = counter + 1;
+    if counter > 200 { counter = 0; }
+    store64(g_counter, counter);
+    store64(g_cycle, cycle + 1);
+    apply_tags();
+    return 0;
+}
+func set_status() -> i64 {
+    GetWindowTextA(load64(g_ed_st), g_inbuf, 32);
+    store64(g_st, str_to_int(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+func set_freq() -> i64 {
+    GetWindowTextA(load64(g_ed_fr), g_inbuf, 32);
+    store64(g_fi, parse_centi(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+func set_volt() -> i64 {
+    GetWindowTextA(load64(g_ed_vl), g_inbuf, 32);
+    store64(g_vi, parse_centi(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+func create_controls(hwnd: i64) -> i64 {
+    hinst = load64(g_hinst);
+    CreateWindowExA(0, cls_stat, txt_hdr, 1342177280, 20, 12, 640, 20, hwnd, 0, hinst, 0);
+    CreateWindowExA(0, cls_stat, txt_sub, 1342177280, 20, 36, 640, 20, hwnd, 0, hinst, 0);
+    CreateWindowExA(0, cls_stat, lbl_st, 1342177280, 20, 80, 230, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 260, 80, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_st, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 360, 78, 100, 24, hwnd, 2103, hinst, 0); store64(g_ed_st, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 470, 77, 60, 26, hwnd, 2003, hinst, 0);
+    CreateWindowExA(0, cls_stat, lbl_fr, 1342177280, 20, 114, 230, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 260, 114, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_fr, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 360, 112, 100, 24, hwnd, 2104, hinst, 0); store64(g_ed_fr, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 470, 111, 60, 26, hwnd, 2004, hinst, 0);
+    CreateWindowExA(0, cls_stat, lbl_vl, 1342177280, 20, 148, 230, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 260, 148, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_vl, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 360, 146, 100, 24, hwnd, 2105, hinst, 0); store64(g_ed_vl, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 470, 145, 60, 26, hwnd, 2005, hinst, 0);
+    CreateWindowExA(0, cls_btn, txt_start, 1342177280, 20, 188, 120, 28, hwnd, 2001, hinst, 0);
+    CreateWindowExA(0, cls_btn, txt_stop,  1342177280, 150, 188, 120, 28, hwnd, 2002, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, s_cyc, 1342177280, 290, 194, 240, 20, hwnd, 0, hinst, 0); store64(g_lbl_cyc, h);
+    CreateWindowExA(0, cls_btn, txt_reg,   1342177280, 20, 224, 120, 28, hwnd, 2006, hinst, 0);
+    CreateWindowExA(0, cls_btn, txt_unreg, 1342177280, 150, 224, 120, 28, hwnd, 2007, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, rs_idle, 1342177280, 290, 230, 400, 20, hwnd, 0, hinst, 0); store64(g_lbl_reg, h);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 20, 262, 660, 20, hwnd, 0, hinst, 0); store64(g_hstatus, h);
+    int_to_str(g_buf, load64(g_st)); SetWindowTextA(load64(g_ed_st), g_buf);
+    fmt_centi(g_buf, load64(g_fi)); SetWindowTextA(load64(g_ed_fr), g_buf);
+    fmt_centi(g_buf, load64(g_vi)); SetWindowTextA(load64(g_ed_vl), g_buf);
+    refresh_labels();
+    return 0;
+}
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { create_controls(hwnd); return 0; }
+    if msg == 273 {
+        id = band(wParam, 65535);
+        if id == 2001 { store64(g_running, 1); refresh_labels(); }
+        if id == 2002 { store64(g_running, 0); refresh_labels(); }
+        if id == 2003 { set_status(); }
+        if id == 2004 { set_freq(); }
+        if id == 2005 { set_volt(); }
+        if id == 2006 { show_reg_status(reg_register()); }
+        if id == 2007 { reg_unregister(); SetWindowTextA(load64(g_lbl_reg), rs_unreg); }
+        return 0;
+    }
+    if msg == 275 { pump_tick(); refresh_labels(); g = load64(g_sub_group); if g != 0 { push_datachange(g, 0); } return 0; }   # WM_TIMER + push subscription
+    if msg == 2 { PostQuitMessage(0); return 0; }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# =====================================================================
+# Self-registration (used by the GUI buttons AND /regserver /unregserver CLI)
+# =====================================================================
+func str_contains(h: i64, n: i64) -> i64 {
+    i = 0;
+    while load8(h + i) != 0 {
+        j = 0;
+        while 1 {
+            cn = load8(n + j);
+            if cn == 0 { return 1; }
+            if load8(h + i + j) != cn { break; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+# create subkey under root and set its DEFAULT value = data (REG_SZ). 0 = ok.
+func reg_set_default(root: i64, subkey: i64, data: i64) -> i64 {
+    rc = RegCreateKeyExA(root, subkey, 0, 0, 0, 0x20006, 0, g_phk, 0);   # KEY_WRITE
+    if rc != 0 { return rc; }
+    hk = load64(g_phk);
+    RegSetValueExA(hk, 0, 0, 1, data, strlen(data) + 1);                 # default value, REG_SZ, +NUL
+    RegCloseKey(hk);
+    return 0;
+}
+func reg_create(root: i64, subkey: i64) -> i64 {
+    rc = RegCreateKeyExA(root, subkey, 0, 0, 0, 0x20006, 0, g_phk, 0);
+    if rc != 0 { return rc; }
+    RegCloseKey(load64(g_phk));
+    return 0;
+}
+# Returns 2 = registered HKLM (machine), 1 = HKCU (per-user), 0 = failed.
+func reg_register() -> i64 {
+    GetModuleFileNameA(0, g_exepath, 512);            # exe path -> LocalServer32 (path-correct anywhere)
+    root = 0x80000002;                                 # HKEY_LOCAL_MACHINE
+    rc = reg_set_default(root, rk_progid, v_friendly);
+    if rc != 0 {
+        root = 0x80000001;                             # HKEY_CURRENT_USER (no admin needed)
+        rc = reg_set_default(root, rk_progid, v_friendly);
+        if rc != 0 { return 0; }
+    }
+    reg_set_default(root, rk_progid_clsid, v_clsidstr);
+    reg_set_default(root, rk_clsid, v_friendly);
+    reg_set_default(root, rk_clsid_progid, v_progidstr);
+    reg_set_default(root, rk_clsid_ls32, g_exepath);
+    reg_create(root, rk_clsid_cat);
+    if root == 0x80000002 { return 2; }
+    return 1;
+}
+func reg_unregister() -> i64 {
+    RegDeleteTreeA(0x80000002, rk_clsid);
+    RegDeleteTreeA(0x80000002, rk_progid);
+    RegDeleteTreeA(0x80000001, rk_clsid);
+    RegDeleteTreeA(0x80000001, rk_progid);
+    return 0;
+}
+func show_reg_status(code: i64) -> i64 {
+    if code == 2 { SetWindowTextA(load64(g_lbl_reg), rs_hklm); }
+    else { if code == 1 { SetWindowTextA(load64(g_lbl_reg), rs_hkcu); } else { SetWindowTextA(load64(g_lbl_reg), rs_fail); } }
+    return 0;
+}
+
+func main() -> i32 {
+    # ---- CLI: /regserver and /unregserver (standard COM self-registration) ----
+    cl = GetCommandLineA();
+    if str_contains(cl, s_unreg_arg) == 1 { reg_unregister(); return 0; }   # check unreg first (substring of regserver)
+    if str_contains(cl, s_reg_arg) == 1 { reg_register(); return 0; }
+
+    dbg(d_boot);
+    store64(g_embedding, str_contains(cl, s_embed_arg));   # COM-launched? -> auto-close when client disconnects
+    # ---- COM server bring-up (MTA) ----
+    CoInitializeEx(0, 0);
+    init_iids();
+    build_vtables();
+    # Global Interface Table for cross-apartment callback delivery (dOPC's sink is STA)
+    store64(git_clsid + 0, 0x0000000000000323); store64(git_clsid + 8, 0x46000000000000C0);   # CLSID_StdGlobalInterfaceTable
+    store64(git_iid + 0,   0x0000000000000146); store64(git_iid + 8,   0x46000000000000C0);   # IID_IGlobalInterfaceTable
+    store64(g_git, 0);
+    githr = CoCreateInstance(git_clsid, 0, 1, git_iid, g_git);   # CLSCTX_INPROC_SERVER
+    dbg(d_git); dbgn(githr); dbg(d_nl);
+    store64(g_grphandle, 0);
+    store64(clsid + 0, 0x6677445500112233);
+    store64(clsid + 8, 0xFFEEDDCCBBAA9988);
+    store64(srv_obj + 0, srv_vt); store64(srv_obj + 8, brw_vt); store64(srv_obj + 16, prop_vt); store64(srv_obj + 24, 0);  # 0 client refs at start
+    store64(cf_obj + 0, cf_vt);   store64(cf_obj + 8, 1);
+
+    # ---- initial simulator state ----
+    store64(g_running, 1);
+    store64(g_counter, 0);
+    store64(g_cycle, 0);
+    store64(g_st, 5);
+    store64(g_fi, 5000);
+    store64(g_vi, 22000);
+    store64(g_conns, 0);
+    apply_tags();
+    store64(tag_data + 24, 0);                  # Substation.Breaker = FALSE (writable, pump never touches it)
+    store64(tag_data + 32, fbits(itof(100)));   # Substation.Setpoint = 100.0 (writable)
+
+    CoRegisterClassObject(clsid, cf_obj, 4, 1, cookie);
+    CoResumeClassObjects();
+
+    # ---- window ----
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, 6);
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 120, 120, 700, 345, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, 1, 500, 0);
+
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { break; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    CoRevokeClassObject(load32(cookie));   # clean COM teardown on window close
+    CoUninitialize();
+    return 0;
+}

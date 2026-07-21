@@ -1,0 +1,1917 @@
+# ============================================================================
+#  iec104_slave_gui.ancl  -  Native Win32 Dark-Themed IEC 104 Slave Simulator
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+
+# ---- Additional Windows API & GDI functions ----
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "user32.dll" PostMessageA;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll" RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "kernel32.dll" GetLocalTime;
+extern "user32.dll" MessageBoxA -> i32;
+extern "user32.dll" LoadIconA -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+
+# ---- Winsock imports ----
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+extern "ws2_32.dll" socket -> i64;
+extern "ws2_32.dll" bind -> i32;
+extern "ws2_32.dll" listen -> i32;
+extern "ws2_32.dll" accept -> i64;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" ioctlsocket -> i32;
+extern "ws2_32.dll" WSAGetLastError -> i32;
+extern "comctl32.dll" InitCommonControlsEx -> i32;
+
+@DATA
+g_icc:               buf = 8;
+# ---- Color Palette (Premium Dark Cobalt Blue) ----
+COL_BG:             i64 = 0x150E0C; # Premium Dark Red-Black
+COL_PANEL:          i64 = 0x050403; # Solid Black
+COL_TEXT:           i64 = 0xAB9687; # Silent Gold/Beige
+COL_ACCENT:         i64 = 0xFF5500; # Cobalt Blue (BGR)
+COL_GREEN:          i64 = 0x00FF00;
+COL_RED:            i64 = 0x0000FF;
+
+COLOR_BG_DEEP:      i64 = 0x070505;
+COLOR_BG_PANEL:     i64 = 0x0B0908;
+COLOR_BG_CARD:      i64 = 0x120F0E;
+COLOR_BG_INPUT:     i64 = 0x1A1513;
+COLOR_BG_HOVER:     i64 = 0x221B19;
+COLOR_BORDER:       i64 = 0x241D1A;
+COLOR_TEXT_PRIMARY: i64 = 0xE5DFDA;
+
+# ---- Class and Window Names ----
+clsname:      str = "ANCLIEC104SLAVE";
+wndname:      str = "AetherEdge IEC 60870-5-104 Slave Simulator";
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+cls_stat:     str = "STATIC";
+cls_btn:      str = "BUTTON";
+cls_edit:     str = "EDIT";
+cls_combo:    str = "COMBOBOX";
+cls_lv:       str = "SysListView32";
+gui_empty:    str = "";
+face_mono:    str = "Consolas";
+crlf:         str = "\r\n";
+
+# ---- Layout labels ----
+lbl_host:     str = "Host IP:";
+lbl_port:     str = "Port:";
+lbl_ca:       str = "Common Address:";
+lbl_status:   str = "Status: Stopped";
+lbl_clients:  str = "Master: (none)";
+lbl_log:      str = "Traffic Log:";
+lbl_points:   str = "Point Database:";
+
+lbl_ioa:      str = "IOA:";
+lbl_type:     str = "Type:";
+lbl_val:      str = "Value:";
+lbl_flags:    str = "Flags:";
+
+btn_start:    str = "Start Server";
+btn_stop:     str = "Stop Server";
+btn_add:      str = "Add Point";
+btn_delete:   str = "Delete Point";
+btn_update:   str = "Update Value";
+btn_clear:    str = "Clear Log";
+btn_save:     str = "Save Log";
+title_draw:   str = "AETHEREDGE IEC 60870-5-104 SLAVE SIMULATOR";
+st_run_ind:   str = "* RUNNING";
+st_stop_ind:  str = "* STOPPED";
+btn_min:      str = "-";
+btn_close:    str = "X";
+ID_BTN_MIN:   i64 = 301;
+ID_BTN_CLOSE: i64 = 302;
+
+col_ioa:      str = "IOA";
+col_type:     str = "ASDU Type";
+col_value:    str = "Value";
+col_flags:    str = "Flags";
+col_time:     str = "Timestamp";
+
+# ---- Default Inputs ----
+def_host:     str = "0.0.0.0";
+def_port:     str = "2404";
+def_ca:       str = "1";
+def_ioa:      str = "100";
+def_val:      str = "0";
+
+# ---- Types ComboBox Strings ----
+t_sp:         str = "1: M_SP_NA_1 (Single Point)";
+t_dp:         str = "3: M_DP_NA_1 (Double Point)";
+t_me:         str = "9: M_ME_NA_1 (Measured Norm)";
+t_ms:         str = "11: M_ME_NB_1 (Measured Scale)";
+t_mf:         str = "13: M_ME_NC_1 (Measured Float)";
+t_spt:        str = "30: M_SP_TB_1 (Single w/ Time)";
+t_mft:        str = "36: M_ME_TF_1 (Float w/ Time)";
+
+# ---- Log and file paths ----
+g_logpath:    str = "iec104_slave_log.txt";
+m_save_ok:    str = "[System] Log saved successfully to iec104_slave_log.txt\r\n";
+m_save_err:   str = "[System] Error: Failed to save log.\r\n";
+m_start_ok:   str = "[System] Server running on port ";
+m_start_fail: str = "[System] Error: Failed to bind to port.\r\n";
+m_stop_msg:   str = "[System] Server stopped.\r\n";
+m_new_conn:   str = "[System] Master connected.\r\n";
+m_disc_conn:  str = "[System] Master disconnected.\r\n";
+
+# ---- Theme files ----
+thm_uxtheme:  str = "uxtheme.dll";
+thm_dm_exp_w: buf = 40;
+thm_dm_exp_a: str = "DarkMode_Explorer";
+thm_dm_cfd_w: buf = 40;
+thm_dm_cfd_a: str = "DarkMode_CFD";
+g_allowdark:  buf = 8;
+
+# ---- UI Window Handles ----
+g_hwnd:       buf = 8;
+g_hinst:      buf = 8;
+g_status:     buf = 8;
+g_clients:    buf = 8;
+g_host_ed:    buf = 8;
+g_port_ed:    buf = 8;
+g_ca_ed:      buf = 8;
+g_log:        buf = 8;
+g_listview:   buf = 8;
+
+g_ioa_ed:     buf = 8;
+g_type_combo: buf = 8;
+g_val_ed:     buf = 8;
+g_combo_ps:       buf = 72;
+g_combo_rect:     buf = 16;
+g_old_combo_proc: buf = 8;
+g_pen_arrow:      buf = 8;
+
+# ---- UI Brushes and Pens ----
+g_bg_brush:   buf = 8;
+g_edit_brush: buf = 8;
+g_brush_deep:  buf = 8;
+g_brush_panel: buf = 8;
+g_brush_card:  buf = 8;
+g_brush_input: buf = 8;
+g_brush_hover: buf = 8;
+g_brush_neon:  buf = 8;
+g_pen_border:  buf = 8;
+g_pen_neon:    buf = 8;
+g_font:       buf = 8;
+g_font_header: buf = 8;
+
+# ---- Win32 UI buffers ----
+g_wndclass_btn: buf = 80;
+g_wndcls:     buf = 80;
+g_msg:        buf = 48;
+g_rect:       buf = 16;
+g_ps:         buf = 72;
+g_track_mouse: buf = 32;
+g_lvcol:      buf = 64;
+g_lvitem:     buf = 96;
+
+# ---- Text formatting buffers ----
+g_numbuf:     buf = 128;
+g_temp_text:  buf = 256;
+g_valbuf:     buf = 128;
+g_logbuf:     buf = 512;
+g_savebuf:    buf = 65536;
+g_decbuf:     buf = 32;
+
+# ---- Polling and socket variables ----
+g_running:    buf = 8;
+g_listen_s:   buf = 8;
+g_client_s:   buf = 8;
+g_nonblock:   buf = 8;
+g_wsa:        buf = 512;
+g_addr:       buf = 32;
+g_addr_len:   buf = 8;
+g_rxbuf:      buf = 2048;
+
+# ---- Point Database Arrays (Parallel Arrays for up to 1000 Points) ----
+g_pt_count:  buf = 8;
+g_pt_ioa:    buf = 8000;  # 1000 * 8 bytes
+g_pt_type:   buf = 8000;  # 1000 * 8 bytes
+g_pt_val:    buf = 8000;  # 1000 * 8 bytes (stores integer value or raw float bits)
+g_pt_flags:  buf = 8000;  # 1000 * 8 bytes (quality flags)
+g_pt_time:   buf = 7000;  # 1000 * 7 bytes (raw CP56Time2a timestamp buffers)
+
+# ---- Protocol Engine Variables ----
+g_rx_seq:    buf = 8;     # V(R) - Receive State Variable
+g_tx_seq:    buf = 8;     # V(S) - Send State Variable
+g_ca:        buf = 8;     # Common Address of ASDU (default 1)
+
+# ---- Select-Before-Operate (SBO) State ----
+g_sbo_active: buf = 8;    # 1 if select is active, 0 otherwise
+g_sbo_ioa:    buf = 8;    # Selected IOA
+g_sbo_type:   buf = 8;    # Selected Type ID
+g_sbo_val:    buf = 8;    # Selected Value
+
+# ---- Temporary Buffers ----
+g_txbuf:     buf = 2048;
+g_systime:   buf = 16;
+g_p_log:     buf = 8;
+
+# ---- Static Strings ----
+m_dir_s:     str = "-->";
+m_dir_r:     str = "<--";
+m_act_con:   str = " (GI ACT CONFIRM)";
+m_act_term:  str = " (GI ACT TERMINATION)";
+m_spont_upd: str = " (SPONTANEOUS UPDATE)";
+m_cmd_sel:   str = " (COMMAND SELECT CONFIRM)";
+m_cmd_exe:   str = " (COMMAND EXEC CONFIRM)";
+m_cmd_term:  str = " (COMMAND ACT TERMINATION)";
+m_cmd_neg:   str = " (COMMAND NEGATIVE CONFIRM)";
+
+# ---- Timer Consts ----
+ID_TIMER_POLL:  i64 = 1;
+ID_TIMER_RAND:  i64 = 2;
+
+# ---- Button IDs ----
+ID_BTN_START:  i64 = 101;
+ID_BTN_STOP:   i64 = 102;
+ID_BTN_CLEAR:  i64 = 103;
+ID_BTN_SAVE:   i64 = 104;
+ID_BTN_ADD:    i64 = 105;
+ID_BTN_DELETE: i64 = 106;
+ID_BTN_UPDATE: i64 = 107;
+
+# ---- Core String Helpers ----
+
+func strlen(s: i64) -> i64 {
+    p = s;
+    while load8(p) != 0 { p = p + 1; }
+    return p - s;
+}
+
+func str_copy(dst: i64, src: i64) -> i64 {
+    d = dst; s = src;
+    while load8(s) != 0 {
+        store8(d, load8(s));
+        d = d + 1; s = s + 1;
+    }
+    store8(d, 0);
+    return d;
+}
+
+func str_to_int(s: i64) -> i64 {
+    v = 0; p = s;
+    neg = 0;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    if load8(p) == 45 { neg = 1; p = p + 1; }
+    while load8(p) >= 48 && load8(p) <= 57 {
+        v = v * 10 + (load8(p) - 48);
+        p = p + 1;
+    }
+    if neg == 1 { return 0 - v; }
+    return v;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+func dark_combo(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_cfd_w, 0);
+    SendMessageA(hwnd, 0x031A, 0, 0);
+    return 0;
+}
+
+func ComboBoxWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_combo_ps);
+        GetClientRect(hwnd, g_combo_rect);
+        l = load32(g_combo_rect + 0);
+        t = load32(g_combo_rect + 4);
+        r = load32(g_combo_rect + 8);
+        b = load32(g_combo_rect + 12);
+        
+        # Background
+        FillRect(hdc, g_combo_rect, load64(g_edit_brush));
+        
+        # Flat border
+        old_brush = SelectObject(hdc, GetStockObject(5));
+        SelectObject(hdc, load64(g_pen_border));
+        Rectangle(hdc, l, t, r, b);
+        SelectObject(hdc, old_brush);
+        
+        # Draw selected text
+        old_font = SelectObject(hdc, load64(g_font));
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkMode(hdc, 1);
+        
+        sel = SendMessageA(hwnd, 327, 0, 0);
+        if sel >= 0 {
+            SendMessageA(hwnd, 328, sel, g_temp_text);
+            store32(g_combo_rect + 0, l + 6);
+            store32(g_combo_rect + 4, t + 2);
+            store32(g_combo_rect + 8, r - 24);
+            store32(g_combo_rect + 12, b - 2);
+            DrawTextA(hdc, g_temp_text, 0 - 1, g_combo_rect, 36);
+        }
+        
+        # Draw Arrow
+        x_mid = r - 12;
+        y_mid = shr(t + b, 1);
+        
+        old_pen = SelectObject(hdc, load64(g_pen_arrow));
+        MoveToEx(hdc, x_mid - 4, y_mid - 2, 0); LineTo(hdc, x_mid + 5, y_mid - 2);
+        MoveToEx(hdc, x_mid - 3, y_mid - 1, 0); LineTo(hdc, x_mid + 4, y_mid - 1);
+        MoveToEx(hdc, x_mid - 2, y_mid, 0);     LineTo(hdc, x_mid + 3, y_mid);
+        MoveToEx(hdc, x_mid - 1, y_mid + 1, 0); LineTo(hdc, x_mid + 2, y_mid + 1);
+        MoveToEx(hdc, x_mid, y_mid + 2, 0);     LineTo(hdc, x_mid + 1, y_mid + 2);
+        
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_font);
+        
+        EndPaint(hwnd, g_combo_ps);
+        return 0;
+    }
+    
+    if msg == 20 { return 1; }
+    
+    if msg == 7 {
+        res = CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, 0, 1);
+        return res;
+    }
+    
+    if msg == 8 {
+        res = CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, 0, 1);
+        return res;
+    }
+    
+    return CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+}
+
+func theme_control(ctrl: i64) -> i64 {
+    if ctrl != 0 {
+        SendMessageA(ctrl, 48, load64(g_font), 1); # WM_SETFONT
+        dark_scroll(ctrl);
+    }
+    return 0;
+}
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    
+    len = SendMessageA(hwnd_log, 14, 0, 0); # WM_GETTEXTLENGTH
+    SendMessageA(hwnd_log, 177, len, len); # EM_SETSEL
+    SendMessageA(hwnd_log, 194, 0, text); # EM_REPLACESEL
+    return 0;
+}
+
+func log_hex_dump(dir: i64, buf: i64, len: i64, suffix: i64) -> i64 {
+    log_append(dir);
+    log_append(" ");
+    
+    i = 0;
+    while i < len {
+        b = load8(buf + i);
+        # Convert to hex
+        h1 = (b / 16) % 16;
+        h2 = b % 16;
+        
+        c1 = 48 + h1; if h1 >= 10 { c1 = 65 + (h1 - 10); }
+        c2 = 48 + h2; if h2 >= 10 { c2 = 65 + (h2 - 10); }
+        
+        store8(g_numbuf + 0, c1);
+        store8(g_numbuf + 1, c2);
+        store8(g_numbuf + 2, 32);
+        store8(g_numbuf + 3, 0);
+        
+        log_append(g_numbuf);
+        i = i + 1;
+    }
+    
+    log_append(suffix);
+    log_append(crlf);
+    return 0;
+}
+
+func int_to_dec_str(val: i64, dst: i64) -> i64 {
+    end = nf_u64dec(val, dst);
+    store8(end, 0);
+    return end;
+}
+
+func post_ui_refresh() -> i64 {
+    PostMessageA(load64(g_hwnd), 273, ID_BTN_UPDATE, 0); # Post message to main loop to refresh database
+    return 0;
+}
+
+func parse_ip_to_octets(ip_str: i64, p_octs: i64) -> i64 {
+    p = ip_str;
+    i = 0;
+    while i < 4 {
+        val = 0;
+        while load8(p) >= 48 && load8(p) <= 57 {
+            val = val * 10 + (load8(p) - 48);
+            p = p + 1;
+        }
+        store8(p_octs + i, val);
+        if load8(p) == 46 { p = p + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func init_point_database() -> i64 {
+    store64(g_pt_count, 0);
+    
+    # 1. Single Point (M_SP_NA_1, TI=1)
+    add_point(100, 1, 0, 0);
+    
+    # 2. Double Point (M_DP_NA_1, TI=3)
+    add_point(101, 3, 1, 0);
+    
+    # 3. Measured Normalized (M_ME_NA_1, TI=9)
+    add_point(102, 9, 1234, 0);
+    
+    # 4. Measured Scaled (M_ME_NB_1, TI=11)
+    add_point(103, 11, 0 - 5678, 0);
+    
+    # 5. Measured Float (M_ME_NC_1, TI=13) -> 45.67 = 0x4236AE14
+    add_point(104, 13, 0x4236AE14, 0);
+    
+    # 6. Single Point with Time (M_SP_TB_1, TI=30)
+    add_point(105, 30, 0, 0);
+    
+    # 7. Float with Time (M_ME_TF_1, TI=36) -> 98.76 = 0x42C5851F
+    add_point(106, 36, 0x42C5851F, 0);
+    
+    return 0;
+}
+
+func refresh_listview() -> i64 {
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    SendMessageA(hlv, 4105, 0, 0); # LVM_DELETEALLITEMS
+    
+    i = 0;
+    count = load64(g_pt_count);
+    while i < count {
+        ioa = load64(g_pt_ioa + i * 8);
+        ti = load64(g_pt_type + i * 8);
+        val = load64(g_pt_val + i * 8);
+        flags = load64(g_pt_flags + i * 8);
+        
+        # Col 0: IOA
+        int_to_dec_str(ioa, g_numbuf);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1); # mask = LVIF_TEXT
+        store32(g_lvitem + 4, i); # iItem
+        store32(g_lvitem + 8, 0); # iSubItem
+        store64(g_lvitem + 24, g_numbuf);
+        SendMessageA(hlv, 4103, 0, g_lvitem); # LVM_INSERTITEMA
+        
+        # Col 1: Type ID
+        type_str = "Unknown";
+        if ti == 1 { type_str = "1: M_SP_NA_1 (Single)"; }
+        if ti == 3 { type_str = "3: M_DP_NA_1 (Double)"; }
+        if ti == 9 { type_str = "9: M_ME_NA_1 (Norm)"; }
+        if ti == 11 { type_str = "11: M_ME_NB_1 (Scaled)"; }
+        if ti == 13 { type_str = "13: M_ME_NC_1 (Float)"; }
+        if ti == 30 { type_str = "30: M_SP_TB_1 (Single+Time)"; }
+        if ti == 36 { type_str = "36: M_ME_TF_1 (Float+Time)"; }
+        
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, type_str);
+        SendMessageA(hlv, 4142, i, g_lvitem); # LVM_SETITEMA
+        
+        # Col 2: Value
+        if ti == 13 || ti == 36 {
+            nf_ftoa(val, g_numbuf);
+        } else {
+            if ti == 1 || ti == 30 {
+                if val == 1 { str_copy(g_numbuf, "ON"); } else { str_copy(g_numbuf, "OFF"); }
+            } else if ti == 3 {
+                if val == 1 { str_copy(g_numbuf, "OFF"); }
+                else if val == 2 { str_copy(g_numbuf, "ON"); }
+                else { str_copy(g_numbuf, "INDETERMINATE"); }
+            } else {
+                int_to_dec_str(val, g_numbuf);
+            }
+        }
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 2);
+        store64(g_lvitem + 24, g_numbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+        
+        # Col 3: Quality Flags
+        if flags == 0 {
+            str_copy(g_numbuf, "GOOD");
+        } else {
+            str_copy(g_numbuf, "0x");
+            p_fl = g_numbuf + 2;
+            h1 = (flags / 16) % 16;
+            h2 = flags % 16;
+            c1 = 48 + h1; if h1 >= 10 { c1 = 65 + (h1 - 10); }
+            c2 = 48 + h2; if h2 >= 10 { c2 = 65 + (h2 - 10); }
+            store8(p_fl + 0, c1);
+            store8(p_fl + 1, c2);
+            store8(p_fl + 2, 0);
+        }
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, g_numbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+        
+        # Col 4: Timestamp
+        format_cp56(g_pt_time + i * 7, g_numbuf);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 4);
+        store64(g_lvitem + 24, g_numbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+func randomize_values() -> i64 {
+    count = load64(g_pt_count);
+    i = 0;
+    while i < count {
+        ti = load64(g_pt_type + i * 8);
+        val = load64(g_pt_val + i * 8);
+        
+        if ti == 1 || ti == 30 {
+            store64(g_pt_val + i * 8, band(val + 1, 1));
+            populate_cp56(g_pt_time + i * 7);
+        }
+        if ti == 9 || ti == 11 {
+            store64(g_pt_val + i * 8, val + 5);
+            populate_cp56(g_pt_time + i * 7);
+        }
+        i = i + 1;
+    }
+    
+    refresh_listview();
+    cs = load64(g_client_s);
+    if cs != 0 {
+        send_point_update(cs, 0, 3);
+    }
+    return 0;
+}
+
+# ---- Protocol Database Functions ----
+
+func find_point_by_ioa(ioa: i64) -> i64 {
+    i = 0;
+    count = load64(g_pt_count);
+    while i < count {
+        if load64(g_pt_ioa + i * 8) == ioa { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+func add_point(ioa: i64, type_id: i64, val: i64, flags: i64) -> i64 {
+    idx = find_point_by_ioa(ioa);
+    if idx != 0 - 1 {
+        store64(g_pt_val + idx * 8, val);
+        store64(g_pt_flags + idx * 8, flags);
+        populate_cp56(g_pt_time + idx * 7);
+        return idx;
+    }
+    count = load64(g_pt_count);
+    if count >= 1000 { return 0 - 1; }
+    store64(g_pt_ioa + count * 8, ioa);
+    store64(g_pt_type + count * 8, type_id);
+    store64(g_pt_val + count * 8, val);
+    store64(g_pt_flags + count * 8, flags);
+    populate_cp56(g_pt_time + count * 7);
+    store64(g_pt_count, count + 1);
+    return count;
+}
+
+func delete_point_by_index(idx: i64) -> i64 {
+    count = load64(g_pt_count);
+    if idx < 0 || idx >= count { return 0; }
+    i = idx;
+    while i < count - 1 {
+        store64(g_pt_ioa + i * 8, load64(g_pt_ioa + (i + 1) * 8));
+        store64(g_pt_type + i * 8, load64(g_pt_type + (i + 1) * 8));
+        store64(g_pt_val + i * 8, load64(g_pt_val + (i + 1) * 8));
+        store64(g_pt_flags + i * 8, load64(g_pt_flags + (i + 1) * 8));
+        
+        k = 0;
+        while k < 7 {
+            store8(g_pt_time + i * 7 + k, load8(g_pt_time + (i + 1) * 7 + k));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    store64(g_pt_count, count - 1);
+    return 1;
+}
+
+func populate_cp56(p_time: ptr) -> i64 {
+    GetLocalTime(g_systime);
+    year = load16(g_systime + 0);
+    month = load16(g_systime + 2);
+    wday = load16(g_systime + 4);
+    day = load16(g_systime + 6);
+    hour = load16(g_systime + 8);
+    minute = load16(g_systime + 10);
+    second = load16(g_systime + 12);
+    msec = load16(g_systime + 14);
+    
+    ms_val = second * 1000 + msec;
+    store16(p_time + 0, ms_val);
+    store8(p_time + 2, band(minute, 63));
+    store8(p_time + 3, band(hour, 31));
+    
+    if wday == 0 { wday = 7; }
+    day_val = band(day, 31) + shl(band(wday, 7), 5);
+    store8(p_time + 4, day_val);
+    store8(p_time + 5, band(month, 15));
+    store8(p_time + 6, band(year % 100, 127));
+    return 0;
+}
+
+func format_cp56(p_time: ptr, dst: ptr) -> i64 {
+    ms = load16(p_time + 0);
+    sec = ms / 1000;
+    ms_rem = ms % 1000;
+    min = band(load8(p_time + 2), 63);
+    hour = band(load8(p_time + 3), 31);
+    day = band(load8(p_time + 4), 31);
+    month = band(load8(p_time + 5), 15);
+    year = 2000 + band(load8(p_time + 6), 127);
+    
+    p = dst;
+    p = nf_4d(year, p);   store8(p, 47); p = p + 1;
+    p = nf_2d(month, p);  store8(p, 47); p = p + 1;
+    p = nf_2d(day, p);    store8(p, 32); p = p + 1;
+    p = nf_2d(hour, p);   store8(p, 58); p = p + 1;
+    p = nf_2d(min, p);    store8(p, 58); p = p + 1;
+    p = nf_2d(sec, p);    store8(p, 46); p = p + 1;
+    
+    store8(p + 0, 48 + (ms_rem / 100) % 10);
+    store8(p + 1, 48 + (ms_rem / 10) % 10);
+    store8(p + 2, 48 + ms_rem % 10);
+    store8(p + 3, 0);
+    return 0;
+}
+
+# ---- Protocol Functions ----
+
+func send_s_frame(socket: i64, rx_seq: i64) -> i64 {
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, 0x04);
+    store8(g_txbuf + 2, 0x01);
+    store8(g_txbuf + 3, 0x00);
+    
+    rx_val = band(shl(rx_seq, 1), 0xFFFF);
+    store8(g_txbuf + 4, band(rx_val, 0xFF));
+    store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+    
+    send(socket, g_txbuf, 6, 0);
+    return 0;
+}
+
+func send_point_update(socket: i64, idx: i64, cot: i64) -> i64 {
+    count = load64(g_pt_count);
+    if idx < 0 || idx >= count { return 0; }
+    
+    ioa = load64(g_pt_ioa + idx * 8);
+    ti = load64(g_pt_type + idx * 8);
+    val = load64(g_pt_val + idx * 8);
+    flags = load64(g_pt_flags + idx * 8);
+    
+    store8(g_txbuf + 6, ti);
+    store8(g_txbuf + 7, 1); # VSQ = 1 item, SQ = 0
+    store8(g_txbuf + 8, cot);
+    store8(g_txbuf + 9, 0); # Originator Address = 0
+    
+    ca_val = load64(g_ca);
+    store8(g_txbuf + 10, band(ca_val, 0xFF));
+    store8(g_txbuf + 11, band(shr(ca_val, 8), 0xFF));
+    
+    store8(g_txbuf + 12, band(ioa, 0xFF));
+    store8(g_txbuf + 13, band(shr(ioa, 8), 0xFF));
+    store8(g_txbuf + 14, band(shr(ioa, 16), 0xFF));
+    
+    offset = 15;
+    
+    # Encode value and quality
+    if ti == 1 {
+        val_byte = band(val, 1) + band(flags, 0xF0);
+        store8(g_txbuf + offset, val_byte);
+        offset = offset + 1;
+    }
+    if ti == 3 {
+        val_byte = band(val, 3) + band(flags, 0xF0);
+        store8(g_txbuf + offset, val_byte);
+        offset = offset + 1;
+    }
+    if ti == 9 || ti == 11 {
+        store8(g_txbuf + offset, band(val, 0xFF));
+        store8(g_txbuf + offset + 1, band(shr(val, 8), 0xFF));
+        store8(g_txbuf + offset + 2, flags);
+        offset = offset + 3;
+    }
+    if ti == 13 {
+        store32(g_txbuf + offset, val);
+        store8(g_txbuf + offset + 4, flags);
+        offset = offset + 5;
+    }
+    if ti == 30 {
+        val_byte = band(val, 1) + band(flags, 0xF0);
+        store8(g_txbuf + offset, val_byte);
+        k = 0; while k < 7 { store8(g_txbuf + offset + 1 + k, load8(g_pt_time + idx * 7 + k)); k = k + 1; }
+        offset = offset + 8;
+    }
+    if ti == 36 {
+        store32(g_txbuf + offset, val);
+        store8(g_txbuf + offset + 4, flags);
+        k = 0; while k < 7 { store8(g_txbuf + offset + 5 + k, load8(g_pt_time + idx * 7 + k)); k = k + 1; }
+        offset = offset + 12;
+    }
+    
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, offset - 2);
+    
+    tx = load64(g_tx_seq);
+    tx_val = band(shl(tx, 1), 0xFFFF);
+    store8(g_txbuf + 2, band(tx_val, 0xFF));
+    store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+    store64(g_tx_seq, band(tx + 1, 0x7FFF));
+    
+    rx = load64(g_rx_seq);
+    rx_val = band(shl(rx, 1), 0xFFFF);
+    store8(g_txbuf + 4, band(rx_val, 0xFF));
+    store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+    
+    send(socket, g_txbuf, offset, 0);
+    return offset;
+}
+
+func process_gi(socket: i64, oa: i64, ca: i64) -> i64 {
+    store8(g_txbuf + 6, 100);
+    store8(g_txbuf + 7, 1);
+    store8(g_txbuf + 8, 7);
+    store8(g_txbuf + 9, oa);
+    store8(g_txbuf + 10, band(ca, 0xFF));
+    store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+    store8(g_txbuf + 12, 0);
+    store8(g_txbuf + 13, 0);
+    store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 20);
+    
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, 14);
+    
+    tx = load64(g_tx_seq);
+    tx_val = band(shl(tx, 1), 0xFFFF);
+    store8(g_txbuf + 2, band(tx_val, 0xFF));
+    store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+    store64(g_tx_seq, band(tx + 1, 0x7FFF));
+    
+    rx = load64(g_rx_seq);
+    rx_val = band(shl(rx, 1), 0xFFFF);
+    store8(g_txbuf + 4, band(rx_val, 0xFF));
+    store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+    
+    send(socket, g_txbuf, 16, 0);
+    log_hex_dump(m_dir_s, g_txbuf, 16, m_act_con);
+    
+    count = load64(g_pt_count);
+    i = 0;
+    while i < count {
+        sent_len = send_point_update(socket, i, 20);
+        log_hex_dump(m_dir_s, g_txbuf, sent_len, m_spont_upd);
+        i = i + 1;
+    }
+    
+    store8(g_txbuf + 6, 100);
+    store8(g_txbuf + 7, 1);
+    store8(g_txbuf + 8, 10);
+    store8(g_txbuf + 9, oa);
+    store8(g_txbuf + 10, band(ca, 0xFF));
+    store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+    store8(g_txbuf + 12, 0);
+    store8(g_txbuf + 13, 0);
+    store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 20);
+    
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, 14);
+    
+    tx = load64(g_tx_seq);
+    tx_val = band(shl(tx, 1), 0xFFFF);
+    store8(g_txbuf + 2, band(tx_val, 0xFF));
+    store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+    store64(g_tx_seq, band(tx + 1, 0x7FFF));
+    
+    rx = load64(g_rx_seq);
+    rx_val = band(shl(rx, 1), 0xFFFF);
+    store8(g_txbuf + 4, band(rx_val, 0xFF));
+    store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+    
+    send(socket, g_txbuf, 16, 0);
+    log_hex_dump(m_dir_s, g_txbuf, 16, m_act_term);
+    return 0;
+}
+
+func handle_command(socket: i64, iec_ptr: i64, ti: i64, cot: i64, oa: i64, ca: i64) -> i64 {
+    ioa = load8(iec_ptr + 12) + shl(load8(iec_ptr + 13), 8) + shl(load8(iec_ptr + 14), 16);
+    idx = find_point_by_ioa(ioa);
+    
+    if idx == 0 - 1 {
+        store8(g_txbuf + 6, ti);
+        store8(g_txbuf + 7, 1);
+        store8(g_txbuf + 8, bor(cot, 0x40));
+        store8(g_txbuf + 9, oa);
+        store8(g_txbuf + 10, band(ca, 0xFF));
+        store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+        
+        store8(g_txbuf + 12, load8(iec_ptr + 12));
+        store8(g_txbuf + 13, load8(iec_ptr + 13));
+        store8(g_txbuf + 14, load8(iec_ptr + 14));
+        
+        cmd_len = 1;
+        if ti == 48 || ti == 49 { cmd_len = 3; }
+        if ti == 50 { cmd_len = 5; }
+        
+        i = 0; while i < cmd_len { store8(g_txbuf + 15 + i, load8(iec_ptr + 15 + i)); i = i + 1; }
+        
+        store8(g_txbuf + 0, 0x68);
+        store8(g_txbuf + 1, 14 + cmd_len);
+        
+        tx = load64(g_tx_seq);
+        tx_val = band(shl(tx, 1), 0xFFFF);
+        store8(g_txbuf + 2, band(tx_val, 0xFF));
+        store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+        store64(g_tx_seq, band(tx + 1, 0x7FFF));
+        
+        rx = load64(g_rx_seq);
+        rx_val = band(shl(rx, 1), 0xFFFF);
+        store8(g_txbuf + 4, band(rx_val, 0xFF));
+        store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+        
+        send(socket, g_txbuf, 16 + cmd_len, 0);
+        log_hex_dump(m_dir_s, g_txbuf, 16 + cmd_len, m_cmd_neg);
+        return 0;
+    }
+    
+    is_sbo = 0;
+    new_val = 0;
+    
+    if ti == 45 || ti == 46 {
+        cmd_byte = load8(iec_ptr + 15);
+        is_sbo = band(cmd_byte, 0x80) >> 7;
+        new_val = band(cmd_byte, 0x03);
+    }
+    if ti == 48 || ti == 49 {
+        new_val = load16(iec_ptr + 15);
+        if band(new_val, 0x8000) != 0 { new_val = new_val - 65536; }
+        qos = load8(iec_ptr + 17);
+        is_sbo = band(qos, 0x80) >> 7;
+    }
+    if ti == 50 {
+        new_val = load32(iec_ptr + 15);
+        qos = load8(iec_ptr + 19);
+        is_sbo = band(qos, 0x80) >> 7;
+    }
+    
+    if is_sbo == 1 {
+        store64(g_sbo_active, 1);
+        store64(g_sbo_ioa, ioa);
+        store64(g_sbo_type, ti);
+        store64(g_sbo_val, new_val);
+        
+        store8(g_txbuf + 6, ti);
+        store8(g_txbuf + 7, 1);
+        store8(g_txbuf + 8, 7);
+        store8(g_txbuf + 9, oa);
+        store8(g_txbuf + 10, band(ca, 0xFF));
+        store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+        store8(g_txbuf + 12, band(ioa, 0xFF));
+        store8(g_txbuf + 13, band(shr(ioa, 8), 0xFF));
+        store8(g_txbuf + 14, band(shr(ioa, 16), 0xFF));
+        
+        cmd_len = 1;
+        if ti == 48 || ti == 49 { cmd_len = 3; }
+        if ti == 50 { cmd_len = 5; }
+        
+        i = 0; while i < cmd_len { store8(g_txbuf + 15 + i, load8(iec_ptr + 15 + i)); i = i + 1; }
+        
+        store8(g_txbuf + 0, 0x68);
+        store8(g_txbuf + 1, 14 + cmd_len);
+        
+        tx = load64(g_tx_seq);
+        tx_val = band(shl(tx, 1), 0xFFFF);
+        store8(g_txbuf + 2, band(tx_val, 0xFF));
+        store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+        store64(g_tx_seq, band(tx + 1, 0x7FFF));
+        
+        rx = load64(g_rx_seq);
+        rx_val = band(shl(rx, 1), 0xFFFF);
+        store8(g_txbuf + 4, band(rx_val, 0xFF));
+        store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+        
+        send(socket, g_txbuf, 16 + cmd_len, 0);
+        log_hex_dump(m_dir_s, g_txbuf, 16 + cmd_len, m_cmd_sel);
+    } else {
+        store64(g_pt_val + idx * 8, new_val);
+        populate_cp56(g_pt_time + idx * 7);
+        
+        store8(g_txbuf + 6, ti);
+        store8(g_txbuf + 7, 1);
+        store8(g_txbuf + 8, 7);
+        store8(g_txbuf + 9, oa);
+        store8(g_txbuf + 10, band(ca, 0xFF));
+        store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+        store8(g_txbuf + 12, band(ioa, 0xFF));
+        store8(g_txbuf + 13, band(shr(ioa, 8), 0xFF));
+        store8(g_txbuf + 14, band(shr(ioa, 16), 0xFF));
+        
+        cmd_len = 1;
+        if ti == 48 || ti == 49 { cmd_len = 3; }
+        if ti == 50 { cmd_len = 5; }
+        
+        i = 0; while i < cmd_len { store8(g_txbuf + 15 + i, load8(iec_ptr + 15 + i)); i = i + 1; }
+        
+        store8(g_txbuf + 0, 0x68);
+        store8(g_txbuf + 1, 14 + cmd_len);
+        
+        tx = load64(g_tx_seq);
+        tx_val = band(shl(tx, 1), 0xFFFF);
+        store8(g_txbuf + 2, band(tx_val, 0xFF));
+        store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+        store64(g_tx_seq, band(tx + 1, 0x7FFF));
+        
+        rx = load64(g_rx_seq);
+        rx_val = band(shl(rx, 1), 0xFFFF);
+        store8(g_txbuf + 4, band(rx_val, 0xFF));
+        store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+        
+        send(socket, g_txbuf, 16 + cmd_len, 0);
+        log_hex_dump(m_dir_s, g_txbuf, 16 + cmd_len, m_cmd_exe);
+        
+        post_ui_refresh();
+        
+        sent_len = send_point_update(socket, idx, 3);
+        log_hex_dump(m_dir_s, g_txbuf, sent_len, m_spont_upd);
+        
+        store8(g_txbuf + 6, ti);
+        store8(g_txbuf + 7, 1);
+        store8(g_txbuf + 8, 10);
+        store8(g_txbuf + 9, oa);
+        store8(g_txbuf + 10, band(ca, 0xFF));
+        store8(g_txbuf + 11, band(shr(ca, 8), 0xFF));
+        store8(g_txbuf + 12, band(ioa, 0xFF));
+        store8(g_txbuf + 13, band(shr(ioa, 8), 0xFF));
+        store8(g_txbuf + 14, band(shr(ioa, 16), 0xFF));
+        
+        i = 0; while i < cmd_len { store8(g_txbuf + 15 + i, load8(iec_ptr + 15 + i)); i = i + 1; }
+        
+        store8(g_txbuf + 0, 0x68);
+        store8(g_txbuf + 1, 14 + cmd_len);
+        
+        tx = load64(g_tx_seq);
+        tx_val = band(shl(tx, 1), 0xFFFF);
+        store8(g_txbuf + 2, band(tx_val, 0xFF));
+        store8(g_txbuf + 3, band(shr(tx_val, 8), 0xFF));
+        store64(g_tx_seq, band(tx + 1, 0x7FFF));
+        
+        rx = load64(g_rx_seq);
+        rx_val = band(shl(rx, 1), 0xFFFF);
+        store8(g_txbuf + 4, band(rx_val, 0xFF));
+        store8(g_txbuf + 5, band(shr(rx_val, 8), 0xFF));
+        
+        send(socket, g_txbuf, 16 + cmd_len, 0);
+        log_hex_dump(m_dir_s, g_txbuf, 16 + cmd_len, m_cmd_term);
+    }
+    return 1;
+}
+
+func parse_iec104_slave_packet(socket: i64, iec_ptr: i64, total_len: i64) -> i64 {
+    if total_len < 6 { return 0; }
+    
+    ctrl0 = load8(iec_ptr + 2);
+    ctrl1 = load8(iec_ptr + 3);
+    ctrl2 = load8(iec_ptr + 4);
+    ctrl3 = load8(iec_ptr + 5);
+    
+    if band(ctrl0, 1) == 0 {
+        tx_seq = shr(ctrl0 + shl(ctrl1, 8), 1);
+        rx_seq = shr(ctrl2 + shl(ctrl3, 8), 1);
+        
+        store64(g_rx_seq, band(tx_seq + 1, 0x7FFF));
+        
+        str_copy(g_txbuf, " (I-FRAME TX=");
+        p = g_txbuf + strlen(g_txbuf);
+        int_to_dec_str(tx_seq, p); p = p + strlen(p);
+        str_copy(p, " RX="); p = p + strlen(p);
+        int_to_dec_str(rx_seq, p); p = p + strlen(p);
+        str_copy(p, ")");
+        log_hex_dump(m_dir_r, iec_ptr, total_len, g_txbuf);
+        
+        send_s_frame(socket, load64(g_rx_seq));
+        
+        if total_len > 6 {
+            ti = load8(iec_ptr + 6);
+            vsq = load8(iec_ptr + 7);
+            cot = load8(iec_ptr + 8);
+            oa = load8(iec_ptr + 9);
+            ca = load8(iec_ptr + 10) + shl(load8(iec_ptr + 11), 8);
+            
+            str_copy(g_txbuf, "    ASDU TI ");
+            p = g_txbuf + strlen(g_txbuf);
+            int_to_dec_str(ti, p); p = p + strlen(p);
+            str_copy(p, " COT "); p = p + strlen(p);
+            int_to_dec_str(band(cot, 0x3F), p); p = p + strlen(p);
+            str_copy(p, " CA "); p = p + strlen(p);
+            int_to_dec_str(ca, p); p = p + strlen(p);
+            log_append(g_txbuf);
+            log_append(crlf);
+            
+            if ti == 100 {
+                process_gi(socket, oa, ca);
+            }
+            if ti == 45 || ti == 46 || ti == 48 || ti == 49 || ti == 50 {
+                handle_command(socket, iec_ptr, ti, cot, oa, ca);
+            }
+        }
+    } else if band(ctrl0, 2) == 0 {
+        rx_seq = shr(ctrl2 + shl(ctrl3, 8), 1);
+        str_copy(g_txbuf, " (S-FRAME RX=");
+        p = g_txbuf + strlen(g_txbuf);
+        int_to_dec_str(rx_seq, p); p = p + strlen(p);
+        str_copy(p, ")");
+        log_hex_dump(m_dir_r, iec_ptr, total_len, g_txbuf);
+    } else {
+        str_copy(g_txbuf, " (U-FRAME");
+        if ctrl0 == 0x07 { str_copy(g_txbuf + 8, " STARTDT act)"); }
+        else if ctrl0 == 0x0B { str_copy(g_txbuf + 8, " STARTDT con)"); }
+        else if ctrl0 == 0x13 { str_copy(g_txbuf + 8, " STOPDT act)"); }
+        else if ctrl0 == 0x17 { str_copy(g_txbuf + 8, " STOPDT con)"); }
+        else if ctrl0 == 0x43 { str_copy(g_txbuf + 8, " TESTFR act)"); }
+        else if ctrl0 == 0x83 { str_copy(g_txbuf + 8, " TESTFR con)"); }
+        else { str_copy(g_txbuf + 8, " UNKNOWN)"); }
+        
+        log_hex_dump(m_dir_r, iec_ptr, total_len, g_txbuf);
+        
+        if ctrl0 == 0x07 {
+            store8(g_txbuf + 0, 0x68);
+            store8(g_txbuf + 1, 0x04);
+            store8(g_txbuf + 2, 0x0B);
+            store8(g_txbuf + 3, 0x00);
+            store8(g_txbuf + 4, 0x00);
+            store8(g_txbuf + 5, 0x00);
+            send(socket, g_txbuf, 6, 0);
+            log_hex_dump(m_dir_s, g_txbuf, 6, " (STARTDT con)");
+        }
+        if ctrl0 == 0x43 {
+            store8(g_txbuf + 0, 0x68);
+            store8(g_txbuf + 1, 0x04);
+            store8(g_txbuf + 2, 0x83);
+            store8(g_txbuf + 3, 0x00);
+            store8(g_txbuf + 4, 0x00);
+            store8(g_txbuf + 5, 0x00);
+            send(socket, g_txbuf, 6, 0);
+            log_hex_dump(m_dir_s, g_txbuf, 6, " (TESTFR con)");
+        }
+    }
+    return 0;
+}
+
+# ---- Network Server Functions ----
+
+func poll_network() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+    
+    ls = load64(g_listen_s);
+    cs = load64(g_client_s);
+    
+    # Accept new connection if none is active
+    if cs == 0 {
+        new_s = accept(ls, 0, 0);
+        if new_s != 0 {
+            if new_s != 0 - 1 {
+                store64(g_client_s, new_s);
+                InvalidateRect(load64(g_hwnd), 0, 1);
+                # Set non-blocking on client socket
+                store64(g_nonblock, 1);
+                ioctlsocket(new_s, 0x8004667E, g_nonblock);
+                
+                log_append(m_new_conn);
+                SetWindowTextA(load64(g_clients), "Master: CONNECTED");
+            }
+        }
+    }
+    
+    # Read from client
+    cs = load64(g_client_s);
+    if cs == 0 { return 0; }
+    
+    n = recv(cs, g_rxbuf, 2048, 0);
+    if n > 0 {
+        parse_iec104_slave_packet(cs, g_rxbuf, n);
+    } else {
+        err = 0;
+        if n == 0 - 1 {
+            err = WSAGetLastError();
+        }
+        if n == 0 || err != 10035 {
+            closesocket(cs);
+            store64(g_client_s, 0);
+            InvalidateRect(load64(g_hwnd), 0, 1);
+            log_append(m_disc_conn);
+            SetWindowTextA(load64(g_clients), "Master: (none)");
+        }
+    }
+    
+    return 0;
+}
+
+func do_start() -> i64 {
+    if load64(g_running) == 1 { return 0; }
+    
+    # Initialize Winsock
+    WSAStartup(0x0202, g_wsa);
+    
+    # Create Socket
+    s = socket(2, 1, 6); # AF_INET = 2, SOCK_STREAM = 1, IPPROTO_TCP = 6
+    if s == 0 - 1 {
+        log_append("[System] Error: Failed to create socket.\r\n");
+        WSACleanup();
+        return 0;
+    }
+    
+    GetWindowTextA(load64(g_host_ed), g_numbuf, 32);
+    GetWindowTextA(load64(g_port_ed), g_valbuf, 32);
+    GetWindowTextA(load64(g_ca_ed), g_logbuf, 32);
+    
+    port_val = str_to_int(g_valbuf);
+    ca_val = str_to_int(g_logbuf);
+    store64(g_ca, ca_val);
+    
+    # Bind Address Setup
+    store16(g_addr + 0, 2); # sin_family = AF_INET
+    store16(g_addr + 2, band(shr(port_val, 8) + shl(port_val, 8), 0xFFFF)); # sin_port network byte order
+    
+    # Parse Host IP to Octets
+    parse_ip_to_octets(g_numbuf, g_addr + 4);
+    store64(g_addr + 8, 0); # zero out remainder
+    
+    res = bind(s, g_addr, 16);
+    if res != 0 {
+        log_append(m_start_fail);
+        closesocket(s);
+        WSACleanup();
+        return 0;
+    }
+    
+    listen(s, 5);
+    
+    # Set non-blocking mode
+    store64(g_nonblock, 1);
+    ioctlsocket(s, 0x8004667E, g_nonblock);
+    
+    store64(g_listen_s, s);
+    store64(g_client_s, 0);
+    store64(g_running, 1);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    
+    # Reset protocol sequence numbers
+    store64(g_rx_seq, 0);
+    store64(g_tx_seq, 0);
+    
+    # Log startup
+    str_copy(g_logbuf, m_start_ok);
+    p = g_logbuf + strlen(g_logbuf);
+    int_to_dec_str(port_val, p);
+    str_copy(p + strlen(p), crlf);
+    log_append(g_logbuf);
+    
+    SetWindowTextA(load64(g_status), "Status: Running");
+    SetTimer(load64(g_hwnd), ID_TIMER_POLL, 50, 0);
+    return 1;
+}
+
+func do_stop() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+    
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+    
+    cs = load64(g_client_s);
+    if cs != 0 { closesocket(cs); store64(g_client_s, 0); }
+    
+    ls = load64(g_listen_s);
+    if ls != 0 { closesocket(ls); store64(g_listen_s, 0); }
+    
+    WSACleanup();
+    store64(g_running, 0);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    
+    log_append(m_stop_msg);
+    SetWindowTextA(load64(g_status), "Status: Stopped");
+    SetWindowTextA(load64(g_clients), "Master: (none)");
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = GetWindowTextA(hwnd_log, g_savebuf, 65536);
+    if len <= 0 { return 0; }
+    
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0); # GENERIC_WRITE, CREATE_ALWAYS
+    if hf == 0 - 1 { log_append(m_save_err); return 0; }
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+func register_class(wndcls_ptr: i64, name: i64, wndproc_addr: i64, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    memset(wndcls_ptr, 0, 80);
+    store32(wndcls_ptr + 0, 80);
+    store32(wndcls_ptr + 4, 3);
+    store64(wndcls_ptr + 8, wndproc_addr);
+    store64(wndcls_ptr + 24, hinst);
+    store64(wndcls_ptr + 40, cursor);
+    store64(wndcls_ptr + 48, brush);
+    store64(wndcls_ptr + 64, name);
+    return RegisterClassExA(wndcls_ptr);
+}
+
+# ---- Glow Button Subclass WndProc ----
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+    if msg == 512 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            SetWindowLongA(hwnd, 0 - 21, bor(pressed, 1));
+            InvalidateRect(hwnd, 0, 1);
+            
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        SetWindowLongA(hwnd, 0 - 21, bor(hover, 2));
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+        
+        btn_color = COL_ACCENT;
+        tmp_pen_neon = CreatePen(0, 2, btn_color);
+        
+        brush = load64(g_brush_card);
+        if pressed == 2 { brush = load64(g_brush_deep); }
+        else if hover == 1 { brush = load64(g_brush_hover); }
+        
+        old_brush = SelectObject(hdc, brush);
+        
+        pen = load64(g_pen_border);
+        if pressed == 2 { pen = tmp_pen_neon; }
+        else if hover == 1 { pen = tmp_pen_neon; }
+        
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, 0, 0, w, h, 6, 6);
+        
+        if hover == 1 {
+            SelectObject(hdc, tmp_pen_neon);
+            RoundRect(hdc, 1, 1, w - 1, h - 1, 6, 6);
+        }
+        
+        SetBkMode(hdc, 1);
+        tc = COLOR_TEXT_PRIMARY;
+        if hover == 1 { tc = btn_color; }
+        else if pressed == 2 { tc = btn_color; }
+        SetTextColor(hdc, tc);
+        
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_numbuf, 256);
+        
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, w);
+        store32(g_rect + 12, h);
+        DrawTextA(hdc, g_numbuf, 0 - 1, g_rect, 37); # DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(tmp_pen_neon);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i + i, c);
+        store8(dst + i + i + 1, 0);
+        if c == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    a2w(thm_dm_exp_w, thm_dm_exp_a);
+    a2w(thm_dm_cfd_w, thm_dm_cfd_a);
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+# ---- Float String Parsers ----
+
+func str_to_hex(s: i64) -> i64 {
+    v = 0; p = s;
+    while load8(p) != 0 {
+        c = load8(p);
+        d = 0;
+        if c >= 48 && c <= 57 { d = c - 48; }
+        else if c >= 65 && c <= 70 { d = 10 + (c - 65); }
+        else if c >= 97 && c <= 102 { d = 10 + (c - 97); }
+        else { return v; }
+        v = shl(v, 4) + d;
+        p = p + 1;
+    }
+    return v;
+}
+
+func int_to_float_bits(v: i64) -> i64 {
+    if v == 0 { return 0; }
+    neg = 0;
+    val = v;
+    if val < 0 { neg = 1; val = 0 - val; }
+    
+    exp = 127 + 23;
+    while val >= 16777216 {
+        val = shr(val, 1);
+        exp = exp + 1;
+    }
+    while val < 8388608 {
+        val = shl(val, 1);
+        exp = exp - 1;
+    }
+    
+    mant = band(val, 0x7FFFFF);
+    res = shl(neg, 31) + shl(exp, 23) + mant;
+    return res;
+}
+
+func pack_float_bits(int_part: i64, frac_part: i64, frac_div: i64, neg: i64) -> i64 {
+    val = int_part * frac_div + frac_part;
+    if val == 0 { return 0; }
+    
+    exp = 127 + 23;
+    target = frac_div * 8388608;
+    while val >= target * 2 {
+        val = shr(val, 1);
+        exp = exp + 1;
+    }
+    while val < target {
+        val = shl(val, 1);
+        exp = exp - 1;
+    }
+    
+    mant = (val - target) / frac_div;
+    if mant < 0 { mant = 0; }
+    if mant >= 8388608 { mant = 8388607; }
+    
+    res = shl(neg, 31) + shl(exp, 23) + mant;
+    return res;
+}
+
+func parse_float_string_to_bits(s: i64) -> i64 {
+    p = s;
+    has_dot = 0;
+    while load8(p) != 0 { if load8(p) == 46 { has_dot = 1; } p = p + 1; }
+    
+    if has_dot == 0 {
+        val_i = str_to_int(s);
+        return int_to_float_bits(val_i);
+    }
+    
+    p = s;
+    neg = 0;
+    if load8(p) == 45 { neg = 1; p = p + 1; }
+    
+    int_part = 0;
+    while load8(p) >= 48 && load8(p) <= 57 {
+        int_part = int_part * 10 + (load8(p) - 48);
+        p = p + 1;
+    }
+    
+    frac_part = 0;
+    frac_div = 1;
+    if load8(p) == 46 {
+        p = p + 1;
+        while load8(p) >= 48 && load8(p) <= 57 {
+            frac_part = frac_part * 10 + (load8(p) - 48);
+            frac_div = frac_div * 10;
+            p = p + 1;
+        }
+    }
+    
+    return pack_float_bits(int_part, frac_part, frac_div, neg);
+}
+
+# ---- Main WndProc ----
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        store64(g_hwnd, hwnd);
+        hinst = load64(g_hinst);
+        
+        store32(g_numbuf, 1);
+        DwmSetWindowAttribute(hwnd, 20, g_numbuf, 4); # DWMWA_USE_IMMERSIVE_DARK_MODE
+        
+        # Build UI Controls - Title Bar Buttons
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 1040, 6, 24, 24, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1068, 6, 24, 24, hwnd, ID_BTN_CLOSE, hinst, 0);
+        
+        # Row 1 Controls (shifted down by 30px)
+        h = CreateWindowExA(0, cls_stat, lbl_host, 0x50000000, 15, 50, 60, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_edit, def_host, 0x50000080, 80, 48, 100, 24, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_host_ed, h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 200, 50, 40, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50000080, 240, 48, 50, 24, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_port_ed, h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_ca, 0x50000000, 310, 50, 120, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_edit, def_ca, 0x50000080, 430, 48, 50, 24, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_ca_ed, h);
+        
+        # Action buttons
+        h = CreateWindowExA(0, cls_glow_btn, btn_start, 0x50000000, 500, 45, 120, 30, hwnd, ID_BTN_START, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 630, 45, 120, 30, hwnd, ID_BTN_STOP, hinst, 0); theme_control(h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 770, 50, 120, 20, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_status, h);
+        h = CreateWindowExA(0, cls_stat, lbl_clients, 0x50000000, 900, 50, 150, 20, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_clients, h);
+        
+        # Headers
+        h = CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 15, 95, 200, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font_header), 1);
+        
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50B00844, 15, 120, 500, 430, hwnd, 0, hinst, 0);
+        store64(g_log, h); theme_control(h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_points, 0x50000000, 540, 95, 200, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font_header), 1);
+        
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 540, 120, 520, 430, hwnd, 0, hinst, 0);
+        store64(g_listview, h); SendMessageA(h, 48, load64(g_font), 1);
+        SendMessageA(h, 4150, 0x20, 0x20); # LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);
+        dark_scroll(h);
+        
+        # Columns setup
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+        
+        store32(g_lvcol + 8, 60); store64(g_lvcol + 16, col_ioa);
+        SendMessageA(h, 4123, 0, g_lvcol);
+        
+        store32(g_lvcol + 8, 175); store64(g_lvcol + 16, col_type); store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+        
+        store32(g_lvcol + 8, 85); store64(g_lvcol + 16, col_value); store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+        
+        store32(g_lvcol + 8, 60); store64(g_lvcol + 16, col_flags); store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+        
+        store32(g_lvcol + 8, 140); store64(g_lvcol + 16, col_time); store32(g_lvcol + 24, 4);
+        SendMessageA(h, 4123, 4, g_lvcol);
+        
+        # Form Controls
+        h = CreateWindowExA(0, cls_stat, lbl_ioa, 0x50000000, 540, 572, 35, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_edit, def_ioa, 0x50000080, 575, 570, 55, 24, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_ioa_ed, h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_type, 0x50000000, 645, 572, 40, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_combo, gui_empty, 0x50230003, 690, 568, 205, 150, hwnd, 0, hinst, 0);
+        old = SetWindowLongPtrA(h, 0 - 4, &ComboBoxWndProc); store64(g_old_combo_proc, old);
+        dark_combo(h);
+        store64(g_type_combo, h);
+        SendMessageA(h, 323, 0, t_sp);
+        SendMessageA(h, 323, 0, t_dp);
+        SendMessageA(h, 323, 0, t_me);
+        SendMessageA(h, 323, 0, t_ms);
+        SendMessageA(h, 323, 0, t_mf);
+        SendMessageA(h, 323, 0, t_spt);
+        SendMessageA(h, 323, 0, t_mft);
+        SendMessageA(h, 327, 0, 0);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_val, 0x50000000, 910, 572, 45, 20, hwnd, 0, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_edit, def_val, 0x50000080, 960, 570, 100, 24, hwnd, 0, hinst, 0); theme_control(h);
+        store64(g_val_ed, h);
+        
+        h = CreateWindowExA(0, cls_glow_btn, btn_add, 0x50000000, 540, 605, 100, 28, hwnd, ID_BTN_ADD, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_glow_btn, btn_delete, 0x50000000, 650, 605, 110, 28, hwnd, ID_BTN_DELETE, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_glow_btn, btn_update, 0x50000000, 770, 605, 120, 28, hwnd, ID_BTN_UPDATE, hinst, 0); theme_control(h);
+        
+        h = CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 15, 565, 100, 28, hwnd, ID_BTN_CLEAR, hinst, 0); theme_control(h);
+        h = CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 125, 565, 100, 28, hwnd, ID_BTN_SAVE, hinst, 0); theme_control(h);
+        
+        refresh_listview();
+        PostMessageA(hwnd, 273, ID_BTN_START, 0); # Auto-start server at startup
+        return 0;
+    }
+    
+    if msg == 311 || msg == 307 || msg == 308 {
+        hdc = wp;
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkColor(hdc, COLOR_BG_INPUT);
+        return load64(g_brush_input);
+    }
+    
+    if msg == 312 {
+        hdc = wp;
+        SetTextColor(hdc, COL_TEXT);
+        SetBkColor(hdc, COL_BG);
+        return load64(g_bg_brush);
+    }
+    
+    if msg == 275 {
+        if wp == ID_TIMER_POLL { poll_network(); }
+        return 0;
+    }
+    
+    if msg == 78 {
+        hdr_ptr = lp;
+        code = load32(hdr_ptr + 16);
+        hwndFrom = load64(hdr_ptr + 0);
+        
+        is_click = band(code, 4294967295) == 4294967294;
+        is_dblclk = band(code, 4294967295) == 4294967293;
+        
+        if bor(is_click, is_dblclk) != 0 {
+            if hwndFrom == load64(g_listview) {
+                row_idx = load32(hdr_ptr + 24);
+                if row_idx != 0 - 1 {
+                    ioa = load64(g_pt_ioa + row_idx * 8);
+                    ti = load64(g_pt_type + row_idx * 8);
+                    val = load64(g_pt_val + row_idx * 8);
+                    
+                    int_to_dec_str(ioa, g_numbuf);
+                    SetWindowTextA(load64(g_ioa_ed), g_numbuf);
+                    
+                    sel_idx = 0;
+                    if ti == 3 { sel_idx = 1; }
+                    if ti == 9 { sel_idx = 2; }
+                    if ti == 11 { sel_idx = 3; }
+                    if ti == 13 { sel_idx = 4; }
+                    if ti == 30 { sel_idx = 5; }
+                    if ti == 36 { sel_idx = 6; }
+                    SendMessageA(load64(g_type_combo), 327, sel_idx, 0);
+                    
+                    if ti == 13 || ti == 36 {
+                        nf_ftoa(val, g_numbuf);
+                    } else {
+                        int_to_dec_str(val, g_numbuf);
+                    }
+                    SetWindowTextA(load64(g_val_ed), g_numbuf);
+                }
+            }
+        }
+        return 0;
+    }
+    
+    if msg == 273 {
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_MIN   { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        if cmd_id == ID_BTN_START { do_start(); }
+        if cmd_id == ID_BTN_STOP { do_stop(); }
+        if cmd_id == ID_BTN_CLEAR { do_clear_log(); }
+        if cmd_id == ID_BTN_SAVE { do_save_log(); }
+        
+        if cmd_id == ID_BTN_ADD {
+            GetWindowTextA(load64(g_ioa_ed), g_numbuf, 32);
+            ioa = str_to_int(g_numbuf);
+            
+            sel = SendMessageA(load64(g_type_combo), 327, 0, 0);
+            type_id = 1;
+            if sel == 1 { type_id = 3; }
+            if sel == 2 { type_id = 9; }
+            if sel == 3 { type_id = 11; }
+            if sel == 4 { type_id = 13; }
+            if sel == 5 { type_id = 30; }
+            if sel == 6 { type_id = 36; }
+            
+            GetWindowTextA(load64(g_val_ed), g_numbuf, 32);
+            val = 0;
+            if type_id == 13 || type_id == 36 {
+                if load8(g_numbuf) == 48 && load8(g_numbuf + 1) == 120 {
+                    val = str_to_hex(g_numbuf + 2);
+                } else {
+                    val = parse_float_string_to_bits(g_numbuf);
+                }
+            } else {
+                val = str_to_int(g_numbuf);
+            }
+            
+            add_point(ioa, type_id, val, 0);
+            refresh_listview();
+        }
+        
+        if cmd_id == ID_BTN_DELETE {
+            hlv = load64(g_listview);
+            row = SendMessageA(hlv, 4108, 0 - 1, 2);
+            if row != 0 - 1 {
+                delete_point_by_index(row);
+                refresh_listview();
+            }
+        }
+        
+        if cmd_id == ID_BTN_UPDATE {
+            hlv = load64(g_listview);
+            row = SendMessageA(hlv, 4108, 0 - 1, 2);
+            if row != 0 - 1 {
+                type_id = load64(g_pt_type + row * 8);
+                GetWindowTextA(load64(g_val_ed), g_numbuf, 32);
+                
+                val = 0;
+                if type_id == 13 || type_id == 36 {
+                    if load8(g_numbuf) == 48 && load8(g_numbuf + 1) == 120 {
+                        val = str_to_hex(g_numbuf + 2);
+                    } else {
+                        val = parse_float_string_to_bits(g_numbuf);
+                    }
+                } else {
+                    val = str_to_int(g_numbuf);
+                }
+                
+                store64(g_pt_val + row * 8, val);
+                populate_cp56(g_pt_time + row * 7);
+                refresh_listview();
+                
+                cs = load64(g_client_s);
+                if cs != 0 {
+                    sent_len = send_point_update(cs, row, 3);
+                    log_hex_dump(m_dir_s, g_txbuf, sent_len, m_spont_upd);
+                }
+            } else {
+                refresh_listview();
+            }
+        }
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+
+        GetClientRect(hwnd, g_rect);
+        FillRect(hdc, g_rect, load64(g_bg_brush));
+
+        # Title bar
+        store32(g_rect + 0, 0); store32(g_rect + 4, 0);
+        store32(g_rect + 8, 1100); store32(g_rect + 12, 36);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+
+        SelectObject(hdc, load64(g_font_header));
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+
+        store32(g_rect + 0, 12); store32(g_rect + 4, 12);
+        store32(g_rect + 8, 600); store32(g_rect + 12, 35);
+        DrawTextA(hdc, title_draw, 0 - 1, g_rect, 0);
+
+        # Running Indicator
+        indicator = st_stop_ind;
+        if load64(g_running) != 0 {
+            indicator = st_run_ind;
+            SetTextColor(hdc, COL_GREEN);
+        } else {
+            SetTextColor(hdc, COL_RED);
+        }
+        store32(g_rect + 0, 480); store32(g_rect + 8, 700);
+        DrawTextA(hdc, indicator, 0 - 1, g_rect, 0);
+
+        # Accent Line
+        SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 12, 36, 0);
+        LineTo(hdc, 1100 - 12, 36);
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+    
+    if msg == 132 { # WM_NCHITTEST
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        if mx >= 32768 { mx = mx - 65536; }
+        my = band(shr(lp, 16), 65535);
+        if my >= 32768 { my = my - 65536; }
+        cx = mx - wl;
+        cy = my - wt;
+
+        if cy < 36 {
+            if cx >= 1040 {
+                if cx < 1064 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            if cx >= 1068 {
+                if cx < 1092 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            return 2; # HTCAPTION
+        }
+    }
+    
+    if msg == 2 {
+        do_stop();
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    store32(g_icc, 8);
+    store32(g_icc + 4, 0x20FF); # ICC_WIN95_CLASSES
+    InitCommonControlsEx(g_icc);
+    
+    store64(g_running, 0);
+    store64(g_client_s, 0);
+    store64(g_listen_s, 0);
+    store64(g_pt_count, 0);
+    store64(g_sbo_active, 0);
+    
+    init_point_database();
+    
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    
+    enable_dark_mode();
+    
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COL_ACCENT));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COL_ACCENT));
+    store64(g_pen_arrow,   CreatePen(0, 1, COLOR_TEXT_PRIMARY));
+    
+    store64(g_font, CreateFontA(15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+    store64(g_font_header, CreateFontA(17, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+    
+    res = register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+    if res == 0 {
+        MessageBoxA(0, "RegisterClassExA failed for GlowButton!", "Error", 16);
+        return 0;
+    }
+    
+    memset(g_wndcls, 0, 80);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 3);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 32, LoadIconA(0, 32512));
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    
+    res = RegisterClassExA(g_wndcls);
+    if res == 0 {
+        MessageBoxA(0, "RegisterClassExA failed for Main Window!", "Error", 16);
+        return 0;
+    }
+    
+    hwnd = CreateWindowExA(0, clsname, wndname, 0x92000000, 100, 100, 1100, 680, 0, 0, hinst, 0);
+    if hwnd == 0 {
+        MessageBoxA(0, "CreateWindowExA failed!", "Error", 16);
+        return 0;
+    }
+    
+    ShowWindow(hwnd, 5);
+    UpdateWindow(hwnd);
+    
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    
+    DeleteObject(load64(g_bg_brush));
+    DeleteObject(load64(g_edit_brush));
+    DeleteObject(load64(g_brush_deep));
+    DeleteObject(load64(g_brush_panel));
+    DeleteObject(load64(g_brush_card));
+    DeleteObject(load64(g_brush_input));
+    DeleteObject(load64(g_brush_hover));
+    DeleteObject(load64(g_brush_neon));
+    DeleteObject(load64(g_pen_border));
+    DeleteObject(load64(g_pen_neon));
+    DeleteObject(load64(g_pen_arrow));
+    DeleteObject(load64(g_font));
+    DeleteObject(load64(g_font_header));
+    
+    return 0;
+}

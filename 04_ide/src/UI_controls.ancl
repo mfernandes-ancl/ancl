@@ -1,0 +1,303 @@
+# =====================================================================
+#  UI_controls.ancl  -  Aether Studio shared UI helpers  (ANCL IDE)
+#
+#  Path utilities + (later milestones) the TreeView workspace, editor
+#  pane plumbing, file open/save, and the compile-with-capture worker.
+#  M0 ships only the path helpers (needed from M3/M4 onward); creating
+#  the module now locks the two-file structure + relative import path.
+#
+#  Imports the repo's REAL core_lib (single source of truth); the dist's
+#  own core_lib/ copy is build-output, never the import target.
+#  src is 3 levels under the repo root -> ../../../core_lib.
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+
+extern "comctl32.dll" InitCommonControlsEx;   # BOOL InitCommonControlsEx(&INITCOMMONCONTROLSEX)
+
+@DATA
+uic_exe: buf = 600;     # scratch for GetModuleFileNameA (full exe path)
+uic_io:  buf = 8;       # ReadFile / WriteFile bytes-transferred sink
+
+# ---- TreeView (M2) state (x64 offsets all Phase-0 verified) ---------
+uic_empty: str = "";
+uic_star:  str = "\\*";
+uic_bs:    str = "\\";
+cls_tree:  str = "SysTreeView32";
+tv_icc:    buf = 8;          # INITCOMMONCONTROLSEX: dwSize@0=8, dwICC@4
+tv_ins:    buf = 96;         # TVINSERTSTRUCTA: union member is TVITEMEXA -> 96 bytes (NOT the legacy 72)
+tv_fd:     buf = 320;        # WIN32_FIND_DATAA
+g_tree_hwnd:  buf = 8;
+g_node_paths: buf = 139264;  # 512 nodes * 272 bytes = full path per node (lParam = node index)
+g_node_isdir: buf = 512;     # 1 byte per node (1 = directory)
+g_node_count: buf = 8;
+
+# ---- editor open/save (M3) scratch ---------------------------------
+uic_filebuf: buf = 1048576;  # raw LF bytes (read cap 512KB; CRLF<->LF never overflows the 1MB pair)
+uic_cvtbuf:  buf = 1048576;  # CRLF text (editor side)
+
+# ---- compile capture (M4): pipe + child-process scratch ------------
+# (one compile at a time, guarded by the GUI's busy flag, so globals are safe)
+cap_sa:    buf = 24;         # SECURITY_ATTRIBUTES
+cap_si:    buf = 104;        # STARTUPINFOA
+cap_pi:    buf = 24;         # PROCESS_INFORMATION
+cap_hrd:   buf = 8;          # pipe read end (parent)
+cap_hwr:   buf = 8;          # pipe write end (child)
+cap_nread: buf = 8;          # ReadFile sink
+cap_exit:  buf = 8;          # GetExitCodeProcess result of the last capture (Run uses it)
+cap_proc:  buf = 8;          # hProcess of the child CURRENTLY running (0 when idle) - for Stop-Run
+
+@CODE
+# index of the last '\' (92) in C-string s, or -1 if none
+func uic_last_bs(s: i64) -> i64 {
+    i = 0;
+    last = 0 - 1;
+    while 1 {
+        c = load8(s + i);
+        if c == 0 { return last; }
+        if c == 92 { last = i; }
+        i = i + 1;
+    }
+    return last;
+}
+
+# write the directory of the running .exe (no trailing slash) into dst;
+# returns the directory length (0 on failure, dst left empty)
+func ui_exedir(dst: i64) -> i64 {
+    GetModuleFileNameA(0, uic_exe, 600);
+    bs = uic_last_bs(uic_exe);
+    if bs < 0 { store8(dst, 0); return 0; }
+    memcpy(dst, uic_exe, bs);
+    store8(dst + bs, 0);
+    return bs;
+}
+
+# join base + suffix into dst (suffix is expected to start with '\')
+func ui_join(dst: i64, base: i64, suf: i64) -> i64 {
+    e = str_copy(dst, base);
+    str_copy(e, suf);
+    return 0;
+}
+
+# ---- file I/O (M3) --------------------------------------------------
+# Raw read of a whole file into dst (cap includes the NUL). Byte-preserving:
+# unlike linguistic's read_file it does NOT scrub CR/LF. Returns the byte
+# count, or -1 if the file could not be opened.
+func ui_read_file(path: i64, dst: i64, cap: i64) -> i64 {
+    h = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);   # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
+    if h == 0 - 1 { return 0 - 1; }
+    ReadFile(h, dst, cap - 1, uic_io, 0);
+    CloseHandle(h);
+    n = load32(uic_io);
+    store8(dst + n, 0);
+    return n;
+}
+
+# Write n bytes from src to path (create/truncate). Returns 1 ok / 0 fail.
+func ui_write_file(path: i64, src: i64, n: i64) -> i64 {
+    h = CreateFileA(path, 0x40000000, 0, 0, 2, 0x80, 0);   # GENERIC_WRITE, CREATE_ALWAYS
+    if h == 0 - 1 { return 0; }
+    WriteFile(h, src, n, uic_io, 0);
+    CloseHandle(h);
+    return 1;
+}
+
+# Append n bytes from src to path (create if absent). FILE_APPEND_DATA-only access makes
+# every WriteFile go to end-of-file, so no SetFilePointer is needed. Returns 1 ok / 0 fail.
+func ui_append_file(path: i64, src: i64, n: i64) -> i64 {
+    h = CreateFileA(path, 0x4, 1, 0, 4, 0x80, 0);          # FILE_APPEND_DATA, FILE_SHARE_READ, OPEN_ALWAYS
+    if h == 0 - 1 { return 0; }
+    WriteFile(h, src, n, uic_io, 0);
+    CloseHandle(h);
+    return 1;
+}
+
+# dst = src with every '\r' dropped (CRLF/CR -> LF). Returns new length.
+# Used on Save: a Win32 EDIT hands back CRLF; files on disk keep LF.
+func ui_crlf_to_lf(dst: i64, src: i64) -> i64 {
+    i = 0;
+    j = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst + j, 0); return j; }
+        if c == 13 { } else { store8(dst + j, c); j = j + 1; }
+        i = i + 1;
+    }
+    return j;
+}
+
+# dst = src normalized to CRLF: drop stray '\r', emit '\r' before each '\n'.
+# Returns new length. Used on Open: a Win32 EDIT wants CRLF line endings.
+func ui_lf_to_crlf(dst: i64, src: i64) -> i64 {
+    i = 0;
+    j = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst + j, 0); return j; }
+        if c == 13 { } else {
+            if c == 10 { store8(dst + j, 13); j = j + 1; }
+            store8(dst + j, c); j = j + 1;
+        }
+        i = i + 1;
+    }
+    return j;
+}
+
+# ---- TreeView (M2): init, create, populate, query ------------------
+func tv_init_common() -> i64 {
+    store32(tv_icc + 0, 8);                   # dwSize = sizeof(INITCOMMONCONTROLSEX)
+    store32(tv_icc + 4, 2);                   # dwICC = ICC_TREEVIEW_CLASSES
+    InitCommonControlsEx(tv_icc);
+    return 0;
+}
+
+# Create the dark-themed SysTreeView32 child; stores + returns its HWND.
+func tv_create(parent: i64, hinst: i64, id: i64) -> i64 {
+    # WS_CHILD|WS_VISIBLE | TVS_HASBUTTONS|HASLINES|LINESATROOT|SHOWSELALWAYS|EDITLABELS(0x8) = 0x5000002F
+    h = CreateWindowExA(0, cls_tree, uic_empty, 0x5000002F, 0, 0, 200, 400, parent, id, hinst, 0);  # borderless (dark sidebar); EDITLABELS -> F2/click/dbl-click rename
+    store64(g_tree_hwnd, h);
+    SendMessageA(h, 0x111D, 0, 0x00000000);   # TVM_SETBKCOLOR  -> pure black
+    SendMessageA(h, 0x111E, 0, 0x00DCDCDC);   # TVM_SETTEXTCOLOR -> light grey
+    return h;
+}
+
+func tv_reset() -> i64 { store64(g_node_count, 0); return 0; }
+
+# Insert one node. TVINSERTSTRUCTA marshaled at the verified x64 offsets;
+# records full path + dir-flag in the node table, lParam = node index.
+# Returns the new HTREEITEM.
+func tv_add(tree: i64, parent_item: i64, name: i64, fullpath: i64, isdir: i64) -> i64 {
+    idx = load64(g_node_count);
+    if idx >= 512 { return 0; }
+    str_copy(g_node_paths + idx * 272, fullpath);
+    store8(g_node_isdir + idx, isdir);
+    store64(g_node_count, idx + 1);
+    memset(tv_ins, 0, 96);
+    store64(tv_ins + 0, parent_item);         # hParent
+    store64(tv_ins + 8, 0 - 0xFFFE);          # hInsertAfter = TVI_LAST (0xFFFFFFFFFFFF0002)
+    store32(tv_ins + 16, 0x5);                # item.mask = TVIF_TEXT|TVIF_PARAM
+    store64(tv_ins + 40, name);               # item.pszText (control copies it on insert)
+    store64(tv_ins + 64, idx);                # item.lParam = node index
+    return SendMessageA(tree, 0x1100, 0, tv_ins);   # TVM_INSERTITEMA -> new HTREEITEM
+}
+
+# Recursively populate `dir` under `parent_item`. Each recursion level uses
+# its OWN alloc'd path buffer so it never aliases the parent's path (a single
+# shared buffer corrupts once a directory has more than one entry).
+func tv_populate(tree: i64, dir: i64, parent_item: i64, depth: i64) -> i64 {
+    if depth > 6 { return 0; }
+    if load64(g_node_count) >= 512 { return 0; }
+    pat = alloc(700);
+    kid = alloc(700);
+    ui_join(pat, dir, uic_star);
+    h = FindFirstFileA(pat, tv_fd);
+    if h == 0 - 1 { free(kid); free(pat); return 0; }
+    cont = 1;
+    while cont == 1 {
+        nm = tv_fd + 44;                         # cFileName (verified offset)
+        skip = 0;
+        if load8(nm) == 46 {                     # '.'
+            if load8(nm + 1) == 0 { skip = 1; }
+            if load8(nm + 1) == 46 { if load8(nm + 2) == 0 { skip = 1; } }
+        }
+        if skip == 0 {
+            ui_join(kid, dir, uic_bs);
+            str_copy(kid + strlen(kid), nm);     # kid = dir + "\" + name
+            if band(load32(tv_fd + 0), 16) == 0 {       # not FILE_ATTRIBUTE_DIRECTORY
+                tv_add(tree, parent_item, nm, kid, 0);
+            } else {
+                hc = tv_add(tree, parent_item, nm, kid, 1);
+                tv_populate(tree, kid, hc, depth + 1);
+            }
+        }
+        if FindNextFileA(h, tv_fd) == 0 { cont = 0; }
+    }
+    FindClose(h);
+    free(kid);
+    free(pat);
+    return 0;
+}
+
+# Accessors for a node index (the value carried in the item's lParam).
+func tv_node_path(idx: i64) -> i64 { return g_node_paths + idx * 272; }
+func tv_node_isdir(idx: i64) -> i64 { return load8(g_node_isdir + idx); }
+
+# ---- editor open / save (M3) ---------------------------------------
+# Load file `path` into the EDIT `hedit` (raw read, LF->CRLF). 1 ok / 0 fail.
+func ui_load_file_to_edit(path: i64, hedit: i64) -> i64 {
+    n = ui_read_file(path, uic_filebuf, 524288);   # cap 512KB so the CRLF copy fits 1MB
+    if n < 0 { return 0; }
+    ui_lf_to_crlf(uic_cvtbuf, uic_filebuf);
+    SendMessageA(hedit, 12, 0, uic_cvtbuf);          # WM_SETTEXT
+    return 1;
+}
+
+# RichEdit text -> LF: map \r\n and lone \r to \n (RichEdit stores \r line breaks).
+func ui_rich_to_lf(dst: i64, src: i64) -> i64 {
+    i = 0;
+    j = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst + j, 0); return j; }
+        if c == 13 {
+            store8(dst + j, 10); j = j + 1;
+            if load8(src + i + 1) == 10 { i = i + 1; }   # consume the \n of a \r\n pair
+        } else {
+            store8(dst + j, c); j = j + 1;
+        }
+        i = i + 1;
+    }
+    return j;
+}
+
+# Save the editor `hedit` text back to `path` (WM_GETTEXT -> LF). 1 ok / 0 fail.
+func ui_save_edit_to_file(path: i64, hedit: i64) -> i64 {
+    len = SendMessageA(hedit, 14, 0, 0);             # WM_GETTEXTLENGTH (chars, excl NUL)
+    if len > 1048574 { len = 1048574; }
+    SendMessageA(hedit, 13, len + 1, uic_cvtbuf);    # WM_GETTEXT (wParam = max chars incl NUL)
+    ui_rich_to_lf(uic_filebuf, uic_cvtbuf);
+    return ui_write_file(path, uic_filebuf, strlen(uic_filebuf));
+}
+
+# ---- compile capture (M4) ------------------------------------------
+# Run `cmdline` (writable) as a child with stdout+stderr redirected into a
+# pipe; drain it into outbuf (NUL-terminated, capped at `cap`). Returns the
+# byte count (<0 on a CreatePipe/CreateProcess failure). Verified Phase-0
+# offsets; sequence proven headless by tests/test_pipe.ancl.
+func ide_run_capture(cmdline: i64, outbuf: i64, cap: i64) -> i64 {
+    memset(cap_sa, 0, 24);
+    store32(cap_sa + 0, 24);                 # nLength
+    store32(cap_sa + 16, 1);                 # bInheritHandle = TRUE
+    if CreatePipe(cap_hrd, cap_hwr, cap_sa, 0) == 0 { return 0 - 1; }
+    SetHandleInformation(load64(cap_hrd), 1, 0);   # parent read end non-inheritable
+
+    memset(cap_si, 0, 104);
+    store32(cap_si + 0, 104);                # cb
+    store32(cap_si + 60, 0x100);             # dwFlags = STARTF_USESTDHANDLES
+    store64(cap_si + 88, load64(cap_hwr));   # hStdOutput = write end
+    store64(cap_si + 96, load64(cap_hwr));   # hStdError  = write end
+
+    memset(cap_pi, 0, 24);
+    ok = CreateProcessA(0, cmdline, 0, 0, 1, 0, 0, 0, cap_si, cap_pi);   # bInheritHandles = 1
+    if ok == 0 { CloseHandle(load64(cap_hrd)); CloseHandle(load64(cap_hwr)); return 0 - 2; }
+    store64(cap_proc, load64(cap_pi + 0));   # publish the running child so Stop-Run can TerminateProcess it
+
+    CloseHandle(load64(cap_hwr));            # parent drops its write end -> ReadFile sees EOF
+    total = 0;
+    while 1 {
+        r = ReadFile(load64(cap_hrd), outbuf + total, 65536, cap_nread, 0);
+        if r == 0 { break; }
+        n = load32(cap_nread);
+        if n == 0 { break; }
+        total = total + n;
+        if total > cap - 65536 { break; }
+    }
+    store8(outbuf + total, 0);
+    CloseHandle(load64(cap_hrd));
+    WaitForSingleObject(load64(cap_pi + 0), 0 - 1);
+    store64(cap_proc, 0);                               # no longer running -> Stop-Run is a no-op
+    store32(cap_exit, 0);
+    GetExitCodeProcess(load64(cap_pi + 0), cap_exit);   # Run shows the child's exit code
+    CloseHandle(load64(cap_pi + 0));
+    CloseHandle(load64(cap_pi + 8));
+    return total;
+}

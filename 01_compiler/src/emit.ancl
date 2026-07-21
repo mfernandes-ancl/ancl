@@ -1,0 +1,551 @@
+# =====================================================================
+#  emit.ancl  -  x86-64 byte emitter for anclc2
+#
+#  Emits raw machine code bytes into g_code[], tracks labels and
+#  relocation fixups that are resolved later by the PE writer.
+#
+#  Fixup kinds:
+#    0 = rel32 to label   (branch / call within .text)
+#    1 = rip-relative to .rdata string (by string id)
+#    2 = rip-relative to .data buffer (by data offset)
+#    3 = rip-relative to IAT slot (by import index)
+# =====================================================================
+
+@DATA
+
+# --- Code buffer (1 MB; the self-host output is ~184 KB of code) ---
+g_code:     buf = 1048576;
+g_code_len: buf = 8;
+
+# --- Label table: g_labels[id] = code offset, or -1 if unplaced (16384 entries) ---
+g_labels:      buf = 131072;
+g_label_count: buf = 8;
+
+# --- Fixup tables (16384 entries each) ---
+g_fixup_pos:   buf = 131072;
+g_fixup_kind:  buf = 131072;
+g_fixup_tgt:   buf = 131072;
+g_fixup_count: buf = 8;
+
+# --- Register constants ---
+EM_RAX: i64 = 0;
+EM_RCX: i64 = 1;
+EM_RDX: i64 = 2;
+EM_RBX: i64 = 3;
+EM_RSP: i64 = 4;
+EM_RBP: i64 = 5;
+EM_RSI: i64 = 6;
+EM_RDI: i64 = 7;
+EM_R8:  i64 = 8;
+EM_R9:  i64 = 9;
+EM_R10: i64 = 10;
+EM_R11: i64 = 11;
+EM_R12: i64 = 12;
+EM_R13: i64 = 13;
+EM_R14: i64 = 14;
+EM_R15: i64 = 15;
+
+@CODE
+
+# ----------------------------------------------------------------
+#  em_b(v) -- emit one byte
+# ----------------------------------------------------------------
+func em_b(v: i64) -> i64 {
+    off = load64(g_code_len);
+    store8(g_code + off, v);
+    store64(g_code_len, off + 1);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_d32(v) -- emit 4 bytes little-endian
+# ----------------------------------------------------------------
+func em_d32(v: i64) -> i64 {
+    em_b(v        % 256);
+    em_b(shr(v,  8) % 256);
+    em_b(shr(v, 16) % 256);
+    em_b(shr(v, 24) % 256);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_d64(v) -- emit 8 bytes little-endian
+# ----------------------------------------------------------------
+func em_d64(v: i64) -> i64 {
+    em_b(v        % 256);
+    em_b(shr(v,  8) % 256);
+    em_b(shr(v, 16) % 256);
+    em_b(shr(v, 24) % 256);
+    em_b(shr(v, 32) % 256);
+    em_b(shr(v, 40) % 256);
+    em_b(shr(v, 48) % 256);
+    em_b(shr(v, 56) % 256);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_rex(W, R, X, B)  -- REX prefix
+# ----------------------------------------------------------------
+func em_rex(W: i64, R: i64, X: i64, B: i64) -> i64 {
+    v = 64 + shl(W,3) + shl(R,2) + shl(X,1) + B;
+    em_b(v);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mem_operand(reg_field, base, disp)
+#  Emits ModRM + optional SIB + disp32 for [base+disp] (mod=10)
+# ----------------------------------------------------------------
+func em_mem_operand(reg_field: i64, base: i64, disp: i64) -> i64 {
+    rm = base % 8;
+    em_b(128 + shl(band(reg_field,7), 3) + rm);
+    if rm == 4 { em_b(36); }   # SIB byte for RSP/R12 base
+    em_d32(disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_label_new() -> label id
+# ----------------------------------------------------------------
+func em_label_new() -> i64 {
+    id = load64(g_label_count);
+    store64(g_labels + id * 8, 0 - 1);   # -1 = unplaced
+    store64(g_label_count, id + 1);
+    return id;
+}
+
+# ----------------------------------------------------------------
+#  em_label_place(id)  -- set label position = current code offset
+# ----------------------------------------------------------------
+func em_label_place(id: i64) -> i64 {
+    off = load64(g_code_len);
+    store64(g_labels + id * 8, off);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_fixup(kind, tgt)  -- record a fixup at current pos, emit 4 zero bytes
+# ----------------------------------------------------------------
+func em_fixup(kind: i64, tgt: i64) -> i64 {
+    fi = load64(g_fixup_count);
+    pos = load64(g_code_len);
+    store64(g_fixup_pos  + fi * 8, pos);
+    store64(g_fixup_kind + fi * 8, kind);
+    store64(g_fixup_tgt  + fi * 8, tgt);
+    store64(g_fixup_count, fi + 1);
+    em_d32(0);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_ri(r, imm)   movabs r64, imm64
+# ----------------------------------------------------------------
+func em_mov_ri(r: i64, imm: i64) -> i64 {
+    b_ext = 0;
+    if r >= 8 { b_ext = 1; }
+    em_rex(1, 0, 0, b_ext);
+    em_b(184 + band(r, 7));   # 0xB8 + reg
+    em_d64(imm);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_rr(dst, src)   mov r64, r64
+# ----------------------------------------------------------------
+func em_mov_rr(dst: i64, src: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if src >= 8 { r_ext = 1; }
+    if dst >= 8 { b_ext = 1; }
+    em_rex(1, r_ext, 0, b_ext);
+    em_b(137);   # 0x89  MOV r/m64, r64
+    em_b(192 + shl(band(src,7), 3) + band(dst,7));
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_rm(dst, base, disp)   mov r64,[base+disp]
+# ----------------------------------------------------------------
+func em_mov_rm(dst: i64, base: i64, disp: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if dst  >= 8 { r_ext = 1; }
+    if base >= 8 { b_ext = 1; }
+    em_rex(1, r_ext, 0, b_ext);
+    em_b(139);   # 0x8B  MOV r64,r/m64
+    em_mem_operand(dst, base, disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_mr(base, disp, src)   mov [base+disp],r64
+# ----------------------------------------------------------------
+func em_mov_mr(base: i64, disp: i64, src: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if src  >= 8 { r_ext = 1; }
+    if base >= 8 { b_ext = 1; }
+    em_rex(1, r_ext, 0, b_ext);
+    em_b(137);   # 0x89  MOV r/m64,r64
+    em_mem_operand(src, base, disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_mr8(base, disp, src)   mov byte[base+disp],r8
+# ----------------------------------------------------------------
+func em_mov_mr8(base: i64, disp: i64, src: i64) -> i64 {
+    if base >= 8 { em_rex(0, 0, 0, 1); }
+    if src  >= 8 { em_rex(0, 1, 0, 0); }
+    em_b(136);   # 0x88
+    em_mem_operand(src, base, disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_movzx_rm8(dst, base, disp)   movzx r64,byte[base+disp]
+# ----------------------------------------------------------------
+func em_movzx_rm8(dst: i64, base: i64, disp: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if dst  >= 8 { r_ext = 1; }
+    if base >= 8 { b_ext = 1; }
+    em_rex(1, r_ext, 0, b_ext);
+    em_b(15); em_b(182);   # 0x0F 0xB6
+    em_mem_operand(dst, base, disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_lea_mem(dst, base, disp)   lea r64,[base+disp]
+# ----------------------------------------------------------------
+func em_lea_mem(dst: i64, base: i64, disp: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if dst  >= 8 { r_ext = 1; }
+    if base >= 8 { b_ext = 1; }
+    em_rex(1, r_ext, 0, b_ext);
+    em_b(141);   # 0x8D  LEA
+    em_mem_operand(dst, base, disp);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_lea_rip(dst, kind, tgt)  lea r64,[rip+disp32]  + fixup
+# ----------------------------------------------------------------
+func em_lea_rip(dst: i64, kind: i64, tgt: i64) -> i64 {
+    r_ext = 0;
+    if dst >= 8 { r_ext = 1; }
+    em_rex(1, r_ext, 0, 0);
+    em_b(141);   # 0x8D  LEA
+    em_b(shl(band(dst,7), 3) + 5);   # mod=00 rm=101 (RIP-relative)
+    em_fixup(kind, tgt);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_rip_load(dst, kind, tgt)  mov r64,[rip+disp32]  + fixup
+# ----------------------------------------------------------------
+func em_mov_rip_load(dst: i64, kind: i64, tgt: i64) -> i64 {
+    r_ext = 0;
+    if dst >= 8 { r_ext = 1; }
+    em_rex(1, r_ext, 0, 0);
+    em_b(139);   # 0x8B  MOV r64,r/m64
+    em_b(shl(band(dst,7), 3) + 5);   # mod=00 rm=101
+    em_fixup(kind, tgt);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_mov_rip_store(src, kind, tgt)  mov [rip+disp32],r64  + fixup
+# ----------------------------------------------------------------
+func em_mov_rip_store(src: i64, kind: i64, tgt: i64) -> i64 {
+    r_ext = 0;
+    if src >= 8 { r_ext = 1; }
+    em_rex(1, r_ext, 0, 0);
+    em_b(137);   # 0x89  MOV r/m64,r64
+    em_b(shl(band(src,7), 3) + 5);   # mod=00 rm=101
+    em_fixup(kind, tgt);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  ALU reg,reg
+# ----------------------------------------------------------------
+func em_add_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if s >= 8 { r_ext = 1; } if d >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(1);   # ADD r/m64,r64
+    em_b(192 + shl(band(s,7),3) + band(d,7));
+    return 0;
+}
+func em_sub_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if s >= 8 { r_ext = 1; } if d >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(41);  # SUB r/m64,r64
+    em_b(192 + shl(band(s,7),3) + band(d,7));
+    return 0;
+}
+func em_and_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if s >= 8 { r_ext = 1; } if d >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(33);  # AND r/m64,r64
+    em_b(192 + shl(band(s,7),3) + band(d,7));
+    return 0;
+}
+func em_or_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if s >= 8 { r_ext = 1; } if d >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(9);   # OR r/m64,r64
+    em_b(192 + shl(band(s,7),3) + band(d,7));
+    return 0;
+}
+func em_xor_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if s >= 8 { r_ext = 1; } if d >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(49);  # XOR r/m64,r64
+    em_b(192 + shl(band(s,7),3) + band(d,7));
+    return 0;
+}
+func em_cmp_rr(a: i64, b: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if b >= 8 { r_ext = 1; } if a >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(57);  # CMP r/m64,r64
+    em_b(192 + shl(band(b,7),3) + band(a,7));
+    return 0;
+}
+func em_test_rr(a: i64, b: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if b >= 8 { r_ext = 1; } if a >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(133); # TEST r/m64,r64
+    em_b(192 + shl(band(b,7),3) + band(a,7));
+    return 0;
+}
+func em_imul_rr(d: i64, s: i64) -> i64 {
+    r_ext = 0; b_ext = 0;
+    if d >= 8 { r_ext = 1; } if s >= 8 { b_ext = 1; }
+    em_rex(1,r_ext,0,b_ext); em_b(15); em_b(175); # IMUL r64,r/m64
+    em_b(192 + shl(band(d,7),3) + band(s,7));
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  ALU reg,imm32  (0x81 group)
+# ----------------------------------------------------------------
+func em_grp1_ri(ext: i64, r: i64, imm: i64) -> i64 {
+    b_ext = 0; if r >= 8 { b_ext = 1; }
+    em_rex(1, 0, 0, b_ext);
+    em_b(129);   # 0x81
+    em_b(192 + shl(ext,3) + band(r,7));
+    em_d32(imm);
+    return 0;
+}
+func em_add_ri(r: i64, imm: i64) -> i64 { return em_grp1_ri(0, r, imm); }
+func em_sub_ri(r: i64, imm: i64) -> i64 { return em_grp1_ri(5, r, imm); }
+func em_cmp_ri(r: i64, imm: i64) -> i64 { return em_grp1_ri(7, r, imm); }
+
+# ----------------------------------------------------------------
+#  Unary ops
+# ----------------------------------------------------------------
+func em_neg(r: i64) -> i64 {
+    b_ext = 0; if r >= 8 { b_ext = 1; }
+    em_rex(1,0,0,b_ext); em_b(247); em_b(192 + shl(3,3) + band(r,7));
+    return 0;
+}
+func em_cqo() -> i64 {
+    em_rex(1,0,0,0); em_b(153); return 0;
+}
+func em_idiv(r: i64) -> i64 {
+    b_ext = 0; if r >= 8 { b_ext = 1; }
+    em_rex(1,0,0,b_ext); em_b(247); em_b(192 + shl(7,3) + band(r,7));
+    return 0;
+}
+func em_shl_cl(r: i64) -> i64 {
+    b_ext = 0; if r >= 8 { b_ext = 1; }
+    em_rex(1,0,0,b_ext); em_b(211); em_b(192 + shl(4,3) + band(r,7));
+    return 0;
+}
+func em_shr_cl(r: i64) -> i64 {
+    b_ext = 0; if r >= 8 { b_ext = 1; }
+    em_rex(1,0,0,b_ext); em_b(211); em_b(192 + shl(5,3) + band(r,7));
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  setcc al + movzx rax,al
+#    cc codes: sete=0x94  setne=0x95  setl=0x9C  setle=0x9E
+#              setg=0x9F  setge=0x9D  setns=0x99
+# ----------------------------------------------------------------
+func em_setcc(cc: i64) -> i64 {
+    em_b(15); em_b(cc); em_b(192);         # setcc al  (rm=al)
+    em_rex(1,0,0,0); em_b(15); em_b(182); em_b(192);  # movzx rax,al
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  Jumps (rel32)
+# ----------------------------------------------------------------
+func em_jmp(label: i64) -> i64 {
+    em_b(233); em_fixup(0, label); return 0;
+}
+func em_jcc(cc: i64, label: i64) -> i64 {
+    em_b(15); em_b(cc); em_fixup(0, label); return 0;
+}
+func em_je(l: i64)  -> i64 { return em_jcc(132, l); }
+func em_jne(l: i64) -> i64 { return em_jcc(133, l); }
+func em_jz(l: i64)  -> i64 { return em_jcc(132, l); }
+func em_jnz(l: i64) -> i64 { return em_jcc(133, l); }
+func em_jl(l: i64)  -> i64 { return em_jcc(140, l); }
+func em_jg(l: i64)  -> i64 { return em_jcc(143, l); }
+func em_jge(l: i64) -> i64 { return em_jcc(141, l); }
+func em_jle(l: i64) -> i64 { return em_jcc(142, l); }
+func em_jns(l: i64) -> i64 { return em_jcc(137, l); }
+
+# ----------------------------------------------------------------
+#  Calls
+# ----------------------------------------------------------------
+func em_call_label(label: i64) -> i64 {
+    em_b(232); em_fixup(0, label); return 0;
+}
+func em_call_import(idx: i64) -> i64 {
+    em_b(255); em_b(21); em_fixup(3, idx); return 0;
+}
+# --target=linux-dyn only: indirect call through the .got.plt slot for a dynamic (libc/.so) import,
+# resolved by ld.so at load under BIND_NOW. FF 15 rip-relative + fixup kind 4 (elf_write_dyn resolves
+# it to the GOT slot). Same byte shape as em_call_import; only the fixup kind differs. Never emitted
+# for PE / static ELF, so the anclc3==anclc4 and Linux fixpoints are untouched.
+func em_call_dynimport(idx: i64) -> i64 {
+    em_b(255); em_b(21); em_fixup(4, idx); return 0;
+}
+func em_call_rax() -> i64 {
+    em_b(255); em_b(208); return 0;
+}
+
+# ----------------------------------------------------------------
+#  syscall  (Linux x86-64, 0F 05; clobbers RCX + R11)
+#  Only ever emitted from targetLinux-gated codegen, so the Windows
+#  byte stream is untouched.
+# ----------------------------------------------------------------
+func em_syscall() -> i64 {
+    em_b(15); em_b(5); return 0;
+}
+
+# ----------------------------------------------------------------
+#  RET
+# ----------------------------------------------------------------
+func em_ret() -> i64 {
+    em_b(195); return 0;
+}
+
+# ----------------------------------------------------------------
+#  movsxd rax,eax   (sign-extend 32-bit return to 64)
+# ----------------------------------------------------------------
+func em_movsxd_rax() -> i64 {
+    em_rex(1,0,0,0); em_b(99); em_b(192); return 0;
+}
+
+# ----------------------------------------------------------------
+#  zext_eax  -- zero-extend rax = just write eax to itself
+#              mov eax,eax  (implicit zero-extends)
+# ----------------------------------------------------------------
+func em_zext_eax() -> i64 {
+    em_b(137); em_b(192); return 0;
+}
+
+# ----------------------------------------------------------------
+#  SSE2 scalar-double (f64) instructions
+#  Mirror the bootstrap anclc.cpp sse_rr/movsd/cvt/movq encoders.
+#  Layout: [mandatory prefix 66/F2] [REX (W=1 for cvt/movq; else only if
+#  a register >=8)] 0F [opcode] [ModRM].  XMM regs are numbered 0..15 just
+#  like GP regs; the codegen only ever uses xmm0/xmm1.
+# ----------------------------------------------------------------
+#  reg<-reg SSE: prefix 0F op  ModRM(11 xd xs).  REX (W=0) only if xd|xs>=8.
+func em_sse_rr(pre: i64, op: i64, xd: i64, xs: i64) -> i64 {
+    em_b(pre);
+    rr = 0; bb = 0; need = 0;
+    if xd >= 8 { rr = 1; need = 1; }
+    if xs >= 8 { bb = 1; need = 1; }
+    if need == 1 { em_rex(0, rr, 0, bb); }
+    em_b(15); em_b(op);
+    em_b(192 + shl(band(xd,7),3) + band(xs,7));
+    return 0;
+}
+func em_addsd(xd: i64, xs: i64)  -> i64 { return em_sse_rr(242, 88, xd, xs); }  # F2 0F 58
+func em_subsd(xd: i64, xs: i64)  -> i64 { return em_sse_rr(242, 92, xd, xs); }  # F2 0F 5C
+func em_mulsd(xd: i64, xs: i64)  -> i64 { return em_sse_rr(242, 89, xd, xs); }  # F2 0F 59
+func em_divsd(xd: i64, xs: i64)  -> i64 { return em_sse_rr(242, 94, xd, xs); }  # F2 0F 5E
+func em_sqrtsd(xd: i64, xs: i64) -> i64 { return em_sse_rr(242, 81, xd, xs); }  # F2 0F 51
+func em_ucomisd(xd: i64, xs: i64)-> i64 { return em_sse_rr(102, 46, xd, xs); }  # 66 0F 2E
+func em_movsd_xx(xd: i64, xs: i64)-> i64 { return em_sse_rr(242, 16, xd, xs); } # F2 0F 10 (xmm<-xmm)
+
+#  movsd xmm, [base+disp]   F2 0F 10  (load an f64 from a stack slot)
+func em_movsd_xm(xd: i64, base: i64, disp: i64) -> i64 {
+    em_b(242);
+    rr = 0; bb = 0; need = 0;
+    if xd   >= 8 { rr = 1; need = 1; }
+    if base >= 8 { bb = 1; need = 1; }
+    if need == 1 { em_rex(0, rr, 0, bb); }
+    em_b(15); em_b(16);                # 0F 10
+    em_mem_operand(xd, base, disp);
+    return 0;
+}
+#  movsd [base+disp], xmm   F2 0F 11  (store an f64 to a stack slot)
+func em_movsd_mx(base: i64, disp: i64, xs: i64) -> i64 {
+    em_b(242);
+    rr = 0; bb = 0; need = 0;
+    if xs   >= 8 { rr = 1; need = 1; }
+    if base >= 8 { bb = 1; need = 1; }
+    if need == 1 { em_rex(0, rr, 0, bb); }
+    em_b(15); em_b(17);                # 0F 11
+    em_mem_operand(xs, base, disp);
+    return 0;
+}
+#  cvtsi2sd xmm, r64   F2 REX.W 0F 2A   (int -> f64 promote)
+func em_cvtsi2sd(xd: i64, gs: i64) -> i64 {
+    em_b(242);
+    rr = 0; bb = 0;
+    if xd >= 8 { rr = 1; }
+    if gs >= 8 { bb = 1; }
+    em_rex(1, rr, 0, bb);
+    em_b(15); em_b(42);                # 0F 2A
+    em_b(192 + shl(band(xd,7),3) + band(gs,7));
+    return 0;
+}
+#  cvttsd2si r64, xmm   F2 REX.W 0F 2C  (f64 -> int truncate)
+func em_cvttsd2si(gd: i64, xs: i64) -> i64 {
+    em_b(242);
+    rr = 0; bb = 0;
+    if gd >= 8 { rr = 1; }
+    if xs >= 8 { bb = 1; }
+    em_rex(1, rr, 0, bb);
+    em_b(15); em_b(44);                # 0F 2C
+    em_b(192 + shl(band(gd,7),3) + band(xs,7));
+    return 0;
+}
+#  movq xmm, r64   66 REX.W 0F 6E   (load f64 bits from a GP reg into XMM)
+func em_movq_xr(xd: i64, gs: i64) -> i64 {
+    em_b(102);                         # 66
+    rr = 0; bb = 0;
+    if xd >= 8 { rr = 1; }
+    if gs >= 8 { bb = 1; }
+    em_rex(1, rr, 0, bb);
+    em_b(15); em_b(110);               # 0F 6E
+    em_b(192 + shl(band(xd,7),3) + band(gs,7));
+    return 0;
+}
+#  movq r64, xmm   66 REX.W 0F 7E   (extract f64 bits from XMM into a GP reg)
+func em_movq_rx(gd: i64, xs: i64) -> i64 {
+    em_b(102);                         # 66
+    rr = 0; bb = 0;
+    if xs >= 8 { rr = 1; }
+    if gd >= 8 { bb = 1; }
+    em_rex(1, rr, 0, bb);
+    em_b(15); em_b(126);               # 0F 7E
+    em_b(192 + shl(band(xs,7),3) + band(gd,7));
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  em_init() -- reset emitter state
+# ----------------------------------------------------------------
+func em_init() -> i64 {
+    store64(g_code_len,    0);
+    store64(g_label_count, 0);
+    store64(g_fixup_count, 0);
+    return 0;
+}

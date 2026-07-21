@@ -1,0 +1,142 @@
+# =====================================================================
+# knowledge_index.ancl - deterministic lexical retrieval primitives.
+#
+# The Lens integration owns storage and UI.  This module deliberately has
+# no database, embedding model, network, or filesystem dependency so the
+# ranking contract can be regression-tested in isolation.
+# =====================================================================
+
+@CODE
+func lki_lower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func lki_word_char(c: i64) -> i64 {
+    c = lki_lower(c);
+    if c >= 97 { if c <= 122 { return 1; } }
+    if c >= 48 { if c <= 57 { return 1; } }
+    if c == 95 { return 1; }
+    return 0;
+}
+
+func lki_stopword(token: i64) -> i64 {
+    if strcmp(token, "the") == 0 { return 1; }
+    if strcmp(token, "and") == 0 { return 1; }
+    if strcmp(token, "for") == 0 { return 1; }
+    if strcmp(token, "that") == 0 { return 1; }
+    if strcmp(token, "this") == 0 { return 1; }
+    if strcmp(token, "with") == 0 { return 1; }
+    if strcmp(token, "from") == 0 { return 1; }
+    if strcmp(token, "what") == 0 { return 1; }
+    if strcmp(token, "when") == 0 { return 1; }
+    if strcmp(token, "where") == 0 { return 1; }
+    if strcmp(token, "which") == 0 { return 1; }
+    if strcmp(token, "would") == 0 { return 1; }
+    if strcmp(token, "could") == 0 { return 1; }
+    if strcmp(token, "should") == 0 { return 1; }
+    if strcmp(token, "have") == 0 { return 1; }
+    if strcmp(token, "does") == 0 { return 1; }
+    if strcmp(token, "about") == 0 { return 1; }
+    if strcmp(token, "into") == 0 { return 1; }
+    if strcmp(token, "your") == 0 { return 1; }
+    if strcmp(token, "please") == 0 { return 1; }
+    return 0;
+}
+
+func lki_match_range(src: i64, pos: i64, end: i64, token: i64) -> i64 {
+    j = 0;
+    while load8(token + j) != 0 {
+        if pos + j >= end { return 0; }
+        if lki_lower(load8(src + pos + j)) != load8(token + j) { return 0; }
+        j = j + 1;
+    }
+    if pos > 0 { if lki_word_char(load8(src + pos - 1)) == 1 { return 0; } }
+    if pos + j < end { if lki_word_char(load8(src + pos + j)) == 1 { return 0; } }
+    return 1;
+}
+
+func lki_count_token(src: i64, start: i64, end: i64, token: i64, cap: i64) -> i64 {
+    i = start;
+    hits = 0;
+    while i < end {
+        if lki_match_range(src, i, end, token) == 1 {
+            hits = hits + 1;
+            if hits >= cap { return hits; }
+            i = i + strlen(token);
+        } else { i = i + 1; }
+    }
+    return hits;
+}
+
+# Score one bounded passage.  Each meaningful query term contributes once per
+# occurrence (capped), while a path/name match receives a small routing bonus.
+func lki_score(query: i64, text: i64, start: i64, end: i64, path: i64, token: i64) -> i64 {
+    qi = 0;
+    score = 0;
+    while load8(query + qi) != 0 {
+        while load8(query + qi) != 0 { if lki_word_char(load8(query + qi)) == 1 { break; } qi = qi + 1; }
+        tj = 0;
+        while load8(query + qi) != 0 {
+            c = load8(query + qi);
+            if lki_word_char(c) == 0 { break; }
+            if tj < 63 { store8(token + tj, lki_lower(c)); tj = tj + 1; }
+            qi = qi + 1;
+        }
+        store8(token + tj, 0);
+        if tj >= 3 {
+            if lki_stopword(token) == 0 {
+                score = score + lki_count_token(text, start, end, token, 8);
+                score = score + lki_count_token(path, 0, strlen(path), token, 2) * 3;
+            }
+        }
+        if load8(query + qi) != 0 { qi = qi + 1; }
+    }
+    return score;
+}
+
+# Prefer a line boundary after the target size, but never exceed hard_end.
+func lki_chunk_end(text: i64, start: i64, total: i64, target: i64, hard: i64) -> i64 {
+    if start >= total { return total; }
+    end = start + target;
+    if end >= total { return total; }
+    hard_end = start + hard;
+    if hard_end > total { hard_end = total; }
+    while end < hard_end {
+        c = load8(text + end);
+        if c == 10 { return end + 1; }
+        end = end + 1;
+    }
+    return hard_end;
+}
+
+func lki_line_number(text: i64, pos: i64) -> i64 {
+    i = 0;
+    line = 1;
+    while i < pos {
+        if load8(text + i) == 10 { line = line + 1; }
+        i = i + 1;
+    }
+    return line;
+}
+
+# Only Lens-created portable excerpt links may be reopened.  Absolute paths,
+# alternate separators/schemes, and traversal are rejected before path joining.
+func lki_excerpt_rel_ok(rel: i64) -> i64 {
+    prefix = "excerpts\\";
+    i = 0;
+    while load8(prefix + i) != 0 {
+        if lki_lower(load8(rel + i)) != lki_lower(load8(prefix + i)) { return 0; }
+        i = i + 1;
+    }
+    if load8(rel + i) == 0 { return 0; }
+    j = 0;
+    while load8(rel + j) != 0 {
+        c = load8(rel + j);
+        if c == 58 { return 0; }
+        if c == 47 { return 0; }
+        if c == 46 { if load8(rel + j + 1) == 46 { return 0; } }
+        j = j + 1;
+    }
+    return 1;
+}

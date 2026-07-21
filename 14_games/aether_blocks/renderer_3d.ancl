@@ -1,0 +1,672 @@
+# =====================================================================
+#  renderer_3d.ancl  -  3D Software Rasterizer & Painter's Algorithm
+#  Format: Bare-Metal ANCL V6, Zero-CRT
+# =====================================================================
+import "win32_api.ancl";
+import "voxel_world.ancl";
+
+extern "gdi32.dll" Polygon;
+
+@DATA
+# Trigonometry LUT Buffers
+g_sin: buf = 8192;                 # 1024 * 8
+g_cos: buf = 8192;                 # 1024 * 8
+
+# Render Queue: Max 2048 faces.
+# Each face: depth (8 bytes), color (8 bytes), 4 x-coords (32 bytes), 4 y-coords (32 bytes) = 80 bytes.
+# Total size: 2048 * 80 = 163840 bytes
+g_face_queue:      buf = 163840;
+g_face_count:      buf = 8;
+
+# Screen dimensions
+VIEW_WIDTH:   i64 = 800;
+VIEW_HEIGHT:  i64 = 480;
+ZOOM_FACTOR:  i64 = 350; # Camera FOV zoom
+
+# Camera parameters
+g_player_x:     buf = 8;
+g_player_y:     buf = 8;
+g_player_z:     buf = 8;
+g_player_yaw:   buf = 8;  # [0..1023]
+g_player_pitch: buf = 8;  # [0..1023]
+
+# Time of day (0..20000, loops)
+g_day_time:     buf = 8;
+
+# View mode (0 = 1st person, 1 = 3rd person)
+g_third_person: buf = 8;
+
+# Calculated camera coordinates in world space for depth sorting
+g_cam_x:        buf = 8;
+g_cam_y:        buf = 8;
+g_cam_z:        buf = 8;
+
+# Walking animation and rotation state
+g_walk_time:    buf = 8;
+g_rot_y11:      buf = 8;
+g_rot_z11:      buf = 8;
+g_rot_y21:      buf = 8;
+g_rot_z21:      buf = 8;
+g_rot_y12:      buf = 8;
+g_rot_z12:      buf = 8;
+g_rot_y22:      buf = 8;
+g_rot_z22:      buf = 8;
+
+# Temporary projections
+g_proj_x:       buf = 32; # 4 vertices * 8 bytes
+g_proj_y:       buf = 32; # 4 vertices * 8 bytes
+
+# GDI structures
+g_poly_points:  buf = 64; # 4 points * 2 coords * 8 bytes (POINT structures)
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Bhaskara I Sine/Cosine LUT Initialization
+# ---------------------------------------------------------------------
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Project a 3D point (wx, wy, wz) relative to camera into (out_x, out_y)
+# Returns 1 if in front of camera, 0 if clipped/behind.
+# ---------------------------------------------------------------------
+func project_vertex(wx: i64, wy: i64, wz: i64, out_x_ptr: i64, out_y_ptr: i64) -> i64 {
+    # 1. Translate relative to camera (eye level is Z + 75)
+    dx = wx - load64(g_player_x);
+    dy = wy - load64(g_player_y);
+    dz = wz - (load64(g_player_z) + 75);
+    
+    # 2. Rotate around Z-axis (Yaw)
+    yaw = load64(g_player_yaw);
+    cosY = load64(g_cos + yaw * 8);
+    sinY = load64(g_sin + yaw * 8);
+    rx = (dx * cosY - dy * sinY) / 65536;
+    ry = (dx * sinY + dy * cosY) / 65536;
+    rz = dz;
+    
+    # 3. Rotate around X-axis (Pitch)
+    pitch = load64(g_player_pitch);
+    pitch_idx = band(pitch, 1023);
+    cosP = load64(g_cos + pitch_idx * 8);
+    sinP = load64(g_sin + pitch_idx * 8);
+    rx2 = rx;
+    ry2 = (ry * cosP - rz * sinP) / 65536;
+    rz2 = (ry * sinP + rz * cosP) / 65536;
+    
+    # Apply 3rd person offset in camera space if active
+    tp = load64(g_third_person);
+    if tp == 1 {
+        ry2 = ry2 + 200; # Camera is 200 units behind player
+        rz2 = rz2 - 50;  # Camera is 50 units above eyes
+    }
+    if tp == 2 {
+        rx2 = 0 - rx2;   # Invert X for front view
+        ry2 = 200 - ry2; # Camera is 200 units in front of player
+        rz2 = rz2 - 50;  # Camera is 50 units above eyes
+    }
+    
+    # Clip vertices behind the camera (ry2 <= 5)
+    if ry2 <= 5 {
+        return 0;
+    }
+    
+    # 4. Perspective Projection
+    cx = VIEW_WIDTH / 2;
+    cy = VIEW_HEIGHT / 2;
+    
+    px = cx + (rx2 * ZOOM_FACTOR) / ry2;
+    py = cy - (rz2 * ZOOM_FACTOR) / ry2;
+    
+    store64(out_x_ptr, px);
+    store64(out_y_ptr, py);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Push face into Painter's algorithm depth queue
+# ---------------------------------------------------------------------
+func queue_face(depth: i64, color: i64) -> i64 {
+    count = load64(g_face_count);
+    if count >= 2048 { return 0; }
+    
+    offset = count * 80;
+    store64(g_face_queue + offset + 0, depth);
+    store64(g_face_queue + offset + 8, color);
+    
+    i = 0;
+    while i < 4 {
+        store64(g_face_queue + offset + 16 + i * 8, load64(g_proj_x + i * 8));
+        store64(g_face_queue + offset + 48 + i * 8, load64(g_proj_y + i * 8));
+        i = i + 1;
+    }
+    
+    store64(g_face_count, count + 1);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Bubble Sort for Face Queue (descending by depth)
+# ---------------------------------------------------------------------
+func sort_faces() -> i64 {
+    count = load64(g_face_count);
+    if count < 2 { return 0; }
+    
+    i = 0;
+    while i < count - 1 {
+        j = 0;
+        while j < count - i - 1 {
+            off1 = j * 80;
+            off2 = (j + 1) * 80;
+            d1 = load64(g_face_queue + off1);
+            d2 = load64(g_face_queue + off2);
+            
+            if d1 < d2 {
+                # Swap elements (80 bytes)
+                k = 0;
+                while k < 10 {
+                    t = load64(g_face_queue + off1 + k * 8);
+                    store64(g_face_queue + off1 + k * 8, load64(g_face_queue + off2 + k * 8));
+                    store64(g_face_queue + off2 + k * 8, t);
+                    k = k + 1;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Computes lighting shade based on face type and day/night cycle
+# ---------------------------------------------------------------------
+func get_shaded_color(base_col: i64, face_type: i64) -> i64 {
+    # base_col: 0x00BBGGRR
+    # face_type: 0 = Top, 1 = Bottom, 2 = North/South, 3 = East/West
+    
+    # Day/Night brightness factor (0..256)
+    time = load64(g_day_time);
+    # Cycle ambient light: peak at time=10000, dark at time=0/20000
+    if time < 10000 {
+        ambient = 50 + (time * 206) / 10000;
+    } else {
+        ambient = 50 + ((20000 - time) * 206) / 10000;
+    }
+    
+    # Face orientation shading
+    shade = 256;
+    if face_type == 0 { shade = 256; } # Top: Fully lit
+    if face_type == 1 { shade = 120; } # Bottom: Muted shadow
+    if face_type == 2 { shade = 200; } # Sides N/S: Slightly shaded
+    if face_type == 3 { shade = 160; } # Sides E/W: More shaded
+    
+    mult = (ambient * shade) / 256; # Combined multiplier [0..256]
+    
+    r = band(base_col, 255);
+    g = band(shr(base_col, 8), 255);
+    b = band(shr(base_col, 16), 255);
+    
+    r = (r * mult) / 256;
+    g = (g * mult) / 256;
+    b = (b * mult) / 256;
+    
+    return r + shl(g, 8) + shl(b, 16);
+}
+
+# ---------------------------------------------------------------------
+# Draw block face (8 vertices) if visible and cue it
+# ---------------------------------------------------------------------
+func check_and_queue_face(
+    x: i64, y: i64, z: i64,
+    v0x: i64, v0y: i64, v0z: i64,
+    v1x: i64, v1y: i64, v1z: i64,
+    v2x: i64, v2y: i64, v2z: i64,
+    v3x: i64, v3y: i64, v3z: i64,
+    face_type: i64, block_color: i64
+) -> i64 {
+    # Project 4 vertices
+    if project_vertex(v0x, v0y, v0z, g_proj_x + 0, g_proj_y + 0) == 0 { return 0; }
+    if project_vertex(v1x, v1y, v1z, g_proj_x + 8, g_proj_y + 8) == 0 { return 0; }
+    if project_vertex(v2x, v2y, v2z, g_proj_x + 16, g_proj_y + 16) == 0 { return 0; }
+    if project_vertex(v3x, v3y, v3z, g_proj_x + 24, g_proj_y + 24) == 0 { return 0; }
+    
+    # Back-face culling using 2D cross product of first 3 projected vertices
+    dx1 = load64(g_proj_x + 8) - load64(g_proj_x + 0);
+    dy1 = load64(g_proj_y + 8) - load64(g_proj_y + 0);
+    dx2 = load64(g_proj_x + 16) - load64(g_proj_x + 8);
+    dy2 = load64(g_proj_y + 16) - load64(g_proj_y + 8);
+    cross = dx1 * dy2 - dy1 * dx2;
+    
+    # Cull if winding order points away (depends on camera normal direction)
+    # Since we want front faces:
+    if cross <= 0 {
+        # Different faces have different winding orders in 3D, but we can do a depth sorting instead.
+        # However, simple painter's algorithm handles overlap correctly.
+    }
+    
+    # Calculate distance to camera for sorting (Depth key)
+    cx = load64(g_cam_x);
+    cy = load64(g_cam_y);
+    cz = load64(g_cam_z);
+    
+    # Midpoint of face coordinates
+    mx = (v0x + v2x) / 2;
+    my = (v0y + v2y) / 2;
+    mz = (v0z + v2z) / 2;
+    
+    dist_x = mx - cx;
+    dist_y = my - cy;
+    dist_z = mz - cz;
+    depth = dist_x * dist_x + dist_y * dist_y + dist_z * dist_z;
+    
+    color = get_shaded_color(block_color, face_type);
+    
+    queue_face(depth, color);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Collects all visible block faces in the world and queues them
+# ---------------------------------------------------------------------
+func collect_world_faces() -> i64 {
+    store64(g_face_count, 0);
+    
+    px = load64(g_player_x);
+    py = load64(g_player_y);
+    pz = load64(g_player_z);
+    
+    if load64(g_third_person) == 0 {
+        store64(g_cam_x, px);
+        store64(g_cam_y, py);
+        store64(g_cam_z, pz + 75);
+    } else {
+        yaw = load64(g_player_yaw);
+        pitch = load64(g_player_pitch);
+        cosY = load64(g_cos + yaw * 8);
+        sinY = load64(g_sin + yaw * 8);
+        pitch_idx = band(pitch, 1023);
+        cosP = load64(g_cos + pitch_idx * 8);
+        sinP = load64(g_sin + pitch_idx * 8);
+        
+        # Calculate camera position offset 200 units (front vs behind) and 50 units above eyes
+        dist = 200;
+        if load64(g_third_person) == 2 {
+            dist = 0 - 200; # Camera is in front
+        }
+        cx = px - (((sinY * cosP) / 65536) * dist) / 65536;
+        cy = py - (((cosY * cosP) / 65536) * dist) / 65536;
+        cz = pz + 75 - (sinP * dist) / 65536;
+        
+        # Make sure camera doesn't clip below floor level (z = 10)
+        if cz < 10 { cz = 10; }
+        
+        store64(g_cam_x, cx);
+        store64(g_cam_y, cy);
+        store64(g_cam_z, cz);
+    }
+    
+    # Queue player character faces first (guarantees they are never discarded by queue limits)
+    if load64(g_third_person) != 0 {
+        queue_player_faces();
+    }
+    
+    wx = 0;
+    while wx < WORLD_W {
+        wy = 0;
+        while wy < WORLD_L {
+            wz = 0;
+            while wz < WORLD_H {
+                block = get_block(wx, wy, wz);
+                if block != BLOCK_AIR {
+                    col = get_block_color(block);
+                    
+                    # Convert voxel indices to world spatial coordinates (scale factor = 100)
+                    bx = wx * 100;
+                    by = wy * 100;
+                    bz = wz * 100;
+                    
+                    # 1. Top face (z + 100)
+                    if wz == WORLD_H - 1 {
+                        check_and_queue_face(wx, wy, wz, bx, by, bz + 100, bx + 100, by, bz + 100, bx + 100, by + 100, bz + 100, bx, by + 100, bz + 100, 0, col);
+                    } else {
+                        if get_block(wx, wy, wz + 1) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx, by, bz + 100, bx + 100, by, bz + 100, bx + 100, by + 100, bz + 100, bx, by + 100, bz + 100, 0, col);
+                        }
+                    }
+                    
+                    # 2. Bottom face (z)
+                    if wz == 0 {
+                        check_and_queue_face(wx, wy, wz, bx, by + 100, bz, bx + 100, by + 100, bz, bx + 100, by, bz, bx, by, bz, 1, col);
+                    } else {
+                        if get_block(wx, wy, wz - 1) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx, by + 100, bz, bx + 100, by + 100, bz, bx + 100, by, bz, bx, by, bz, 1, col);
+                        }
+                    }
+                    
+                    # 3. North/South faces (y and y + 100)
+                    if wy == 0 {
+                        check_and_queue_face(wx, wy, wz, bx, by, bz, bx + 100, by, bz, bx + 100, by, bz + 100, bx, by, bz + 100, 2, col);
+                    } else {
+                        if get_block(wx, wy - 1, wz) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx, by, bz, bx + 100, by, bz, bx + 100, by, bz + 100, bx, by, bz + 100, 2, col);
+                        }
+                    }
+                    if wy == WORLD_L - 1 {
+                        check_and_queue_face(wx, wy, wz, bx + 100, by + 100, bz, bx, by + 100, bz, bx, by + 100, bz + 100, bx + 100, by + 100, bz + 100, 2, col);
+                    } else {
+                        if get_block(wx, wy + 1, wz) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx + 100, by + 100, bz, bx, by + 100, bz, bx, by + 100, bz + 100, bx + 100, by + 100, bz + 100, 2, col);
+                        }
+                    }
+                    
+                    # 4. East/West faces (x and x + 100)
+                    if wx == 0 {
+                        check_and_queue_face(wx, wy, wz, bx, by + 100, bz, bx, by, bz, bx, by, bz + 100, bx, by + 100, bz + 100, 3, col);
+                    } else {
+                        if get_block(wx - 1, wy, wz) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx, by + 100, bz, bx, by, bz, bx, by, bz + 100, bx, by + 100, bz + 100, 3, col);
+                        }
+                    }
+                    if wx == WORLD_W - 1 {
+                        check_and_queue_face(wx, wy, wz, bx + 100, by, bz, bx + 100, by + 100, bz, bx + 100, by + 100, bz + 100, bx + 100, by, bz + 100, 3, col);
+                    } else {
+                        if get_block(wx + 1, wy, wz) == BLOCK_AIR {
+                            check_and_queue_face(wx, wy, wz, bx + 100, by, bz, bx + 100, by + 100, bz, bx + 100, by + 100, bz + 100, bx + 100, by, bz + 100, 3, col);
+                        }
+                    }
+                }
+                wz = wz + 1;
+            }
+            wy = wy + 1;
+        }
+        wx = wx + 1;
+    }
+    
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Draw all visible sorted faces on DC
+# ---------------------------------------------------------------------
+func draw_world_scene(hdc: i64) -> i64 {
+    # 1. Fill sky background based on time of day
+    time = load64(g_day_time);
+    # Sky color interpolation (peak 10000, cycle 20000)
+    if time < 10000 {
+        r_sky = 10 + (time * 110) / 10000;
+        g_sky = 20 + (time * 180) / 10000;
+        b_sky = 40 + (time * 215) / 10000;
+    } else {
+        r_sky = 10 + ((20000 - time) * 110) / 10000;
+        g_sky = 20 + ((20000 - time) * 180) / 10000;
+        b_sky = 40 + ((20000 - time) * 215) / 10000;
+    }
+    sky_color = r_sky + shl(g_sky, 8) + shl(b_sky, 16);
+    hSkyBrush = CreateSolidBrush(sky_color);
+    
+    # Viewport rect
+    store32(g_poly_points, 0);
+    store32(g_poly_points + 4, 0);
+    store32(g_poly_points + 8, VIEW_WIDTH);
+    store32(g_poly_points + 12, VIEW_HEIGHT);
+    FillRect(hdc, g_poly_points, hSkyBrush);
+    DeleteObject(hSkyBrush);
+    
+    # 2. Collect and Sort faces
+    collect_world_faces();
+    sort_faces();
+    
+    # 3. Render sorted faces
+    count = load64(g_face_count);
+    face_idx = 0;
+    while face_idx < count {
+        offset = face_idx * 80;
+        color = load64(g_face_queue + offset + 8);
+        
+        # Create solid color brush and pen for the face
+        hBrush = CreateSolidBrush(color);
+        # Pen matching block color for seamless rendering
+        hPen = CreatePen(0, 1, color);
+        oldPen = SelectObject(hdc, hPen);
+        oldBrush = SelectObject(hdc, hBrush);
+        
+        # Setup 4 polygon point structures (each point has x and y i32 coords)
+        # Windows POINT structure is: {LONG x, LONG y} (4 bytes x, 4 bytes y = 8 bytes total)
+        # So 4 points take 32 bytes.
+        i = 0;
+        while i < 4 {
+            px = load64(g_face_queue + offset + 16 + i * 8);
+            py = load64(g_face_queue + offset + 48 + i * 8);
+            store32(g_poly_points + i * 8 + 0, px);
+            store32(g_poly_points + i * 8 + 4, py);
+            i = i + 1;
+        }
+        
+        # Draw the solid face
+        Polygon(hdc, g_poly_points, 4);
+        
+        # Cleanup GDI handles
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(hPen);
+        DeleteObject(hBrush);
+        
+        face_idx = face_idx + 1;
+    }
+    
+    # 4. Draw Crosshair in screen center
+    hCrossPen = CreatePen(0, 2, 0x00FFFFFF); # White crosshair
+    oldPen = SelectObject(hdc, hCrossPen);
+    cx = VIEW_WIDTH / 2;
+    cy = VIEW_HEIGHT / 2;
+    MoveToEx(hdc, cx - 10, cy, 0); LineTo(hdc, cx + 10, cy);
+    MoveToEx(hdc, cx, cy - 10, 0); LineTo(hdc, cx, cy + 10);
+    SelectObject(hdc, oldPen);
+    DeleteObject(hCrossPen);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Project a player model vertex in camera space
+# ---------------------------------------------------------------------
+func project_player_vertex(lx: i64, ly: i64, lz: i64, out_x_ptr: i64, out_y_ptr: i64) -> i64 {
+    rx = lx;
+    ry = ly;
+    rz = lz - 75; # relative to eye height (75)
+    
+    pitch = load64(g_player_pitch);
+    pitch_idx = band(pitch, 1023);
+    cosP = load64(g_cos + pitch_idx * 8);
+    sinP = load64(g_sin + pitch_idx * 8);
+    
+    rx2 = rx;
+    ry2 = (ry * cosP - rz * sinP) / 65536;
+    rz2 = (ry * sinP + rz * cosP) / 65536;
+    
+    # 3rd person offset in camera space
+    tp = load64(g_third_person);
+    if tp == 1 {
+        ry_cam = ry2 + 200;
+        rz_cam = rz2 - 50;
+    }
+    if tp == 2 {
+        rx2 = 0 - rx2;
+        ry_cam = 200 - ry2;
+        rz_cam = rz2 - 50;
+    }
+    
+    if ry_cam <= 5 { return 0; }
+    
+    cx = VIEW_WIDTH / 2;
+    cy = VIEW_HEIGHT / 2;
+    
+    px = cx + (rx2 * ZOOM_FACTOR) / ry_cam;
+    py = cy - (rz2 * ZOOM_FACTOR) / ry_cam;
+    
+    store64(out_x_ptr, px);
+    store64(out_y_ptr, py);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Queues a single face of the player model
+# ---------------------------------------------------------------------
+func queue_player_face(
+    v0x: i64, v0y: i64, v0z: i64,
+    v1x: i64, v1y: i64, v1z: i64,
+    v2x: i64, v2y: i64, v2z: i64,
+    v3x: i64, v3y: i64, v3z: i64,
+    face_type: i64, base_color: i64
+) -> i64 {
+    if project_player_vertex(v0x, v0y, v0z, g_proj_x + 0, g_proj_y + 0) == 0 { return 0; }
+    if project_player_vertex(v1x, v1y, v1z, g_proj_x + 8, g_proj_y + 8) == 0 { return 0; }
+    if project_player_vertex(v2x, v2y, v2z, g_proj_x + 16, g_proj_y + 16) == 0 { return 0; }
+    if project_player_vertex(v3x, v3y, v3z, g_proj_x + 24, g_proj_y + 24) == 0 { return 0; }
+    
+    mx = (v0x + v2x) / 2;
+    my = (v0y + v2y) / 2;
+    mz = (v0z + v2z) / 2;
+    
+    rx = mx;
+    ry = my;
+    rz = mz - 75;
+    
+    pitch = load64(g_player_pitch);
+    pitch_idx = band(pitch, 1023);
+    cosP = load64(g_cos + pitch_idx * 8);
+    sinP = load64(g_sin + pitch_idx * 8);
+    
+    ry2 = (ry * cosP - rz * sinP) / 65536;
+    rz2 = (ry * sinP + rz * cosP) / 65536;
+    
+    tp = load64(g_third_person);
+    if tp == 1 {
+        ry_cam = ry2 + 200;
+        rz_cam = rz2 - 50;
+    }
+    if tp == 2 {
+        rx = 0 - rx;
+        ry_cam = 200 - ry2;
+        rz_cam = rz2 - 50;
+    }
+    
+    depth = rx * rx + ry_cam * ry_cam + rz_cam * rz_cam;
+    
+    color = get_shaded_color(base_color, face_type);
+    queue_face(depth, color);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Queues a 3D box of the player model
+# ---------------------------------------------------------------------
+func queue_player_box(x1: i64, x2: i64, y1: i64, y2: i64, z1: i64, z2: i64, color: i64) -> i64 {
+    queue_player_face(x1, y1, z2,  x2, y1, z2,  x2, y2, z2,  x1, y2, z2, 0, color); # Top
+    queue_player_face(x1, y2, z1,  x2, y2, z1,  x2, y1, z1,  x1, y1, z1, 1, color); # Bottom
+    queue_player_face(x1, y2, z1,  x1, y2, z2,  x2, y2, z2,  x2, y2, z1, 2, color); # Front
+    queue_player_face(x2, y1, z1,  x2, y1, z2,  x1, y1, z2,  x1, y1, z1, 2, color); # Back
+    queue_player_face(x1, y1, z1,  x1, y1, z2,  x1, y2, z2,  x1, y2, z1, 3, color); # Left
+    queue_player_face(x2, y2, z1,  x2, y2, z2,  x2, y1, z2,  x2, y1, z1, 3, color); # Right
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Rotates a 2D local coordinate (y, z) around a joint (jy, jz)
+# ---------------------------------------------------------------------
+func rotate_y_z(y: i64, z: i64, jy: i64, jz: i64, angle_idx: i64, out_y: i64, out_z: i64) -> i64 {
+    dy = y - jy;
+    dz = z - jz;
+    cosT = load64(g_cos + angle_idx * 8);
+    sinT = load64(g_sin + angle_idx * 8);
+    ry = (dy * cosT - dz * sinT) / 65536;
+    rz = (dy * sinT + dz * cosT) / 65536;
+    store64(out_y, jy + ry);
+    store64(out_z, jz + rz);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Queues a 3D box of the player model, rotated around a joint
+# ---------------------------------------------------------------------
+func queue_animated_player_box(x1: i64, x2: i64, y1: i64, y2: i64, z1: i64, z2: i64, jy: i64, jz: i64, angle_idx: i64, color: i64) -> i64 {
+    rotate_y_z(y1, z1, jy, jz, angle_idx, g_rot_y11, g_rot_z11);
+    rotate_y_z(y2, z1, jy, jz, angle_idx, g_rot_y21, g_rot_z21);
+    rotate_y_z(y1, z2, jy, jz, angle_idx, g_rot_y12, g_rot_z12);
+    rotate_y_z(y2, z2, jy, jz, angle_idx, g_rot_y22, g_rot_z22);
+    
+    y11 = load64(g_rot_y11); z11 = load64(g_rot_z11);
+    y21 = load64(g_rot_y21); z21 = load64(g_rot_z21);
+    y12 = load64(g_rot_y12); z12 = load64(g_rot_z12);
+    y22 = load64(g_rot_y22); z22 = load64(g_rot_z22);
+    
+    # 1. Top face
+    queue_player_face(x1, y12, z12,  x2, y12, z12,  x2, y22, z22,  x1, y22, z22, 0, color);
+    # 2. Bottom face
+    queue_player_face(x1, y21, z21,  x2, y21, z21,  x2, y11, z11,  x1, y11, z11, 1, color);
+    # 3. Front face
+    queue_player_face(x1, y21, z21,  x1, y22, z22,  x2, y22, z22,  x2, y21, z21, 2, color);
+    # 4. Back face
+    queue_player_face(x2, y11, z11,  x2, y12, z12,  x1, y12, z12,  x1, y11, z11, 2, color);
+    # 5. Left face
+    queue_player_face(x1, y11, z11,  x1, y12, z12,  x1, y22, z22,  x1, y21, z21, 3, color);
+    # 6. Right face
+    queue_player_face(x2, y21, z21,  x2, y22, z22,  x2, y12, z12,  x2, y11, z11, 3, color);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Queues all player character boxes (static + animated walking limbs)
+# ---------------------------------------------------------------------
+func queue_player_faces() -> i64 {
+    # Calculate swing angle based on global walk timer
+    # swing is in [-85, 85] index units (approx +- 30 degrees)
+    walk_t = load64(g_walk_time);
+    swing = (load64(g_sin + walk_t * 8) * 85) / 65536;
+    
+    swing_left_leg  = band(swing, 1023);
+    swing_right_leg = band(0 - swing, 1023);
+    swing_left_arm  = band(0 - swing, 1023);
+    swing_right_arm = band(swing, 1023);
+    
+    # 1. Legs (Animated - Swing around hip joint at Z=30)
+    queue_animated_player_box(0 - 12, 0 - 2, 0 - 6, 6, 0, 30, 0, 30, swing_left_leg,  0x00A02010); # Left Leg
+    queue_animated_player_box(2, 12, 0 - 6, 6, 0, 30, 0, 30, swing_right_leg, 0x00A02010);        # Right Leg
+    
+    # 2. Torso (Static)
+    queue_player_box(0 - 12, 12, 0 - 8, 8, 30, 70, 0x00FF6020); # Teal shirt
+    
+    # 3. Arms (Animated - Swing around shoulder joint at Z=70)
+    queue_animated_player_box(0 - 20, 0 - 12, 0 - 6, 6, 30, 70, 0, 70, swing_left_arm,  0x0020D0FF); # Left Arm
+    queue_animated_player_box(12, 20, 0 - 6, 6, 30, 70, 0, 70, swing_right_arm, 0x0020D0FF);        # Right Arm
+    
+    # 4. Head (Static)
+    queue_player_box(0 - 8, 8, 0 - 8, 8, 70, 88, 0x0020D0FF); # Skin Head
+    
+    return 0;
+}

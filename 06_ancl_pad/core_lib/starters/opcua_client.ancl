@@ -1,0 +1,195 @@
+# opcua_client.ancl - OPC UA TCP endpoint-discovery STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client: HELLO -> OpenSecureChannel(None) -> GetEndpoints, then
+# prints every endpoint URL the server advertises. Edit the CONFIG block, COMPILE, RUN,
+# then extend it (CreateSession/ActivateSession/Read/Write) - Ctrl+Space knows the idioms.
+# Loaded by Aether Studio for OPC-UA intent.
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" setsockopt;
+extern "kernel32.dll" Sleep;
+
+@DATA
+mInfo: str = "[opcua] OPC UA endpoint reader (ANCL starter)";
+# NOTE: mUrl must match CFG_IP/CFG_PORT below (it is sent in HELLO + GetEndpoints).
+mUrl:  str = "opc.tcp://127.0.0.1:4840";
+mPol:  str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+mErr:  str = "[opcua] connect failed - check IP / port / cable.";
+mNo:   str = "[opcua] protocol exchange failed.";
+mAck:  str = "[opcua] HELLO acknowledged.";
+mUaE:  str = "[opcua] server ERR, code = ";
+mChan: str = "[opcua] secure channel open, id = ";
+mEp:   str = "[opcua] ";
+mCnt:  str = "[opcua] uri/url strings found: ";
+nl:    str = "\r\n";
+# ==== CONFIG - edit these (and mUrl above to match) ====
+CFG_IP0:  i64 = 127;    # target IP, octet 1
+CFG_IP1:  i64 = 0;      #   octet 2
+CFG_IP2:  i64 = 0;      #   octet 3
+CFG_IP3:  i64 = 1;      #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 4840;   # OPC UA TCP port (standard 4840; note Windows opcualds may squat it)
+# =======================================================
+g_wsa: buf = 512;
+g_addr: buf = 16;
+g_tmo: buf = 8;
+g_req: buf = 256;
+g_buf: buf = 8192;
+g_drain: buf = 256;
+g_name: buf = 256;
+g_chan: buf = 8;
+g_tok: buf = 8;
+
+@CODE
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+func recv_msg(s: i64) -> i64 {
+    if recv_n(s, g_buf, 8) < 0 { return 0 - 1; }
+    sz = load8(g_buf+4) + load8(g_buf+5)*256 + load8(g_buf+6)*65536 + load8(g_buf+7)*16777216;
+    if sz < 8 { return 0 - 1; }
+    body = sz - 8;
+    keep = body;
+    if keep > 8100 { keep = 8100; }
+    if keep > 0 { if recv_n(s, g_buf + 8, keep) < 0 { return 0 - 1; } }
+    left = body - keep;
+    while left > 0 {
+        ch = left;
+        if ch > 256 { ch = 256; }
+        if recv_n(s, g_drain, ch) < 0 { return 0 - 1; }
+        left = left - ch;
+    }
+    return 8 + keep;
+}
+func ua_hello(s: i64) -> i64 {
+    ul = strlen(mUrl);
+    memset(g_req, 0, 64);
+    store8(g_req+0,72); store8(g_req+1,69); store8(g_req+2,76); store8(g_req+3,70);
+    store32(g_req+4, 32 + ul);
+    store32(g_req+12, 65536);
+    store32(g_req+16, 65536);
+    store32(g_req+28, ul);
+    memcpy(g_req+32, mUrl, ul);
+    if send(s, g_req, 32 + ul, 0) <= 0 { return 0; }
+    if recv_msg(s) < 0 { return 0; }
+    if load8(g_buf+0) == 69 { ec = load32(g_buf+8); syscall 1, mUaE, ec, nl; return 0; }
+    if load8(g_buf+0) != 65 { return 0; }
+    syscall 1, mAck, nl;
+    return 1;
+}
+func ua_open(s: i64) -> i64 {
+    pl = strlen(mPol);
+    memset(g_req, 0, 160);
+    store8(g_req+0,79); store8(g_req+1,80); store8(g_req+2,78); store8(g_req+3,70);
+    store32(g_req+4, 132);
+    store32(g_req+12, pl);
+    memcpy(g_req+16, mPol, pl);
+    store32(g_req+63, 0 - 1);
+    store32(g_req+67, 0 - 1);
+    store32(g_req+71, 1);
+    store32(g_req+75, 1);
+    store8(g_req+79, 1); store8(g_req+81, 0xBE); store8(g_req+82, 1);
+    store32(g_req+93, 1);
+    store32(g_req+101, 0 - 1);
+    store32(g_req+105, 15000);
+    store32(g_req+120, 1);
+    store32(g_req+124, 0 - 1);
+    store32(g_req+128, 3600000);
+    if send(s, g_req, 132, 0) <= 0 { return 0; }
+    fl = recv_msg(s);
+    if fl < 0 { return 0; }
+    if load8(g_buf+0) == 69 { ec = load32(g_buf+8); syscall 1, mUaE, ec, nl; return 0; }
+    if load8(g_buf+0) != 79 { return 0; }
+    ch = load32(g_buf+8);
+    store64(g_chan, ch);
+    store64(g_tok, 0);
+    i = fl - 8;
+    while i >= 12 {
+        if load32(g_buf+i) == ch { store64(g_tok, load32(g_buf+i+4)); break; }
+        i = i - 1;
+    }
+    syscall 1, mChan, ch, nl;
+    return 1;
+}
+func ua_geteps(s: i64) -> i64 {
+    ul = strlen(mUrl);
+    memset(g_req, 0, 160);
+    store8(g_req+0,77); store8(g_req+1,83); store8(g_req+2,71); store8(g_req+3,70);
+    store32(g_req+4, 69 + ul);
+    store32(g_req+8, load64(g_chan));
+    store32(g_req+12, load64(g_tok));
+    store32(g_req+16, 2);
+    store32(g_req+20, 2);
+    store8(g_req+24, 1); store8(g_req+26, 0xAC); store8(g_req+27, 1);
+    store32(g_req+38, 2);
+    store32(g_req+46, 0 - 1);
+    store32(g_req+50, 15000);
+    store32(g_req+57, ul);
+    memcpy(g_req+61, mUrl, ul);
+    store32(g_req+61+ul, 0 - 1);
+    store32(g_req+65+ul, 0 - 1);
+    if send(s, g_req, 69 + ul, 0) <= 0 { return 0 - 1; }
+    fl = recv_msg(s);
+    if fl < 0 { return 0 - 1; }
+    if load8(g_buf+0) == 69 { ec = load32(g_buf+8); syscall 1, mUaE, ec, nl; return 0 - 1; }
+    return fl;
+}
+func has_sep(p: i64, n: i64) -> i64 {
+    i = 0;
+    while i + 2 < n {
+        if load8(p+i) == 58 { if load8(p+i+1) == 47 { if load8(p+i+2) == 47 { return 1; } } }
+        i = i + 1;
+    }
+    if n > 4 {
+        if load8(p) == 117 { if load8(p+1) == 114 { if load8(p+2) == 110 { if load8(p+3) == 58 { return 1; } } } }
+    }
+    return 0;
+}
+func scan_eps(fl: i64) -> i64 {
+    cnt = 0; i = 8;
+    while i + 4 < fl {
+        ln = load32(g_buf + i);
+        if ln >= 8 { if ln < 250 { if i + 4 + ln <= fl {
+            ok = 1; k = 0;
+            while k < ln {
+                c = load8(g_buf + i + 4 + k);
+                if c < 32 { ok = 0; break; }
+                if c > 126 { ok = 0; break; }
+                k = k + 1;
+            }
+            if ok == 1 { if has_sep(g_buf + i + 4, ln) == 1 {
+                memcpy(g_name, g_buf + i + 4, ln);
+                store8(g_name + ln, 0);
+                syscall 1, mEp; puts_cstr(g_name); syscall 1, nl;
+                cnt = cnt + 1;
+                i = i + 4 + ln;
+                continue;
+            } }
+        } } }
+        i = i + 1;
+    }
+    return cnt;
+}
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, htons(CFG_PORT));
+    store32(g_addr + 4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24));
+    store64(g_addr + 8, 0);
+    if connect(s, g_addr, 16) != 0 { syscall 1, mErr, nl; closesocket(s); return 1; }
+    store32(g_tmo, 3000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);
+    if ua_hello(s) == 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    if ua_open(s) == 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    fl = ua_geteps(s);
+    if fl <= 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    n = scan_eps(fl);
+    syscall 1, mCnt, n, nl;
+    closesocket(s);
+    return 0;
+}

@@ -1,0 +1,313 @@
+# =====================================================================
+#  modbus_sim_gui.ancl  -  Graphical Modbus TCP Simulator
+#
+#  A native Win32 GUI application (no runtime, no framework) that:
+#   * Opens a real window with child controls (labels, edit box, buttons).
+#   * Holds a table of 10 Modbus Holding Registers (40001-40010).
+#   * Lets the user TYPE a TCP port and START / STOP the server live.
+#   * Runs a non-blocking Winsock TCP server (Modbus/TCP, Function 03).
+#   * Updates the on-screen values live (network drift + Randomize button).
+#
+#  Compiled by anclc straight to a native PE32+ binary importing only
+#  kernel32.dll, Ws2_32.dll and user32.dll.
+# =====================================================================
+
+@DATA
+clsname:  str = "ANCLMODBUSWND";
+title:    str = "ANCL Modbus TCP Simulator";
+cls_stat: str = "STATIC";
+cls_btn:  str = "BUTTON";
+cls_edit: str = "EDIT";
+
+txt_hdr:  str = "ANCL Modbus/TCP Holding-Register Simulator";
+txt_r1:   str = "Holding Register 40001 (Flow rate) :";
+txt_r2:   str = "Holding Register 40002 (Temp degC) :";
+txt_btn:  str = "Randomize Values";
+txt_start:str = "Start Server";
+txt_stop: str = "Stop Server";
+txt_port: str = "TCP Port:";
+txt_dport:str = "502";
+txt_dash: str = "----";
+
+st_stop:  str = "Status: STOPPED   (type a port, then press Start Server)";
+st_run:   str = "Status: LISTENING on TCP port ";
+st_err:   str = "Status: ERROR - could not bind TCP port ";
+
+# ---- writable globals / Win32 structures (raw byte buffers) ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_lbl1:     buf = 8;     # HWND of 40001 value label
+g_lbl2:     buf = 8;     # HWND of 40002 value label
+g_hedit:    buf = 8;     # HWND of the port edit box
+g_hstatus:  buf = 8;     # HWND of the status label
+g_running:  buf = 8;     # 0 = stopped, 1 = listening
+g_port:     buf = 8;     # active port number
+g_listen:   buf = 8;     # listening socket
+g_client:   buf = 8;     # current client socket (-1 = none)
+g_one:      buf = 8;     # u_long = 1 for ioctlsocket(FIONBIO)
+g_regs:     buf = 32;    # 10 holding registers (16-bit each)
+g_wndclass: buf = 96;    # WNDCLASSEXA
+g_msg:      buf = 64;    # MSG
+g_wsadata:  buf = 512;   # WSADATA
+g_sockaddr: buf = 16;    # sockaddr_in
+g_recvbuf:  buf = 512;   # inbound Modbus request
+g_sendbuf:  buf = 512;   # outbound Modbus response
+g_strbuf1:  buf = 32;    # formatted 40001 value
+g_strbuf2:  buf = 32;    # formatted 40002 value
+g_portbuf:  buf = 32;    # raw text typed in the port box
+g_statusbuf:buf = 128;   # composed status line
+
+@CODE
+
+# ---- format and push both register values to their labels ----
+func update_labels() -> i64 {
+    v1 = load16(g_regs + 0);
+    int_to_str(g_strbuf1, v1);
+    SetWindowTextA(load64(g_lbl1), g_strbuf1);
+    v2 = load16(g_regs + 2);
+    int_to_str(g_strbuf2, v2);
+    SetWindowTextA(load64(g_lbl2), g_strbuf2);
+    return 0;
+}
+
+# ---- status helpers (compose "<prefix><port>") ----
+func set_status_run(port: i64) -> i64 {
+    e = str_copy(g_statusbuf, st_run);
+    int_to_str(e, port);
+    SetWindowTextA(load64(g_hstatus), g_statusbuf);
+    return 0;
+}
+func set_status_err(port: i64) -> i64 {
+    e = str_copy(g_statusbuf, st_err);
+    int_to_str(e, port);
+    SetWindowTextA(load64(g_hstatus), g_statusbuf);
+    return 0;
+}
+
+# ---- create all child controls on WM_CREATE ----
+func create_controls(hwnd: i64) -> i64 {
+    hinst = load64(g_hinst);
+    # header
+    a = CreateWindowExA(0, cls_stat, txt_hdr, 1342177280, 20, 12, 500, 20, hwnd, 0, hinst, 0);
+    # register 40001
+    a = CreateWindowExA(0, cls_stat, txt_r1, 1342177280, 20, 46, 300, 20, hwnd, 0, hinst, 0);
+    v1 = CreateWindowExA(0, cls_stat, txt_dash, 1342177280, 340, 46, 150, 20, hwnd, 0, hinst, 0);
+    store64(g_lbl1, v1);
+    # register 40002
+    a = CreateWindowExA(0, cls_stat, txt_r2, 1342177280, 20, 72, 300, 20, hwnd, 0, hinst, 0);
+    v2 = CreateWindowExA(0, cls_stat, txt_dash, 1342177280, 340, 72, 150, 20, hwnd, 0, hinst, 0);
+    store64(g_lbl2, v2);
+    # control row : "TCP Port:" label + editable port box
+    a = CreateWindowExA(0, cls_stat, txt_port, 1342177280, 20, 110, 60, 20, hwnd, 0, hinst, 0);
+    # EDIT: WS_CHILD|WS_VISIBLE|WS_BORDER = 0x50800000 = 1350565888
+    ed = CreateWindowExA(0, cls_edit, txt_dport, 1350565888, 85, 108, 70, 24, hwnd, 1010, hinst, 0);
+    store64(g_hedit, ed);
+    # Start / Stop / Randomize buttons
+    bs = CreateWindowExA(0, cls_btn, txt_start, 1342177280, 165, 107, 95, 26, hwnd, 1002, hinst, 0);
+    bt = CreateWindowExA(0, cls_btn, txt_stop,  1342177280, 265, 107, 90, 26, hwnd, 1003, hinst, 0);
+    br = CreateWindowExA(0, cls_btn, txt_btn,   1342177280, 360, 107, 140, 26, hwnd, 1001, hinst, 0);
+    # status line
+    hs = CreateWindowExA(0, cls_stat, st_stop, 1342177280, 20, 148, 480, 20, hwnd, 0, hinst, 0);
+    store64(g_hstatus, hs);
+    update_labels();
+    return 0;
+}
+
+# ---- randomize register values (Randomize button) ----
+func randomize() -> i64 {
+    t = GetTickCount();
+    r1 = band(t, 1023);
+    r1 = r1 + 1000;
+    store16(g_regs + 0, r1);
+    r2 = band(shr(t, 5), 255);
+    store16(g_regs + 2, r2);
+    update_labels();
+    return 0;
+}
+
+# ---- start the TCP server on the port typed in the edit box ----
+func start_server() -> i64 {
+    run = load64(g_running);
+    if run > 0 { return 0; }                       # already running
+    GetWindowTextA(load64(g_hedit), g_portbuf, 32);
+    port = str_to_int(g_portbuf);
+    if port < 1 { port = 502; }
+    if port > 65535 { port = 502; }
+    store64(g_port, port);
+    s = socket(2, 1, 6);                           # AF_INET, SOCK_STREAM, TCP
+    store64(g_listen, s);
+    store16(g_sockaddr + 0, 2);                    # AF_INET
+    pp = htons(port);
+    store16(g_sockaddr + 2, pp);
+    store32(g_sockaddr + 4, 0);                    # INADDR_ANY
+    store64(g_sockaddr + 8, 0);
+    rb = bind(s, g_sockaddr, 16);
+    if rb == 0 - 1 {                               # bind failed (port busy)
+        closesocket(s);
+        store64(g_listen, 0 - 1);
+        set_status_err(port);
+        return 0;
+    }
+    listen(s, 8);
+    store32(g_one, 1);
+    ioctlsocket(s, 2147772030, g_one);             # FIONBIO -> non-blocking
+    store64(g_client, 0 - 1);
+    store64(g_running, 1);
+    set_status_run(port);
+    return 0;
+}
+
+# ---- stop the TCP server, close sockets ----
+func stop_server() -> i64 {
+    run = load64(g_running);
+    if run == 0 { return 0; }
+    c = load64(g_client);
+    if c == 0 - 1 { } else { closesocket(c); }
+    store64(g_client, 0 - 1);
+    ls = load64(g_listen);
+    closesocket(ls);
+    store64(g_listen, 0 - 1);
+    store64(g_running, 0);
+    SetWindowTextA(load64(g_hstatus), st_stop);
+    return 0;
+}
+
+# ---- Modbus/TCP request handler (Function Code 03) ----
+func handle_modbus(c: i64, n: i64) -> i64 {
+    if n < 12 { return 0; }
+    fc = load8(g_recvbuf + 7);
+    if fc == 3 {
+        start = load8(g_recvbuf + 8);
+        start = shl(start, 8);
+        start = start + load8(g_recvbuf + 9);
+        qty = load8(g_recvbuf + 10);
+        qty = shl(qty, 8);
+        qty = qty + load8(g_recvbuf + 11);
+        if qty > 10 { qty = 10; }
+        store8(g_sendbuf + 0, load8(g_recvbuf + 0));
+        store8(g_sendbuf + 1, load8(g_recvbuf + 1));
+        store8(g_sendbuf + 2, 0);
+        store8(g_sendbuf + 3, 0);
+        len = qty + qty;
+        len = len + 3;
+        store8(g_sendbuf + 4, shr(len, 8));
+        store8(g_sendbuf + 5, band(len, 255));
+        store8(g_sendbuf + 6, load8(g_recvbuf + 6));
+        store8(g_sendbuf + 7, 3);
+        bc = qty + qty;
+        store8(g_sendbuf + 8, bc);
+        i = 0;
+        loop qty - i {
+            idx = start + i;
+            boff = idx + idx;
+            val = load16(g_regs + boff);
+            soff = i + i;
+            base = g_sendbuf + 9;
+            base = base + soff;
+            store8(base, shr(val, 8));
+            store8(base + 1, band(val, 255));
+            i = i + 1;
+        }
+        total = bc + 9;
+        send(c, g_sendbuf, total, 0);
+        d = load16(g_regs + 0);
+        d = d + 1;
+        store16(g_regs + 0, d);
+        update_labels();
+    }
+    return 0;
+}
+
+# ---- non-blocking network poll (driven by WM_TIMER) ----
+func poll_net() -> i64 {
+    run = load64(g_running);
+    if run == 0 { return 0; }                      # server stopped -> nothing to do
+    c = load64(g_client);
+    if c == 0 - 1 {
+        ls = load64(g_listen);
+        c = accept(ls, 0, 0);
+        store64(g_client, c);
+    }
+    c = load64(g_client);
+    if c == 0 - 1 { return 0; }
+    n = recv(c, g_recvbuf, 512, 0);
+    if n == 0 - 1 { return 0; }                    # WSAEWOULDBLOCK / no data
+    if n == 0 {                                    # peer closed
+        closesocket(c);
+        store64(g_client, 0 - 1);
+        return 0;
+    }
+    handle_modbus(c, n);
+    return 0;
+}
+
+# ---- the window procedure (called by the OS) ----
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { create_controls(hwnd); return 0; }       # WM_CREATE
+    if msg == 273 {                                        # WM_COMMAND
+        id = band(wParam, 65535);
+        if id == 1001 { randomize(); }
+        if id == 1002 { start_server(); }
+        if id == 1003 { stop_server(); }
+        return 0;
+    }
+    if msg == 275 { poll_net(); return 0; }                # WM_TIMER
+    if msg == 2 {                                          # WM_DESTROY
+        stop_server();
+        PostQuitMessage(0);
+        return 0;
+    }
+    r = DefWindowProcA(hwnd, msg, wParam, lParam);
+    return r;
+}
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);                # IDC_ARROW
+    w = WSAStartup(514, g_wsadata);                # MAKEWORD(2,2), once
+
+    store64(g_running, 0);
+    store64(g_listen, 0 - 1);
+    store64(g_client, 0 - 1);
+
+    store16(g_regs + 0,  1250);                    # 40001 flow
+    store16(g_regs + 2,  85);                      # 40002 temp
+    store16(g_regs + 4,  320);                     # 40003
+    store16(g_regs + 6,  47);                      # 40004
+    store16(g_regs + 8,  1013);                    # 40005
+    store16(g_regs + 10, 60);                      # 40006
+    store16(g_regs + 12, 12);                      # 40007
+    store16(g_regs + 14, 990);                     # 40008
+    store16(g_regs + 16, 5);                       # 40009
+    store16(g_regs + 18, 7);                       # 40010
+
+    store32(g_wndclass + 0,  80);                  # cbSize
+    store32(g_wndclass + 4,  3);                   # CS_HREDRAW|CS_VREDRAW
+    store64(g_wndclass + 8,  &WndProc);            # lpfnWndProc
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, 6);                   # COLOR_WINDOW+1
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    atom = RegisterClassExA(g_wndclass);
+
+    # WS_OVERLAPPEDWINDOW|WS_VISIBLE = 0x10CF0000 = 282001408
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 120, 120, 540, 230, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, 1, 100, 0);                     # 100 ms poll tick
+
+    loop 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }                    # WM_QUIT
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

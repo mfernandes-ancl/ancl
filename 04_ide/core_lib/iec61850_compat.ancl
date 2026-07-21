@@ -1,0 +1,211 @@
+# =====================================================================
+#  core_lib/iec61850_compat.ancl
+#  libiec61850 CLIENT-API compatibility shim over the pure-ANCL MMS client
+#  (core_lib/iec61850.ancl).  Lets code written against libiec61850's
+#  IedConnection_* / MmsValue_* / ControlObjectClient_* / LinkedList_* run
+#  zero-dep (no iec61850.dll), UNCHANGED.
+#
+#  The returned MmsValue mimics libiec61850's memory layout so the caller's
+#  own decode (MmsValue_getType == the libiec61850 type ENUM, value at
+#  val+offset with offset from a MmsValue_newBoolean alignment probe) works
+#  as-is.  offset resolves to 8 here (bool byte @8; float size@8/width@9/f32
+#  bits@10; int/utc @16; string ptr @24).
+#
+#  Type enums (libiec61850 MmsType): 2 BOOLEAN 3 BIT_STRING 4 INTEGER
+#  5 UNSIGNED 6 FLOAT 8 VISIBLE_STRING 14 UTC_TIME 15 DATA_ACCESS_ERROR.
+#
+#  Covers the read/discovery/direct-control subset the showcase testers use.
+#  100% CRT-free, zero-dep.
+# =====================================================================
+import "iec61850.ancl";     # i61850_connect / read_scalar / operate_bool / get_devices/variables / split_objref / g_res_*
+
+@DATA
+cmp_o0: buf = 8;
+cmp_o1: buf = 8;
+cmp_o2: buf = 8;
+cmp_o3: buf = 8;
+cmp_conn:  buf = 8;         # the "IedConnection" object = a socket holder
+cmp_dom:   buf = 256;       # domain copied out of split_objref's g_dom
+cmp_item:  buf = 256;       # built "LN$FC$DO$DA" MMS item
+cmp_val:   buf = 256;       # fake MmsValue (libiec61850 layout, offset 8)
+cmp_str:   buf = 512;       # backing store for MmsValue_toString
+cmp_list:  buf = 16384;     # fake LinkedList nodes (16 bytes: next@0, data@8)
+cmp_lhdr:  buf = 8;         # list header node (next -> first)
+cmp_ldnm:  buf = 4096;      # copy of the LD name list (survives get_variables reusing g_nl_buf)
+cmp_ldls:  buf = 512;       # LD list nodes
+cmp_ldhdr: buf = 8;
+cmp_ctl:   buf = 16;        # ControlObjectClient: socket@0, objref-ptr@8
+cmp_ctlref: buf = 256;
+
+cmpfc_mx: str = "MX";
+cmpfc_st: str = "ST";
+cmpfc_co: str = "CO";
+cmpfc_dc: str = "DC";
+cmpfc_cf: str = "CF";
+
+@CODE
+# ---- ip "a.b.c.d" -> 4 octets ----
+func cmp_parse_ip(ip: i64) -> i64 {
+    o = 0; k = 0; p = ip;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 { if k < 4 { store64(cmp_o0 + k * 8, o); k = k + 1; } o = 0; }
+        else { if c >= 48 { if c <= 57 { o = o * 10 + (c - 48); } } }
+        p = p + 1;
+    }
+    if k < 4 { store64(cmp_o0 + k * 8, o); }
+    return 0;
+}
+
+# build "LN$FC$DO$DA" from an ACSI ref "LN.DO.DA" + FC string (drops the leading LN before the first '.')
+func cmp_build_item(acsi: i64, fc: i64, out: i64) -> i64 {
+    s = acsi; d = out;
+    while load8(s) != 0 { if load8(s) == 46 { break; } store8(d, load8(s)); s = s + 1; d = d + 1; }
+    store8(d, 36); d = d + 1;                      # '$'
+    d = str_copy(d, fc);
+    store8(d, 36); d = d + 1;                      # '$'
+    if load8(s) == 46 { s = s + 1; }
+    while load8(s) != 0 { c = load8(s); if c == 46 { store8(d, 36); } else { store8(d, c); } s = s + 1; d = d + 1; }
+    store8(d, 0);
+    return 0;
+}
+
+# ---- IedConnection ----
+func IedConnection_create() -> i64 { store64(cmp_conn, 0); return cmp_conn; }
+
+func IedConnection_connect(conn: i64, err: i64, ip: i64, port: i64) -> i64 {
+    cmp_parse_ip(ip);
+    s = i61850_connect(load64(cmp_o0), load64(cmp_o1), load64(cmp_o2), load64(cmp_o3), port, 0, 0);
+    if s == 0 { store32(err, 1); return 0; }
+    if s == 0 - 1 { store32(err, 1); return 0; }
+    store64(conn, s);
+    store32(err, 0);
+    return s;
+}
+func IedConnection_close(conn: i64) -> i64 {
+    if conn != 0 { s = load64(conn); if s != 0 { if s != 0 - 1 { closesocket(s); } } store64(conn, 0); }
+    return 0;
+}
+func IedConnection_destroy(conn: i64) -> i64 { if conn != 0 { store64(conn, 0); } return 0; }
+
+func IedConnection_getLogicalDeviceList(conn: i64, err: i64) -> i64 {
+    if conn == 0 { store32(err, 1); return 0; }
+    s = load64(conn);
+    n = i61850_get_devices(s);
+    if n == 0 { store32(err, 1); return 0; }
+    store32(err, 0);
+    # copy the packed names (get_variables later reuses g_nl_buf) into cmp_ldnm
+    nl = load64(g_nl_end); if nl > 4096 { nl = 4096; }
+    i = 0; while i < nl { store8(cmp_ldnm + i, load8(g_nl_buf + i)); i = i + 1; }
+    i = 0;
+    while i < n {
+        node = cmp_ldls + i * 16;
+        nx = 0; if i < n - 1 { nx = cmp_ldls + (i + 1) * 16; }
+        store64(node + 0, nx);
+        store64(node + 8, cmp_ldnm + (i61850_name_at(i) - g_nl_buf));
+        i = i + 1;
+    }
+    store64(cmp_ldhdr, cmp_ldls);
+    return cmp_ldhdr;
+}
+
+func IedConnection_getLogicalDeviceVariables(conn: i64, err: i64, ld: i64) -> i64 {
+    if conn == 0 { store32(err, 1); return 0; }
+    s = load64(conn);
+    n = i61850_get_variables(s, ld);
+    if n == 0 { store32(err, 1); return 0; }
+    store32(err, 0);
+    i = 0;
+    while i < n {
+        node = cmp_list + i * 16;
+        nx = 0; if i < n - 1 { nx = cmp_list + (i + 1) * 16; }
+        store64(node + 0, nx);
+        store64(node + 8, i61850_name_at(i));      # points into g_nl_buf (consumed before next call)
+        i = i + 1;
+    }
+    store64(cmp_lhdr, cmp_list);
+    return cmp_lhdr;
+}
+
+# pack the pure-ANCL lib's g_res_* into a libiec61850-layout MmsValue at cmp_val
+func cmp_pack() -> i64 {
+    memset(cmp_val, 0, 256);
+    t = load64(g_res_type);                        # BER tag from the lib
+    if t == 0x83 { store32(cmp_val + 0, 2); if load64(g_res_int) != 0 { store8(cmp_val + 8, 1); } return 0; }   # BOOLEAN
+    if t == 0x85 { store32(cmp_val + 0, 4); store64(cmp_val + 16, load64(g_res_int)); return 0; }               # INTEGER
+    if t == 0x86 { store32(cmp_val + 0, 5); store64(cmp_val + 16, load64(g_res_int)); return 0; }               # UNSIGNED
+    if t == 0x87 {                                                                                              # FLOAT
+        store32(cmp_val + 0, 6);
+        store8(cmp_val + 8, 4);                     # size
+        store8(cmp_val + 9, load64(g_res_fwidth));  # width 32/64
+        store64(cmp_val + 10, load64(g_res_fbits)); # f32 -> low 4 bytes (load32 @+10); f64 -> load64 @+10
+        return 0;
+    }
+    if t == 0x8A { store32(cmp_val + 0, 8); str_copy(cmp_str, g_res_str); store64(cmp_val + 24, cmp_str); return 0; }  # VISIBLE_STRING
+    if t == 0x90 { store32(cmp_val + 0, 8); str_copy(cmp_str, g_res_str); store64(cmp_val + 24, cmp_str); return 0; }
+    if t == 0x84 { store32(cmp_val + 0, 3); store64(cmp_val + 16, load64(g_res_qual)); return 0; }              # BIT_STRING (quality)
+    store32(cmp_val + 0, 15); store64(cmp_val + 16, load64(g_res_err));                                         # DATA_ACCESS_ERROR
+    return 0;
+}
+
+func IedConnection_readObject(conn: i64, err: i64, objref: i64, fc_val: i64) -> i64 {
+    if conn == 0 { store32(err, 1); return 0; }
+    s = load64(conn);
+    rest = split_objref(objref);                   # sets g_dom
+    if rest == 0 { store32(err, 1); return 0; }
+    str_copy(cmp_dom, g_dom);
+    fc = cmpfc_mx;
+    if fc_val == 0 { fc = cmpfc_st; }
+    if fc_val == 1 { fc = cmpfc_mx; }
+    if fc_val == 12 { fc = cmpfc_co; }
+    if fc_val == 5 { fc = cmpfc_dc; }
+    if fc_val == 4 { fc = cmpfc_cf; }
+    cmp_build_item(rest, fc, cmp_item);
+    r = i61850_read_scalar(s, cmp_dom, cmp_item);
+    if r == 0 { store32(err, 1); return 0; }
+    store32(err, 0);
+    cmp_pack();
+    return cmp_val;
+}
+
+# ---- LinkedList ----
+func LinkedList_getNext(el: i64) -> i64 { if el == 0 { return 0; } return load64(el + 0); }
+func LinkedList_getData(el: i64) -> i64 { if el == 0 { return 0; } return load64(el + 8); }
+func LinkedList_destroy(list: i64) -> i64 { return 0; }
+
+# ---- MmsValue (libiec61850-compatible view) ----
+func MmsValue_getType(v: i64) -> i32 { if v == 0 { return 0; } return load32(v + 0); }
+func MmsValue_toInt64(v: i64) -> i64 { if v == 0 { return 0; } return load64(v + 16); }
+func MmsValue_toString(v: i64) -> i64 { if v == 0 { return 0; } return load64(v + 24); }
+func MmsValue_getUtcTimeInMs(v: i64) -> i64 { if v == 0 { return 0; } return load64(v + 16) * 1000; }
+func MmsValue_getBoolean(v: i64) -> i32 { if v == 0 { return 0; } return load8(v + 8); }
+func MmsValue_getBitStringAsInteger(v: i64) -> i32 { if v == 0 { return 0; } return load64(v + 16); }
+func MmsValue_newBoolean(b: i64) -> i64 { memset(cmp_val, 0, 256); store32(cmp_val + 0, 2); if b != 0 { store8(cmp_val + 8, 1); } return cmp_val; }
+func MmsValue_delete(v: i64) -> i64 { return 0; }
+
+# ---- ControlObjectClient (Direct-Operate) ----
+func ControlObjectClient_create(objref: i64, conn: i64) -> i64 {
+    store64(cmp_ctl + 0, load64(conn));
+    str_copy(cmp_ctlref, objref);
+    store64(cmp_ctl + 8, cmp_ctlref);
+    return cmp_ctl;
+}
+func ControlObjectClient_setOrigin(control: i64, id: i64, cat: i64) -> i64 { return 0; }
+func ControlObjectClient_operate(control: i64, ctlVal: i64, ctlNum: i64) -> i32 {
+    s = load64(control + 0);
+    objref = load64(control + 8);
+    b = load8(ctlVal + 8);                         # MmsValue_newBoolean stored the bool @8
+    m = i61850_ctl_model(s, objref);
+    return i61850_operate_bool(s, objref, b, m);
+}
+# SBO-enhanced select-with-value (boolean)
+func ControlObjectClient_selectWithValue(control: i64, ctlVal: i64) -> i32 {
+    s = load64(control + 0);
+    objref = load64(control + 8);
+    b = load8(ctlVal + 8);
+    return i61850_select_with_value_bool(s, objref, b);
+}
+func ControlObjectClient_destroy(control: i64) -> i64 { return 0; }
+
+# quality/bit-string size (fixed; callers only special-case size==2, else generic)
+func MmsValue_getBitStringSize(v: i64) -> i32 { return 13; }

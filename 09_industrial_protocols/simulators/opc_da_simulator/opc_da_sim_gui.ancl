@@ -1,0 +1,404 @@
+# =====================================================================
+#  opc_da_sim_gui.ancl  -  OPC DA COM Server  +  native Win32 control GUI
+#
+#  Same COM server as opc_da_com_server.ancl (registers an IClassFactory via
+#  CoRegisterClassObject; an OPC client tester CoCreateInstance's the CLSID and
+#  calls ReadTag), but instead of a blocking console data-pump it runs a real
+#  Win32 window so you can:
+#     * Start / Stop the auto data-pump (triangle-wave oscillation).
+#     * Type new values and push them into the live tags (manual override).
+#     * Watch the tags update live + see how many clients have connected.
+#
+#  The pump runs off a WM_TIMER tick; the COM server lives in the (MTA) COM
+#  runtime threads, so clients can connect while the GUI stays responsive.
+#  Win32 GUI calls are anclc built-ins; only COM + VirtualAlloc need externs.
+#
+#  Build: bin\anclc.exe showcase\opc_da_simulator\opc_da_sim_gui.ancl showcase\opc_da_simulator\opc_da_sim_gui.exe
+#  Run:   opc_da_sim_gui.exe   (a window opens; leave it running for clients)
+# =====================================================================
+
+@DATA
+# ---- COM GUIDs (filled at runtime) ----
+clsid:   buf = 16;   # {00112233-4455-6677-8899-AABBCCDDEEFF}
+iid_unk: buf = 16;   # IID_IUnknown
+iid_cf:  buf = 16;   # IID_IClassFactory
+
+# ---- COM vtables / objects ----
+cf_vt:   buf = 40;   # class-factory vtable [QI|AddRef|Release|CreateInstance|LockServer]
+cf_obj:  buf = 16;   # [vt_ptr:8][refcnt:8]
+srv_vt:  buf = 32;   # server-object vtable [QI|AddRef|Release|ReadTag]
+cookie:  buf = 8;    # CoRegisterClassObject cookie
+
+# ---- live tag data (read by the COM ReadTag, written by pump / manual set) ----
+#   +0  Substation_Status (i64)   +8 Frequency_Hz (f64 bits)   +16 Voltage_kV (f64 bits)
+tag_data: buf = 24;
+
+# ---- GUI handles / structures ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_wndclass: buf = 96;   # WNDCLASSEXA
+g_msg:      buf = 64;   # MSG
+g_lbl_st:   buf = 8;    # value labels
+g_lbl_fr:   buf = 8;
+g_lbl_vl:   buf = 8;
+g_lbl_cyc:  buf = 8;
+g_hstatus:  buf = 8;    # bottom status line
+g_ed_st:    buf = 8;    # edit boxes (manual entry)
+g_ed_fr:    buf = 8;
+g_ed_vl:    buf = 8;
+
+# ---- simulator state (globals so the timer keeps them across ticks) ----
+g_running: buf = 8;     # 1 = auto-pump on, 0 = paused
+g_counter: buf = 8;     # triangle-wave phase (0..200)
+g_cycle:   buf = 8;     # tick count (drives status rotation)
+g_st:      buf = 8;     # current status bitmask
+g_fi:      buf = 8;     # current frequency in CENTI-Hz (5000 = 50.00)
+g_vi:      buf = 8;     # current voltage in CENTI-kV  (22000 = 220.00)
+g_conns:   buf = 8;     # number of client CreateInstance calls
+
+# ---- scratch ----
+g_buf:       buf = 64;
+g_inbuf:     buf = 64;
+g_statusbuf: buf = 160;
+g_cyclebuf:  buf = 48;
+
+# ---- strings (ASCII only -- the ...A Win32 calls are ANSI) ----
+clsname:  str = "ANCLOPCDAWND";
+title:    str = "ANCL OPC DA Simulator - COM server + control panel";
+cls_stat: str = "STATIC";
+cls_btn:  str = "BUTTON";
+cls_edit: str = "EDIT";
+txt_hdr:  str = "OPC DA COM Server  -  CLSID {00112233-4455-6677-8899-AABBCCDDEEFF}";
+txt_sub:  str = "An OPC client tester can CoCreateInstance this CLSID and call ReadTag(0..2).";
+lbl_st:   str = "Substation_Status:";
+lbl_fr:   str = "Frequency_Hz (e.g. 50.00):";
+lbl_vl:   str = "Voltage_kV (e.g. 220.00):";
+txt_set:  str = "Set";
+txt_start:str = "Start Auto";
+txt_stop: str = "Stop Auto";
+dash:     str = "----";
+s_auto:   str = "Auto: ";
+s_run:    str = "RUNNING";
+s_stop:   str = "STOPPED";
+s_conns:  str = "      Clients connected: ";
+s_cyc:    str = "Cycle: ";
+
+# ---- externs (COM + memory; GUI calls are anclc built-ins) ----
+extern "ole32.dll" CoInitializeEx -> ptr;
+extern "ole32.dll" CoRegisterClassObject -> ptr;
+extern "ole32.dll" CoResumeClassObjects -> ptr;
+extern "kernel32.dll" VirtualAlloc -> ptr;
+
+@CODE
+# =====================================================================
+# COM: IClassFactory + server object  (unchanged logic; &fn vtable fix)
+# =====================================================================
+func compare_guid(a: ptr, b: ptr) -> i64 {
+    if load64(a) != load64(b) { return 1; }
+    if load64(a + 8) != load64(b + 8) { return 1; }
+    return 0;
+}
+
+func CF_QueryInterface(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if riid == 0 { return 0x80004003; }
+    if ppv == 0  { return 0x80004003; }
+    store64(ppv, 0);
+    if compare_guid(riid, iid_unk) == 0 {
+        store64(ppv, this);
+        store64(this + 8, load64(this + 8) + 1);
+        return 0;
+    }
+    if compare_guid(riid, iid_cf) == 0 {
+        store64(ppv, this);
+        store64(this + 8, load64(this + 8) + 1);
+        return 0;
+    }
+    return 0x80004002;  # E_NOINTERFACE
+}
+func CF_AddRef(this: ptr) -> i64 {
+    store64(this + 8, load64(this + 8) + 1);
+    return load64(this + 8);
+}
+func CF_Release(this: ptr) -> i64 {
+    store64(this + 8, load64(this + 8) - 1);
+    return load64(this + 8);
+}
+func CF_CreateInstance(this: ptr, outer: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    if outer != 0 { return 0x80040110; }            # CLASS_E_NOAGGREGATION
+    obj = VirtualAlloc(0, 16, 0x3000, 4);
+    if obj == 0 { return 0x8007000E; }              # E_OUTOFMEMORY
+    store64(obj, srv_vt);
+    store64(obj + 8, 1);
+    store64(ppv, obj);
+    store64(g_conns, load64(g_conns) + 1);          # count client activations (shown in the GUI)
+    return 0;
+}
+func CF_LockServer(this: ptr, flock: i64) -> i64 { return 0; }
+
+func Srv_QueryInterface(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if riid == 0 { return 0x80004003; }
+    if ppv == 0  { return 0x80004003; }
+    store64(ppv, 0);
+    if compare_guid(riid, iid_unk) == 0 {
+        store64(ppv, this);
+        store64(this + 8, load64(this + 8) + 1);
+        return 0;
+    }
+    return 0x80004002;
+}
+func Srv_AddRef(this: ptr) -> i64 {
+    store64(this + 8, load64(this + 8) + 1);
+    return load64(this + 8);
+}
+func Srv_Release(this: ptr) -> i64 {
+    store64(this + 8, load64(this + 8) - 1);
+    return load64(this + 8);
+}
+# ReadTag(tagIndex, pValue): 0=status(i64) 1=freq(f64 bits) 2=volt(f64 bits)
+func Srv_ReadTag(this: ptr, tag_idx: i64, pval: ptr) -> i64 {
+    if pval == 0 { return 0x80004003; }
+    if tag_idx == 0 { store64(pval, load64(tag_data));      return 0; }
+    if tag_idx == 1 { store64(pval, load64(tag_data + 8));  return 0; }
+    if tag_idx == 2 { store64(pval, load64(tag_data + 16)); return 0; }
+    return 0x80070057;  # E_INVALIDARG
+}
+
+# ANCL takes a function's code address with the & prefix (see minimal_window.ancl / threadpool).
+func init_vtables() -> i64 {
+    store64(cf_vt,       &CF_QueryInterface);
+    store64(cf_vt + 8,   &CF_AddRef);
+    store64(cf_vt + 16,  &CF_Release);
+    store64(cf_vt + 24,  &CF_CreateInstance);
+    store64(cf_vt + 32,  &CF_LockServer);
+    store64(srv_vt,      &Srv_QueryInterface);
+    store64(srv_vt + 8,  &Srv_AddRef);
+    store64(srv_vt + 16, &Srv_Release);
+    store64(srv_vt + 24, &Srv_ReadTag);
+    return 0;
+}
+
+# =====================================================================
+# Value formatting / parsing helpers (centi-units <-> "NN.NN" text)
+# =====================================================================
+func fmt_centi(buf: ptr, v: i64) -> i64 {
+    whole = v / 100;
+    frac = v - whole * 100;
+    int_to_str(buf, whole);
+    e = buf + strlen(buf);
+    store8(e, 46);                              # '.'
+    e = e + 1;
+    if frac < 10 { store8(e, 48); e = e + 1; }  # leading zero -> ".0N"
+    int_to_str(e, frac);
+    return 0;
+}
+func parse_centi(s: ptr) -> i64 {
+    i = 0; whole = 0;
+    while 1 {
+        c = load8(s + i);
+        if c < 48 { break; }
+        if c > 57 { break; }
+        whole = whole * 10 + (c - 48);
+        i = i + 1;
+    }
+    frac = 0; digits = 0;
+    if load8(s + i) == 46 {                     # '.'
+        i = i + 1;
+        while digits < 2 {
+            c = load8(s + i);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            frac = frac * 10 + (c - 48);
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits == 1 { frac = frac * 10; }
+    if digits == 0 { frac = 0; }
+    return whole * 100 + frac;
+}
+
+# write current g_st/g_fi/g_vi into the COM-visible tag buffer
+func apply_tags() -> i64 {
+    store64(tag_data,      load64(g_st));
+    store64(tag_data + 8,  fbits(itof(load64(g_fi)) / itof(100)));
+    store64(tag_data + 16, fbits(itof(load64(g_vi)) / itof(100)));
+    return 0;
+}
+
+# refresh all on-screen labels from current state
+func refresh_labels() -> i64 {
+    int_to_str(g_buf, load64(g_st));
+    SetWindowTextA(load64(g_lbl_st), g_buf);
+    fmt_centi(g_buf, load64(g_fi));
+    SetWindowTextA(load64(g_lbl_fr), g_buf);
+    fmt_centi(g_buf, load64(g_vi));
+    SetWindowTextA(load64(g_lbl_vl), g_buf);
+    e = str_copy(g_cyclebuf, s_cyc);
+    int_to_str(e, load64(g_cycle));
+    SetWindowTextA(load64(g_lbl_cyc), g_cyclebuf);
+    e = str_copy(g_statusbuf, s_auto);
+    if load64(g_running) == 1 { e = str_copy(e, s_run); } else { e = str_copy(e, s_stop); }
+    e = str_copy(e, s_conns);
+    int_to_str(e, load64(g_conns));
+    SetWindowTextA(load64(g_hstatus), g_statusbuf);
+    return 0;
+}
+
+# one auto-pump step: advance the triangle waves + status rotation
+func pump_tick() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+    counter = load64(g_counter);
+    cycle = load64(g_cycle);
+    if counter <= 100 { fi = 4900 + counter * 2; } else { t = counter - 100; fi = 5100 - t * 2; }
+    if counter <= 100 { vi = 21500 + counter * 10; } else { t = counter - 100; vi = 22500 - t * 10; }
+    m = cycle % 4;
+    if m == 0 { st = 1; } else { if m == 1 { st = 3; } else { if m == 2 { st = 5; } else { st = 7; } } }
+    store64(g_fi, fi); store64(g_vi, vi); store64(g_st, st);
+    counter = counter + 1;
+    if counter > 200 { counter = 0; }
+    store64(g_counter, counter);
+    store64(g_cycle, cycle + 1);
+    apply_tags();
+    return 0;
+}
+
+# manual overrides (read edit box -> state -> tags)
+func set_status() -> i64 {
+    GetWindowTextA(load64(g_ed_st), g_inbuf, 32);
+    store64(g_st, str_to_int(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+func set_freq() -> i64 {
+    GetWindowTextA(load64(g_ed_fr), g_inbuf, 32);
+    store64(g_fi, parse_centi(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+func set_volt() -> i64 {
+    GetWindowTextA(load64(g_ed_vl), g_inbuf, 32);
+    store64(g_vi, parse_centi(g_inbuf));
+    apply_tags(); refresh_labels();
+    return 0;
+}
+
+# build all child controls (called on WM_CREATE)
+func create_controls(hwnd: i64) -> i64 {
+    hinst = load64(g_hinst);
+    # header + subtitle
+    CreateWindowExA(0, cls_stat, txt_hdr, 1342177280, 20, 12, 620, 20, hwnd, 0, hinst, 0);
+    CreateWindowExA(0, cls_stat, txt_sub, 1342177280, 20, 36, 620, 20, hwnd, 0, hinst, 0);
+
+    # Status row: label | value | edit | Set
+    CreateWindowExA(0, cls_stat, lbl_st, 1342177280, 20, 80, 220, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 250, 80, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_st, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 350, 78, 100, 24, hwnd, 2103, hinst, 0); store64(g_ed_st, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 460, 77, 60, 26, hwnd, 2003, hinst, 0);
+
+    # Frequency row
+    CreateWindowExA(0, cls_stat, lbl_fr, 1342177280, 20, 114, 220, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 250, 114, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_fr, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 350, 112, 100, 24, hwnd, 2104, hinst, 0); store64(g_ed_fr, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 460, 111, 60, 26, hwnd, 2004, hinst, 0);
+
+    # Voltage row
+    CreateWindowExA(0, cls_stat, lbl_vl, 1342177280, 20, 148, 220, 20, hwnd, 0, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 250, 148, 90, 20, hwnd, 0, hinst, 0); store64(g_lbl_vl, h);
+    h = CreateWindowExA(0, cls_edit, dash, 1350565888, 350, 146, 100, 24, hwnd, 2105, hinst, 0); store64(g_ed_vl, h);
+    CreateWindowExA(0, cls_btn, txt_set, 1342177280, 460, 145, 60, 26, hwnd, 2005, hinst, 0);
+
+    # Control row: Start / Stop / Cycle
+    CreateWindowExA(0, cls_btn, txt_start, 1342177280, 20, 188, 120, 28, hwnd, 2001, hinst, 0);
+    CreateWindowExA(0, cls_btn, txt_stop,  1342177280, 150, 188, 120, 28, hwnd, 2002, hinst, 0);
+    h = CreateWindowExA(0, cls_stat, s_cyc, 1342177280, 290, 194, 230, 20, hwnd, 0, hinst, 0); store64(g_lbl_cyc, h);
+
+    # bottom status line
+    h = CreateWindowExA(0, cls_stat, dash, 1342177280, 20, 230, 620, 20, hwnd, 0, hinst, 0); store64(g_hstatus, h);
+
+    # pre-fill the edit boxes with the current values
+    int_to_str(g_buf, load64(g_st)); SetWindowTextA(load64(g_ed_st), g_buf);
+    fmt_centi(g_buf, load64(g_fi)); SetWindowTextA(load64(g_ed_fr), g_buf);
+    fmt_centi(g_buf, load64(g_vi)); SetWindowTextA(load64(g_ed_vl), g_buf);
+
+    refresh_labels();
+    return 0;
+}
+
+# window procedure
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { create_controls(hwnd); return 0; }   # WM_CREATE
+    if msg == 273 {                                    # WM_COMMAND
+        id = band(wParam, 65535);
+        if id == 2001 { store64(g_running, 1); refresh_labels(); }
+        if id == 2002 { store64(g_running, 0); refresh_labels(); }
+        if id == 2003 { set_status(); }
+        if id == 2004 { set_freq(); }
+        if id == 2005 { set_volt(); }
+        return 0;
+    }
+    if msg == 275 { pump_tick(); refresh_labels(); return 0; }   # WM_TIMER
+    if msg == 2 { PostQuitMessage(0); return 0; }      # WM_DESTROY
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+func main() -> i32 {
+    # ---- COM server bring-up (MTA: client calls serviced on COM RPC threads) ----
+    CoInitializeEx(0, 0);
+    store64(clsid,      0x6677445500112233);
+    store64(clsid + 8,  0xFFEEDDCCBBAA9988);
+    store64(iid_unk,     0x0000000000000000);
+    store64(iid_unk + 8, 0x46000000000000C0);
+    store64(iid_cf,      0x0000000000000001);
+    store64(iid_cf + 8,  0x46000000000000C0);
+    init_vtables();
+    store64(cf_obj,     cf_vt);
+    store64(cf_obj + 8, 1);
+
+    # ---- initial simulator state ----
+    store64(g_running, 1);      # start auto-pumping
+    store64(g_counter, 0);
+    store64(g_cycle,   0);
+    store64(g_st,      1);      # Running
+    store64(g_fi,      5000);   # 50.00 Hz
+    store64(g_vi,      22000);  # 220.00 kV
+    store64(g_conns,   0);
+    apply_tags();
+
+    CoRegisterClassObject(clsid, cf_obj, 4, 1, cookie);   # CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE
+    CoResumeClassObjects();
+
+    # ---- window class + window ----
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);                  # IDC_ARROW
+    store32(g_wndclass + 0,  80);                    # cbSize
+    store32(g_wndclass + 4,  3);                     # CS_HREDRAW|CS_VREDRAW
+    store64(g_wndclass + 8,  &WndProc);              # lpfnWndProc
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, 6);                     # COLOR_WINDOW+1
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+
+    # WS_OVERLAPPEDWINDOW|WS_VISIBLE = 0x10CF0000
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 120, 120, 680, 300, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, 1, 500, 0);                       # 500 ms pump tick
+
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }                      # WM_QUIT
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

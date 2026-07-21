@@ -1,0 +1,3006 @@
+# =====================================================================
+#  ANCL Sheet - native Win32 CSV/spreadsheet editor showcase.
+# =====================================================================
+import "gui_v2.ancl";
+import "numfmt.ancl";
+import "process_capture.ancl";
+
+extern "user32.dll" DestroyWindow -> i32;
+extern "user32.dll" MessageBoxA -> i32;
+extern "user32.dll" MoveWindow;
+extern "user32.dll" DestroyMenu;
+extern "gdi32.dll"  RoundRect;
+extern "kernel32.dll" SetFilePointer;
+extern "kernel32.dll" GetFileSize;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "shell32.dll" ShellExecuteA -> ptr;
+
+@DATA
+SHEET_ROWS: i64 = 40;
+SHEET_COLS: i64 = 12;
+SHEET_CELL: i64 = 96;
+SHEET_BYTES: i64 = 46080;
+
+cls_main:  str = "ANCL_SHEET_MAIN";
+title_app: str = "ANCL Sheet - Native Data Grid";
+title_sub: str = "CSV formulas, read-only XLSX, and transactional SQLite";
+face_ui:   str = "Segoe UI";
+face_mono: str = "Consolas";
+cls_combo: str = "COMBOBOX";
+
+txt_path:   str = "Data Path";
+txt_filter: str = "Filter";
+txt_fcol:   str = "Col";
+txt_find:   str = "Find";
+txt_row:    str = "Row";
+txt_col:    str = "Col";
+txt_value:  str = "Cell Value";
+txt_table:  str = "Table";
+
+mtop_file: str = "File";
+mtop_edit: str = "Edit";
+mtop_data: str = "Data";
+mtop_help: str = "Help";
+
+btn_open:   str = "Open";
+btn_save:   str = "Save";
+btn_saveas: str = "Save As";
+btn_close:  str = "Close";
+btn_new:    str = "New";
+btn_sample: str = "Sample";
+btn_undo:   str = "Undo";
+btn_redo:   str = "Redo";
+btn_copy:   str = "Copy";
+btn_paste:  str = "Paste";
+btn_delete: str = "Delete";
+btn_find:   str = "Find";
+btn_next:   str = "Next";
+btn_all:    str = "Select All";
+btn_insrow: str = "Insert Row";
+btn_delrow: str = "Delete Row";
+btn_inscol: str = "Insert Col";
+btn_delcol: str = "Delete Col";
+btn_sorta:  str = "A to Z";
+btn_sortd:  str = "Z to A";
+btn_clear:  str = "Clear";
+btn_read:   str = "Read";
+btn_apply:  str = "Apply";
+btn_schema: str = "Schema";
+btn_view:   str = "View";
+btn_prev:   str = "Previous";
+
+mi_new:      str = "New\tCtrl+N";
+mi_open:     str = "Open...\tCtrl+O";
+mi_save:     str = "Save\tCtrl+S";
+mi_saveas:   str = "Save As...\tCtrl+Shift+S";
+mi_close:    str = "Close\tCtrl+W";
+mi_sample:   str = "Load Sample";
+mi_exit:     str = "Exit";
+mi_undo:     str = "Undo\tCtrl+Z";
+mi_redo:     str = "Redo\tCtrl+Y";
+mi_copy:     str = "Copy\tCtrl+C";
+mi_paste:    str = "Paste\tCtrl+V";
+mi_delete:   str = "Delete\tDel";
+mi_all:      str = "Select All\tCtrl+A";
+mi_find:     str = "Find\tCtrl+F";
+mi_next:     str = "Find Next\tF3";
+mi_goto:     str = "Go To Cell\tCtrl+G";
+mi_apply:    str = "Apply Cell\tCtrl+Enter";
+mi_read:     str = "Read Cell\tEnter";
+mi_filter:   str = "Apply Filter\tCtrl+Shift+F";
+mi_clearflt: str = "Clear Filter";
+mi_insrow:   str = "Insert Row\tCtrl+I";
+mi_delrow:   str = "Delete Row\tCtrl+Shift+D";
+mi_inscol:   str = "Insert Column\tCtrl+Shift+I";
+mi_delcol:   str = "Delete Column\tCtrl+Shift+K";
+mi_sorta:    str = "Sort A to Z";
+mi_sortd:    str = "Sort Z to A";
+mi_guide:    str = "User Guide\tF1";
+mi_shortcuts:str = "Keyboard Shortcuts";
+mi_about:    str = "About ANCL Sheet";
+guide_suffix:str = "\\guide.html";
+op_open:     str = "open";
+mi_recent:   str = "Recent files";
+mi_recent_none: str = "(no recent files)";
+recent_suffix: str = "\\ancl_sheet_recent.txt";
+
+col_idx: str = "#";
+col_a: str = "A"; col_b: str = "B"; col_c: str = "C"; col_d: str = "D";
+col_e: str = "E"; col_f: str = "F"; col_g: str = "G"; col_h: str = "H";
+col_i: str = "I"; col_j: str = "J"; col_k: str = "K"; col_l: str = "L";
+
+default_suffix: str = "\\sample.csv";
+default_row:    str = "1";
+default_col:    str = "A";
+empty_text:     str = "";
+all_text:       str = "All";
+defext_csv:     str = "csv";
+defext_db:      str = "db";
+sqlite_dll:     str = "sqlite3.dll";
+sqlite_suffix:  str = "\\sqlite3.dll";
+winsqlite_dll:  str = "winsqlite3.dll";
+provider_windows:str = "Windows WinSQLite (winsqlite3.dll)";
+provider_fallback:str = "side-by-side sqlite3.dll fallback";
+provider_none:  str = "unavailable - SQLite browsing remains read-only";
+about_provider:str = "\r\n\r\nSQLite writer: ";
+backup_suffix:  str = ".bak";
+sql_begin:      str = "BEGIN IMMEDIATE";
+sql_commit:     str = "COMMIT";
+sql_rollback:   str = "ROLLBACK";
+sql_update:     str = "UPDATE ";
+sql_set:        str = " SET ";
+sql_where:      str = "=?1 WHERE rowid=?2";
+sq_open_v2:     str = "sqlite3_open_v2";
+sq_prepare:     str = "sqlite3_prepare_v2";
+sq_bind_text:   str = "sqlite3_bind_text";
+sq_bind_i64:    str = "sqlite3_bind_int64";
+sq_step:        str = "sqlite3_step";
+sq_finalize:    str = "sqlite3_finalize";
+sq_close:       str = "sqlite3_close";
+sq_exec:        str = "sqlite3_exec";
+
+flt_a: str = "CSV, XLSX and SQLite (*.csv;*.xlsx;*.db;*.sqlite)";
+flt_b: str = "*.csv;*.xlsx;*.db;*.sqlite";
+flt_c: str = "CSV files (*.csv)";
+flt_d: str = "*.csv";
+flt_e: str = "SQLite databases (*.db;*.sqlite)";
+flt_f: str = "*.db;*.sqlite";
+flt_g: str = "All files (*.*)";
+flt_h: str = "*.*";
+xlsx_tar_prefix: str = "tar.exe -xOf \"";
+xlsx_shared_part: str = "\" xl/sharedStrings.xml";
+xlsx_sheet_part: str = "\" xl/worksheets/sheet1.xml";
+xml_si_open: str = "<si"; xml_si_close: str = "</si>";
+xml_c_open: str = "<c"; xml_c_close: str = "</c>";
+xml_t_open: str = "<t"; xml_v_open: str = "<v>";
+xml_attr_r: str = " r=\""; xml_attr_t: str = " t=\"";
+
+st_ready:      str = "Ready.";
+st_new:        str = "New workbook.";
+st_loaded:     str = "Loaded CSV.";
+st_dbloaded:   str = "Loaded SQLite schema.";
+st_dbbad:      str = "Could not read SQLite schema.";
+st_dbtable:    str = "Loaded SQLite table page.";
+st_dbempty:    str = "This SQLite database has no user tables.";
+st_dbselect:   str = "Choose a SQLite table first.";
+st_dbfirst:    str = "Already at the first table page.";
+st_dblast:     str = "Already at the last table page.";
+st_readonly:   str = "SQLite schema is read-only. Open a table to edit values.";
+st_dbstaged:   str = "Database cell staged. Save commits it transactionally.";
+st_dbsaved:    str = "Database changes committed; backup created.";
+st_dbcopy:     str = "Database changes committed to the Save As copy.";
+st_dbdll:      str = "SQLite writing needs Windows 10+ WinSQLite or sqlite3.dll beside ANCL Sheet.";
+st_dbcommitbad:str = "SQLite transaction failed; database was rolled back.";
+st_dbbackupbad:str = "Could not create the database backup.";
+st_dbsavefirst:str = "Save or reopen the database before changing page or table.";
+st_dbsortedit: str = "Reload the table page before editing a sorted database view.";
+st_noguide:    str = "guide.html was not found beside ANCL Sheet.";
+st_dbexportbad:str = "Choose a .csv filename for the database export.";
+st_saved:      str = "Saved CSV.";
+st_loadfail:   str = "Could not load CSV.";
+st_xlsxloaded: str = "Loaded first XLSX worksheet read-only.";
+st_xlsxro:     str = "XLSX worksheets are read-only. Save As exports CSV.";
+st_xlsxtool:   str = "XLSX import needs the Windows archive tool (tar.exe).";
+st_xlsxbad:    str = "Could not read the first worksheet from this XLSX file.";
+st_xlsxlarge:  str = "XLSX worksheet is too large for the bounded import buffer.";
+st_savefail:   str = "Could not save CSV.";
+st_badcell:    str = "Choose row 1-40 and column A-L.";
+st_applied:    str = "Cell updated.";
+st_picked:     str = "Cell loaded into editor.";
+st_editing:    str = "Editing cell value.";
+st_insertrow:  str = "Row inserted.";
+st_deleterow:  str = "Row deleted.";
+st_insertcol:  str = "Column inserted.";
+st_deletecol:  str = "Column deleted.";
+st_sorted:     str = "Column sorted.";
+st_dbsorted:   str = "Database page sorted in memory; source unchanged.";
+st_formula:    str = "Formula calculated.";
+st_filtered:   str = "Filter applied.";
+st_filterclr:  str = "Filter cleared.";
+st_copied:     str = "Copied to clipboard.";
+st_pasted:     str = "Pasted from clipboard.";
+st_clipfail:   str = "Clipboard is unavailable.";
+st_deleted:    str = "Selection cleared.";
+st_all:        str = "All cells selected for Copy/Delete.";
+st_findnone:   str = "No match found.";
+st_undone:     str = "Undo complete.";
+st_redone:     str = "Redo complete.";
+st_noundo:     str = "Nothing to undo.";
+st_noredo:     str = "Nothing to redo.";
+st_csvonly:    str = "CSV formulas + read-only XLSX + transactional SQLite with automatic backup.";
+about_title:   str = "About ANCL Sheet";
+about_text:    str = "ANCL Sheet\r\n\r\nNative CSV formulas, read-only XLSX import, and transactional SQLite editing.\r\nNo .NET, no CRT, no runtime.";
+shortcuts_text:str = "Keyboard shortcuts\r\n\r\nF1 User Guide\r\nCtrl+N New\r\nCtrl+O Open\r\nCtrl+S Save\r\nCtrl+Shift+S Save As\r\nCtrl+W Close\r\nCtrl+Z Undo\r\nCtrl+Y Redo\r\nCtrl+C Copy\r\nCtrl+V Paste\r\nCtrl+A Select All\r\nDelete Clear selection\r\nCtrl+F Find\r\nF3 Find Next\r\nCtrl+G Go to row field\r\nEnter Read cell\r\nCtrl+Enter Apply cell\r\nCtrl+I Insert row\r\nCtrl+Shift+D Delete row\r\nCtrl+Shift+I Insert column\r\nCtrl+Shift+K Delete column\r\nCtrl+Shift+F Apply filter";
+
+ID_GRID:      i64 = 100;
+ID_OPEN:      i64 = 101;
+ID_SAVE:      i64 = 102;
+ID_SAVEAS:    i64 = 103;
+ID_CLOSE:     i64 = 104;
+ID_NEW:       i64 = 105;
+ID_SAMPLE:    i64 = 106;
+ID_UNDO:      i64 = 107;
+ID_REDO:      i64 = 108;
+ID_COPY:      i64 = 109;
+ID_PASTE:     i64 = 110;
+ID_DELETE:    i64 = 111;
+ID_FIND:      i64 = 112;
+ID_FINDNEXT:  i64 = 113;
+ID_SELECTALL: i64 = 114;
+ID_INSROW:    i64 = 115;
+ID_DELROW:    i64 = 116;
+ID_INSCOL:    i64 = 117;
+ID_DELCOL:    i64 = 118;
+ID_SORTA:     i64 = 119;
+ID_SORTD:     i64 = 120;
+ID_FILTER:    i64 = 121;
+ID_CLEARFLT:  i64 = 122;
+ID_READ:      i64 = 123;
+ID_APPLY:     i64 = 124;
+ID_EXIT:      i64 = 125;
+ID_GOTO:      i64 = 126;
+ID_HELP_KEYS: i64 = 127;
+ID_ABOUT:     i64 = 128;
+ID_DB_TABLE:  i64 = 129;
+ID_DB_SCHEMA: i64 = 130;
+ID_DB_VIEW:   i64 = 131;
+ID_DB_PREV:   i64 = 132;
+ID_DB_NEXT:   i64 = 133;
+ID_RECENT_1:  i64 = 134;
+ID_RECENT_2:  i64 = 135;
+ID_RECENT_3:  i64 = 136;
+ID_RECENT_NONE:i64 = 137;
+ID_GUIDE:     i64 = 138;
+ID_MENU_FILE: i64 = 201;
+ID_MENU_EDIT: i64 = 202;
+ID_MENU_DATA: i64 = 203;
+ID_MENU_HELP: i64 = 204;
+ID_CELL_EDIT: i64 = 501;
+
+COLOR_BG:       i64 = 0xF0F0F0;
+COLOR_PANEL:    i64 = 0xFFFFFF;
+COLOR_CARD:     i64 = 0xFAFAFA;
+COLOR_EDIT:     i64 = 0xFFFFFF;
+COLOR_WARN:     i64 = 0xFFFFFF;
+COLOR_LINE:     i64 = 0xD0D0D0;
+COLOR_TEXT:     i64 = 0x202020;
+COLOR_MUTED:    i64 = 0x666666;
+COLOR_ACCENT:   i64 = 0xD77800;
+COLOR_BUTTON:   i64 = 0xF5F5F5;
+COLOR_HOVER:    i64 = 0xE9E9E9;
+
+g_hinst:     buf = 8;
+g_hwnd:      buf = 8;
+g_grid:      buf = 8;
+g_path_ed:   buf = 8;
+g_mb_file:   buf = 8;
+g_mb_edit:   buf = 8;
+g_mb_data:   buf = 8;
+g_mb_help:   buf = 8;
+g_menu_file: buf = 8;
+g_menu_edit: buf = 8;
+g_menu_data: buf = 8;
+g_menu_help: buf = 8;
+g_filter_col_ed: buf = 8;
+g_filter_ed: buf = 8;
+g_find_ed:   buf = 8;
+g_row_ed:    buf = 8;
+g_col_ed:    buf = 8;
+g_value_ed:  buf = 8;
+g_cell_edit: buf = 8;
+g_status:    buf = 8;
+g_db_table_label: buf = 8;
+g_db_table_combo: buf = 8;
+g_db_schema_btn:  buf = 8;
+g_db_view_btn:    buf = 8;
+g_db_prev_btn:    buf = 8;
+g_db_next_btn:    buf = 8;
+g_db_page_label:  buf = 8;
+
+g_font:      buf = 8;
+g_font_bold: buf = 8;
+g_font_mono: buf = 8;
+g_br_bg:     buf = 8;
+g_br_panel:  buf = 8;
+g_br_card:   buf = 8;
+g_br_warn:   buf = 8;
+g_br_edit:   buf = 8;
+g_br_button: buf = 8;
+g_br_hover:  buf = 8;
+g_br_accent: buf = 8;
+g_pen_line:  buf = 8;
+g_pen_accent:buf = 8;
+
+g_wndclass:  buf = 80;
+g_msg:       buf = 64;
+g_ps:        buf = 72;
+g_rect:      buf = 16;
+g_io:        buf = 8;
+g_ofn:       buf = 152;
+g_filter:    buf = 192;
+g_csv_filter:buf = 64;
+
+g_cells:      buf = 46080; # 40 rows * 12 cols * 96 bytes
+g_formulas:   buf = 46080; # formula source; calculated values stay in g_cells
+g_undo_cells: buf = 46080;
+g_undo_formulas: buf = 46080;
+g_redo_cells: buf = 46080;
+g_redo_formulas: buf = 46080;
+g_rowtmp:     buf = 1152;  # 12 cols * 96 bytes
+g_view_map:   buf = 320;   # 40 visible rows -> backing row index
+g_rows:       buf = 8;
+g_cols:       buf = 8;
+g_sel_row:    buf = 8;
+g_sel_col:    buf = 8;
+g_undo_rows:  buf = 8;
+g_undo_cols:  buf = 8;
+g_redo_rows:  buf = 8;
+g_redo_cols:  buf = 8;
+g_have_undo:  buf = 8;
+g_have_redo:  buf = 8;
+g_select_all: buf = 8;
+g_cell_editing: buf = 8;
+g_cell_edit_row: buf = 8;
+g_cell_edit_col: buf = 8;
+g_dirty:      buf = 8;
+g_last_find_row: buf = 8;
+g_last_find_col: buf = 8;
+
+g_exedir:    buf = 600;
+g_path:      buf = 700;
+g_dialog_file: buf = 700;
+g_filebuf:   buf = 131072;
+g_savebuf:   buf = 131072;
+g_clipbuf:   buf = 32768;
+g_numbuf:    buf = 32;
+g_colbuf:    buf = 32;
+g_cellbuf:   buf = 512;
+g_filterbuf: buf = 128;
+g_findbuf:   buf = 128;
+g_db_page_size: buf = 8;
+g_db_file_size: buf = 8;
+g_db_mode: buf = 8;       # 0 CSV, 1 schema, 2 table rows
+g_xlsx_mode: buf = 8;     # 1 = read-only worksheet imported into the grid
+g_db_table_count: buf = 8;
+g_db_selected: buf = 8;
+g_db_page: buf = 8;
+g_db_has_more: buf = 8;
+g_db_schema_row: buf = 8;
+g_db_scan_seen: buf = 8;
+g_db_scan_out: buf = 8;
+g_db_scan_stop: buf = 8;
+g_db_pk_col: buf = 8;
+g_db_table_names: buf = 1536; # 16 names * 96 bytes
+g_db_table_roots: buf = 128;  # 16 root page numbers
+g_db_table_sql: buf = 8192;   # 16 CREATE TABLE strings * 512 bytes
+g_db_schema_fields: buf = 2560; # five decoded sqlite_master fields
+g_db_page_text: buf = 96;
+g_db_rowids: buf = 320;       # backing grid row -> SQLite rowid
+g_db_changed: buf = 480;      # one staged flag per grid cell
+g_db_change_count: buf = 8;
+g_db_sorted: buf = 8;
+g_sqlite_mod: buf = 8;
+g_sqlite_provider: buf = 96;
+g_about_buf: buf = 512;
+g_guide_path: buf = 700;
+g_sq_open_v2: buf = 8;
+g_sq_prepare: buf = 8;
+g_sq_bind_text: buf = 8;
+g_sq_bind_i64: buf = 8;
+g_sq_step: buf = 8;
+g_sq_finalize: buf = 8;
+g_sq_close: buf = 8;
+g_sq_exec: buf = 8;
+g_sq_db: buf = 8;
+g_sq_stmt: buf = 8;
+g_sq_err: buf = 8;
+g_sqlbuf: buf = 1024;
+g_backup_path: buf = 720;
+g_db_save_path: buf = 700;
+g_db_copy_in: buf = 8;
+g_db_copy_out: buf = 8;
+g_db_copy_read: buf = 8;
+g_db_copy_written: buf = 8;
+g_var_next: buf = 8;
+g_record_types: buf = 96; # 12 serial-type slots
+g_recent_count: buf = 8;
+g_recent_paths: buf = 2100; # three paths * 700 bytes
+g_recent_labels: buf = 2160; # three menu labels * 720 bytes
+g_recent_file: buf = 700;
+g_recent_buf: buf = 2200;
+g_copy_row_count: buf = 8;
+g_formula_ptr: buf = 8;
+g_formula_error: buf = 8;
+g_formula_state: buf = 480;
+g_formula_name: buf = 24;
+g_formula_ref_row: buf = 8;
+g_formula_ref_col: buf = 8;
+g_formula_ref_numeric: buf = 8;
+g_xlsx_cmd: buf = 1024;
+g_xlsx_xml: buf = 262144;
+g_xlsx_shared: buf = 49152; # 512 shared strings * 96 bytes
+g_xlsx_shared_count: buf = 8;
+g_xlsx_truncated: buf = 8;
+g_xlsx_max_row: buf = 8;
+g_xlsx_max_col: buf = 8;
+g_xlsx_attr: buf = 64;
+
+@CODE
+
+func app_last_bs(s: i64) -> i64 {
+    i = 0; last = 0 - 1;
+    while 1 {
+        c = load8(s + i);
+        if c == 0 { return last; }
+        if c == 92 { last = i; }
+        i = i + 1;
+    }
+    return last;
+}
+
+func app_exedir(dst: i64) -> i64 {
+    GetModuleFileNameA(0, g_exedir, 600);
+    bs = app_last_bs(g_exedir);
+    if bs < 0 { store8(dst, 0); return 0; }
+    memcpy(dst, g_exedir, bs);
+    store8(dst + bs, 0);
+    return bs;
+}
+
+func app_join(dst: i64, base: i64, suffix: i64) -> i64 {
+    p = str_copy(dst, base);
+    str_copy(p, suffix);
+    return 0;
+}
+
+func app_parse_int(s: i64) -> i64 {
+    p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    v = 0;
+    while load8(p) >= 48 && load8(p) <= 57 {
+        v = v * 10 + load8(p) - 48;
+        p = p + 1;
+    }
+    return v;
+}
+
+func app_u64_text(v: i64, dst: i64) -> i64 {
+    p = nf_u64dec(v, dst);
+    store8(p, 0);
+    return p;
+}
+
+func app_i64_text(v: i64, dst: i64) -> i64 {
+    p = dst;
+    if v < 0 {
+        store8(p, 45);
+        p = p + 1;
+        v = 0 - v;
+    }
+    p = nf_u64dec(v, p);
+    store8(p, 0);
+    return p;
+}
+
+func app_tolower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func app_strcmp_i(a: i64, b: i64) -> i64 {
+    i = 0;
+    while 1 {
+        ca = app_tolower(load8(a + i));
+        cb = app_tolower(load8(b + i));
+        if ca < cb { return 0 - 1; }
+        if ca > cb { return 1; }
+        if ca == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func app_contains_i(hay: i64, needle: i64) -> i64 {
+    if load8(needle) == 0 { return 1; }
+    i = 0;
+    while load8(hay + i) != 0 {
+        j = 0;
+        ok = 1;
+        while load8(needle + j) != 0 {
+            hc = app_tolower(load8(hay + i + j));
+            nc = app_tolower(load8(needle + j));
+            if hc == 0 { ok = 0; break; }
+            if hc != nc { ok = 0; break; }
+            j = j + 1;
+        }
+        if ok == 1 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func app_starts_i(s: i64, prefix: i64) -> i64 {
+    i = 0;
+    while load8(prefix + i) != 0 {
+        if app_tolower(load8(s + i)) != app_tolower(load8(prefix + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+func app_ends_i(s: i64, suffix: i64) -> i64 {
+    a = 0; while load8(s + a) != 0 { a = a + 1; }
+    b = 0; while load8(suffix + b) != 0 { b = b + 1; }
+    if b > a { return 0; }
+    i = 0;
+    while i < b { if app_tolower(load8(s + a - b + i)) != app_tolower(load8(suffix + i)) { return 0; } i = i + 1; }
+    return 1;
+}
+
+func app_is_number(s: i64) -> i64 {
+    p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    if load8(p) == 43 || load8(p) == 45 { p = p + 1; }
+    digits = 0;
+    while load8(p) >= 48 && load8(p) <= 57 { digits = digits + 1; p = p + 1; }
+    if load8(p) == 46 {
+        p = p + 1;
+        while load8(p) >= 48 && load8(p) <= 57 { digits = digits + 1; p = p + 1; }
+    }
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    if digits == 0 { return 0; }
+    if load8(p) != 0 { return 0; }
+    return 1;
+}
+
+func app_parse_number(s: i64) -> f64 {
+    p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    sign = 1.0;
+    if load8(p) == 45 { sign = 0.0 - 1.0; p = p + 1; }
+    else if load8(p) == 43 { p = p + 1; }
+    val = 0.0;
+    while load8(p) >= 48 && load8(p) <= 57 { val = val * 10.0 + itof(load8(p) - 48); p = p + 1; }
+    if load8(p) == 46 {
+        p = p + 1; divisor = 10.0;
+        while load8(p) >= 48 && load8(p) <= 57 { val = val + itof(load8(p) - 48) / divisor; divisor = divisor * 10.0; p = p + 1; }
+    }
+    return val * sign;
+}
+
+func app_cell_compare(a: i64, b: i64) -> i64 {
+    if app_is_number(a) == 1 { if app_is_number(b) == 1 {
+        av = app_parse_number(a); bv = app_parse_number(b);
+        if av < bv { return 0 - 1; }
+        if av > bv { return 1; }
+        return 0;
+    } }
+    return app_strcmp_i(a, b);
+}
+
+func app_has_char(s: i64, ch: i64) -> i64 {
+    i = 0;
+    while load8(s + i) != 0 {
+        if load8(s + i) == ch { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func app_col_name(col: i64, dst: i64) -> i64 {
+    store8(dst + 0, 65 + col);
+    store8(dst + 1, 0);
+    return dst;
+}
+
+func build_filter() -> i64 {
+    p = gui_file_filter_first(g_filter, flt_a, flt_b);
+    p = gui_file_filter_add(p, flt_c, flt_d);
+    p = gui_file_filter_add(p, flt_e, flt_f);
+    p = gui_file_filter_add(p, flt_g, flt_h);
+    gui_file_filter_done(p);
+    p = gui_file_filter_first(g_csv_filter, flt_c, flt_d);
+    p = gui_file_filter_add(p, flt_g, flt_h);
+    gui_file_filter_done(p);
+    return 0;
+}
+
+func recent_slot(i: i64) -> i64 {
+    return g_recent_paths + i * 700;
+}
+
+func recent_pathfile() -> i64 {
+    app_exedir(g_recent_file);
+    str_copy(g_recent_file + strlen(g_recent_file), recent_suffix);
+    return g_recent_file;
+}
+
+func recent_load() -> i64 {
+    store64(g_recent_count, 0);
+    memset(g_recent_paths, 0, 2100);
+    recent_pathfile();
+    n = sheet_read_file(g_recent_file, g_recent_buf, 2200);
+    if n < 0 { return 0; }
+    p = g_recent_buf; count = 0;
+    while load8(p) != 0 { if count >= 3 { break; }
+        start = p;
+        while load8(p) != 0 { if load8(p) == 13 || load8(p) == 10 { break; } p = p + 1; }
+        len = p - start;
+        if len > 0 { if len > 699 { len = 699; } memcpy(recent_slot(count), start, len); store8(recent_slot(count) + len, 0); count = count + 1; }
+        if load8(p) == 13 { p = p + 1; }
+        if load8(p) == 10 { p = p + 1; }
+    }
+    store64(g_recent_count, count);
+    return count;
+}
+
+func recent_save() -> i64 {
+    p = g_recent_buf; i = 0; count = load64(g_recent_count);
+    while i < count {
+        p = str_copy(p, recent_slot(i));
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        i = i + 1;
+    }
+    store8(p, 0);
+    recent_pathfile();
+    return sheet_write_file(g_recent_file, g_recent_buf, p - g_recent_buf);
+}
+
+func recent_push(path: i64) -> i64 {
+    if load8(path) == 0 { return 0; }
+    count = load64(g_recent_count); found = 0 - 1; i = 0;
+    while i < count { if app_strcmp_i(recent_slot(i), path) == 0 { found = i; break; } i = i + 1; }
+    if found == 0 { return 1; }
+    if found < 0 {
+        if count < 3 { count = count + 1; }
+        found = count - 1;
+    }
+    i = found;
+    while i > 0 { cstr_copy_n(recent_slot(i), recent_slot(i - 1), 700); i = i - 1; }
+    cstr_copy_n(recent_slot(0), path, 700);
+    store64(g_recent_count, count);
+    recent_save();
+    return 1;
+}
+
+func recent_label(i: i64) -> i64 {
+    dst = g_recent_labels + i * 720;
+    store8(dst, 49 + i); store8(dst + 1, 46); store8(dst + 2, 32);
+    cstr_copy_n(dst + 3, recent_slot(i), 717);
+    return dst;
+}
+
+func sheet_build_file_menu() -> i64 {
+    old = load64(g_menu_file);
+    if old != 0 { DestroyMenu(old); }
+    mf = gui_menu_create();
+    gui_menu_item(mf, ID_NEW, mi_new);
+    gui_menu_item(mf, ID_OPEN, mi_open);
+    gui_menu_sep(mf);
+    gui_menu_item(mf, ID_SAVE, mi_save);
+    gui_menu_item(mf, ID_SAVEAS, mi_saveas);
+    gui_menu_sep(mf);
+    gui_menu_item(mf, ID_RECENT_NONE, mi_recent);
+    gui_menu_enable(mf, ID_RECENT_NONE, 0);
+    count = load64(g_recent_count); i = 0;
+    while i < count { gui_menu_item(mf, ID_RECENT_1 + i, recent_label(i)); i = i + 1; }
+    if count == 0 { gui_menu_item(mf, ID_RECENT_1, mi_recent_none); gui_menu_enable(mf, ID_RECENT_1, 0); }
+    gui_menu_sep(mf);
+    gui_menu_item(mf, ID_SAMPLE, mi_sample);
+    gui_menu_item(mf, ID_CLOSE, mi_close);
+    gui_menu_sep(mf);
+    gui_menu_item(mf, ID_EXIT, mi_exit);
+    store64(g_menu_file, mf);
+    return mf;
+}
+
+func sheet_build_menus() -> i64 {
+    sheet_build_file_menu();
+
+    me = gui_menu_create();
+    gui_menu_item(me, ID_UNDO, mi_undo);
+    gui_menu_item(me, ID_REDO, mi_redo);
+    gui_menu_sep(me);
+    gui_menu_item(me, ID_COPY, mi_copy);
+    gui_menu_item(me, ID_PASTE, mi_paste);
+    gui_menu_item(me, ID_DELETE, mi_delete);
+    gui_menu_item(me, ID_SELECTALL, mi_all);
+    gui_menu_sep(me);
+    gui_menu_item(me, ID_FIND, mi_find);
+    gui_menu_item(me, ID_FINDNEXT, mi_next);
+    gui_menu_item(me, ID_GOTO, mi_goto);
+    store64(g_menu_edit, me);
+
+    md = gui_menu_create();
+    gui_menu_item(md, ID_READ, mi_read);
+    gui_menu_item(md, ID_APPLY, mi_apply);
+    gui_menu_sep(md);
+    gui_menu_item(md, ID_FILTER, mi_filter);
+    gui_menu_item(md, ID_CLEARFLT, mi_clearflt);
+    gui_menu_sep(md);
+    gui_menu_item(md, ID_INSROW, mi_insrow);
+    gui_menu_item(md, ID_DELROW, mi_delrow);
+    gui_menu_item(md, ID_INSCOL, mi_inscol);
+    gui_menu_item(md, ID_DELCOL, mi_delcol);
+    gui_menu_sep(md);
+    gui_menu_item(md, ID_SORTA, mi_sorta);
+    gui_menu_item(md, ID_SORTD, mi_sortd);
+    store64(g_menu_data, md);
+
+    mh = gui_menu_create();
+    gui_menu_item(mh, ID_GUIDE, mi_guide);
+    gui_menu_item(mh, ID_HELP_KEYS, mi_shortcuts);
+    gui_menu_sep(mh);
+    gui_menu_item(mh, ID_ABOUT, mi_about);
+    store64(g_menu_help, mh);
+    return 0;
+}
+
+func menu_drop(btn: i64, menu: i64) -> i64 {
+    gui_menu_drop(load64(g_hwnd), btn, menu, g_rect);
+    return 0;
+}
+
+func formula_slot(row: i64, col: i64) -> i64 {
+    return g_formulas + (row * SHEET_COLS + col) * SHEET_CELL;
+}
+
+func formula_input(row: i64, col: i64) -> i64 {
+    idx = (row * SHEET_COLS + col) * SHEET_CELL;
+    f = g_formulas + idx;
+    if load8(f) == 61 { return f; }
+    return g_cells + idx;
+}
+
+func formula_skip_ws() -> i64 {
+    p = load64(g_formula_ptr);
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    store64(g_formula_ptr, p);
+    return p;
+}
+
+func formula_parse_ref_token() -> i64 {
+    p = formula_skip_ws(); c = load8(p);
+    if c >= 97 { if c <= 122 { c = c - 32; } }
+    if c < 65 || c >= 65 + SHEET_COLS { return 0; }
+    col = c - 65; p = p + 1;
+    if load8(p) < 48 || load8(p) > 57 { return 0; }
+    row = 0;
+    while load8(p) >= 48 && load8(p) <= 57 { row = row * 10 + load8(p) - 48; p = p + 1; }
+    if row < 1 || row > SHEET_ROWS { store64(g_formula_error, 3); return 0; }
+    store64(g_formula_ref_row, row - 1); store64(g_formula_ref_col, col); store64(g_formula_ptr, p);
+    return 1;
+}
+
+func formula_ref_value(row: i64, col: i64) -> f64 {
+    saved = load64(g_formula_ptr);
+    idx = (row * SHEET_COLS + col) * SHEET_CELL;
+    f = g_formulas + idx;
+    numeric = app_is_number(g_cells + idx);
+    if load8(f) == 61 { numeric = 1; }
+    store64(g_formula_ref_numeric, numeric);
+    v = formula_eval_cell(row, col);
+    err = load64(g_formula_error);
+    store64(g_formula_ptr, saved);
+    store64(g_formula_error, err);
+    return v;
+}
+
+func formula_parse_number() -> f64 {
+    p = formula_skip_ws(); val = 0.0; digits = 0;
+    while load8(p) >= 48 && load8(p) <= 57 { val = val * 10.0 + itof(load8(p) - 48); p = p + 1; digits = digits + 1; }
+    if load8(p) == 46 {
+        p = p + 1; divisor = 10.0;
+        while load8(p) >= 48 && load8(p) <= 57 { val = val + itof(load8(p) - 48) / divisor; divisor = divisor * 10.0; p = p + 1; digits = digits + 1; }
+    }
+    if digits == 0 { store64(g_formula_error, 1); }
+    store64(g_formula_ptr, p);
+    return val;
+}
+
+func formula_parse_function(name: i64) -> f64 {
+    is_sum = app_strcmp_i(name, "SUM") == 0;
+    is_avg = app_strcmp_i(name, "AVERAGE") == 0;
+    is_min = app_strcmp_i(name, "MIN") == 0;
+    is_max = app_strcmp_i(name, "MAX") == 0;
+    is_count = app_strcmp_i(name, "COUNT") == 0;
+    if is_sum == 0 && is_avg == 0 && is_min == 0 && is_max == 0 && is_count == 0 { store64(g_formula_error, 1); return 0.0; }
+    total = 0.0; best = 0.0; count = 0; first = 1;
+    while 1 {
+        p = formula_skip_ws();
+        if load8(p) == 41 { store64(g_formula_ptr, p + 1); break; }
+        saved = p; have_ref = formula_parse_ref_token();
+        if have_ref == 1 {
+            r1 = load64(g_formula_ref_row); c1 = load64(g_formula_ref_col); p = formula_skip_ws();
+            if load8(p) == 58 {
+                store64(g_formula_ptr, p + 1);
+                if formula_parse_ref_token() == 0 { store64(g_formula_error, 3); return 0.0; }
+                r2 = load64(g_formula_ref_row); c2 = load64(g_formula_ref_col);
+                if r2 < r1 { t = r1; r1 = r2; r2 = t; }
+                if c2 < c1 { t = c1; c1 = c2; c2 = t; }
+                r = r1;
+                while r <= r2 { c = c1; while c <= c2 {
+                    v = formula_ref_value(r, c); numeric = load64(g_formula_ref_numeric);
+                    if numeric != 0 { total = total + v; if first == 1 { best = v; first = 0; } else { if is_min != 0 { if v < best { best = v; } } if is_max != 0 { if v > best { best = v; } } } count = count + 1; }
+                    if load64(g_formula_error) != 0 { return 0.0; }
+                    c = c + 1;
+                } r = r + 1; }
+            } else if load8(p) == 44 || load8(p) == 41 {
+                v = formula_ref_value(r1, c1); numeric = load64(g_formula_ref_numeric);
+                if numeric != 0 { total = total + v; best = v; first = 0; count = count + 1; }
+            } else {
+                store64(g_formula_ptr, saved); v = formula_parse_expr();
+                total = total + v; if first == 1 { best = v; first = 0; } else { if is_min != 0 { if v < best { best = v; } } if is_max != 0 { if v > best { best = v; } } } count = count + 1;
+            }
+        } else {
+            store64(g_formula_ptr, saved); v = formula_parse_expr();
+            total = total + v; if first == 1 { best = v; first = 0; } else { if is_min != 0 { if v < best { best = v; } } if is_max != 0 { if v > best { best = v; } } } count = count + 1;
+        }
+        if load64(g_formula_error) != 0 { return 0.0; }
+        p = formula_skip_ws();
+        if load8(p) == 44 { store64(g_formula_ptr, p + 1); }
+        else if load8(p) == 41 { store64(g_formula_ptr, p + 1); break; }
+        else { store64(g_formula_error, 1); return 0.0; }
+    }
+    if is_count != 0 { return itof(count); }
+    if is_avg != 0 { if count == 0 { store64(g_formula_error, 1); return 0.0; } return total / itof(count); }
+    if is_min != 0 || is_max != 0 { if count == 0 { store64(g_formula_error, 1); return 0.0; } return best; }
+    return total;
+}
+
+func formula_parse_primary() -> f64 {
+    p = formula_skip_ws(); ch = load8(p);
+    if ch == 43 { store64(g_formula_ptr, p + 1); return formula_parse_primary(); }
+    if ch == 45 { store64(g_formula_ptr, p + 1); return 0.0 - formula_parse_primary(); }
+    if ch == 40 {
+        store64(g_formula_ptr, p + 1); v = formula_parse_expr(); p = formula_skip_ws();
+        if load8(p) != 41 { store64(g_formula_error, 1); return 0.0; }
+        store64(g_formula_ptr, p + 1); return v;
+    }
+    if ch >= 48 { if ch <= 57 { return formula_parse_number(); } }
+    if ch == 46 { return formula_parse_number(); }
+    if (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
+        q = p; n = 0;
+        while 1 { c = load8(q); if c >= 97 { if c <= 122 { c = c - 32; } } if c < 65 || c > 90 { break; } if n < 23 { store8(g_formula_name + n, c); n = n + 1; } q = q + 1; }
+        store8(g_formula_name + n, 0);
+        if load8(q) == 40 { store64(g_formula_ptr, q + 1); return formula_parse_function(g_formula_name); }
+        store64(g_formula_ptr, p);
+        if formula_parse_ref_token() == 0 { store64(g_formula_error, 3); return 0.0; }
+        return formula_ref_value(load64(g_formula_ref_row), load64(g_formula_ref_col));
+    }
+    store64(g_formula_error, 1); return 0.0;
+}
+
+func formula_parse_term() -> f64 {
+    v = formula_parse_primary();
+    while load64(g_formula_error) == 0 {
+        p = formula_skip_ws(); op = load8(p);
+        if op != 42 && op != 47 { break; }
+        store64(g_formula_ptr, p + 1); rhs = formula_parse_primary();
+        if op == 42 { v = v * rhs; }
+        else { if rhs == 0.0 { store64(g_formula_error, 2); return 0.0; } v = v / rhs; }
+    }
+    return v;
+}
+
+func formula_parse_expr() -> f64 {
+    v = formula_parse_term();
+    while load64(g_formula_error) == 0 {
+        p = formula_skip_ws(); op = load8(p);
+        if op != 43 && op != 45 { break; }
+        store64(g_formula_ptr, p + 1); rhs = formula_parse_term();
+        if op == 43 { v = v + rhs; } else { v = v - rhs; }
+    }
+    return v;
+}
+
+func formula_format(v: f64, dst: i64) -> i64 {
+    nf_dtoa(fbits(v), dst);
+    dot = 0 - 1; i = 0;
+    while load8(dst + i) != 0 { if load8(dst + i) == 46 { dot = i; } i = i + 1; }
+    if dot >= 0 { i = i - 1; while i > dot { if load8(dst + i) != 48 { break; } store8(dst + i, 0); i = i - 1; } if i == dot { store8(dst + i, 0); } }
+    return 1;
+}
+
+func formula_eval_cell(row: i64, col: i64) -> f64 {
+    cell_idx = row * SHEET_COLS + col; byte_idx = cell_idx * SHEET_CELL; state = load8(g_formula_state + cell_idx); f = g_formulas + byte_idx; cell = g_cells + byte_idx;
+    if load8(f) != 61 { if app_is_number(cell) == 1 { return app_parse_number(cell); } return 0.0; }
+    if state == 1 { store64(g_formula_error, 4); return 0.0; }
+    if state == 2 { if app_is_number(cell) == 1 { return app_parse_number(cell); } store64(g_formula_error, 1); return 0.0; }
+    store8(g_formula_state + cell_idx, 1); saved = load64(g_formula_ptr); store64(g_formula_ptr, f + 1); store64(g_formula_error, 0);
+    v = formula_parse_expr(); p = formula_skip_ws(); if load8(p) != 0 { store64(g_formula_error, 1); }
+    err = load64(g_formula_error);
+    if err == 0 { formula_format(v, cell); }
+    else if err == 2 { cstr_copy_n(cell, "#DIV/0!", SHEET_CELL); }
+    else if err == 3 { cstr_copy_n(cell, "#REF!", SHEET_CELL); }
+    else if err == 4 { cstr_copy_n(cell, "#CYCLE!", SHEET_CELL); }
+    else { cstr_copy_n(cell, "#ERROR!", SHEET_CELL); }
+    store8(g_formula_state + cell_idx, 2); store64(g_formula_ptr, saved); store64(g_formula_error, err);
+    return v;
+}
+
+func formula_recalc() -> i64 {
+    memset(g_formula_state, 0, 480); r = 0; count = 0;
+    while r < load64(g_rows) { c = 0; while c < load64(g_cols) {
+        if load8(formula_slot(r, c)) == 61 { store64(g_formula_error, 0); formula_eval_cell(r, c); count = count + 1; }
+        c = c + 1;
+    } r = r + 1; }
+    return count;
+}
+
+func formula_set_input(row: i64, col: i64, text: i64) -> i64 {
+    idx = (row * SHEET_COLS + col) * SHEET_CELL;
+    f = g_formulas + idx; cell = g_cells + idx;
+    if load8(text) == 61 { cstr_copy_n(f, text, SHEET_CELL); store8(cell, 0); }
+    else { store8(f, 0); cstr_copy_n(cell, text, SHEET_CELL); }
+    return 1;
+}
+
+func formula_import_cells() -> i64 {
+    memset(g_formulas, 0, SHEET_BYTES); r = 0;
+    while r < load64(g_rows) { c = 0; while c < load64(g_cols) {
+        cell = sheet_cell(r, c);
+        if load8(cell) == 61 { cstr_copy_n(formula_slot(r, c), cell, SHEET_CELL); store8(cell, 0); }
+        c = c + 1;
+    } r = r + 1; }
+    return formula_recalc();
+}
+
+func formula_capture_new_cells() -> i64 {
+    r = 0; found = 0;
+    while r < load64(g_rows) { c = 0; while c < load64(g_cols) {
+        cell = sheet_cell(r, c);
+        if load8(cell) == 61 { cstr_copy_n(formula_slot(r, c), cell, SHEET_CELL); store8(cell, 0); found = found + 1; }
+        c = c + 1;
+    } r = r + 1; }
+    return found;
+}
+
+func formula_clear_paste_area(src: i64, delim: i64, start_row: i64, start_col: i64) -> i64 {
+    rows = 1; cols = 1; cur = 1; p = src; inq = 0;
+    while load8(p) != 0 {
+        ch = load8(p);
+        if ch == 34 { if inq == 0 { inq = 1; } else { if load8(p + 1) == 34 { p = p + 1; } else { inq = 0; } } }
+        else if inq == 0 {
+            if ch == delim { cur = cur + 1; if cur > cols { cols = cur; } }
+            else if ch == 13 || ch == 10 { if ch == 13 { if load8(p + 1) == 10 { p = p + 1; } } rows = rows + 1; cur = 1; }
+        }
+        p = p + 1;
+    }
+    r = start_row;
+    while r < start_row + rows { if r >= SHEET_ROWS { break; } c = start_col; while c < start_col + cols { if c >= SHEET_COLS { break; } store8(formula_slot(r, c), 0); c = c + 1; } r = r + 1; }
+    return 1;
+}
+
+func sheet_cell(row: i64, col: i64) -> ptr {
+    return g_cells + (row * SHEET_COLS + col) * SHEET_CELL;
+}
+
+func sheet_set(row: i64, col: i64, text: str) -> i64 {
+    if row < 0 { return 0; }
+    if row >= SHEET_ROWS { return 0; }
+    if col < 0 { return 0; }
+    if col >= SHEET_COLS { return 0; }
+    cstr_copy_n(sheet_cell(row, col), text, SHEET_CELL);
+    return 1;
+}
+
+func sheet_parse_col(s: i64) -> i64 {
+    p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    c = load8(p);
+    if c >= 97 { if c <= 122 { c = c - 32; } }
+    if c >= 65 { if c < 65 + SHEET_COLS { return c - 65; } }
+    n = app_parse_int(p);
+    if n >= 1 { if n <= SHEET_COLS { return n - 1; } }
+    return 0 - 1;
+}
+
+func sheet_set_status(text: str) -> i64 {
+    if load64(g_status) != 0 { SetWindowTextA(load64(g_status), text); }
+    return 0;
+}
+
+func sheet_mark_dirty() -> i64 {
+    store64(g_dirty, 1);
+    return 0;
+}
+
+func sheet_capture_undo() -> i64 {
+    memcpy(g_undo_cells, g_cells, SHEET_BYTES);
+    memcpy(g_undo_formulas, g_formulas, SHEET_BYTES);
+    store64(g_undo_rows, load64(g_rows));
+    store64(g_undo_cols, load64(g_cols));
+    store64(g_have_undo, 1);
+    store64(g_have_redo, 0);
+    return 0;
+}
+
+func sheet_capture_redo() -> i64 {
+    memcpy(g_redo_cells, g_cells, SHEET_BYTES);
+    memcpy(g_redo_formulas, g_formulas, SHEET_BYTES);
+    store64(g_redo_rows, load64(g_rows));
+    store64(g_redo_cols, load64(g_cols));
+    store64(g_have_redo, 1);
+    return 0;
+}
+
+func sheet_restore_from(cells: i64, formulas: i64, rows: i64, cols: i64) -> i64 {
+    memcpy(g_cells, cells, SHEET_BYTES);
+    memcpy(g_formulas, formulas, SHEET_BYTES);
+    store64(g_rows, rows);
+    store64(g_cols, cols);
+    if load64(g_rows) < 1 { store64(g_rows, 1); }
+    if load64(g_cols) < 1 { store64(g_cols, 1); }
+    return 0;
+}
+
+func sheet_clear(rows: i64, cols: i64) -> i64 {
+    memset(g_cells, 0, SHEET_BYTES);
+    memset(g_formulas, 0, SHEET_BYTES);
+    if rows < 1 { rows = 1; }
+    if rows > SHEET_ROWS { rows = SHEET_ROWS; }
+    if cols < 1 { cols = 1; }
+    if cols > SHEET_COLS { cols = SHEET_COLS; }
+    store64(g_rows, rows);
+    store64(g_cols, cols);
+    store64(g_sel_row, 0);
+    store64(g_sel_col, 0);
+    store64(g_select_all, 0);
+    store64(g_last_find_row, 0 - 1);
+    store64(g_last_find_col, 0 - 1);
+    return 0;
+}
+
+func sheet_seed() -> i64 {
+    sheet_clear(8, 8);
+    sheet_set(0, 0, "Item");          sheet_set(0, 1, "Owner");       sheet_set(0, 2, "Status");      sheet_set(0, 3, "Qty");
+    sheet_set(0, 4, "Unit");          sheet_set(0, 5, "Due");         sheet_set(0, 6, "Notes");       sheet_set(0, 7, "Total");
+    sheet_set(1, 0, "Pump rebuild");  sheet_set(1, 1, "Rita");        sheet_set(1, 2, "In Progress"); sheet_set(1, 3, "3");
+    sheet_set(1, 4, "sets");          sheet_set(1, 5, "2026-07-02");  sheet_set(1, 6, "seal kits quoted");
+    sheet_set(2, 0, "Sensor audit");  sheet_set(2, 1, "Mika");        sheet_set(2, 2, "Open");        sheet_set(2, 3, "18");
+    sheet_set(2, 4, "tags");          sheet_set(2, 5, "2026-07-05");  sheet_set(2, 6, "CSV import check");
+    sheet_set(3, 0, "Valve report");  sheet_set(3, 1, "Noah");        sheet_set(3, 2, "Done");        sheet_set(3, 3, "7");
+    sheet_set(3, 4, "loops");         sheet_set(3, 5, "2026-06-28");  sheet_set(3, 6, "exported from ANCL Sheet");
+    sheet_set(4, 0, "Line flush");    sheet_set(4, 1, "Ada");         sheet_set(4, 2, "Open");        sheet_set(4, 3, "2");
+    sheet_set(4, 4, "lines");         sheet_set(4, 5, "2026-07-09");  sheet_set(4, 6, "requires permit");
+    sheet_set(5, 0, "Calibration");   sheet_set(5, 1, "Sofia");       sheet_set(5, 2, "In Progress"); sheet_set(5, 3, "11");
+    sheet_set(5, 4, "meters");        sheet_set(5, 5, "2026-07-12");  sheet_set(5, 6, "quote-safe, comma-safe cell");
+    formula_set_input(1, 7, "=D2*125");
+    formula_set_input(2, 7, "=D3*9.5");
+    formula_set_input(3, 7, "=D4*42");
+    formula_set_input(4, 7, "=D5*80");
+    formula_set_input(5, 7, "=D6*55.25");
+    formula_recalc();
+    return 0;
+}
+
+func sheet_detect_delim(src: i64) -> i64 {
+    comma = 0; semi = 0; tab = 0; pipe = 0; i = 0;
+    while load8(src + i) != 0 {
+        ch = load8(src + i);
+        if ch == 13 || ch == 10 { break; }
+        if ch == 44 { comma = comma + 1; }
+        if ch == 59 { semi = semi + 1; }
+        if ch == 9 { tab = tab + 1; }
+        if ch == 124 { pipe = pipe + 1; }
+        i = i + 1;
+    }
+    best = comma; delim = 44;
+    if semi > best { best = semi; delim = 59; }
+    if tab > best { best = tab; delim = 9; }
+    if pipe > best { best = pipe; delim = 124; }
+    return delim;
+}
+
+func sheet_parse_delimited(src: i64, delim: i64, start_row: i64, start_col: i64) -> i64 {
+    r = start_row; c = start_col; di = 0; inq = 0; touched = 0;
+    max_rows = load64(g_rows); max_cols = load64(g_cols);
+    dst = sheet_cell(r, c);
+    p = src;
+    while load8(p) != 0 {
+        if r >= SHEET_ROWS { break; }
+        ch = load8(p);
+        if inq == 1 {
+            if ch == 34 {
+                if load8(p + 1) == 34 {
+                    if c < SHEET_COLS { if di < SHEET_CELL - 1 { store8(dst + di, 34); di = di + 1; } }
+                    touched = 1; p = p + 2;
+                } else {
+                    inq = 0; p = p + 1;
+                }
+            } else {
+                if c < SHEET_COLS { if di < SHEET_CELL - 1 { store8(dst + di, ch); di = di + 1; } }
+                touched = 1; p = p + 1;
+            }
+        } else {
+            if ch == 34 {
+                inq = 1; touched = 1; p = p + 1;
+            } else if ch == delim {
+                if c < SHEET_COLS { store8(dst + di, 0); }
+                c = c + 1; touched = 1;
+                if c + 1 > max_cols { max_cols = c + 1; }
+                di = 0;
+                if c < SHEET_COLS { dst = sheet_cell(r, c); }
+                p = p + 1;
+            } else if ch == 13 || ch == 10 {
+                if c < SHEET_COLS { store8(dst + di, 0); }
+                if touched == 1 || c > start_col {
+                    if r + 1 > max_rows { max_rows = r + 1; }
+                    if c + 1 > max_cols { max_cols = c + 1; }
+                }
+                if ch == 13 { if load8(p + 1) == 10 { p = p + 1; } }
+                r = r + 1; c = start_col; di = 0; touched = 0;
+                if r < SHEET_ROWS { dst = sheet_cell(r, c); }
+                p = p + 1;
+            } else {
+                if c < SHEET_COLS { if di < SHEET_CELL - 1 { store8(dst + di, ch); di = di + 1; } }
+                touched = 1; p = p + 1;
+            }
+        }
+    }
+    if r < SHEET_ROWS {
+        if touched == 1 || c > start_col || max_rows == 0 {
+            if c < SHEET_COLS { store8(dst + di, 0); }
+            if r + 1 > max_rows { max_rows = r + 1; }
+            if c + 1 > max_cols { max_cols = c + 1; }
+        }
+    }
+    if max_rows < 1 { max_rows = 1; }
+    if max_cols < 1 { max_cols = 1; }
+    if max_rows > SHEET_ROWS { max_rows = SHEET_ROWS; }
+    if max_cols > SHEET_COLS { max_cols = SHEET_COLS; }
+    store64(g_rows, max_rows);
+    store64(g_cols, max_cols);
+    return max_rows;
+}
+
+func sheet_parse_csv(src: i64) -> i64 {
+    memset(g_cells, 0, SHEET_BYTES);
+    store64(g_rows, 1);
+    store64(g_cols, 1);
+    rows = sheet_parse_delimited(src, sheet_detect_delim(src), 0, 0);
+    formula_import_cells();
+    return rows;
+}
+
+func db_be16(p: i64) -> i64 {
+    return shl(load8(p), 8) + load8(p + 1);
+}
+
+func db_be24(p: i64) -> i64 {
+    return shl(load8(p), 16) + shl(load8(p + 1), 8) + load8(p + 2);
+}
+
+func db_be32(p: i64) -> i64 {
+    return shl(load8(p), 24) + shl(load8(p + 1), 16) + shl(load8(p + 2), 8) + load8(p + 3);
+}
+
+func db_be48(p: i64) -> i64 {
+    v = 0; i = 0;
+    while i < 6 { v = shl(v, 8) + load8(p + i); i = i + 1; }
+    return v;
+}
+
+func db_be64(p: i64) -> i64 {
+    v = 0; i = 0;
+    while i < 8 { v = shl(v, 8) + load8(p + i); i = i + 1; }
+    return v;
+}
+
+func db_is_sqlite(buf: i64, n: i64) -> i64 {
+    if n < 120 { return 0; }
+    magic: str = "SQLite format 3";
+    i = 0;
+    while i < 15 {
+        if load8(buf + i) != load8(magic + i) { return 0; }
+        i = i + 1;
+    }
+    if load8(buf + 15) != 0 { return 0; }
+    return 1;
+}
+
+func db_varint(p: i64) -> i64 {
+    v = 0; i = 0;
+    while i < 8 {
+        b = load8(p + i);
+        v = shl(v, 7) + band(b, 127);
+        if band(b, 128) == 0 {
+            store64(g_var_next, p + i + 1);
+            return v;
+        }
+        i = i + 1;
+    }
+    v = shl(v, 8) + load8(p + 8);
+    store64(g_var_next, p + 9);
+    return v;
+}
+
+func db_serial_len(st: i64) -> i64 {
+    if st == 0 { return 0; }
+    if st == 1 { return 1; }
+    if st == 2 { return 2; }
+    if st == 3 { return 3; }
+    if st == 4 { return 4; }
+    if st == 5 { return 6; }
+    if st == 6 { return 8; }
+    if st == 7 { return 8; }
+    if st == 8 { return 0; }
+    if st == 9 { return 0; }
+    if st >= 12 { return (st - 12) / 2; }
+    return 0;
+}
+
+func db_i64_text(p: i64, st: i64, dst: i64) -> i64 {
+    v = 0;
+    if st == 1 { v = nf_sext8(load8(p)); }
+    else if st == 2 { v = nf_sext16(db_be16(p)); }
+    else if st == 3 { v = db_be24(p); if v >= 8388608 { v = v - 16777216; } }
+    else if st == 4 { v = nf_sext32(db_be32(p)); }
+    else if st == 5 { v = db_be48(p); if v >= 140737488355328 { v = v - 281474976710656; } }
+    else if st == 6 { v = db_be64(p); }
+    else if st == 8 { v = 0; }
+    else if st == 9 { v = 1; }
+    app_i64_text(v, dst);
+    return 0;
+}
+
+func db_field_to_buf(data: i64, st: i64, dst: i64, cap: i64) -> i64 {
+    if st >= 13 {
+        if band(st, 1) == 1 {
+            n = (st - 13) / 2;
+            if n >= cap { n = cap - 1; }
+            memcpy(dst, data, n);
+            store8(dst + n, 0);
+            return 1;
+        }
+    }
+    if st == 1 || st == 2 || st == 3 || st == 4 || st == 5 || st == 6 || st == 8 || st == 9 {
+        db_i64_text(data, st, dst);
+        return 1;
+    }
+    if st == 7 { nf_dtoa(db_be64(data), dst); return 1; }
+    if st == 0 { store8(dst, 0); return 1; }
+    cstr_copy_n(dst, "(blob)", cap);
+    return 1;
+}
+
+func db_field_to_cell(data: i64, st: i64, row: i64, col: i64) -> i64 {
+    return db_field_to_buf(data, st, sheet_cell(row, col), SHEET_CELL);
+}
+
+func db_capture_table() -> i64 {
+    typ = g_db_schema_fields;
+    name = g_db_schema_fields + 512;
+    root = g_db_schema_fields + 1536;
+    sql = g_db_schema_fields + 2048;
+    table_word: str = "table";
+    internal_prefix: str = "sqlite_";
+    if app_strcmp_i(typ, table_word) != 0 { return 0; }
+    if app_starts_i(name, internal_prefix) == 1 { return 0; }
+    count = load64(g_db_table_count);
+    if count >= 16 { return 0; }
+    cstr_copy_n(g_db_table_names + count * 96, name, 96);
+    store64(g_db_table_roots + count * 8, app_parse_int(root));
+    cstr_copy_n(g_db_table_sql + count * 512, sql, 512);
+    store64(g_db_table_count, count + 1);
+    return 1;
+}
+
+func db_parse_schema_record(cell: i64, row: i64, page_end: i64) -> i64 {
+    payload_len = db_varint(cell);
+    p = load64(g_var_next);
+    rowid = db_varint(p);
+    payload = load64(g_var_next);
+    if payload + payload_len > page_end { return 0; }
+    hdr_size = db_varint(payload);
+    q = load64(g_var_next);
+    i = 0;
+    while i < 12 { store64(g_record_types + i * 8, 0); i = i + 1; }
+    i = 0;
+    while q < payload + hdr_size {
+        if i >= 12 { break; }
+        st = db_varint(q);
+        store64(g_record_types + i * 8, st);
+        q = load64(g_var_next);
+        i = i + 1;
+    }
+    data = payload + hdr_size;
+    i = 0;
+    while i < 5 {
+        st2 = load64(g_record_types + i * 8);
+        db_field_to_buf(data, st2, g_db_schema_fields + i * 512, 512);
+        sheet_set(row, i, g_db_schema_fields + i * 512);
+        data = data + db_serial_len(st2);
+        i = i + 1;
+    }
+    db_capture_table();
+    return 1;
+}
+
+func db_source_size() -> i64 {
+    h = CreateFileA(g_path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 { return 0; }
+    n = GetFileSize(h, 0);
+    CloseHandle(h);
+    return n;
+}
+
+func db_read_page(page_no: i64) -> i64 {
+    ps = load64(g_db_page_size);
+    if page_no < 1 { return 0; }
+    h = CreateFileA(g_path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 { return 0; }
+    SetFilePointer(h, (page_no - 1) * ps, 0, 0);
+    ReadFile(h, g_filebuf, ps, g_io, 0);
+    CloseHandle(h);
+    if load32(g_io) != ps { return 0; }
+    return 1;
+}
+
+func db_parse_schema_page(buf: i64, n: i64, page_no: i64) -> i64 {
+    ps = load64(g_db_page_size);
+    if db_read_page(page_no) == 0 { return 0; }
+    page = g_filebuf;
+    hdr = page;
+    if page_no == 1 { hdr = page + 100; }
+    typ = load8(hdr);
+    cells = db_be16(hdr + 3);
+    if typ == 13 {
+        i = 0;
+        while i < cells {
+            coff = db_be16(hdr + 8 + i * 2);
+            if coff > 0 { if coff < ps {
+                row = load64(g_db_schema_row);
+                db_parse_schema_record(page + coff, row, page + ps);
+                store64(g_db_schema_row, row + 1);
+            } }
+            i = i + 1;
+        }
+        return 1;
+    }
+    if typ == 5 {
+        i = 0;
+        while i < cells {
+            if db_read_page(page_no) == 0 { return 0; }
+            page = g_filebuf; hdr = page; if page_no == 1 { hdr = page + 100; }
+            coff = db_be16(hdr + 12 + i * 2);
+            if coff > 0 { if coff + 4 <= ps { db_parse_schema_page(buf, n, db_be32(page + coff)); } }
+            i = i + 1;
+        }
+        if db_read_page(page_no) == 0 { return 0; }
+        hdr = g_filebuf; if page_no == 1 { hdr = g_filebuf + 100; }
+        db_parse_schema_page(buf, n, db_be32(hdr + 8));
+        return 1;
+    }
+    return 0;
+}
+
+func db_parse_schema(buf: i64, n: i64) -> i64 {
+    if db_is_sqlite(buf, n) == 0 { return 0; }
+    ps = db_be16(buf + 16);
+    if ps == 1 { ps = 65536; }
+    if ps < 512 { return 0; }
+    if ps > n { return 0; }
+    store64(g_db_page_size, ps);
+    store64(g_db_file_size, db_source_size());
+    store64(g_db_table_count, 0);
+    store64(g_db_schema_row, 1);
+    memset(g_db_table_names, 0, 1536);
+    memset(g_db_table_roots, 0, 128);
+    memset(g_db_table_sql, 0, 8192);
+    sheet_clear(1, 5);
+    sheet_set(0, 0, "type");
+    sheet_set(0, 1, "name");
+    sheet_set(0, 2, "table");
+    sheet_set(0, 3, "rootpage");
+    sheet_set(0, 4, "sql");
+    if db_parse_schema_page(buf, n, 1) == 0 { return 0; }
+    row = load64(g_db_schema_row);
+    if row > SHEET_ROWS { row = SHEET_ROWS; }
+    store64(g_rows, row);
+    store64(g_cols, 5);
+    store64(g_db_mode, 1);
+    return 1;
+}
+
+func db_sqlite_resolve(h: i64, provider: i64) -> i64 {
+    if h == 0 { return 0; }
+    store64(g_sq_open_v2, GetProcAddress(h, sq_open_v2));
+    store64(g_sq_prepare, GetProcAddress(h, sq_prepare));
+    store64(g_sq_bind_text, GetProcAddress(h, sq_bind_text));
+    store64(g_sq_bind_i64, GetProcAddress(h, sq_bind_i64));
+    store64(g_sq_step, GetProcAddress(h, sq_step));
+    store64(g_sq_finalize, GetProcAddress(h, sq_finalize));
+    store64(g_sq_close, GetProcAddress(h, sq_close));
+    store64(g_sq_exec, GetProcAddress(h, sq_exec));
+    if load64(g_sq_open_v2) == 0 { return 0; }
+    if load64(g_sq_prepare) == 0 { return 0; }
+    if load64(g_sq_bind_text) == 0 { return 0; }
+    if load64(g_sq_bind_i64) == 0 { return 0; }
+    if load64(g_sq_step) == 0 { return 0; }
+    if load64(g_sq_finalize) == 0 { return 0; }
+    if load64(g_sq_close) == 0 { return 0; }
+    if load64(g_sq_exec) == 0 { return 0; }
+    store64(g_sqlite_mod, h);
+    cstr_copy_n(g_sqlite_provider, provider, 96);
+    return 1;
+}
+
+func db_sqlite_load() -> i64 {
+    if load64(g_sqlite_mod) != 0 { return 1; }
+    h = LoadLibraryA(winsqlite_dll);
+    if db_sqlite_resolve(h, provider_windows) != 0 { return 1; }
+    n = app_exedir(g_dialog_file);
+    str_copy(g_dialog_file + n, sqlite_suffix);
+    h = LoadLibraryA(g_dialog_file);
+    if h == 0 { h = LoadLibraryA(sqlite_dll); }
+    if db_sqlite_resolve(h, provider_fallback) != 0 { return 1; }
+    cstr_copy_n(g_sqlite_provider, provider_none, 96);
+    return 0;
+}
+
+func sheet_show_about() -> i64 {
+    db_sqlite_load();
+    p = str_copy(g_about_buf, about_text);
+    p = str_copy(p, about_provider);
+    if load8(g_sqlite_provider) != 0 { str_copy(p, g_sqlite_provider); }
+    else { str_copy(p, provider_none); }
+    MessageBoxA(load64(g_hwnd), g_about_buf, about_title, 0x40);
+    return 0;
+}
+
+func sheet_open_guide() -> i64 {
+    n = app_exedir(g_guide_path);
+    str_copy(g_guide_path + n, guide_suffix);
+    rv = ShellExecuteA(load64(g_hwnd), op_open, g_guide_path, 0, 0, 5);
+    if rv <= 32 { sheet_set_status(st_noguide); MessageBoxA(load64(g_hwnd), st_noguide, about_title, 0x30); }
+    return 0;
+}
+
+func db_copy_file(src: i64, dst: i64) -> i64 {
+    hin = CreateFileA(src, 0x80000000, 1, 0, 3, 0x80, 0);
+    if hin == 0 - 1 { return 0; }
+    store64(g_db_copy_in, hin);
+    hout = CreateFileA(dst, 0x40000000, 0, 0, 2, 0x80, 0);
+    if hout == 0 - 1 { CloseHandle(load64(g_db_copy_in)); return 0; }
+    store64(g_db_copy_out, hout); ok = 1; going = 1;
+    while going != 0 {
+        store64(g_db_copy_read, 0);
+        if ReadFile(load64(g_db_copy_in), g_filebuf, 65536, g_db_copy_read, 0) == 0 { ok = 0; going = 0; }
+        else {
+            n = load64(g_db_copy_read);
+            if n == 0 { going = 0; }
+            else {
+                store64(g_db_copy_written, 0);
+                if WriteFile(load64(g_db_copy_out), g_filebuf, n, g_db_copy_written, 0) == 0 { ok = 0; going = 0; }
+                else { if load64(g_db_copy_written) != n { ok = 0; going = 0; } }
+            }
+        }
+    }
+    CloseHandle(load64(g_db_copy_out)); CloseHandle(load64(g_db_copy_in));
+    return ok;
+}
+
+func db_sql_exec(sql: i64) -> i64 {
+    store64(g_sq_err, 0);
+    return callp(load64(g_sq_exec), load64(g_sq_db), sql, 0, 0, g_sq_err);
+}
+
+func db_sql_ident(dst: i64, name: i64) -> i64 {
+    store8(dst, 34); out = dst + 1; p = name;
+    while load8(p) != 0 {
+        ch = load8(p);
+        if ch == 34 { store8(out, 34); out = out + 1; }
+        store8(out, ch); out = out + 1; p = p + 1;
+    }
+    store8(out, 34); store8(out + 1, 0);
+    return out + 1;
+}
+
+func db_commit_changes(target: i64, copied: i64) -> i64 {
+    if load64(g_db_change_count) == 0 {
+        if copied != 0 { SetWindowTextA(load64(g_path_ed), g_path); recent_push(g_path); sheet_set_status(st_dbcopy); }
+        else { sheet_set_status(st_dbsaved); }
+        return 1;
+    }
+    if db_sqlite_load() == 0 { sheet_set_status(st_dbdll); return 0; }
+    cstr_copy_n(g_backup_path, g_path, 700);
+    str_copy(g_backup_path + strlen(g_backup_path), backup_suffix);
+    if db_copy_file(g_path, g_backup_path) == 0 { sheet_set_status(st_dbbackupbad); return 0; }
+    store64(g_sq_db, 0);
+    rc = callp(load64(g_sq_open_v2), g_path, g_sq_db, 2, 0);
+    if rc != 0 { sheet_set_status(st_dbcommitbad); return 0; }
+    if db_sql_exec(sql_begin) != 0 { callp(load64(g_sq_close), load64(g_sq_db)); sheet_set_status(st_dbcommitbad); return 0; }
+    ok = 1; r = 1;
+    while r < load64(g_rows) {
+        c = 0;
+        while c < load64(g_cols) {
+            idx = r * SHEET_COLS + c;
+            if load8(g_db_changed + idx) != 0 {
+                p = str_copy(g_sqlbuf, sql_update);
+                p = db_sql_ident(p, g_db_table_names + load64(g_db_selected) * 96);
+                p = str_copy(p, sql_set);
+                p = db_sql_ident(p, sheet_cell(0, c));
+                str_copy(p, sql_where);
+                store64(g_sq_stmt, 0);
+                rc = callp(load64(g_sq_prepare), load64(g_sq_db), g_sqlbuf, 0 - 1, g_sq_stmt, 0);
+                if rc != 0 { ok = 0; }
+                if ok != 0 {
+                    rc = callp(load64(g_sq_bind_text), load64(g_sq_stmt), 1, sheet_cell(r, c), 0 - 1, 0 - 1);
+                    if rc != 0 { ok = 0; }
+                }
+                if ok != 0 {
+                    rc = callp(load64(g_sq_bind_i64), load64(g_sq_stmt), 2, load64(g_db_rowids + r * 8));
+                    if rc != 0 { ok = 0; }
+                }
+                if ok != 0 { if callp(load64(g_sq_step), load64(g_sq_stmt)) != 101 { ok = 0; } }
+                if load64(g_sq_stmt) != 0 { callp(load64(g_sq_finalize), load64(g_sq_stmt)); store64(g_sq_stmt, 0); }
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    if ok != 0 { if db_sql_exec(sql_commit) != 0 { ok = 0; } }
+    if ok == 0 { db_sql_exec(sql_rollback); }
+    callp(load64(g_sq_close), load64(g_sq_db)); store64(g_sq_db, 0);
+    if ok == 0 { sheet_set_status(st_dbcommitbad); return 0; }
+    memset(g_db_changed, 0, 480); store64(g_db_change_count, 0); store64(g_dirty, 0);
+    SetWindowTextA(load64(g_path_ed), g_path);
+    recent_push(g_path);
+    if copied != 0 { sheet_set_status(st_dbcopy); } else { sheet_set_status(st_dbsaved); }
+    return 1;
+}
+
+func db_parse_columns(sql: i64) -> i64 {
+    sheet_clear(1, 1);
+    store64(g_db_pk_col, 0 - 1);
+    p = sql;
+    while load8(p) != 0 { if load8(p) == 40 { p = p + 1; break; } p = p + 1; }
+    col = 0; depth = 1; quote = 0; seg = p;
+    while load8(p) != 0 {
+        ch = load8(p);
+        if quote != 0 {
+            if ch == quote { quote = 0; }
+        } else {
+            if ch == 34 || ch == 39 || ch == 96 { quote = ch; }
+            else if ch == 91 { quote = 93; }
+            else if ch == 40 { depth = depth + 1; }
+            else if ch == 41 { depth = depth - 1; }
+        }
+        if quote == 0 {
+            if ch == 44 { if depth == 1 {
+                end = p;
+                s = seg; while s < end { if load8(s) == 32 || load8(s) == 9 || load8(s) == 13 || load8(s) == 10 { s = s + 1; } else { break; } }
+                n = end - s; if n > 511 { n = 511; }
+                memcpy(g_cellbuf, s, n); store8(g_cellbuf + n, 0);
+                if app_starts_i(g_cellbuf, "primary") == 0 && app_starts_i(g_cellbuf, "constraint") == 0 && app_starts_i(g_cellbuf, "unique") == 0 && app_starts_i(g_cellbuf, "check") == 0 && app_starts_i(g_cellbuf, "foreign") == 0 {
+                    if col < SHEET_COLS {
+                        dst = sheet_cell(0, col); di = 0; q = load8(s); closeq = 0;
+                        if q == 34 || q == 39 || q == 96 { closeq = q; s = s + 1; }
+                        else if q == 91 { closeq = 93; s = s + 1; }
+                        while s < end { c = load8(s); if closeq != 0 { if c == closeq { break; } } else { if c == 32 || c == 9 || c == 13 || c == 10 { break; } } if di < SHEET_CELL - 1 { store8(dst + di, c); di = di + 1; } s = s + 1; }
+                        store8(dst + di, 0);
+                        if app_contains_i(g_cellbuf, "primary key") == 1 { if app_contains_i(g_cellbuf, "int") == 1 { store64(g_db_pk_col, col); } }
+                        col = col + 1;
+                    }
+                }
+                seg = p + 1;
+            } }
+            if ch == 41 { if depth == 0 { break; } }
+        }
+        p = p + 1;
+    }
+    if p > seg {
+        end = p; s = seg;
+        while s < end { if load8(s) == 32 || load8(s) == 9 || load8(s) == 13 || load8(s) == 10 { s = s + 1; } else { break; } }
+        n = end - s; if n > 511 { n = 511; }
+        memcpy(g_cellbuf, s, n); store8(g_cellbuf + n, 0);
+        if app_starts_i(g_cellbuf, "primary") == 0 && app_starts_i(g_cellbuf, "constraint") == 0 && app_starts_i(g_cellbuf, "unique") == 0 && app_starts_i(g_cellbuf, "check") == 0 && app_starts_i(g_cellbuf, "foreign") == 0 {
+            if col < SHEET_COLS {
+                dst = sheet_cell(0, col); di = 0; q = load8(s); closeq = 0;
+                if q == 34 || q == 39 || q == 96 { closeq = q; s = s + 1; }
+                else if q == 91 { closeq = 93; s = s + 1; }
+                while s < end { c = load8(s); if closeq != 0 { if c == closeq { break; } } else { if c == 32 || c == 9 || c == 13 || c == 10 { break; } } if di < SHEET_CELL - 1 { store8(dst + di, c); di = di + 1; } s = s + 1; }
+                store8(dst + di, 0);
+                if app_contains_i(g_cellbuf, "primary key") == 1 { if app_contains_i(g_cellbuf, "int") == 1 { store64(g_db_pk_col, col); } }
+                col = col + 1;
+            }
+        }
+    }
+    if col < 1 { sheet_set(0, 0, "value"); col = 1; }
+    store64(g_cols, col);
+    return col;
+}
+
+func db_parse_table_record(cell: i64, row: i64, page_end: i64) -> i64 {
+    payload_len = db_varint(cell);
+    p = load64(g_var_next);
+    rowid = db_varint(p);
+    store64(g_db_rowids + row * 8, rowid);
+    payload = load64(g_var_next);
+    if payload + payload_len > page_end { sheet_set(row, 0, "(overflow row)"); return 0; }
+    hdr_size = db_varint(payload);
+    if hdr_size > payload_len { return 0; }
+    q = load64(g_var_next);
+    i = 0; while i < 12 { store64(g_record_types + i * 8, 0); i = i + 1; }
+    i = 0;
+    while q < payload + hdr_size { if i >= 12 { break; } st = db_varint(q); store64(g_record_types + i * 8, st); q = load64(g_var_next); i = i + 1; }
+    data = payload + hdr_size; cols = load64(g_cols); i = 0;
+    while i < cols {
+        st2 = load64(g_record_types + i * 8);
+        if st2 == 0 { if i == load64(g_db_pk_col) { app_i64_text(rowid, sheet_cell(row, i)); } else { store8(sheet_cell(row, i), 0); } }
+        else { db_field_to_cell(data, st2, row, i); }
+        data = data + db_serial_len(st2);
+        i = i + 1;
+    }
+    return 1;
+}
+
+func db_scan_table_page(buf: i64, n: i64, page_no: i64) -> i64 {
+    if load64(g_db_scan_stop) != 0 { return 1; }
+    ps = load64(g_db_page_size);
+    if db_read_page(page_no) == 0 { return 0; }
+    page = g_filebuf; hdr = page; typ = load8(hdr); cells = db_be16(hdr + 3);
+    if typ == 13 {
+        i = 0;
+        while i < cells {
+            seen = load64(g_db_scan_seen);
+            skip = load64(g_db_page) * 39;
+            if seen >= skip + 39 { store64(g_db_has_more, 1); store64(g_db_scan_stop, 1); return 1; }
+            if seen >= skip {
+                coff = db_be16(hdr + 8 + i * 2);
+                if coff > 0 { if coff < ps { out = load64(g_db_scan_out); db_parse_table_record(page + coff, out, page + ps); store64(g_db_scan_out, out + 1); } }
+            }
+            store64(g_db_scan_seen, seen + 1);
+            i = i + 1;
+        }
+        return 1;
+    }
+    if typ == 5 {
+        i = 0;
+        while i < cells {
+            if db_read_page(page_no) == 0 { return 0; }
+            page = g_filebuf; hdr = page;
+            coff = db_be16(hdr + 12 + i * 2);
+            if coff > 0 { if coff + 4 <= ps { db_scan_table_page(buf, n, db_be32(page + coff)); } }
+            if load64(g_db_scan_stop) != 0 { return 1; }
+            i = i + 1;
+        }
+        if db_read_page(page_no) == 0 { return 0; }
+        hdr = g_filebuf;
+        db_scan_table_page(buf, n, db_be32(hdr + 8));
+        return 1;
+    }
+    return 0;
+}
+
+func db_update_page_label() -> i64 {
+    p = str_copy(g_db_page_text, "Page ");
+    app_u64_text(load64(g_db_page) + 1, p);
+    if load64(g_db_page_label) != 0 { SetWindowTextA(load64(g_db_page_label), g_db_page_text); }
+    return 0;
+}
+
+func db_show_table(page_no: i64) -> i64 {
+    if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); return 0; }
+    sel = SendMessageA(load64(g_db_table_combo), 327, 0, 0);
+    if sel < 0 { sheet_set_status(st_dbselect); return 0; }
+    if sel >= load64(g_db_table_count) { sheet_set_status(st_dbselect); return 0; }
+    store64(g_db_selected, sel);
+    store64(g_db_page, page_no);
+    db_parse_columns(g_db_table_sql + sel * 512);
+    memset(g_db_rowids, 0, 320); memset(g_db_changed, 0, 480); store64(g_db_sorted, 0);
+    store64(g_db_has_more, 0); store64(g_db_scan_seen, 0); store64(g_db_scan_out, 1); store64(g_db_scan_stop, 0);
+    root = load64(g_db_table_roots + sel * 8);
+    if db_scan_table_page(g_filebuf, load64(g_db_file_size), root) == 0 { sheet_set_status(st_dbbad); return 0; }
+    store64(g_rows, load64(g_db_scan_out));
+    store64(g_db_mode, 2);
+    store64(g_dirty, 0);
+    sheet_refresh_grid();
+    sheet_select_cell(0, 0, st_dbtable);
+    db_update_page_label();
+    return 1;
+}
+
+func db_show_schema() -> i64 {
+    sel = load64(g_db_selected);
+    n = sheet_read_file(g_path, g_filebuf, 131072);
+    if n < 0 { sheet_set_status(st_dbbad); return 0; }
+    if db_parse_schema(g_filebuf, n) == 0 { sheet_set_status(st_dbbad); return 0; }
+    if sel >= 0 { if sel < load64(g_db_table_count) { store64(g_db_selected, sel); SendMessageA(load64(g_db_table_combo), 334, sel, 0); } }
+    store64(g_db_page, 0);
+    sheet_refresh_grid();
+    sheet_select_cell(0, 0, st_dbloaded);
+    SetWindowTextA(load64(g_db_page_label), "Schema");
+    return 1;
+}
+
+func db_populate_tables() -> i64 {
+    combo = load64(g_db_table_combo);
+    if combo == 0 { return 0; }
+    SendMessageA(combo, 331, 0, 0);
+    count = load64(g_db_table_count); i = 0;
+    while i < count { SendMessageA(combo, 323, 0, g_db_table_names + i * 96); i = i + 1; }
+    if count > 0 { store64(g_db_selected, 0); SendMessageA(combo, 334, 0, 0); }
+    else { store64(g_db_selected, 0 - 1); }
+    return count;
+}
+
+func db_show_controls(show: i64) -> i64 {
+    ShowWindow(load64(g_db_table_label), show);
+    ShowWindow(load64(g_db_table_combo), show);
+    ShowWindow(load64(g_db_schema_btn), show);
+    ShowWindow(load64(g_db_view_btn), show);
+    ShowWindow(load64(g_db_prev_btn), show);
+    ShowWindow(load64(g_db_next_btn), show);
+    ShowWindow(load64(g_db_page_label), show);
+    if load64(g_grid) != 0 {
+        if show != 0 {
+            MoveWindow(load64(g_grid), 18, 204, 1168, 368, 1);
+            MoveWindow(load64(g_cell_edit), 18, 204, 120, 22, 1);
+        } else {
+            MoveWindow(load64(g_grid), 18, 180, 1168, 392, 1);
+            MoveWindow(load64(g_cell_edit), 18, 180, 120, 22, 1);
+        }
+        InvalidateRect(load64(g_hwnd), 0, 1);
+    }
+    return 0;
+}
+
+func sheet_read_file(path: i64, dst: i64, cap: i64) -> i64 {
+    h = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 { return 0 - 1; }
+    ReadFile(h, dst, cap - 1, g_io, 0);
+    CloseHandle(h);
+    n = load32(g_io);
+    store8(dst + n, 0);
+    return n;
+}
+
+func sheet_write_file(path: i64, src: i64, n: i64) -> i64 {
+    h = CreateFileA(path, 0x40000000, 0, 0, 2, 0x80, 0);
+    if h == 0 - 1 { return 0; }
+    WriteFile(h, src, n, g_io, 0);
+    CloseHandle(h);
+    return 1;
+}
+
+func sheet_build_csv(dst: i64) -> i64 {
+    p = dst; rows = load64(g_rows); cols = load64(g_cols);
+    r = 0;
+    while r < rows {
+        c = 0;
+        while c < cols {
+            store8(p, 34); p = p + 1;
+            s = sheet_cell(r, c); i = 0;
+            while load8(s + i) != 0 {
+                ch = load8(s + i);
+                if ch == 34 {
+                    store8(p, 34); p = p + 1; store8(p, 34); p = p + 1;
+                } else {
+                    store8(p, ch); p = p + 1;
+                }
+                i = i + 1;
+            }
+            store8(p, 34); p = p + 1;
+            if c + 1 < cols { store8(p, 44); p = p + 1; }
+            c = c + 1;
+        }
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        r = r + 1;
+    }
+    store8(p, 0);
+    return p - dst;
+}
+
+func sheet_build_filtered_csv(dst: i64) -> i64 {
+    p = dst; rows = load64(g_rows); cols = load64(g_cols); r = 0;
+    while r < rows {
+        include = 0;
+        if r == 0 { include = 1; }
+        else { include = sheet_filter_matches(r); }
+        if include == 1 {
+            c = 0;
+            while c < cols {
+                store8(p, 34); p = p + 1;
+                s = sheet_cell(r, c); i = 0;
+                while load8(s + i) != 0 {
+                    ch = load8(s + i);
+                    if ch == 34 { store8(p, 34); p = p + 1; store8(p, 34); p = p + 1; }
+                    else { store8(p, ch); p = p + 1; }
+                    i = i + 1;
+                }
+                store8(p, 34); p = p + 1;
+                if c + 1 < cols { store8(p, 44); p = p + 1; }
+                c = c + 1;
+            }
+            store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        }
+        r = r + 1;
+    }
+    store8(p, 0);
+    return p - dst;
+}
+
+func sheet_build_tsv(dst: i64) -> i64 {
+    p = dst; rows = load64(g_rows); cols = load64(g_cols);
+    r = 0;
+    while r < rows {
+        c = 0;
+        while c < cols {
+            p = str_copy(p, formula_input(r, c));
+            if c + 1 < cols { store8(p, 9); p = p + 1; }
+            c = c + 1;
+        }
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        r = r + 1;
+    }
+    store8(p, 0);
+    return p - dst;
+}
+
+func sheet_build_selected_rows_tsv(dst: i64) -> i64 {
+    p = dst; cols = load64(g_cols); view_row = 0 - 1; count = 0;
+    while 1 {
+        view_row = SendMessageA(load64(g_grid), 4108, view_row, 2);
+        if view_row < 0 { break; }
+        if view_row >= SHEET_ROWS { break; }
+        row = load64(g_view_map + view_row * 8);
+        c = 0;
+        while c < cols {
+            p = str_copy(p, formula_input(row, c));
+            if c + 1 < cols { store8(p, 9); p = p + 1; }
+            c = c + 1;
+        }
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        count = count + 1;
+    }
+    store8(p, 0);
+    store64(g_copy_row_count, count);
+    return p - dst;
+}
+
+func sheet_filter_matches(row: i64) -> i64 {
+    if row == 0 { return 1; }
+    GetWindowTextA(load64(g_filter_ed), g_filterbuf, 128);
+    if load8(g_filterbuf) == 0 { return 1; }
+    GetWindowTextA(load64(g_filter_col_ed), g_colbuf, 32);
+    col = 0 - 1;
+    if app_strcmp_i(g_colbuf, all_text) != 0 { col = sheet_parse_col(g_colbuf); }
+    cols = load64(g_cols);
+    if col >= 0 {
+        if col < cols { return app_contains_i(sheet_cell(row, col), g_filterbuf); }
+        return 0;
+    }
+    c = 0;
+    while c < cols {
+        if app_contains_i(sheet_cell(row, c), g_filterbuf) == 1 { return 1; }
+        c = c + 1;
+    }
+    return 0;
+}
+
+func sheet_refresh_grid() -> i64 {
+    hlv = load64(g_grid);
+    if hlv == 0 { return 0; }
+    SendMessageA(hlv, 11, 0, 0);
+    gui_lv_clear(hlv);
+    rows = load64(g_rows);
+    cols = load64(g_cols);
+    vi = 0; r = 0;
+    while r < rows {
+        if sheet_filter_matches(r) == 1 {
+            store64(g_view_map + vi * 8, r);
+            app_u64_text(r + 1, g_numbuf);
+            gui_lv_insert_row(hlv, vi, g_numbuf);
+            c = 0;
+            while c < SHEET_COLS {
+                if c < cols { gui_lv_set_cell(hlv, vi, c + 1, sheet_cell(r, c)); }
+                else { gui_lv_set_cell(hlv, vi, c + 1, empty_text); }
+                c = c + 1;
+            }
+            vi = vi + 1;
+        }
+        r = r + 1;
+    }
+    SendMessageA(hlv, 11, 1, 0);
+    InvalidateRect(hlv, 0, 1);
+    return 0;
+}
+
+func sheet_select_cell(row: i64, col: i64, status: str) -> i64 {
+    if row < 0 { sheet_set_status(st_badcell); return 0; }
+    if row >= SHEET_ROWS { sheet_set_status(st_badcell); return 0; }
+    if col < 0 { sheet_set_status(st_badcell); return 0; }
+    if col >= SHEET_COLS { sheet_set_status(st_badcell); return 0; }
+    store64(g_sel_row, row);
+    store64(g_sel_col, col);
+    store64(g_select_all, 0);
+    app_u64_text(row + 1, g_numbuf);
+    SetWindowTextA(load64(g_row_ed), g_numbuf);
+    app_col_name(col, g_colbuf);
+    SetWindowTextA(load64(g_col_ed), g_colbuf);
+    idx = (load64(g_sel_row) * SHEET_COLS + load64(g_sel_col)) * SHEET_CELL;
+    if load8(g_formulas + idx) == 61 { SetWindowTextA(load64(g_value_ed), g_formulas + idx); }
+    else { SetWindowTextA(load64(g_value_ed), g_cells + idx); }
+    sheet_set_status(status);
+    return 1;
+}
+
+func sheet_read_target() -> i64 {
+    GetWindowTextA(load64(g_row_ed), g_numbuf, 32);
+    row = app_parse_int(g_numbuf) - 1;
+    store64(g_sel_row, row);
+    GetWindowTextA(load64(g_col_ed), g_colbuf, 32);
+    col = sheet_parse_col(g_colbuf);
+    store64(g_sel_col, col);
+    return sheet_select_cell(load64(g_sel_row), load64(g_sel_col), st_picked);
+}
+
+func sheet_apply_edit() -> i64 {
+    if load64(g_xlsx_mode) != 0 { sheet_set_status(st_xlsxro); return 0; }
+    GetWindowTextA(load64(g_row_ed), g_numbuf, 32);
+    row = app_parse_int(g_numbuf) - 1;
+    store64(g_sel_row, row);
+    GetWindowTextA(load64(g_col_ed), g_colbuf, 32);
+    col = sheet_parse_col(g_colbuf);
+    store64(g_sel_col, col);
+    row = load64(g_sel_row); col = load64(g_sel_col);
+    if row < 0 { sheet_set_status(st_badcell); return 0; }
+    if row >= SHEET_ROWS { sheet_set_status(st_badcell); return 0; }
+    if col < 0 { sheet_set_status(st_badcell); return 0; }
+    if col >= SHEET_COLS { sheet_set_status(st_badcell); return 0; }
+    if load64(g_db_mode) != 0 {
+        if load64(g_db_mode) != 2 || load64(g_sel_row) <= 0 || load64(g_sel_row) >= load64(g_rows) || load64(g_sel_col) >= load64(g_cols) { sheet_set_status(st_readonly); return 0; }
+        if load64(g_db_sorted) != 0 { sheet_set_status(st_dbsortedit); return 0; }
+        GetWindowTextA(load64(g_value_ed), g_cellbuf, 512);
+        row = load64(g_sel_row); col = load64(g_sel_col); idx = row * SHEET_COLS + col;
+        if load8(g_db_changed + idx) == 0 { store8(g_db_changed + idx, 1); store64(g_db_change_count, load64(g_db_change_count) + 1); }
+        cstr_copy_n(g_cells + idx * SHEET_CELL, g_cellbuf, SHEET_CELL);
+        store64(g_dirty, 1); sheet_refresh_grid(); sheet_select_cell(row, col, st_dbstaged);
+        return 1;
+    }
+    sheet_capture_undo();
+    GetWindowTextA(load64(g_value_ed), g_cellbuf, 512);
+    row = load64(g_sel_row); col = load64(g_sel_col);
+    idx = (row * SHEET_COLS + col) * SHEET_CELL;
+    if load8(g_cellbuf) == 61 { cstr_copy_n(g_formulas + idx, g_cellbuf, SHEET_CELL); store8(g_cells + idx, 0); }
+    else { store8(g_formulas + idx, 0); cstr_copy_n(g_cells + idx, g_cellbuf, SHEET_CELL); }
+    if load64(g_sel_row) + 1 > load64(g_rows) { store64(g_rows, load64(g_sel_row) + 1); }
+    if load64(g_sel_col) + 1 > load64(g_cols) { store64(g_cols, load64(g_sel_col) + 1); }
+    sheet_mark_dirty();
+    formulas = formula_recalc();
+    sheet_refresh_grid();
+    row = load64(g_sel_row); col = load64(g_sel_col);
+    if formulas > 0 { sheet_select_cell(row, col, st_formula); }
+    else { sheet_select_cell(row, col, st_applied); }
+    return 1;
+}
+
+func sheet_inline_hide() -> i64 {
+    store64(g_cell_editing, 0);
+    gui_grid_hide_cell_editor(load64(g_cell_edit));
+    return 0;
+}
+
+func sheet_inline_commit() -> i64 {
+    if load64(g_cell_editing) == 0 { return 0; }
+    if load64(g_xlsx_mode) != 0 { sheet_inline_hide(); sheet_set_status(st_xlsxro); return 0; }
+    row = load64(g_cell_edit_row);
+    col = load64(g_cell_edit_col);
+    GetWindowTextA(load64(g_cell_edit), g_cellbuf, 512);
+    if load64(g_db_mode) == 2 {
+        if row <= 0 || row >= load64(g_rows) || col >= load64(g_cols) { sheet_inline_hide(); sheet_set_status(st_readonly); return 0; }
+        if load64(g_db_sorted) != 0 { sheet_inline_hide(); sheet_set_status(st_dbsortedit); return 0; }
+        idx = row * SHEET_COLS + col;
+        if load8(g_db_changed + idx) == 0 { store8(g_db_changed + idx, 1); store64(g_db_change_count, load64(g_db_change_count) + 1); }
+        cstr_copy_n(g_cells + idx * SHEET_CELL, g_cellbuf, SHEET_CELL);
+        store64(g_dirty, 1); sheet_inline_hide(); sheet_refresh_grid(); sheet_select_cell(row, col, st_dbstaged);
+        return 1;
+    }
+    sheet_capture_undo();
+    row = load64(g_cell_edit_row); col = load64(g_cell_edit_col);
+    idx = (row * SHEET_COLS + col) * SHEET_CELL;
+    if load8(g_cellbuf) == 61 { cstr_copy_n(g_formulas + idx, g_cellbuf, SHEET_CELL); store8(g_cells + idx, 0); }
+    else { store8(g_formulas + idx, 0); cstr_copy_n(g_cells + idx, g_cellbuf, SHEET_CELL); }
+    if load64(g_cell_edit_row) + 1 > load64(g_rows) { store64(g_rows, load64(g_cell_edit_row) + 1); }
+    if load64(g_cell_edit_col) + 1 > load64(g_cols) { store64(g_cols, load64(g_cell_edit_col) + 1); }
+    sheet_mark_dirty();
+    formulas = formula_recalc();
+    sheet_inline_hide();
+    sheet_refresh_grid();
+    row = load64(g_cell_edit_row); col = load64(g_cell_edit_col);
+    if formulas > 0 { sheet_select_cell(row, col, st_formula); }
+    else { sheet_select_cell(row, col, st_applied); }
+    return 1;
+}
+
+func sheet_inline_cancel() -> i64 {
+    if load64(g_cell_editing) == 0 { return 0; }
+    row = load64(g_cell_edit_row);
+    col = load64(g_cell_edit_col);
+    sheet_inline_hide();
+    sheet_select_cell(row, col, st_picked);
+    return 1;
+}
+
+func sheet_begin_cell_edit(row: i64, col: i64, view_row: i64, sub: i64) -> i64 {
+    if load64(g_xlsx_mode) != 0 { return sheet_select_cell(row, col, st_xlsxro); }
+    if load64(g_db_mode) != 0 { if load64(g_db_mode) != 2 || row <= 0 || load64(g_db_sorted) != 0 { return sheet_select_cell(row, col, st_readonly); } }
+    if sub <= 0 { return sheet_select_cell(row, col, st_picked); }
+    if sub > SHEET_COLS { return 0; }
+    if load64(g_cell_editing) != 0 { sheet_inline_cancel(); }
+    if sheet_select_cell(row, col, st_editing) == 0 { return 0; }
+
+    grid_y = 180;
+    if load64(g_db_mode) != 0 { grid_y = 204; }
+    if gui_grid_show_cell_editor(load64(g_grid), load64(g_cell_edit), 18, grid_y, view_row, sub, formula_input(row, col), g_rect) == 0 { return 0; }
+    store64(g_cell_edit_row, row);
+    store64(g_cell_edit_col, col);
+    store64(g_cell_editing, 1);
+    return 1;
+}
+
+func xlsx_find(p: i64, needle: i64) -> i64 {
+    if load8(needle) == 0 { return p; }
+    while load8(p) != 0 {
+        i = 0;
+        while load8(needle + i) != 0 { if load8(p + i) != load8(needle + i) { break; } i = i + 1; }
+        if load8(needle + i) == 0 { return p; }
+        p = p + 1;
+    }
+    return 0;
+}
+
+func xlsx_find_before(p: i64, needle: i64, limit: i64) -> i64 {
+    if load8(needle) == 0 { return p; }
+    while p < limit {
+        i = 0;
+        while load8(needle + i) != 0 { if p + i >= limit { break; } if load8(p + i) != load8(needle + i) { break; } i = i + 1; }
+        if load8(needle + i) == 0 { return p; }
+        p = p + 1;
+    }
+    return 0;
+}
+
+func xlsx_decode(dst: i64, src: i64, end: i64, cap: i64) -> i64 {
+    di = 0; p = src;
+    while p < end { if di + 1 >= cap { break; } ch = load8(p);
+        if ch == 38 {
+            if p + 4 <= end { if load8(p + 1) == 108 && load8(p + 2) == 116 && load8(p + 3) == 59 { ch = 60; p = p + 3; } }
+            if ch == 38 { if p + 4 <= end { if load8(p + 1) == 103 && load8(p + 2) == 116 && load8(p + 3) == 59 { ch = 62; p = p + 3; } } }
+            if ch == 38 { if p + 5 <= end { if load8(p + 1) == 97 && load8(p + 2) == 109 && load8(p + 3) == 112 && load8(p + 4) == 59 { ch = 38; p = p + 4; } } }
+            if ch == 38 { if p + 6 <= end { if load8(p + 1) == 113 && load8(p + 2) == 117 && load8(p + 3) == 111 && load8(p + 4) == 116 && load8(p + 5) == 59 { ch = 34; p = p + 5; } } }
+            if ch == 38 { if p + 6 <= end { if load8(p + 1) == 97 && load8(p + 2) == 112 && load8(p + 3) == 111 && load8(p + 4) == 115 && load8(p + 5) == 59 { ch = 39; p = p + 5; } } }
+        }
+        store8(dst + di, ch); di = di + 1; p = p + 1;
+    }
+    store8(dst + di, 0); return di;
+}
+
+func xlsx_capture(part: i64, dst: i64, cap: i64) -> i64 {
+    p = str_copy(g_xlsx_cmd, xlsx_tar_prefix);
+    p = str_copy(p, g_path);
+    str_copy(p, part);
+    n = pcap_run_capture(g_xlsx_cmd, dst, cap);
+    if n < 0 { return n; }
+    if pcap_last_exit() != 0 { return 0 - 3; }
+    return n;
+}
+
+func xlsx_parse_shared(xml: i64) -> i64 {
+    memset(g_xlsx_shared, 0, 49152); count = 0; p = xml;
+    while count < 512 {
+        si = xlsx_find(p, xml_si_open); if si == 0 { break; }
+        end = xlsx_find(si, xml_si_close); if end == 0 { break; }
+        dst = g_xlsx_shared + count * SHEET_CELL; store8(dst, 0); used = 0; q = si;
+        while q < end {
+            t = xlsx_find_before(q, xml_t_open, end); if t == 0 { break; }
+            gt = t; while gt < end { if load8(gt) == 62 { break; } gt = gt + 1; }
+            if gt >= end { break; }
+            close = gt + 1; while close < end { if load8(close) == 60 { break; } close = close + 1; }
+            if close > gt + 1 { used = used + xlsx_decode(dst + used, gt + 1, close, SHEET_CELL - used); }
+            if used >= SHEET_CELL - 1 { break; }
+            q = close + 1;
+        }
+        count = count + 1; p = end + 5;
+    }
+    store64(g_xlsx_shared_count, count); return count;
+}
+
+func xlsx_attr(tag: i64, tag_end: i64, pattern: i64, dst: i64, cap: i64) -> i64 {
+    a = xlsx_find_before(tag, pattern, tag_end); if a == 0 { store8(dst, 0); return 0; }
+    a = a + strlen(pattern); e = a;
+    while e < tag_end { if load8(e) == 34 { break; } e = e + 1; }
+    return xlsx_decode(dst, a, e, cap);
+}
+
+func xlsx_ref(ref: i64) -> i64 {
+    p = ref; col = 0;
+    while load8(p) >= 65 && load8(p) <= 90 { col = col * 26 + load8(p) - 64; p = p + 1; }
+    if col < 1 { return 0; }
+    row = app_parse_int(p); if row < 1 { return 0; }
+    store64(g_formula_ref_row, row - 1); store64(g_formula_ref_col, col - 1); return 1;
+}
+
+func xlsx_parse_sheet(xml: i64) -> i64 {
+    sheet_clear(1, 1); store64(g_xlsx_max_row, 0); store64(g_xlsx_max_col, 0); p = xml;
+    while 1 {
+        cell = xlsx_find(p, xml_c_open); if cell == 0 { break; }
+        next = load8(cell + 2); if next != 32 && next != 9 && next != 62 { p = cell + 2; }
+        else {
+            tag_end = cell; while load8(tag_end) != 0 { if load8(tag_end) == 62 { break; } tag_end = tag_end + 1; }
+            if load8(tag_end) == 0 { break; }
+            close = xlsx_find(tag_end, xml_c_close); if close == 0 { break; }
+            if xlsx_attr(cell, tag_end, xml_attr_r, g_xlsx_attr, 64) != 0 { if xlsx_ref(g_xlsx_attr) != 0 {
+                row = load64(g_formula_ref_row); col = load64(g_formula_ref_col);
+                if row < SHEET_ROWS && col < SHEET_COLS {
+                    xlsx_attr(cell, tag_end, xml_attr_t, g_colbuf, 32);
+                    val = xlsx_find_before(tag_end, xml_v_open, close); text_start = 0;
+                    if val != 0 { text_start = val + 3; }
+                    else { t = xlsx_find_before(tag_end, xml_t_open, close); if t != 0 { gt = t; while gt < close { if load8(gt) == 62 { break; } gt = gt + 1; } if gt < close { text_start = gt + 1; } } }
+                    if text_start != 0 {
+                        text_end = text_start; while text_end < close { if load8(text_end) == 60 { break; } text_end = text_end + 1; }
+                        xlsx_decode(g_cellbuf, text_start, text_end, 512);
+                        if load8(g_colbuf) == 115 && load8(g_colbuf + 1) == 0 {
+                            si = app_parse_int(g_cellbuf);
+                            if si >= 0 && si < load64(g_xlsx_shared_count) { cstr_copy_n(sheet_cell(row, col), g_xlsx_shared + si * SHEET_CELL, SHEET_CELL); }
+                            else { cstr_copy_n(sheet_cell(row, col), g_cellbuf, SHEET_CELL); }
+                        } else { cstr_copy_n(sheet_cell(row, col), g_cellbuf, SHEET_CELL); }
+                    }
+                    if row > load64(g_xlsx_max_row) { store64(g_xlsx_max_row, row); }
+                    if col > load64(g_xlsx_max_col) { store64(g_xlsx_max_col, col); }
+                }
+            } }
+            p = close + 4;
+        }
+    }
+    store64(g_rows, load64(g_xlsx_max_row) + 1); store64(g_cols, load64(g_xlsx_max_col) + 1);
+    if load64(g_rows) < 1 { store64(g_rows, 1); } if load64(g_cols) < 1 { store64(g_cols, 1); }
+    return 1;
+}
+
+func xlsx_load() -> i64 {
+    n = xlsx_capture(xlsx_shared_part, g_filebuf, 131072);
+    if n >= 0 { xlsx_parse_shared(g_filebuf); } else { memset(g_xlsx_shared, 0, 49152); store64(g_xlsx_shared_count, 0); }
+    n = xlsx_capture(xlsx_sheet_part, g_xlsx_xml, 262144);
+    if n < 0 { sheet_set_status(st_xlsxtool); return 0; }
+    if n >= 262143 { sheet_set_status(st_xlsxlarge); return 0; }
+    if xlsx_parse_sheet(g_xlsx_xml) == 0 { sheet_set_status(st_xlsxbad); return 0; }
+    store64(g_db_mode, 0); store64(g_xlsx_mode, 1); store64(g_db_file_size, 0); store64(g_dirty, 0);
+    db_show_controls(0); sheet_refresh_grid(); sheet_select_cell(0, 0, st_xlsxloaded); return 1;
+}
+
+func sheet_load_from_path() -> i64 {
+    GetWindowTextA(load64(g_path_ed), g_path, 700);
+    if app_ends_i(g_path, ".xlsx") == 1 {
+        if xlsx_load() == 0 { return 0; }
+        store64(g_have_undo, 0); store64(g_have_redo, 0); recent_push(g_path); return 1;
+    }
+    n = sheet_read_file(g_path, g_filebuf, 131072);
+    if n < 0 { sheet_set_status(st_loadfail); return 0; }
+    isdb = db_is_sqlite(g_filebuf, n);
+    if isdb == 1 {
+        store64(g_xlsx_mode, 0);
+        memset(g_db_changed, 0, 480); memset(g_db_rowids, 0, 320); store64(g_db_change_count, 0);
+        if db_parse_schema(g_filebuf, n) == 0 { sheet_set_status(st_dbbad); return 0; }
+        db_populate_tables();
+        db_show_controls(1);
+    } else {
+        store64(g_xlsx_mode, 0);
+        store64(g_db_mode, 0);
+        store64(g_db_file_size, 0);
+        db_show_controls(0);
+        sheet_parse_csv(g_filebuf);
+    }
+    store64(g_have_undo, 0);
+    store64(g_have_redo, 0);
+    store64(g_dirty, 0);
+    sheet_refresh_grid();
+    if isdb == 1 {
+        if load64(g_db_table_count) == 0 { sheet_select_cell(0, 0, st_dbempty); }
+        else { sheet_select_cell(0, 0, st_dbloaded); }
+        SetWindowTextA(load64(g_db_page_label), "Schema");
+    }
+    else { sheet_select_cell(0, 0, st_loaded); }
+    recent_push(g_path);
+    return 1;
+}
+
+func sheet_save_to_path() -> i64 {
+    GetWindowTextA(load64(g_path_ed), g_path, 700);
+    n = sheet_build_csv(g_savebuf);
+    if sheet_write_file(g_path, g_savebuf, n) == 0 { sheet_set_status(st_savefail); return 0; }
+    store64(g_dirty, 0);
+    sheet_set_status(st_saved);
+    return 1;
+}
+
+func sheet_new_book() -> i64 {
+    store64(g_db_mode, 0);
+    store64(g_xlsx_mode, 0);
+    store64(g_db_file_size, 0);
+    db_show_controls(0);
+    sheet_capture_undo();
+    sheet_clear(10, 5);
+    sheet_mark_dirty();
+    sheet_refresh_grid();
+    sheet_select_cell(0, 0, st_new);
+    return 0;
+}
+
+func sheet_insert_row() -> i64 {
+    rows = load64(g_rows);
+    if rows >= SHEET_ROWS { sheet_set_status(st_badcell); return 0; }
+    row = load64(g_sel_row);
+    if row < 0 { row = rows; }
+    if row > rows { row = rows; }
+    sheet_capture_undo();
+    r = rows;
+    while r > row {
+        memcpy(sheet_cell(r, 0), sheet_cell(r - 1, 0), 1152);
+        memcpy(formula_slot(r, 0), formula_slot(r - 1, 0), 1152);
+        r = r - 1;
+    }
+    memset(sheet_cell(row, 0), 0, 1152);
+    memset(formula_slot(row, 0), 0, 1152);
+    store64(g_rows, rows + 1);
+    sheet_mark_dirty();
+    formula_recalc();
+    sheet_refresh_grid();
+    sheet_select_cell(row, load64(g_sel_col), st_insertrow);
+    return 1;
+}
+
+func sheet_delete_row() -> i64 {
+    rows = load64(g_rows);
+    row = load64(g_sel_row);
+    if row < 0 { sheet_set_status(st_badcell); return 0; }
+    if row >= rows { sheet_set_status(st_badcell); return 0; }
+    sheet_capture_undo();
+    if rows <= 1 {
+        memset(g_cells, 0, SHEET_BYTES);
+        memset(g_formulas, 0, SHEET_BYTES);
+        store64(g_rows, 1);
+    } else {
+        r = row;
+        while r + 1 < rows {
+            memcpy(sheet_cell(r, 0), sheet_cell(r + 1, 0), 1152);
+            memcpy(formula_slot(r, 0), formula_slot(r + 1, 0), 1152);
+            r = r + 1;
+        }
+        memset(sheet_cell(rows - 1, 0), 0, 1152);
+        memset(formula_slot(rows - 1, 0), 0, 1152);
+        store64(g_rows, rows - 1);
+    }
+    if row >= load64(g_rows) { row = load64(g_rows) - 1; }
+    sheet_mark_dirty();
+    formula_recalc();
+    sheet_refresh_grid();
+    sheet_select_cell(row, load64(g_sel_col), st_deleterow);
+    return 1;
+}
+
+func sheet_insert_col() -> i64 {
+    cols = load64(g_cols);
+    if cols >= SHEET_COLS { sheet_set_status(st_badcell); return 0; }
+    col = load64(g_sel_col) + 1;
+    if col < 0 { col = cols; }
+    if col > cols { col = cols; }
+    sheet_capture_undo();
+    r = 0;
+    while r < SHEET_ROWS {
+        c = cols;
+        while c > col {
+            cstr_copy_n(sheet_cell(r, c), sheet_cell(r, c - 1), SHEET_CELL);
+            cstr_copy_n(formula_slot(r, c), formula_slot(r, c - 1), SHEET_CELL);
+            c = c - 1;
+        }
+        memset(sheet_cell(r, col), 0, SHEET_CELL);
+        memset(formula_slot(r, col), 0, SHEET_CELL);
+        r = r + 1;
+    }
+    store64(g_cols, cols + 1);
+    sheet_mark_dirty();
+    formula_recalc();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), col, st_insertcol);
+    return 1;
+}
+
+func sheet_delete_col() -> i64 {
+    cols = load64(g_cols);
+    col = load64(g_sel_col);
+    if col < 0 { sheet_set_status(st_badcell); return 0; }
+    if col >= cols { sheet_set_status(st_badcell); return 0; }
+    sheet_capture_undo();
+    if cols <= 1 {
+        r0 = 0;
+        while r0 < SHEET_ROWS { memset(sheet_cell(r0, 0), 0, SHEET_CELL); memset(formula_slot(r0, 0), 0, SHEET_CELL); r0 = r0 + 1; }
+        store64(g_cols, 1);
+    } else {
+        r = 0;
+        while r < SHEET_ROWS {
+            c = col;
+            while c + 1 < cols {
+                cstr_copy_n(sheet_cell(r, c), sheet_cell(r, c + 1), SHEET_CELL);
+                cstr_copy_n(formula_slot(r, c), formula_slot(r, c + 1), SHEET_CELL);
+                c = c + 1;
+            }
+            memset(sheet_cell(r, cols - 1), 0, SHEET_CELL);
+            memset(formula_slot(r, cols - 1), 0, SHEET_CELL);
+            r = r + 1;
+        }
+        store64(g_cols, cols - 1);
+    }
+    if col >= load64(g_cols) { col = load64(g_cols) - 1; }
+    sheet_mark_dirty();
+    formula_recalc();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), col, st_deletecol);
+    return 1;
+}
+
+func sheet_swap_rows(a: i64, b: i64) -> i64 {
+    memcpy(g_rowtmp, sheet_cell(a, 0), 1152);
+    memcpy(sheet_cell(a, 0), sheet_cell(b, 0), 1152);
+    memcpy(sheet_cell(b, 0), g_rowtmp, 1152);
+    memcpy(g_rowtmp, formula_slot(a, 0), 1152);
+    memcpy(formula_slot(a, 0), formula_slot(b, 0), 1152);
+    memcpy(formula_slot(b, 0), g_rowtmp, 1152);
+    return 0;
+}
+
+func sheet_sort_selected(ascending: i64) -> i64 {
+    rows = load64(g_rows);
+    col = load64(g_sel_col);
+    if rows <= 2 { return 0; }
+    if col < 0 { sheet_set_status(st_badcell); return 0; }
+    isdb = load64(g_db_mode); if load64(g_xlsx_mode) != 0 { isdb = 1; }
+    if isdb == 0 { sheet_capture_undo(); }
+    i = 1;
+    while i < rows {
+        j = i + 1;
+        while j < rows {
+            cmp = app_cell_compare(sheet_cell(i, col), sheet_cell(j, col));
+            swap = 0;
+            if ascending == 1 {
+                if cmp > 0 { swap = 1; }
+            } else {
+                if cmp < 0 { swap = 1; }
+            }
+            if swap == 1 { sheet_swap_rows(i, j); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if isdb == 0 { sheet_mark_dirty(); }
+    if isdb == 0 { formula_recalc(); }
+    sheet_refresh_grid();
+    if isdb != 0 { store64(g_db_sorted, 1); sheet_select_cell(0, col, st_dbsorted); }
+    else { sheet_select_cell(0, col, st_sorted); }
+    return 1;
+}
+
+func sheet_delete_selection() -> i64 {
+    sheet_capture_undo();
+    if load64(g_select_all) == 1 {
+        memset(g_cells, 0, SHEET_BYTES);
+        memset(g_formulas, 0, SHEET_BYTES);
+    } else {
+        sheet_set(load64(g_sel_row), load64(g_sel_col), empty_text);
+        store8(formula_slot(load64(g_sel_row), load64(g_sel_col)), 0);
+    }
+    sheet_mark_dirty();
+    formula_recalc();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), load64(g_sel_col), st_deleted);
+    return 1;
+}
+
+func sheet_find_next() -> i64 {
+    GetWindowTextA(load64(g_find_ed), g_findbuf, 128);
+    if load8(g_findbuf) == 0 { sheet_set_status(st_findnone); return 0; }
+    rows = load64(g_rows); cols = load64(g_cols);
+    sr = load64(g_last_find_row);
+    sc = load64(g_last_find_col) + 1;
+    if sr < 0 { sr = 0; sc = 0; }
+    r = sr;
+    while r < rows {
+        c = sc;
+        while c < cols {
+            if app_contains_i(sheet_cell(r, c), g_findbuf) == 1 {
+                store64(g_last_find_row, r);
+                store64(g_last_find_col, c);
+                sheet_select_cell(r, c, st_picked);
+                return 1;
+            }
+            c = c + 1;
+        }
+        sc = 0;
+        r = r + 1;
+    }
+    r = 0;
+    while r <= sr {
+        c = 0;
+        while c < cols {
+            if r == sr { if c >= load64(g_last_find_col) { break; } }
+            if app_contains_i(sheet_cell(r, c), g_findbuf) == 1 {
+                store64(g_last_find_row, r);
+                store64(g_last_find_col, c);
+                sheet_select_cell(r, c, st_picked);
+                return 1;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    sheet_set_status(st_findnone);
+    return 0;
+}
+
+func clip_write_text(src: i64, n: i64) -> i64 {
+    return gui_clip_write_text(load64(g_hwnd), src, n);
+}
+
+func clip_read_text(dst: i64, cap: i64) -> i64 {
+    return gui_clip_read_text(load64(g_hwnd), dst, cap);
+}
+
+func sheet_copy_selection() -> i64 {
+    if load64(g_select_all) == 1 {
+        n = sheet_build_tsv(g_savebuf);
+        if clip_write_text(g_savebuf, n) == 0 { sheet_set_status(st_clipfail); return 0; }
+    } else {
+        n = sheet_build_selected_rows_tsv(g_savebuf);
+        if load64(g_copy_row_count) > 1 {
+            if clip_write_text(g_savebuf, n) == 0 { sheet_set_status(st_clipfail); return 0; }
+        } else {
+            s = formula_input(load64(g_sel_row), load64(g_sel_col));
+            if clip_write_text(s, strlen(s)) == 0 { sheet_set_status(st_clipfail); return 0; }
+        }
+    }
+    sheet_set_status(st_copied);
+    return 1;
+}
+
+func sheet_paste_selection() -> i64 {
+    n = clip_read_text(g_clipbuf, 32768);
+    if n <= 0 { sheet_set_status(st_clipfail); return 0; }
+    sheet_capture_undo();
+    if app_has_char(g_clipbuf, 9) == 1 {
+        formula_clear_paste_area(g_clipbuf, 9, load64(g_sel_row), load64(g_sel_col));
+        sheet_parse_delimited(g_clipbuf, 9, load64(g_sel_row), load64(g_sel_col));
+    } else if app_has_char(g_clipbuf, 10) == 1 || app_has_char(g_clipbuf, 13) == 1 {
+        formula_clear_paste_area(g_clipbuf, 44, load64(g_sel_row), load64(g_sel_col));
+        sheet_parse_delimited(g_clipbuf, 44, load64(g_sel_row), load64(g_sel_col));
+    } else {
+        formula_set_input(load64(g_sel_row), load64(g_sel_col), g_clipbuf);
+    }
+    formula_capture_new_cells();
+    formula_recalc();
+    sheet_mark_dirty();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), load64(g_sel_col), st_pasted);
+    return 1;
+}
+
+func sheet_undo() -> i64 {
+    if load64(g_have_undo) == 0 { sheet_set_status(st_noundo); return 0; }
+    sheet_capture_redo();
+    memcpy(g_cells, g_undo_cells, SHEET_BYTES);
+    memcpy(g_formulas, g_undo_formulas, SHEET_BYTES);
+    store64(g_rows, load64(g_undo_rows));
+    store64(g_cols, load64(g_undo_cols));
+    store64(g_have_undo, 0);
+    sheet_mark_dirty();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), load64(g_sel_col), st_undone);
+    return 1;
+}
+
+func sheet_redo() -> i64 {
+    if load64(g_have_redo) == 0 { sheet_set_status(st_noredo); return 0; }
+    sheet_capture_undo();
+    memcpy(g_cells, g_redo_cells, SHEET_BYTES);
+    memcpy(g_formulas, g_redo_formulas, SHEET_BYTES);
+    store64(g_rows, load64(g_redo_rows));
+    store64(g_cols, load64(g_redo_cols));
+    store64(g_have_redo, 0);
+    sheet_mark_dirty();
+    sheet_refresh_grid();
+    sheet_select_cell(load64(g_sel_row), load64(g_sel_col), st_redone);
+    return 1;
+}
+
+func show_open_dialog() -> i64 {
+    memset(g_dialog_file, 0, 700);
+    if gui_open_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog_file, 700, 0, title_app, 0x1804) == 0 { return 0; }
+    SetWindowTextA(load64(g_path_ed), g_dialog_file);
+    return sheet_load_from_path();
+}
+
+func show_save_dialog() -> i64 {
+    GetWindowTextA(load64(g_path_ed), g_dialog_file, 700);
+    if gui_save_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog_file, 700, 0, title_app, defext_csv, 0x806) == 0 { return 0; }
+    SetWindowTextA(load64(g_path_ed), g_dialog_file);
+    return sheet_save_to_path();
+}
+
+func show_db_export_dialog() -> i64 {
+    memset(g_dialog_file, 0, 700);
+    if gui_save_file_dialog(g_ofn, load64(g_hwnd), g_csv_filter, g_dialog_file, 700, 0, title_app, defext_csv, 0x806) == 0 { return 0; }
+    if app_ends_i(g_dialog_file, ".db") == 1 || app_ends_i(g_dialog_file, ".sqlite") == 1 { sheet_set_status(st_dbexportbad); return 0; }
+    n = sheet_build_filtered_csv(g_savebuf);
+    if sheet_write_file(g_dialog_file, g_savebuf, n) == 0 { sheet_set_status(st_savefail); return 0; }
+    sheet_set_status(st_saved);
+    return 1;
+}
+
+func show_db_saveas_dialog() -> i64 {
+    memset(g_dialog_file, 0, 700);
+    if gui_save_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog_file, 700, 0, title_app, defext_db, 0x806) == 0 { return 0; }
+    if app_ends_i(g_dialog_file, ".csv") == 1 {
+        n = sheet_build_filtered_csv(g_savebuf);
+        if sheet_write_file(g_dialog_file, g_savebuf, n) == 0 { sheet_set_status(st_savefail); return 0; }
+        sheet_set_status(st_saved); return 1;
+    }
+    if db_copy_file(g_path, g_dialog_file) == 0 { sheet_set_status(st_savefail); return 0; }
+    cstr_copy_n(g_path, g_dialog_file, 700);
+    SetWindowTextA(load64(g_path_ed), g_path);
+    return db_commit_changes(g_path, 1);
+}
+
+func sheet_command(id: i64) -> i64 {
+    if id == ID_MENU_FILE { sheet_build_file_menu(); menu_drop(load64(g_mb_file), load64(g_menu_file)); return 0; }
+    if id == ID_MENU_EDIT { menu_drop(load64(g_mb_edit), load64(g_menu_edit)); return 0; }
+    if id == ID_MENU_DATA { menu_drop(load64(g_mb_data), load64(g_menu_data)); return 0; }
+    if id == ID_MENU_HELP { menu_drop(load64(g_mb_help), load64(g_menu_help)); return 0; }
+
+    if id == ID_OPEN { if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); } else { show_open_dialog(); } return 0; }
+    if id >= ID_RECENT_1 { if id <= ID_RECENT_3 {
+        idx = id - ID_RECENT_1;
+        if idx < load64(g_recent_count) {
+            if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); }
+            else { cstr_copy_n(g_path, recent_slot(idx), 700); SetWindowTextA(load64(g_path_ed), g_path); sheet_load_from_path(); }
+        }
+        return 0;
+    } }
+    if id == ID_SAVE { if load64(g_xlsx_mode) != 0 { show_db_export_dialog(); } else { if load64(g_db_mode) == 2 { db_commit_changes(g_path, 0); } else { if load64(g_db_mode) != 0 { show_db_export_dialog(); } else { sheet_save_to_path(); } } } return 0; }
+    if id == ID_SAVEAS { if load64(g_xlsx_mode) != 0 { show_db_export_dialog(); } else { if load64(g_db_mode) == 2 { show_db_saveas_dialog(); } else { if load64(g_db_mode) != 0 { show_db_export_dialog(); } else { show_save_dialog(); } } } return 0; }
+    if id == ID_CLOSE { if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); } else { sheet_new_book(); } return 0; }
+    if id == ID_NEW { if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); } else { sheet_new_book(); } return 0; }
+    if id == ID_SAMPLE {
+        store64(g_db_mode, 0); store64(g_xlsx_mode, 0); store64(g_db_file_size, 0); db_show_controls(0);
+        sheet_capture_undo();
+        sheet_seed();
+        sheet_mark_dirty();
+        sheet_refresh_grid();
+        sheet_select_cell(0, 0, st_ready);
+        return 0;
+    }
+    if id == ID_DB_SCHEMA { if load64(g_db_change_count) != 0 { sheet_set_status(st_dbsavefirst); } else { db_show_schema(); } return 0; }
+    if id == ID_DB_VIEW { db_show_table(0); return 0; }
+    if id == ID_DB_PREV {
+        if load64(g_db_mode) != 2 { sheet_set_status(st_dbselect); return 0; }
+        page = load64(g_db_page); if page <= 0 { sheet_set_status(st_dbfirst); return 0; }
+        db_show_table(page - 1); return 0;
+    }
+    if id == ID_DB_NEXT {
+        if load64(g_db_mode) != 2 { sheet_set_status(st_dbselect); return 0; }
+        if load64(g_db_has_more) == 0 { sheet_set_status(st_dblast); return 0; }
+        db_show_table(load64(g_db_page) + 1); return 0;
+    }
+    if load64(g_db_mode) != 0 {
+        if id == ID_UNDO || id == ID_REDO || id == ID_PASTE || id == ID_DELETE || id == ID_INSROW || id == ID_DELROW || id == ID_INSCOL || id == ID_DELCOL { sheet_set_status(st_readonly); return 0; }
+    }
+    if load64(g_xlsx_mode) != 0 {
+        if id == ID_UNDO || id == ID_REDO || id == ID_PASTE || id == ID_DELETE || id == ID_INSROW || id == ID_DELROW || id == ID_INSCOL || id == ID_DELCOL || id == ID_APPLY { sheet_set_status(st_xlsxro); return 0; }
+    }
+    if id == ID_UNDO { sheet_undo(); return 0; }
+    if id == ID_REDO { sheet_redo(); return 0; }
+    if id == ID_COPY { sheet_copy_selection(); return 0; }
+    if id == ID_PASTE { sheet_paste_selection(); return 0; }
+    if id == ID_DELETE { sheet_delete_selection(); return 0; }
+    if id == ID_SELECTALL { store64(g_select_all, 1); sheet_set_status(st_all); return 0; }
+    if id == ID_INSROW { sheet_insert_row(); return 0; }
+    if id == ID_DELROW { sheet_delete_row(); return 0; }
+    if id == ID_INSCOL { sheet_insert_col(); return 0; }
+    if id == ID_DELCOL { sheet_delete_col(); return 0; }
+    if id == ID_SORTA { sheet_sort_selected(1); return 0; }
+    if id == ID_SORTD { sheet_sort_selected(0); return 0; }
+    if id == ID_FILTER { sheet_refresh_grid(); sheet_set_status(st_filtered); return 0; }
+    if id == ID_CLEARFLT {
+        SetWindowTextA(load64(g_filter_col_ed), all_text);
+        SetWindowTextA(load64(g_filter_ed), empty_text);
+        sheet_refresh_grid();
+        sheet_set_status(st_filterclr);
+        return 0;
+    }
+    if id == ID_FIND {
+        store64(g_last_find_row, 0 - 1);
+        store64(g_last_find_col, 0 - 1);
+        SetFocus(load64(g_find_ed));
+        sheet_find_next();
+        return 0;
+    }
+    if id == ID_FINDNEXT { sheet_find_next(); return 0; }
+    if id == ID_GOTO { SetFocus(load64(g_row_ed)); return 0; }
+    if id == ID_READ { sheet_read_target(); return 0; }
+    if id == ID_APPLY {
+        if load64(g_cell_editing) != 0 { sheet_inline_commit(); return 0; }
+        sheet_apply_edit();
+        return 0;
+    }
+    if id == ID_GUIDE { sheet_open_guide(); return 0; }
+    if id == ID_HELP_KEYS { MessageBoxA(load64(g_hwnd), shortcuts_text, about_title, 0x40); return 0; }
+    if id == ID_ABOUT { sheet_show_about(); return 0; }
+    if id == ID_EXIT { DestroyWindow(load64(g_hwnd)); return 0; }
+    return 0;
+}
+
+func sheet_focus_is_text() -> i64 {
+    h = GetFocus();
+    if h == load64(g_path_ed) { return 1; }
+    if h == load64(g_filter_col_ed) { return 1; }
+    if h == load64(g_filter_ed) { return 1; }
+    if h == load64(g_find_ed) { return 1; }
+    if h == load64(g_row_ed) { return 1; }
+    if h == load64(g_col_ed) { return 1; }
+    if h == load64(g_value_ed) { return 1; }
+    if h == load64(g_cell_edit) { return 1; }
+    return 0;
+}
+
+func sheet_handle_key(vk: i64, ctrl: i64, shft: i64) -> i64 {
+    text_focus = sheet_focus_is_text();
+
+    if load64(g_cell_editing) != 0 {
+        if vk == 27 { sheet_inline_cancel(); return 1; }      # Esc
+        if vk == 13 { sheet_inline_commit(); return 1; }      # Enter
+    }
+
+    if vk == 0x70 { sheet_command(ID_GUIDE); return 1; }  # F1
+    if vk == 0x72 { sheet_command(ID_FINDNEXT); return 1; }   # F3
+
+    if ctrl != 0 {
+        if vk == 78 { sheet_command(ID_NEW); return 1; }      # Ctrl+N
+        if vk == 79 { sheet_command(ID_OPEN); return 1; }     # Ctrl+O
+        if vk == 83 {                                         # Ctrl+S / Ctrl+Shift+S
+            if load64(g_cell_editing) != 0 { sheet_inline_commit(); }
+            if shft != 0 { sheet_command(ID_SAVEAS); } else { sheet_command(ID_SAVE); }
+            return 1;
+        }
+        if vk == 87 { sheet_command(ID_CLOSE); return 1; }    # Ctrl+W
+        if vk == 70 {                                         # Ctrl+F / Ctrl+Shift+F
+            if shft != 0 { sheet_command(ID_FILTER); } else { sheet_command(ID_FIND); }
+            return 1;
+        }
+        if vk == 71 { sheet_command(ID_GOTO); return 1; }     # Ctrl+G
+        if vk == 73 {                                         # Ctrl+I / Ctrl+Shift+I
+            if shft != 0 { sheet_command(ID_INSCOL); } else { sheet_command(ID_INSROW); }
+            return 1;
+        }
+        if vk == 68 { if shft != 0 { sheet_command(ID_DELROW); return 1; } } # Ctrl+Shift+D
+        if vk == 75 { if shft != 0 { sheet_command(ID_DELCOL); return 1; } } # Ctrl+Shift+K
+    }
+
+    if text_focus != 0 {
+        if vk == 13 { if ctrl != 0 { sheet_command(ID_APPLY); return 1; } }
+        return 0;
+    }
+
+    if vk == 46 { sheet_command(ID_DELETE); return 1; }       # Delete
+    if vk == 13 {                                             # Enter / Ctrl+Enter
+        if ctrl != 0 { sheet_command(ID_APPLY); } else { sheet_command(ID_READ); }
+        return 1;
+    }
+
+    if ctrl != 0 {
+        if vk == 90 { sheet_command(ID_UNDO); return 1; }     # Ctrl+Z
+        if vk == 89 { sheet_command(ID_REDO); return 1; }     # Ctrl+Y
+        if vk == 67 { sheet_command(ID_COPY); return 1; }     # Ctrl+C
+        if vk == 86 { sheet_command(ID_PASTE); return 1; }    # Ctrl+V
+        if vk == 65 { sheet_command(ID_SELECTALL); return 1; } # Ctrl+A
+    }
+
+    return 0;
+}
+
+func sheet_message_loop() -> i64 {
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        skip = 0;
+        if gui_msg_is_keydown(g_msg) != 0 {
+            vk = gui_msg_vk(g_msg);
+            ctrl = gui_key_down(0x11);
+            shft = gui_key_down(0x10);
+            skip = sheet_handle_key(vk, ctrl, shft);
+        }
+        if skip == 0 {
+            TranslateMessage(g_msg);
+            DispatchMessageA(g_msg);
+        }
+    }
+    return 0;
+}
+
+func create_columns(hlv: i64) -> i64 {
+    gui_lv_style_grid(hlv);
+    SendMessageA(hlv, 4097, 0, COLOR_EDIT);
+    SendMessageA(hlv, 4132, 0, COLOR_TEXT);
+    SendMessageA(hlv, 4134, 0, COLOR_EDIT);
+    gui_lv_add_col(hlv, 0, 44, col_idx);
+    gui_lv_add_col(hlv, 1, 136, col_a);
+    gui_lv_add_col(hlv, 2, 100, col_b);
+    gui_lv_add_col(hlv, 3, 104, col_c);
+    gui_lv_add_col(hlv, 4, 72, col_d);
+    gui_lv_add_col(hlv, 5, 84, col_e);
+    gui_lv_add_col(hlv, 6, 108, col_f);
+    gui_lv_add_col(hlv, 7, 160, col_g);
+    gui_lv_add_col(hlv, 8, 96, col_h);
+    gui_lv_add_col(hlv, 9, 96, col_i);
+    gui_lv_add_col(hlv, 10, 96, col_j);
+    gui_lv_add_col(hlv, 11, 96, col_k);
+    gui_lv_add_col(hlv, 12, 96, col_l);
+    return 0;
+}
+
+func make_button(hwnd: i64, id: i64, text: str, x: i64, y: i64, w: i64) -> i64 {
+    h = CreateWindowExA(0, gui_button, text, 0x5000000B, x, y, w, 25, hwnd, id, load64(g_hinst), 0);
+    gui_set_font(h, load64(g_font));
+    return h;
+}
+
+func sheet_button_label(id: i64) -> i64 {
+    if id == ID_MENU_FILE { return mtop_file; }
+    if id == ID_MENU_EDIT { return mtop_edit; }
+    if id == ID_MENU_DATA { return mtop_data; }
+    if id == ID_MENU_HELP { return mtop_help; }
+    if id == ID_FILTER { return txt_filter; }
+    if id == ID_CLEARFLT { return btn_clear; }
+    if id == ID_FIND { return btn_find; }
+    if id == ID_FINDNEXT { return btn_next; }
+    if id == ID_READ { return btn_read; }
+    if id == ID_APPLY { return btn_apply; }
+    if id == ID_DB_SCHEMA { return btn_schema; }
+    if id == ID_DB_VIEW { return btn_view; }
+    if id == ID_DB_PREV { return btn_prev; }
+    if id == ID_DB_NEXT { return btn_next; }
+    return empty_text;
+}
+
+func sheet_draw_button(lp: i64) -> i64 {
+    id = load32(lp + 4);
+    state = load32(lp + 16);
+    hdc = load64(lp + 32);
+    rc = lp + 40;
+    pressed = band(state, 1);
+    br = load64(g_br_button);
+    if pressed != 0 { br = load64(g_br_hover); }
+    FillRect(hdc, rc, load64(g_br_panel));
+    ob = SelectObject(hdc, br);
+    op = SelectObject(hdc, load64(g_pen_line));
+    RoundRect(hdc, load32(rc), load32(rc + 4), load32(rc + 8), load32(rc + 12), 6, 6);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    of = SelectObject(hdc, load64(g_font));
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, COLOR_TEXT);
+    DrawTextA(hdc, sheet_button_label(id), 0 - 1, rc, 0x25);
+    SelectObject(hdc, of);
+    return 1;
+}
+
+func create_controls(hwnd: i64) -> i64 {
+    hinst = load64(g_hinst);
+    f = load64(g_font);
+
+    h = make_button(hwnd, ID_MENU_FILE, mtop_file, 18, 49, 52);
+    store64(g_mb_file, h);
+    h = make_button(hwnd, ID_MENU_EDIT, mtop_edit, 74, 49, 52);
+    store64(g_mb_edit, h);
+    h = make_button(hwnd, ID_MENU_DATA, mtop_data, 130, 49, 54);
+    store64(g_mb_data, h);
+    h = make_button(hwnd, ID_MENU_HELP, mtop_help, 188, 49, 56);
+    store64(g_mb_help, h);
+
+    gui_set_font(gui_static_text(hwnd, hinst, txt_path, 18, 84, 62, 20), f);
+    h = gui_edit_text(hwnd, hinst, 300, g_path, 82, 81, 1104, 24);
+    store64(g_path_ed, h); gui_set_font(h, f);
+
+    gui_set_font(gui_static_text(hwnd, hinst, txt_filter, 18, 121, 44, 20), f);
+    h = gui_edit_text(hwnd, hinst, 401, all_text, 65, 118, 54, 24);
+    store64(g_filter_col_ed, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 402, empty_text, 124, 118, 235, 24);
+    store64(g_filter_ed, h); gui_set_font(h, f);
+    make_button(hwnd, ID_FILTER, txt_filter, 365, 117, 64);
+    make_button(hwnd, ID_CLEARFLT, btn_clear, 433, 117, 62);
+
+    gui_set_font(gui_static_text(hwnd, hinst, txt_find, 518, 121, 34, 20), f);
+    h = gui_edit_text(hwnd, hinst, 403, empty_text, 552, 118, 235, 24);
+    store64(g_find_ed, h); gui_set_font(h, f);
+    make_button(hwnd, ID_FIND, btn_find, 793, 117, 58);
+    make_button(hwnd, ID_FINDNEXT, btn_next, 855, 117, 58);
+
+    h = gui_static_text(hwnd, hinst, txt_table, 18, 157, 42, 20);
+    store64(g_db_table_label, h); gui_set_font(h, f);
+    h = CreateWindowExA(0, cls_combo, empty_text, 0x50200003, 62, 152, 238, 180, hwnd, ID_DB_TABLE, hinst, 0);
+    store64(g_db_table_combo, h); gui_set_font(h, f);
+    h = make_button(hwnd, ID_DB_SCHEMA, btn_schema, 310, 151, 70); store64(g_db_schema_btn, h);
+    h = make_button(hwnd, ID_DB_VIEW, btn_view, 384, 151, 58); store64(g_db_view_btn, h);
+    h = make_button(hwnd, ID_DB_PREV, btn_prev, 450, 151, 76); store64(g_db_prev_btn, h);
+    h = make_button(hwnd, ID_DB_NEXT, btn_next, 530, 151, 58); store64(g_db_next_btn, h);
+    h = gui_static_text(hwnd, hinst, empty_text, 600, 157, 160, 20);
+    store64(g_db_page_label, h); gui_set_font(h, f);
+    db_show_controls(0);
+
+    hlv = gui_listview_report(hwnd, hinst, ID_GRID, 18, 180, 1168, 392);
+    store64(g_grid, hlv);
+    gui_set_font(hlv, load64(g_font_mono));
+    create_columns(hlv);
+    h = gui_edit_text(hwnd, hinst, ID_CELL_EDIT, empty_text, 18, 180, 120, 22);
+    store64(g_cell_edit, h);
+    gui_set_font(h, load64(g_font_mono));
+    ShowWindow(h, 0);
+
+    gui_set_font(gui_static_text(hwnd, hinst, txt_row, 18, 612, 32, 20), f);
+    h = gui_edit_text(hwnd, hinst, 301, default_row, 50, 609, 48, 24);
+    store64(g_row_ed, h); gui_set_font(h, f);
+    gui_set_font(gui_static_text(hwnd, hinst, txt_col, 110, 612, 28, 20), f);
+    h = gui_edit_text(hwnd, hinst, 302, default_col, 140, 609, 48, 24);
+    store64(g_col_ed, h); gui_set_font(h, f);
+    gui_set_font(gui_static_text(hwnd, hinst, txt_value, 204, 612, 72, 20), f);
+    h = gui_edit_text(hwnd, hinst, 303, empty_text, 278, 609, 646, 24);
+    store64(g_value_ed, h); gui_set_font(h, f);
+    make_button(hwnd, ID_READ, btn_read, 936, 608, 62);
+    make_button(hwnd, ID_APPLY, btn_apply, 1002, 608, 72);
+
+    h = gui_static_text(hwnd, hinst, st_ready, 18, 648, 1168, 17);
+    store64(g_status, h); gui_set_font(h, f);
+
+    sheet_refresh_grid();
+    sheet_select_cell(0, 0, st_ready);
+    return 0;
+}
+
+func handle_grid_notify(lp: i64) -> i64 {
+    hwnd_from = load64(lp + 0);
+    if hwnd_from != load64(g_grid) { return 0; }
+    code = load32(lp + 16);
+    is_click = gui_notify_is_click(code);
+    is_dblclk = gui_notify_is_dblclk(code);
+    if bor(is_click, is_dblclk) == 0 { return 0; }
+    view_row = load32(lp + 24);
+    sub = load32(lp + 28);
+    if view_row < 0 { return 0; }
+    if view_row >= SHEET_ROWS { return 0; }
+    row = load64(g_view_map + view_row * 8);
+    col = load64(g_sel_col);
+    if sub > 0 { col = sub - 1; }
+    if col >= SHEET_COLS { return 0; }
+    if is_dblclk != 0 { sheet_begin_cell_edit(row, col, view_row, sub); return 1; }
+    sheet_select_cell(row, col, st_picked);
+    return 1;
+}
+
+func MainWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { create_controls(hwnd); return 0; }
+
+    if msg == 43 {
+        return sheet_draw_button(lp);
+    }
+
+    if msg == 273 {
+        id = band(wp, 65535);
+        code = gui_hiword(wp);
+        if id == ID_DB_TABLE { if code == 1 { db_show_table(0); } return 0; }
+        if id == ID_CELL_EDIT {
+            if code == 512 { sheet_inline_commit(); } # EN_KILLFOCUS
+            return 0;
+        }
+        sheet_command(id);
+        return 0;
+    }
+
+    if msg == 78 { handle_grid_notify(lp); return 0; }
+
+    if msg == 312 || msg == 307 || msg == 308 {
+        SetTextColor(wp, COLOR_TEXT);
+        if msg == 307 || msg == 308 {
+            SetBkColor(wp, COLOR_EDIT);
+            return load64(g_br_edit);
+        }
+        SetBkColor(wp, COLOR_PANEL);
+        return load64(g_br_panel);
+    }
+
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        gdi_fill_xy(hdc, 0, 0, w, h, load64(g_br_bg));
+        gdi_fill_xy(hdc, 0, 0, w, 38, load64(g_br_panel));
+        gdi_line(hdc, 0, 38, w, 38, load64(g_pen_accent));
+        gdi_text_out(hdc, 18, 8, title_app, COLOR_TEXT, load64(g_font_bold));
+        gdi_text_out(hdc, 268, 11, title_sub, COLOR_MUTED, load64(g_font));
+        if load64(g_db_mode) != 0 {
+            gdi_fill_frame_rect(hdc, 12, 42, w - 16, 190, load64(g_br_panel), load64(g_pen_line));
+            gdi_fill_frame_rect(hdc, 12, 198, w - 16, 584, load64(g_br_panel), load64(g_pen_line));
+        } else {
+            gdi_fill_frame_rect(hdc, 12, 42, w - 16, 166, load64(g_br_panel), load64(g_pen_line));
+            gdi_fill_frame_rect(hdc, 12, 174, w - 16, 584, load64(g_br_panel), load64(g_pen_line));
+        }
+        gdi_fill_frame_rect(hdc, 12, 594, w - 16, 706, load64(g_br_panel), load64(g_pen_line));
+        gdi_text_out(hdc, 20, 681, st_csvonly, COLOR_MUTED, load64(g_font));
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 20 { return 1; }
+    if msg == 2 {
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func main() -> i32 {
+    build_filter();
+    app_exedir(g_path);
+    app_join(g_path, g_path, default_suffix);
+    recent_load();
+    sheet_seed();
+    store64(g_dirty, 0);
+    store64(g_have_undo, 0);
+    store64(g_have_redo, 0);
+    store64(g_last_find_row, 0 - 1);
+    store64(g_last_find_col, 0 - 1);
+
+    store64(g_br_bg, CreateSolidBrush(COLOR_BG));
+    store64(g_br_panel, CreateSolidBrush(COLOR_PANEL));
+    store64(g_br_card, CreateSolidBrush(COLOR_CARD));
+    store64(g_br_warn, CreateSolidBrush(COLOR_WARN));
+    store64(g_br_edit, CreateSolidBrush(COLOR_EDIT));
+    store64(g_br_button, CreateSolidBrush(COLOR_BUTTON));
+    store64(g_br_hover, CreateSolidBrush(COLOR_HOVER));
+    store64(g_br_accent, CreateSolidBrush(COLOR_ACCENT));
+    store64(g_pen_line, CreatePen(0, 1, COLOR_LINE));
+    store64(g_pen_accent, CreatePen(0, 2, COLOR_ACCENT));
+    store64(g_font, gdi_make_font(0 - 14, 400, face_ui));
+    store64(g_font_bold, gdi_make_font(0 - 16, 700, face_ui));
+    store64(g_font_mono, gdi_make_font(0 - 14, 400, face_mono));
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    gui_init_common_controls(1);
+    gui_register_class(g_wndclass, cls_main, &MainWndProc, hinst, cursor, load64(g_br_bg));
+    sheet_build_menus();
+
+    hwnd = CreateWindowExA(0, cls_main, title_app, 0x16CF0000, 90, 60, 1220, 760, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    if hwnd == 0 { return 1; }
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    sheet_message_loop();
+
+    gdi_delete(load64(g_font));
+    gdi_delete(load64(g_font_bold));
+    gdi_delete(load64(g_font_mono));
+    gdi_delete(load64(g_br_bg));
+    gdi_delete(load64(g_br_panel));
+    gdi_delete(load64(g_br_card));
+    gdi_delete(load64(g_br_warn));
+    gdi_delete(load64(g_br_edit));
+    gdi_delete(load64(g_br_button));
+    gdi_delete(load64(g_br_hover));
+    gdi_delete(load64(g_br_accent));
+    gdi_delete(load64(g_pen_line));
+    gdi_delete(load64(g_pen_accent));
+    return 0;
+}

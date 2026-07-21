@@ -1,0 +1,47 @@
+# =====================================================================
+#  sqlite.ancl - tiny SQLite C API helpers for ANCL edge tools.
+# =====================================================================
+import "cstring.ancl";
+
+extern "sqlite3.dll" sqlite3_open -> i32;
+extern "sqlite3.dll" sqlite3_prepare_v2 -> i32;
+extern "sqlite3.dll" sqlite3_step -> i32;
+extern "sqlite3.dll" sqlite3_column_text -> ptr;
+extern "sqlite3.dll" sqlite3_finalize -> i32;
+extern "sqlite3.dll" sqlite3_close -> i32;
+
+@DATA
+sqlite_dbh:  buf = 8;
+sqlite_stmt: buf = 8;
+
+@CODE
+
+# Run sql and copy first column of first row into dest.
+# Returns 1 copied, 0 no text row, -1 open failure, -2 prepare failure.
+func sqlite_query_first_text(db_path: str, sql: str, dest: ptr, cap: i64) -> i64 {
+    if cap > 0 { store8(dest, 0); }
+
+    store64(sqlite_dbh, 0);
+    if sqlite3_open(db_path, sqlite_dbh) != 0 { return 0 - 1; }
+
+    dbp = load64(sqlite_dbh);
+    store64(sqlite_stmt, 0);
+    if sqlite3_prepare_v2(dbp, sql, 0 - 1, sqlite_stmt, 0) != 0 {
+        sqlite3_close(dbp);
+        return 0 - 2;
+    }
+
+    copied = 0;
+    stp = load64(sqlite_stmt);
+    if sqlite3_step(stp) == 100 {
+        row_str = sqlite3_column_text(stp, 0);
+        if row_str != 0 {
+            cstr_copy_n(dest, row_str, cap);
+            copied = 1;
+        }
+    }
+
+    sqlite3_finalize(stp);
+    sqlite3_close(dbp);
+    return copied;
+}

@@ -1,0 +1,3372 @@
+# =====================================================================
+#  ANCL Pad - native ANCL-aware source editor showcase.
+# =====================================================================
+import "../core_lib/editor_gutter.ancl";
+import "../core_lib/syntax_ancl.ancl";
+import "../core_lib/numfmt.ancl";
+import "../core_lib/process_capture.ancl";
+import "../core_lib/text_encoding.ancl";
+
+extern "user32.dll" DestroyWindow -> i32;
+extern "user32.dll" MessageBoxA -> i32;
+extern "user32.dll" DestroyMenu;
+extern "user32.dll" CheckMenuItem;
+extern "gdi32.dll" RoundRect;
+extern "shell32.dll" ShellExecuteA -> ptr;
+extern "shell32.dll" SHBrowseForFolderA -> ptr;
+extern "shell32.dll" SHGetPathFromIDListA;
+extern "ole32.dll" CoTaskMemFree;
+extern "kernel32.dll" FindFirstFileA -> ptr;
+extern "kernel32.dll" FindNextFileA;
+extern "kernel32.dll" FindClose;
+extern "kernel32.dll" DeleteFileA;
+extern "kernel32.dll" MoveFileExA;
+
+@DATA
+cls_main:  str = "ANCL_PAD_MAIN";
+title_app: str = "ANCL Pad";
+title_sub: str = "Native multi-language editor and ANCL build workspace";
+face_ui:   str = "Segoe UI";
+face_code: str = "Consolas";
+
+mtop_file: str = "File";
+mtop_edit: str = "Edit";
+mtop_build: str = "Build";
+mtop_view: str = "View";
+mtop_help: str = "Help";
+
+mi_new:      str = "New\tCtrl+N";
+mi_open:     str = "Open...\tCtrl+O";
+mi_close:    str = "Close\tCtrl+W";
+mi_save:     str = "Save\tCtrl+S";
+mi_saveas:   str = "Save As...\tCtrl+Shift+S";
+mi_sample:   str = "Load Sample";
+mi_new_starter: str = "New From Starter";
+mi_recent: str = "Recent files";
+mi_recent_none: str = "(no recent files)";
+mi_st_modbus:  str = "Modbus TCP Client";
+mi_st_mqtt:    str = "MQTT Publisher";
+mi_st_sqlite:  str = "SQLite App";
+mi_st_bacnet:  str = "BACnet Client";
+mi_st_dnp3:    str = "DNP3 Client";
+mi_st_eip:     str = "EtherNet/IP Client";
+mi_st_fins:    str = "FINS Client";
+mi_st_iec104:  str = "IEC 60870-5-104 Client";
+mi_st_opcua:   str = "OPC UA Client";
+mi_st_s7:      str = "S7 Client";
+mi_exit:     str = "Exit";
+mi_undo:     str = "Undo\tCtrl+Z";
+mi_redo:     str = "Redo\tCtrl+Y";
+mi_cut:      str = "Cut\tCtrl+X";
+mi_copy:     str = "Copy\tCtrl+C";
+mi_paste:    str = "Paste\tCtrl+V";
+mi_all:      str = "Select All\tCtrl+A";
+mi_insert_import: str = "Insert Import";
+mi_imp_cstring: str = "core_lib/cstring.ancl";
+mi_imp_numfmt: str = "core_lib/numfmt.ancl";
+mi_imp_process: str = "core_lib/process.ancl";
+mi_imp_capture: str = "core_lib/process_capture.ancl";
+mi_imp_sqlite: str = "core_lib/sqlite.ancl";
+mi_imp_mqtt: str = "core_lib/mqtt.ancl";
+mi_imp_gui: str = "core_lib/gui_v2.ancl";
+mi_imp_gdi: str = "core_lib/gdi_v2.ancl";
+mi_imp_rich: str = "core_lib/rich_edit.ancl";
+mi_imp_syntax: str = "core_lib/syntax_ancl.ancl";
+mi_find:     str = "Find...\tCtrl+F";
+mi_findnext: str = "Find Next\tF3";
+mi_replace:  str = "Replace...\tCtrl+H";
+mi_goto:     str = "Go To Line...\tCtrl+G";
+mi_findfiles:str = "Find in Files...\tCtrl+Shift+F";
+mi_bookmark_toggle: str = "Toggle Bookmark\tCtrl+F2";
+mi_bookmark_next:   str = "Next Bookmark\tF2";
+mi_bookmark_prev:   str = "Previous Bookmark\tShift+F2";
+mi_bookmark_clear:  str = "Clear Bookmarks";
+mi_compile:  str = "Compile\tCtrl+B";
+mi_run:      str = "Run\tF5";
+mi_fix:      str = "Fix...\tCtrl+Shift+B";
+mi_showout:  str = "Show Output";
+mi_hideout:  str = "Hide Output";
+mi_calc:     str = "Value Converter\tCtrl+Shift+K";
+mi_compare:  str = "Compare Side by Side...";
+mi_compare_close: str = "Close Comparison";
+mi_encoding: str = "Encoding";
+mi_enc_ansi: str = "ANSI";
+mi_enc_utf8: str = "UTF-8";
+mi_enc_utf8_bom: str = "UTF-8 with BOM";
+mi_enc_utf16: str = "UTF-16 LE";
+mi_line_endings: str = "Line Endings";
+mi_eol_crlf: str = "Windows (CRLF)";
+mi_eol_lf: str = "Unix (LF)";
+mi_eol_cr: str = "Classic Mac (CR)";
+mi_recolor:  str = "Recolor Syntax";
+mi_gutter:   str = "Refresh Line Numbers";
+mi_lang_auto:str = "Language: Auto";
+mi_lang_ancl:str = "Language: ANCL";
+mi_lang_py:  str = "Language: Python";
+mi_lang_cs:  str = "Language: C#";
+mi_lang_log: str = "Language: Log";
+mi_lang_txt: str = "Language: Text";
+mi_lang_json:str = "Language: JSON";
+mi_lang_xml: str = "Language: XML";
+mi_lang_html:str = "Language: HTML";
+mi_lang_sql: str = "Language: SQL";
+mi_lang_md:  str = "Language: Markdown";
+mi_lang_ini: str = "Language: INI";
+mi_lang_ps:  str = "Language: PowerShell";
+mi_guide:    str = "User Guide\tF1";
+mi_shortcuts:str = "Keyboard Shortcuts";
+mi_bundle:   str = "Bundle Guide";
+mi_about:    str = "About ANCL Pad";
+
+txt_path:    str = "Path";
+txt_find:    str = "Find";
+txt_replace: str = "Replace";
+txt_line:    str = "Line";
+txt_next:    str = "Next";
+txt_repl:    str = "Replace";
+txt_all:     str = "All";
+txt_go:      str = "Go";
+txt_close:   str = "X";
+txt_tab_close: str = "x";
+txt_value:   str = "Value";
+txt_convert: str = "Convert";
+txt_copy:    str = "Copy";
+txt_dec:     str = "Dec";
+txt_hex:     str = "Hex";
+txt_bin:     str = "Bin";
+txt_bcd:     str = "BCD";
+txt_folder:  str = "Folder";
+txt_browse:  str = "Browse";
+txt_search:  str = "Search";
+txt_compare: str = "Compare: ";
+compare_title: str = "Choose a file to compare";
+flt_ancl:    str = "ANCL files (*.ancl)";
+pat_ancl:    str = "*.ancl";
+flt_py:      str = "Python files (*.py)";
+pat_py:      str = "*.py";
+flt_cs:      str = "C# files (*.cs)";
+pat_cs:      str = "*.cs";
+flt_logs:    str = "Logs/Text (*.log;*.txt)";
+pat_logs:    str = "*.log;*.txt";
+flt_data:    str = "JSON/XML/HTML/SQL/Markdown/INI/PowerShell";
+pat_data:    str = "*.json;*.xml;*.html;*.htm;*.sql;*.md;*.markdown;*.ini;*.cfg;*.ps1";
+flt_all:     str = "All files (*.*)";
+pat_all:     str = "*.*";
+defext_ancl: str = "ancl";
+untitled:    str = "Untitled.ancl";
+sample_suffix: str = "\\sample.ancl";
+guide_suffix: str = "\\guide.html";
+recent_suffix: str = "\\ancl_pad_recent.txt";
+session_suffix: str = "\\ancl_pad_session.txt";
+recovery_suffix: str = "\\ancl_pad_recovery.txt";
+recovery_new_suffix: str = "\\ancl_pad_recovery.new";
+recovery_snap_prefix: str = "\\ancl_pad_recovery_";
+recovery_snap_suffix: str = ".tmp";
+recovery_magic: str = "ANCLPAD2";
+op_open: str = "open";
+
+st_ready:    str = "Ready";
+st_new:      str = "New file";
+st_closed:   str = "Document closed";
+st_loaded:   str = "Loaded";
+st_saved:    str = "Saved";
+st_loadfail: str = "Could not load file";
+st_savefail: str = "Could not save file";
+st_sample:   str = "Sample loaded";
+st_find_empty: str = "Find text is empty";
+st_not_found: str = "Text not found";
+st_replaced: str = "Replaced ";
+st_matches:  str = " matches";
+st_bad_line: str = "Line number out of range";
+st_no_file:  str = "Save the file before compiling";
+st_compiling:str = "Compiling...";
+st_compile_ok: str = "Compile OK";
+st_compile_fail: str = "Compile failed";
+st_running:  str = "Running...";
+st_run_done: str = "Run finished";
+st_launch_fail: str = "Could not launch compiler or program";
+st_fixing:   str = "Checking mechanical fixes...";
+st_fix_none: str = "No mechanical fixes found";
+st_fix_cancel: str = "Fix cancelled";
+st_fixed:    str = "Fix applied";
+st_ancl_only:str = "Build actions are only available for .ancl files";
+st_starter:  str = "Starter loaded";
+st_imported: str = "Import inserted";
+st_calc_ready: str = "Edit Dec, Hex, Bin, or BCD";
+st_calc_bad: str = "Invalid value";
+st_calc_done: str = "Value synchronized";
+st_calc_copied: str = "Value conversion copied";
+st_noguide: str = "guide.html was not found beside ANCL Pad";
+st_diag_jump: str = "Jumped to compiler diagnostic";
+st_files_ready: str = "Choose a folder and enter search text";
+st_files_empty: str = "Find in Files text is empty";
+st_files_folder: str = "Choose a valid search folder";
+st_files_searching: str = "Searching files...";
+st_files_done_a: str = "Found ";
+st_files_done_b: str = " matching line(s)";
+st_files_none: str = "No matching lines found";
+st_files_limit: str = "Search limit reached (500 results / 5,000 files)";
+st_bookmark_added: str = "Bookmark added on line ";
+st_bookmark_removed: str = "Bookmark removed from line ";
+st_bookmark_jump: str = "Bookmark line ";
+st_bookmark_none: str = "No bookmarks in this document";
+st_bookmark_cleared: str = "Bookmarks cleared";
+st_bookmark_full: str = "Bookmark limit reached (256 per document)";
+st_recovered: str = "Recovered unsaved work";
+st_compare_loaded: str = "Side-by-side comparison loaded";
+st_compare_closed: str = "Comparison closed";
+st_format_changed: str = "Document format changed";
+recovery_title: str = "ANCL Pad Recovery";
+recovery_prompt: str = "ANCL Pad found unsaved work from an interrupted session. Restore it?";
+folder_title: str = "Select a folder to search";
+st_tab_limit: str = "Close a tab before opening another file";
+st_session: str = "Session restored";
+close_title: str = "Close Document?";
+close_modified: str = "This document has unsaved changes.\r\n\r\nDiscard the changes and close it?";
+exit_title: str = "Exit ANCL Pad?";
+exit_modified: str = "One or more open documents have unsaved changes.\r\n\r\nDiscard the changes and exit?";
+st_ln:       str = "Ln ";
+st_col:      str = ", Col ";
+st_lang_ancl:str = "  ANCL";
+st_lang_py:  str = "  Python";
+st_lang_cs:  str = "  C#";
+st_lang_log: str = "  Log";
+st_lang_txt: str = "  Text";
+st_lang_json:str = "  JSON";
+st_lang_xml: str = "  XML";
+st_lang_html:str = "  HTML";
+st_lang_sql: str = "  SQL";
+st_lang_md:  str = "  Markdown";
+st_lang_ini: str = "  INI";
+st_lang_ps:  str = "  PowerShell";
+st_dirty:    str = "  Modified";
+st_clean:    str = "  Saved";
+st_enc_ansi: str = "  ANSI";
+st_enc_utf8: str = "  UTF-8";
+st_enc_utf8_bom: str = "  UTF-8 BOM";
+st_enc_utf16: str = "  UTF-16 LE";
+st_eol_crlf: str = "  CRLF";
+st_eol_lf: str = "  LF";
+st_eol_cr: str = "  CR";
+
+about_title: str = "About ANCL Pad";
+about_text:  str = "ANCL Pad\r\n\r\nA native multi-language editor and ANCL build workspace.\r\n\r\nANCL and multi-language coloring, tabs, recovery, side-by-side comparison, encoding and line-ending conversion, line numbers, find/replace, bookmarks, starters, import helpers, value conversion, captured output, ANCL Compile/Run/Fix, synchronized core libraries, and an offline user guide.";
+shortcuts_text: str = "Keyboard shortcuts\r\n\r\nF1 User Guide\r\nCtrl+N New\r\nCtrl+O Open\r\nCtrl+W Close document\r\nCtrl+Tab / Ctrl+Shift+Tab Next / previous tab\r\nCtrl+S Save\r\nCtrl+Shift+S Save As\r\nCtrl+Z Undo\r\nCtrl+Y Redo\r\nCtrl+X/C/V Cut Copy Paste\r\nCtrl+A Select All\r\nCtrl+F Find\r\nCtrl+Shift+F Find in Files\r\nF3 Find Next\r\nCtrl+H Replace\r\nCtrl+G Go To Line\r\nCtrl+F2 Toggle bookmark\r\nF2 / Shift+F2 Next / previous bookmark\r\nCtrl+Shift+K Value Converter\r\nCtrl+B Compile\r\nCtrl+Shift+B Fix\r\nF5 Compile and Run\r\nEsc Hide active bar";
+bundle_title: str = "ANCL Pad Bundle Guide";
+bundle_text: str = "Portable bundle layout\r\n\r\nancl_pad\\\r\n  bin\\ancl_pad.exe\r\n  bin\\guide.html\r\n  compiler\\anclc.exe\r\n  core_lib\\   current reusable ANCL libraries and starters\r\n  programs\\   compiled .exe and .asm files\r\n  sample.ancl\r\n  README.md\r\n\r\nShare the whole ancl_pad folder. Build > Compile/Run/Fix uses compiler\\anclc.exe and writes outputs to programs\\.\r\n\r\nPrograms in this folder can import bundled libraries with paths like:\r\n  import \"core_lib/cstring.ancl\";\r\n  import \"core_lib/gui_v2.ancl\";\r\n\r\nUse File > New From Starter for protocol templates and Edit > Insert Import for library imports. Build actions are enabled for .ancl files only; other languages are editor/highlighting modes.";
+fix_title: str = "Apply ANCL Fixes?";
+fix_q_a:   str = "Apply ";
+fix_q_b:   str = " mechanical fix(es)?\r\n\r\nThe compiler report is in the output pane. Your original file will be kept as .bak.";
+seed_src: str = "# ANCL Pad sample\r\n\r\n@DATA\r\nmsg: str = \"Hello from ANCL Pad\";\r\n\r\n@CODE\r\nfunc main() -> i32 {\r\n    syscall 1, msg, \"\\n\";\r\n    return 0;\r\n}\r\n";
+
+ID_EDITOR:    i64 = 100;
+ID_PATH:      i64 = 101;
+ID_STATUS:    i64 = 102;
+ID_COMPARE_EDITOR:i64 = 103;
+ID_NEW:       i64 = 201;
+ID_OPEN:      i64 = 202;
+ID_SAVE:      i64 = 203;
+ID_SAVEAS:    i64 = 204;
+ID_SAMPLE:    i64 = 205;
+ID_EXIT:      i64 = 206;
+ID_CLOSE:     i64 = 207;
+ID_ST_MODBUS: i64 = 250;
+ID_ST_MQTT:   i64 = 251;
+ID_ST_SQLITE: i64 = 252;
+ID_ST_BACNET: i64 = 253;
+ID_ST_DNP3:   i64 = 254;
+ID_ST_EIP:    i64 = 255;
+ID_ST_FINS:   i64 = 256;
+ID_ST_IEC104: i64 = 257;
+ID_ST_OPCUA:  i64 = 258;
+ID_ST_S7:     i64 = 259;
+ID_LANG_AUTO: i64 = 260;
+ID_LANG_ANCL: i64 = 261;
+ID_LANG_PY:   i64 = 262;
+ID_LANG_CS:   i64 = 263;
+ID_LANG_LOG:  i64 = 264;
+ID_LANG_TXT:  i64 = 265;
+ID_LANG_JSON: i64 = 266;
+ID_LANG_XML:  i64 = 267;
+ID_LANG_SQL:  i64 = 268;
+ID_LANG_MD:   i64 = 269;
+ID_LANG_INI:  i64 = 278;
+ID_LANG_PS:   i64 = 279;
+ID_UNDO:      i64 = 210;
+ID_REDO:      i64 = 211;
+ID_CUT:       i64 = 212;
+ID_COPY:      i64 = 213;
+ID_PASTE:     i64 = 214;
+ID_SELECTALL: i64 = 215;
+ID_FIND_SHOW: i64 = 216;
+ID_FIND_NEXT: i64 = 217;
+ID_REPL_SHOW: i64 = 218;
+ID_REPL_ONE:  i64 = 219;
+ID_RECOLOR:   i64 = 220;
+ID_GUTTER:    i64 = 221;
+ID_REPL_ALL:  i64 = 222;
+ID_GOTO_SHOW: i64 = 223;
+ID_GO_LINE:   i64 = 224;
+ID_FIND_HIDE: i64 = 225;
+ID_FIND_FILES_SHOW:i64 = 226;
+ID_FIND_FILES_SEARCH:i64 = 227;
+ID_FIND_FILES_BROWSE:i64 = 228;
+ID_FIND_FILES_HIDE:i64 = 229;
+ID_BUILD_COMPILE: i64 = 240;
+ID_BUILD_RUN:     i64 = 241;
+ID_OUTPUT_SHOW:   i64 = 242;
+ID_OUTPUT_HIDE:   i64 = 243;
+ID_BUILD_FIX:     i64 = 244;
+ID_CALC_SHOW:     i64 = 270;
+ID_CALC_CONVERT:  i64 = 271;
+ID_CALC_COPY:     i64 = 272;
+ID_CALC_HIDE:     i64 = 273;
+ID_CALC_DEC:      i64 = 274;
+ID_CALC_HEX:      i64 = 275;
+ID_CALC_BIN:      i64 = 276;
+ID_CALC_BCD:      i64 = 277;
+ID_IMP_CSTRING: i64 = 280;
+ID_IMP_NUMFMT:  i64 = 281;
+ID_IMP_PROCESS: i64 = 282;
+ID_IMP_CAPTURE: i64 = 283;
+ID_IMP_SQLITE:  i64 = 284;
+ID_IMP_MQTT:    i64 = 285;
+ID_IMP_GUI:     i64 = 286;
+ID_IMP_GDI:     i64 = 287;
+ID_IMP_RICH:    i64 = 288;
+ID_IMP_SYNTAX:  i64 = 289;
+ID_BOOKMARK_TOGGLE:i64 = 290;
+ID_BOOKMARK_NEXT:  i64 = 291;
+ID_BOOKMARK_PREV:  i64 = 292;
+ID_BOOKMARK_CLEAR: i64 = 293;
+ID_COMPARE_SHOW:   i64 = 294;
+ID_COMPARE_HIDE:   i64 = 295;
+ID_LANG_HTML:      i64 = 296;
+ID_ENC_ANSI:       i64 = 297;
+ID_ENC_UTF8:       i64 = 298;
+ID_ENC_UTF8_BOM:   i64 = 299;
+ID_ENC_UTF16:      i64 = 300;
+ID_EOL_CRLF:       i64 = 301;
+ID_EOL_LF:         i64 = 302;
+ID_EOL_CR:         i64 = 303;
+ID_HELP_KEYS: i64 = 230;
+ID_ABOUT:     i64 = 231;
+ID_BUNDLE:    i64 = 232;
+ID_GUIDE:     i64 = 233;
+ID_MENU_FILE: i64 = 400;
+ID_MENU_EDIT: i64 = 401;
+ID_MENU_BUILD:i64 = 402;
+ID_MENU_VIEW: i64 = 403;
+ID_MENU_HELP: i64 = 404;
+ID_RECENT_1:  i64 = 410;
+ID_RECENT_2:  i64 = 411;
+ID_RECENT_3:  i64 = 412;
+ID_RECENT_NONE:i64 = 413;
+ID_TAB_1:      i64 = 420;
+ID_TAB_8:      i64 = 427;
+ID_TAB_CLOSE_1:i64 = 430;
+ID_TAB_CLOSE_8:i64 = 437;
+
+PAD_MAX_TABS:  i64 = 8;
+PAD_TAB_CAP:   i64 = 1048576;
+PAD_FILE_CAP:  i64 = 2097152;
+PAD_BOOKMARK_CAP: i64 = 256;
+
+COLOR_BG:       i64 = 0x00F0F0F0;
+COLOR_PANEL:    i64 = 0x00FFFFFF;
+COLOR_LINE:     i64 = 0x00D0D0D0;
+COLOR_TEXT:     i64 = 0x00202020;
+COLOR_DIM:      i64 = 0x00666666;
+COLOR_EDITOR:   i64 = 0x00FFFFFF;
+COLOR_DEFAULT:  i64 = 0x001E1E1E;
+COLOR_ACCENT:   i64 = 0x00D77800;
+COLOR_BUTTON:   i64 = 0x00F5F5F5;
+COLOR_HOVER:    i64 = 0x00E9E9E9;
+
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_editor:   buf = 8;
+g_compare:  buf = 8;
+g_compare_label: buf = 8;
+g_compare_close: buf = 8;
+g_output:   buf = 8;
+g_path_ed:  buf = 8;
+g_status:   buf = 8;
+g_find_lbl: buf = 8;
+g_find_ed:  buf = 8;
+g_find_btn: buf = 8;
+g_repl_lbl: buf = 8;
+g_repl_ed:  buf = 8;
+g_repl_btn: buf = 8;
+g_all_btn:  buf = 8;
+g_line_lbl: buf = 8;
+g_line_ed:  buf = 8;
+g_go_btn:   buf = 8;
+g_hide_btn: buf = 8;
+g_calc_lbl: buf = 8;
+g_calc_in:  buf = 8;
+g_calc_btn: buf = 8;
+g_calc_copy_btn: buf = 8;
+g_calc_dec_lbl: buf = 8;
+g_calc_dec_ed:  buf = 8;
+g_calc_hex_lbl: buf = 8;
+g_calc_hex_ed:  buf = 8;
+g_calc_bin_lbl: buf = 8;
+g_calc_bin_ed:  buf = 8;
+g_calc_bcd_lbl: buf = 8;
+g_calc_bcd_ed:  buf = 8;
+g_calc_msg_lbl: buf = 8;
+g_calc_hide_btn: buf = 8;
+g_menu_bar:  buf = 8;
+g_menu_file: buf = 8;
+g_menu_edit: buf = 8;
+g_menu_build: buf = 8;
+g_menu_view: buf = 8;
+g_menu_help: buf = 8;
+g_menu_encoding: buf = 8;
+g_menu_eol: buf = 8;
+g_menu_starter: buf = 8;
+g_menu_import:  buf = 8;
+g_mb_file: buf = 8;
+g_mb_edit: buf = 8;
+g_mb_build: buf = 8;
+g_mb_view: buf = 8;
+g_mb_help: buf = 8;
+
+g_font_ui:   buf = 8;
+g_font_bold: buf = 8;
+g_font_code: buf = 8;
+g_br_bg:     buf = 8;
+g_br_panel:  buf = 8;
+g_br_editor: buf = 8;
+g_br_gutter: buf = 8;
+g_br_button: buf = 8;
+g_br_hover:  buf = 8;
+g_br_accent: buf = 8;
+g_pen_line:  buf = 8;
+g_pen_acc:   buf = 8;
+
+g_wc:      buf = 80;
+g_msg:     buf = 64;
+g_ps:      buf = 72;
+g_rect:    buf = 16;
+g_gutter:  buf = 16;
+g_compare_gutter: buf = 16;
+g_pt:      buf = 8;
+g_sel:     buf = 8;
+g_scroll:  buf = 16;
+g_compare_sel: buf = 8;
+g_compare_scroll: buf = 16;
+g_bracket_sel: buf = 8;
+g_bracket_scroll: buf = 16;
+g_cf:      buf = 60;
+g_crange:  buf = 8;
+g_io:      buf = 8;
+g_stex:    buf = 8;
+g_gtex:    buf = 32;
+g_filter:  buf = 320;
+g_ofn:     buf = 152;
+g_curpath: buf = 700;
+g_dialog:  buf = 700;
+g_load_path: buf = 700;
+g_exe:     buf = 700;
+g_exedir:  buf = 700;
+g_rootdir: buf = 700;
+g_compiler: buf = 700;
+g_bindir:  buf = 700;
+g_outpath: buf = 700;
+g_cmd:     buf = 1600;
+g_runcmd:  buf = 1600;
+g_sample:  buf = 700;
+g_starter: buf = 700;
+g_statusbuf: buf = 256;
+g_status_last: buf = 256;
+g_fixmsg: buf = 512;
+g_findbuf: buf = 256;
+g_replbuf: buf = 256;
+g_linebuf: buf = 32;
+g_num:     buf = 32;
+g_raw_p:   buf = 8;
+g_doc_p:   buf = 8;
+g_filebuf_p: buf = 8;
+g_wide_p:  buf = 8;
+g_loading: buf = 8;
+g_in_recolor: buf = 8;
+g_in_bracket: buf = 8;
+g_scroll_pend: buf = 8;
+g_find_visible: buf = 8;
+g_files_visible: buf = 8;
+g_output_visible: buf = 8;
+g_output_loading: buf = 8;
+g_lang_mode: buf = 8;
+g_encoding_mode: buf = 8;
+g_eol_mode: buf = 8;
+g_detect_encoding: buf = 8;
+g_detect_eol: buf = 8;
+g_calc_visible: buf = 8;
+g_compare_visible: buf = 8;
+g_calc_ok: buf = 8;
+g_calc_value: buf = 8;
+g_calc_suffix_pos: buf = 8;
+g_calc_updating: buf = 8;
+g_guide_path: buf = 700;
+g_compare_path: buf = 700;
+g_compare_labelbuf: buf = 720;
+g_bracket_a: buf = 8;
+g_bracket_b: buf = 8;
+g_recent_count: buf = 8;
+g_recent_paths: buf = 2100;
+g_recent_labels: buf = 2160;
+g_recent_file: buf = 700;
+g_recent_buf: buf = 2200;
+g_files_find_lbl: buf = 8;
+g_files_find_ed: buf = 8;
+g_files_folder_lbl: buf = 8;
+g_files_folder_ed: buf = 8;
+g_files_browse_btn: buf = 8;
+g_files_search_btn: buf = 8;
+g_files_hide_btn: buf = 8;
+g_files_query: buf = 256;
+g_files_folder: buf = 700;
+g_files_browse_info: buf = 64;
+g_files_display: buf = 700;
+g_files_find_data: buf = 3840;
+g_files_globs: buf = 8400;
+g_files_paths: buf = 8400;
+g_files_output_p: buf = 8;
+g_files_count: buf = 8;
+g_files_scanned: buf = 8;
+g_files_truncated: buf = 8;
+g_files_out_len: buf = 8;
+g_tab_count: buf = 8;
+g_tab_current: buf = 8;
+g_tab_switching: buf = 8;
+g_tab_paths: buf = 5600;
+g_tab_texts: buf = 64;
+g_tab_dirty: buf = 64;
+g_tab_lang: buf = 64;
+g_tab_encoding: buf = 64;
+g_tab_eol: buf = 64;
+g_tab_sel_a: buf = 64;
+g_tab_sel_b: buf = 64;
+g_tab_scroll_x: buf = 64;
+g_tab_scroll_y: buf = 64;
+g_tab_labels: buf = 1440;
+g_tab_buttons: buf = 64;
+g_tab_close_buttons: buf = 64;
+g_tab_bookmark_count: buf = 64;
+g_tab_bookmark_lines: buf = 16384;
+g_session_file: buf = 700;
+g_session_buf: buf = 6400;
+g_recovery_file: buf = 700;
+g_recovery_new: buf = 700;
+g_recovery_snap: buf = 700;
+g_recovery_active: buf = 8;
+
+s_compiler: str = "\\compiler\\anclc.exe";
+s_bindir:   str = "\\programs";
+s_starters: str = "\\core_lib\\starters\\";
+s_exe_ext:  str = ".exe";
+ext_ancl:   str = ".ancl";
+ext_py:     str = ".py";
+ext_cs:     str = ".cs";
+ext_log:    str = ".log";
+ext_txt:    str = ".txt";
+ext_json:   str = ".json";
+ext_xml:    str = ".xml";
+ext_html:   str = ".html";
+ext_htm:    str = ".htm";
+ext_sql:    str = ".sql";
+ext_md:     str = ".md";
+ext_markdown:str = ".markdown";
+ext_ini:    str = ".ini";
+ext_cfg:    str = ".cfg";
+ext_ps1:    str = ".ps1";
+q:          str = "\"";
+qspq:       str = "\" \"";
+out_compile: str = "[compile]\r\n";
+out_fix_cancel: str = "\r\n[fix] cancelled\r\n";
+out_fix_none: str = "\r\n[fix] no mechanical fixes found\r\n";
+out_run:     str = "\r\n[run]\r\n";
+out_exit:    str = "\r\n[exit ";
+out_close:   str = "]\r\n";
+out_no_compiler: str = "[compile] compiler missing. Expected:\r\n";
+out_bundle_hint: str = "\r\n\r\nUse Help > Bundle Guide, or copy bin\\anclc.exe into compiler\\anclc.exe.\r\n";
+calc_0x: str = "0x";
+calc_0b: str = "0b";
+calc_dec_hdr: str = "Dec: ";
+calc_hex_hdr: str = "Hex: ";
+calc_bin_hdr: str = "Bin: ";
+calc_bcd_hdr: str = "BCD: ";
+calc_crlf: str = "\r\n";
+calc_colon_sp: str = ": ";
+calc_zero: str = "0";
+
+fn_modbus:  str = "modbus_client.ancl";
+fn_mqtt:    str = "mqtt_pubsub.ancl";
+fn_sqlite:  str = "sqlite_report.ancl";
+fn_bacnet:  str = "bacnet_client.ancl";
+fn_dnp3:    str = "dnp3_client.ancl";
+fn_eip:     str = "eip_client.ancl";
+fn_fins:    str = "fins_client.ancl";
+fn_iec104:  str = "iec104_client.ancl";
+fn_opcua:   str = "opcua_client.ancl";
+fn_s7:      str = "s7_client.ancl";
+
+imp_cstring: str = "import \"core_lib/cstring.ancl\";\r\n";
+imp_numfmt:  str = "import \"core_lib/numfmt.ancl\";\r\n";
+imp_process: str = "import \"core_lib/process.ancl\";\r\n";
+imp_capture: str = "import \"core_lib/process_capture.ancl\";\r\n";
+imp_sqlite:  str = "import \"core_lib/sqlite.ancl\";\r\n";
+imp_mqtt:    str = "import \"core_lib/mqtt.ancl\";\r\n";
+imp_gui:     str = "import \"core_lib/gui_v2.ancl\";\r\n";
+imp_gdi:     str = "import \"core_lib/gdi_v2.ancl\";\r\n";
+imp_rich:    str = "import \"core_lib/rich_edit.ancl\";\r\n";
+imp_syntax:  str = "import \"core_lib/syntax_ancl.ancl\";\r\n";
+
+g_calcbuf: buf = 256;
+g_calc_decbuf: buf = 64;
+g_calc_hexbuf: buf = 64;
+g_calc_binbuf: buf = 128;
+g_calc_bcdbuf: buf = 64;
+g_calc_all: buf = 512;
+g_calc_tmp: buf = 128;
+
+@CODE
+
+func pad_last_bs(s: i64) -> i64 {
+    i = 0; last = 0 - 1;
+    while 1 {
+        c = load8(s + i);
+        if c == 0 { return last; }
+        if c == 92 { last = i; }
+        i = i + 1;
+    }
+    return last;
+}
+
+func pad_exedir(dst: i64) -> i64 {
+    GetModuleFileNameA(0, g_exe, 700);
+    bs = pad_last_bs(g_exe);
+    if bs < 0 { store8(dst, 0); return 0; }
+    memcpy(dst, g_exe, bs);
+    store8(dst + bs, 0);
+    return bs;
+}
+
+func pad_join(dst: i64, base: i64, suffix: i64) -> i64 {
+    p = str_copy(dst, base);
+    str_copy(p, suffix);
+    return 0;
+}
+
+func pad_parent(dst: i64, src: i64) -> i64 {
+    bs = pad_last_bs(src);
+    if bs < 0 { store8(dst, 0); return 0; }
+    memcpy(dst, src, bs);
+    store8(dst + bs, 0);
+    return bs;
+}
+
+func pad_is_bin_dir(path: i64) -> i64 {
+    n = strlen(path);
+    if n < 3 { return 0; }
+    if load8(path + n - 3) != 98 { return 0; }
+    if load8(path + n - 2) != 105 { return 0; }
+    if load8(path + n - 1) != 110 { return 0; }
+    return 1;
+}
+
+func pad_lower_ascii(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func pad_ends_with_ci(path: i64, ext: i64) -> i64 {
+    pn = strlen(path);
+    en = strlen(ext);
+    if en <= 0 { return 0; }
+    if pn < en { return 0; }
+    i = 0;
+    while i < en {
+        pc = pad_lower_ascii(load8(path + pn - en + i));
+        ec = pad_lower_ascii(load8(ext + i));
+        if pc != ec { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+func pad_is_ancl_path(path: i64) -> i64 {
+    return pad_ends_with_ci(path, ext_ancl);
+}
+
+func pad_detect_lang(path: i64) -> i64 {
+    if pad_ends_with_ci(path, ext_ancl) != 0 { return SYN_MODE_ANCL; }
+    if pad_ends_with_ci(path, ext_py) != 0 { return SYN_MODE_PYTHON; }
+    if pad_ends_with_ci(path, ext_cs) != 0 { return SYN_MODE_CSHARP; }
+    if pad_ends_with_ci(path, ext_log) != 0 { return SYN_MODE_LOG; }
+    if pad_ends_with_ci(path, ext_txt) != 0 { return SYN_MODE_TEXT; }
+    if pad_ends_with_ci(path, ext_json) != 0 { return SYN_MODE_JSON; }
+    if pad_ends_with_ci(path, ext_xml) != 0 { return SYN_MODE_XML; }
+    if pad_ends_with_ci(path, ext_html) != 0 { return SYN_MODE_HTML; }
+    if pad_ends_with_ci(path, ext_htm) != 0 { return SYN_MODE_HTML; }
+    if pad_ends_with_ci(path, ext_sql) != 0 { return SYN_MODE_SQL; }
+    if pad_ends_with_ci(path, ext_md) != 0 { return SYN_MODE_MARKDOWN; }
+    if pad_ends_with_ci(path, ext_markdown) != 0 { return SYN_MODE_MARKDOWN; }
+    if pad_ends_with_ci(path, ext_ini) != 0 { return SYN_MODE_INI; }
+    if pad_ends_with_ci(path, ext_cfg) != 0 { return SYN_MODE_INI; }
+    if pad_ends_with_ci(path, ext_ps1) != 0 { return SYN_MODE_POWERSHELL; }
+    return SYN_MODE_TEXT;
+}
+
+func pad_effective_lang() -> i64 {
+    mode = load64(g_lang_mode);
+    if mode != SYN_MODE_AUTO { return mode; }
+    return pad_detect_lang(g_curpath);
+}
+
+func pad_lang_label() -> i64 {
+    mode = pad_effective_lang();
+    if mode == SYN_MODE_ANCL { return st_lang_ancl; }
+    if mode == SYN_MODE_PYTHON { return st_lang_py; }
+    if mode == SYN_MODE_CSHARP { return st_lang_cs; }
+    if mode == SYN_MODE_LOG { return st_lang_log; }
+    if mode == SYN_MODE_JSON { return st_lang_json; }
+    if mode == SYN_MODE_XML { return st_lang_xml; }
+    if mode == SYN_MODE_HTML { return st_lang_html; }
+    if mode == SYN_MODE_SQL { return st_lang_sql; }
+    if mode == SYN_MODE_MARKDOWN { return st_lang_md; }
+    if mode == SYN_MODE_INI { return st_lang_ini; }
+    if mode == SYN_MODE_POWERSHELL { return st_lang_ps; }
+    return st_lang_txt;
+}
+
+func pad_set_lang(mode: i64) -> i64 {
+    store64(g_lang_mode, mode);
+    i = load64(g_tab_current); if i >= 0 { store64(g_tab_lang + i * 8, mode); }
+    pad_recolor_chars(0, 0 - 1);
+    pad_update_status();
+    SetFocus(load64(g_editor));
+    return 0;
+}
+
+func pad_update_build_menu() -> i64 {
+    mbu = load64(g_menu_build);
+    if mbu == 0 { return 0; }
+    en = pad_is_ancl_path(g_curpath);
+    gui_menu_enable(mbu, ID_BUILD_COMPILE, en);
+    gui_menu_enable(mbu, ID_BUILD_RUN, en);
+    gui_menu_enable(mbu, ID_BUILD_FIX, en);
+    if load64(g_hwnd) != 0 { DrawMenuBar(load64(g_hwnd)); }
+    return 0;
+}
+
+func pad_init_paths() -> i64 {
+    pad_exedir(g_exedir);
+    if pad_is_bin_dir(g_exedir) == 1 {
+        pad_parent(g_rootdir, g_exedir);
+    } else {
+        str_copy(g_rootdir, g_exedir);
+    }
+    pad_join(g_sample, g_rootdir, sample_suffix);
+    pad_join(g_compiler, g_rootdir, s_compiler);
+    pad_join(g_bindir, g_rootdir, s_bindir);
+    CreateDirectoryA(g_bindir, 0);
+    return 0;
+}
+
+func pad_read_file(path: i64, dst: i64, cap: i64) -> i64 {
+    h = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 { return 0 - 1; }
+    ReadFile(h, dst, cap - 1, g_io, 0);
+    CloseHandle(h);
+    n = load32(g_io);
+    store8(dst + n, 0);
+    return n;
+}
+
+func pad_write_file(path: i64, src: i64, n: i64) -> i64 {
+    h = CreateFileA(path, 0x40000000, 0, 0, 2, 0x80, 0);
+    if h == 0 - 1 { return 0; }
+    WriteFile(h, src, n, g_io, 0);
+    CloseHandle(h);
+    return 1;
+}
+
+func pad_rich_set_utf8(ed: i64, src: i64) -> i64 {
+    store32(g_stex, 0); store32(g_stex + 4, TEXT_CP_UTF8);
+    return SendMessageA(ed, 0x461, g_stex, src);
+}
+
+func pad_rich_get_utf8(ed: i64, dst: i64, cap: i64) -> i64 {
+    if cap <= 0 { return 0 - 1; }
+    memset(g_gtex, 0, 32); store32(g_gtex, cap); store32(g_gtex + 4, 0); store32(g_gtex + 8, TEXT_CP_UTF8);
+    SendMessageA(ed, 0x45E, g_gtex, dst); store8(dst + cap - 1, 0); return strlen(dst);
+}
+
+func pad_read_document(path: i64, dst: i64, cap: i64) -> i64 {
+    raw = load64(g_filebuf_p); n = pad_read_file(path, raw, PAD_FILE_CAP);
+    if n < 0 { return 0 - 1; }
+    enc = text_detect_encoding(raw, n); store64(g_detect_encoding, enc);
+    count = text_decode_to_utf8(raw, n, enc, dst, cap, load64(g_wide_p), PAD_TAB_CAP);
+    if count < 0 { return 0 - 1; }
+    store64(g_detect_eol, text_detect_eol(dst)); return count;
+}
+
+func pad_encoding_label() -> i64 {
+    enc = load64(g_encoding_mode);
+    if enc == TEXT_ENC_ANSI { return st_enc_ansi; }
+    if enc == TEXT_ENC_UTF8_BOM { return st_enc_utf8_bom; }
+    if enc == TEXT_ENC_UTF16_LE { return st_enc_utf16; }
+    return st_enc_utf8;
+}
+
+func pad_eol_label() -> i64 {
+    eol = load64(g_eol_mode);
+    if eol == TEXT_EOL_LF { return st_eol_lf; }
+    if eol == TEXT_EOL_CR { return st_eol_cr; }
+    return st_eol_crlf;
+}
+
+func pad_update_format_menu() -> i64 {
+    me = load64(g_menu_encoding); ml = load64(g_menu_eol);
+    if me != 0 {
+        CheckMenuItem(me, ID_ENC_ANSI, 0); CheckMenuItem(me, ID_ENC_UTF8, 0); CheckMenuItem(me, ID_ENC_UTF8_BOM, 0); CheckMenuItem(me, ID_ENC_UTF16, 0);
+        enc = load64(g_encoding_mode); id = ID_ENC_UTF8;
+        if enc == TEXT_ENC_ANSI { id = ID_ENC_ANSI; }
+        if enc == TEXT_ENC_UTF8_BOM { id = ID_ENC_UTF8_BOM; }
+        if enc == TEXT_ENC_UTF16_LE { id = ID_ENC_UTF16; }
+        CheckMenuItem(me, id, 8);
+    }
+    if ml != 0 {
+        CheckMenuItem(ml, ID_EOL_CRLF, 0); CheckMenuItem(ml, ID_EOL_LF, 0); CheckMenuItem(ml, ID_EOL_CR, 0);
+        eol = load64(g_eol_mode); id2 = ID_EOL_CRLF;
+        if eol == TEXT_EOL_LF { id2 = ID_EOL_LF; }
+        if eol == TEXT_EOL_CR { id2 = ID_EOL_CR; }
+        CheckMenuItem(ml, id2, 8);
+    }
+    return 0;
+}
+
+func pad_mark_format_modified() -> i64 {
+    i = load64(g_tab_current);
+    if i >= 0 {
+        store64(g_tab_encoding + i * 8, load64(g_encoding_mode)); store64(g_tab_eol + i * 8, load64(g_eol_mode));
+        store64(g_tab_dirty + i * 8, 1);
+    }
+    rich_set_modified(load64(g_editor), 1); pad_tabs_refresh(); pad_update_format_menu(); pad_update_status(); pad_set_status(st_format_changed); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_set_encoding(enc: i64) -> i64 {
+    if enc == load64(g_encoding_mode) { SetFocus(load64(g_editor)); return 0; }
+    store64(g_encoding_mode, enc); return pad_mark_format_modified();
+}
+
+func pad_set_eol(eol: i64) -> i64 {
+    if eol == load64(g_eol_mode) { SetFocus(load64(g_editor)); return 0; }
+    store64(g_eol_mode, eol); return pad_mark_format_modified();
+}
+
+func pad_recent_slot(i: i64) -> i64 { return g_recent_paths + i * 700; }
+
+func pad_recent_pathfile() -> i64 {
+    n = pad_exedir(g_recent_file); str_copy(g_recent_file + n, recent_suffix); return g_recent_file;
+}
+
+func pad_recent_load() -> i64 {
+    store64(g_recent_count, 0); memset(g_recent_paths, 0, 2100); pad_recent_pathfile();
+    n = pad_read_file(g_recent_file, g_recent_buf, 2200); if n < 0 { return 0; }
+    p = g_recent_buf; count = 0;
+    while load8(p) != 0 { if count >= 3 { break; } start = p;
+        while load8(p) != 0 { if load8(p) == 13 || load8(p) == 10 { break; } p = p + 1; }
+        len = p - start; if len > 0 { if len > 699 { len = 699; } memcpy(pad_recent_slot(count), start, len); store8(pad_recent_slot(count) + len, 0); count = count + 1; }
+        if load8(p) == 13 { p = p + 1; } if load8(p) == 10 { p = p + 1; }
+    }
+    store64(g_recent_count, count); return count;
+}
+
+func pad_recent_save() -> i64 {
+    p = g_recent_buf; i = 0;
+    while i < load64(g_recent_count) { p = str_copy(p, pad_recent_slot(i)); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1; i = i + 1; }
+    store8(p, 0); pad_recent_pathfile(); return pad_write_file(g_recent_file, g_recent_buf, p - g_recent_buf);
+}
+
+func pad_recent_push(path: i64) -> i64 {
+    if load8(path) == 0 { return 0; } if strcmp(path, untitled) == 0 { return 0; } if strcmp(path, g_sample) == 0 { return 0; }
+    count = load64(g_recent_count); found = 0 - 1; i = 0;
+    while i < count { if strcmp(pad_recent_slot(i), path) == 0 { found = i; break; } i = i + 1; }
+    if found == 0 { return 1; }
+    if found < 0 { if count < 3 { count = count + 1; } found = count - 1; }
+    i = found; while i > 0 { cstr_copy_n(pad_recent_slot(i), pad_recent_slot(i - 1), 700); i = i - 1; }
+    cstr_copy_n(pad_recent_slot(0), path, 700); store64(g_recent_count, count); pad_recent_save(); return 1;
+}
+
+func pad_recent_label(i: i64) -> i64 {
+    dst = g_recent_labels + i * 720; store8(dst, 49 + i); store8(dst + 1, 46); store8(dst + 2, 32);
+    cstr_copy_n(dst + 3, pad_recent_slot(i), 717); return dst;
+}
+
+func pad_tab_path(i: i64) -> i64 { return g_tab_paths + i * 700; }
+func pad_tab_text(i: i64) -> i64 { return load64(g_tab_texts + i * 8); }
+func pad_tab_label(i: i64) -> i64 { return g_tab_labels + i * 180; }
+func pad_bookmark_base(i: i64) -> i64 { return g_tab_bookmark_lines + i * PAD_BOOKMARK_CAP * 8; }
+
+func pad_bookmarks_reset(i: i64) -> i64 {
+    store64(g_tab_bookmark_count + i * 8, 0);
+    return 0;
+}
+
+func pad_bookmarks_copy(dst: i64, src: i64) -> i64 {
+    count = load64(g_tab_bookmark_count + src * 8);
+    store64(g_tab_bookmark_count + dst * 8, count);
+    d = pad_bookmark_base(dst); s = pad_bookmark_base(src); i = 0;
+    while i < count { store64(d + i * 8, load64(s + i * 8)); i = i + 1; }
+    return count;
+}
+
+func pad_tab_make_label(i: i64) -> i64 {
+    dst = pad_tab_label(i); src = pad_tab_path(i); last = pad_last_bs(src); if last >= 0 { src = src + last + 1; }
+    cstr_copy_n(dst, src, 176); p = dst + strlen(dst);
+    if load64(g_tab_dirty + i * 8) != 0 { store8(p, 32); store8(p + 1, 42); store8(p + 2, 0); }
+    return dst;
+}
+
+func pad_tabs_refresh() -> i64 {
+    i = 0; count = load64(g_tab_count);
+    while i < PAD_MAX_TABS {
+        h = load64(g_tab_buttons + i * 8);
+        hc = load64(g_tab_close_buttons + i * 8);
+        if h != 0 {
+            if i < count { SetWindowTextA(h, pad_tab_make_label(i)); ShowWindow(h, 1); InvalidateRect(h, 0, 1); if hc != 0 { ShowWindow(hc, 1); InvalidateRect(hc, 0, 1); } } else { ShowWindow(h, 0); if hc != 0 { ShowWindow(hc, 0); } }
+        }
+        i = i + 1;
+    }
+    if load64(g_hwnd) != 0 { GetClientRect(load64(g_hwnd), g_rect); pad_reflow(load32(g_rect + 8), load32(g_rect + 12)); InvalidateRect(load64(g_hwnd), 0, 0); }
+    return 0;
+}
+
+func pad_tab_init(i: i64, path: i64, src: i64, dirty: i64, enc: i64, eol: i64) -> i64 {
+    cstr_copy_n(pad_tab_path(i), path, 700); cstr_copy_n(pad_tab_text(i), src, PAD_TAB_CAP);
+    store64(g_tab_dirty + i * 8, dirty); store64(g_tab_lang + i * 8, SYN_MODE_AUTO);
+    store64(g_tab_encoding + i * 8, enc); store64(g_tab_eol + i * 8, eol);
+    store64(g_tab_sel_a + i * 8, 0); store64(g_tab_sel_b + i * 8, 0);
+    store64(g_tab_scroll_x + i * 8, 0); store64(g_tab_scroll_y + i * 8, 0); pad_bookmarks_reset(i); return 1;
+}
+
+func pad_tab_save_current() -> i64 {
+    i = load64(g_tab_current); if i < 0 { return 0; } if i >= load64(g_tab_count) { return 0; }
+    ed = load64(g_editor); if ed == 0 { return 0; }
+    pad_rich_get_utf8(ed, pad_tab_text(i), PAD_TAB_CAP); cstr_copy_n(pad_tab_path(i), g_curpath, 700);
+    store64(g_tab_dirty + i * 8, rich_get_modified(ed)); store64(g_tab_lang + i * 8, load64(g_lang_mode));
+    store64(g_tab_encoding + i * 8, load64(g_encoding_mode)); store64(g_tab_eol + i * 8, load64(g_eol_mode));
+    rich_get_sel(ed, g_sel); store64(g_tab_sel_a + i * 8, load32(g_sel)); store64(g_tab_sel_b + i * 8, load32(g_sel + 4));
+    rich_get_scroll_pos(ed, g_scroll); store64(g_tab_scroll_x + i * 8, load32(g_scroll)); store64(g_tab_scroll_y + i * 8, load32(g_scroll + 4));
+    return 1;
+}
+
+func pad_tab_load(i: i64) -> i64 {
+    if i < 0 { return 0; } if i >= load64(g_tab_count) { return 0; }
+    store64(g_tab_switching, 1); store64(g_tab_current, i); store64(g_lang_mode, load64(g_tab_lang + i * 8));
+    store64(g_encoding_mode, load64(g_tab_encoding + i * 8)); store64(g_eol_mode, load64(g_tab_eol + i * 8));
+    pad_set_path(pad_tab_path(i)); pad_set_text(pad_tab_text(i)); rich_set_modified(load64(g_editor), load64(g_tab_dirty + i * 8));
+    store32(g_sel, load64(g_tab_sel_a + i * 8)); store32(g_sel + 4, load64(g_tab_sel_b + i * 8)); rich_exset_sel(load64(g_editor), g_sel);
+    store32(g_scroll, load64(g_tab_scroll_x + i * 8)); store32(g_scroll + 4, load64(g_tab_scroll_y + i * 8)); rich_set_scroll_pos(load64(g_editor), g_scroll);
+    store64(g_tab_switching, 0); pad_tabs_refresh(); pad_update_format_menu(); pad_update_status(); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_tab_activate(i: i64) -> i64 {
+    if i == load64(g_tab_current) { SetFocus(load64(g_editor)); return 1; }
+    pad_tab_save_current(); return pad_tab_load(i);
+}
+
+func pad_tab_find(path: i64) -> i64 {
+    i = 0; while i < load64(g_tab_count) { if strcmp(pad_tab_path(i), path) == 0 { return i; } i = i + 1; } return 0 - 1;
+}
+
+func pad_tab_reuse_blank() -> i64 {
+    if load64(g_tab_count) != 1 { return 0; } if load64(g_tab_current) != 0 { return 0; }
+    if strcmp(g_curpath, untitled) != 0 { return 0; } if rich_get_modified(load64(g_editor)) != 0 { return 0; }
+    if rich_get_text_length(load64(g_editor)) != 0 { return 0; } return 1;
+}
+
+func pad_tab_add(path: i64, src: i64, dirty: i64, enc: i64, eol: i64) -> i64 {
+    pad_tab_save_current(); count = load64(g_tab_count); idx = count;
+    if pad_tab_reuse_blank() != 0 { idx = 0; } else { if count >= PAD_MAX_TABS { pad_set_status(st_tab_limit); return 0; } store64(g_tab_count, count + 1); }
+    pad_tab_init(idx, path, src, dirty, enc, eol); return pad_tab_load(idx);
+}
+
+func pad_tab_reload_current() -> i64 {
+    i = load64(g_tab_current); if i < 0 { return 0; } n = pad_read_document(g_curpath, pad_tab_text(i), PAD_TAB_CAP); if n < 0 { return 0; }
+    store64(g_tab_dirty + i * 8, 0); store64(g_tab_encoding + i * 8, load64(g_detect_encoding)); store64(g_tab_eol + i * 8, load64(g_detect_eol)); return pad_tab_load(i);
+}
+
+func pad_session_pathfile() -> i64 { n = pad_exedir(g_session_file); str_copy(g_session_file + n, session_suffix); return g_session_file; }
+
+func pad_session_save() -> i64 {
+    pad_tab_save_current(); p = g_session_buf; p = str_copy(p, "active:"); i = load64(g_tab_current);
+    if i >= 0 { if strcmp(pad_tab_path(i), untitled) != 0 { p = str_copy(p, pad_tab_path(i)); } }
+    store8(p, 13); store8(p + 1, 10); p = p + 2; i = 0;
+    while i < load64(g_tab_count) { path = pad_tab_path(i); if strcmp(path, untitled) != 0 { p = str_copy(p, path); store8(p, 13); store8(p + 1, 10); p = p + 2; } i = i + 1; }
+    store8(p, 0); pad_session_pathfile(); return pad_write_file(g_session_file, g_session_buf, p - g_session_buf);
+}
+
+func pad_session_restore() -> i64 {
+    pad_session_pathfile(); n = pad_read_file(g_session_file, g_session_buf, 6400); if n <= 0 { return 0; }
+    p = g_session_buf; active = g_load_path; store8(active, 0);
+    if load8(p) == 97 { if load8(p + 6) == 58 { q = p + 7; e = q; while load8(e) != 0 { if load8(e) == 13 || load8(e) == 10 { break; } e = e + 1; } len = e - q; if len > 699 { len = 699; } memcpy(active, q, len); store8(active + len, 0); p = e; } }
+    if load8(p) == 13 { p = p + 1; } if load8(p) == 10 { p = p + 1; }
+    count = 0; chosen = 0;
+    while load8(p) != 0 { if count >= PAD_MAX_TABS { break; } q = p; while load8(p) != 0 { if load8(p) == 13 || load8(p) == 10 { break; } p = p + 1; }
+        len = p - q; if len > 0 { if len > 699 { len = 699; } memcpy(g_dialog, q, len); store8(g_dialog + len, 0);
+            if pad_read_document(g_dialog, pad_tab_text(count), PAD_TAB_CAP) >= 0 { cstr_copy_n(pad_tab_path(count), g_dialog, 700); store64(g_tab_dirty + count * 8, 0); store64(g_tab_lang + count * 8, SYN_MODE_AUTO); store64(g_tab_encoding + count * 8, load64(g_detect_encoding)); store64(g_tab_eol + count * 8, load64(g_detect_eol)); if strcmp(g_dialog, active) == 0 { chosen = count; } count = count + 1; }
+        }
+        if load8(p) == 13 { p = p + 1; } if load8(p) == 10 { p = p + 1; }
+    }
+    if count == 0 { return 0; } store64(g_tab_count, count); store64(g_tab_current, 0 - 1); pad_tab_load(chosen); pad_set_status(st_session); return count;
+}
+
+func pad_recovery_manifest_path() -> i64 {
+    n = pad_exedir(g_recovery_file); str_copy(g_recovery_file + n, recovery_suffix); return g_recovery_file;
+}
+
+func pad_recovery_new_path() -> i64 {
+    n = pad_exedir(g_recovery_new); str_copy(g_recovery_new + n, recovery_new_suffix); return g_recovery_new;
+}
+
+func pad_recovery_snapshot_path(i: i64) -> i64 {
+    n = pad_exedir(g_recovery_snap); p = str_copy(g_recovery_snap + n, recovery_snap_prefix);
+    store8(p, 49 + i); p = p + 1; str_copy(p, recovery_snap_suffix); return g_recovery_snap;
+}
+
+func pad_recovery_clear() -> i64 {
+    pad_recovery_manifest_path(); DeleteFileA(g_recovery_file); pad_recovery_new_path(); DeleteFileA(g_recovery_new);
+    i = 0; while i < PAD_MAX_TABS { pad_recovery_snapshot_path(i); DeleteFileA(g_recovery_snap); i = i + 1; }
+    store64(g_recovery_active, 0); return 1;
+}
+
+func pad_recovery_dirty_count() -> i64 {
+    count = 0; i = 0; while i < load64(g_tab_count) { if load64(g_tab_dirty + i * 8) != 0 { count = count + 1; } i = i + 1; }
+    return count;
+}
+
+func pad_recovery_save() -> i64 {
+    if load64(g_editor) == 0 { return 0; }
+    pad_tab_save_current(); if pad_recovery_dirty_count() == 0 { return pad_recovery_clear(); }
+    p = str_copy(g_session_buf, recovery_magic); store8(p, 13); store8(p + 1, 10); p = p + 2;
+    p = str_copy(p, "active:"); active = load64(g_tab_current); if active < 0 { active = 0; } p = nf_u64dec(active, p); store8(p, 13); store8(p + 1, 10); p = p + 2;
+    i = 0; count = load64(g_tab_count);
+    while i < count {
+        pad_recovery_snapshot_path(i); text = pad_tab_text(i); if pad_write_file(g_recovery_snap, text, strlen(text)) == 0 { return 0; }
+        dirty = load64(g_tab_dirty + i * 8); if dirty != 0 { store8(p, 49); } else { store8(p, 48); } store8(p + 1, 124);
+        store8(p + 2, 48 + load64(g_tab_encoding + i * 8)); store8(p + 3, 124); store8(p + 4, 48 + load64(g_tab_eol + i * 8)); store8(p + 5, 124); p = p + 6;
+        p = str_copy(p, pad_tab_path(i)); store8(p, 13); store8(p + 1, 10); p = p + 2; i = i + 1;
+    }
+    store8(p, 0); pad_recovery_new_path(); if pad_write_file(g_recovery_new, g_session_buf, p - g_session_buf) == 0 { return 0; }
+    pad_recovery_manifest_path(); if MoveFileExA(g_recovery_new, g_recovery_file, 1) == 0 { return 0; }
+    store64(g_recovery_active, 1); return 1;
+}
+
+func pad_recovery_magic_ok(p: i64) -> i64 {
+    i = 0; while i < 8 { if load8(p + i) != load8(recovery_magic + i) { return 0; } i = i + 1; } return 1;
+}
+
+func pad_recovery_next_line(p: i64) -> i64 {
+    while load8(p) != 0 { if load8(p) == 13 || load8(p) == 10 { break; } p = p + 1; }
+    if load8(p) == 13 { p = p + 1; } if load8(p) == 10 { p = p + 1; } return p;
+}
+
+func pad_recovery_restore() -> i64 {
+    pad_recovery_manifest_path(); n = pad_read_file(g_recovery_file, g_session_buf, 6400); if n <= 0 { return 0; }
+    if pad_recovery_magic_ok(g_session_buf) == 0 { pad_recovery_clear(); return 0; }
+    if MessageBoxA(load64(g_hwnd), recovery_prompt, recovery_title, 0x24) != 6 { pad_recovery_clear(); return 0; }
+    p = pad_recovery_next_line(g_session_buf); active = 0;
+    if load8(p) == 97 { if load8(p + 6) == 58 { active = str_to_int(p + 7); } }
+    p = pad_recovery_next_line(p); count = 0;
+    while load8(p) != 0 {
+        if count >= PAD_MAX_TABS { break; }
+        dirty = 0; if load8(p) == 49 { dirty = 1; }
+        if load8(p + 1) != 124 { break; } if load8(p + 3) != 124 { break; } if load8(p + 5) != 124 { break; }
+        enc = load8(p + 2) - 48; eol = load8(p + 4) - 48; if enc < 0 { enc = TEXT_ENC_UTF8; } if enc > TEXT_ENC_UTF16_LE { enc = TEXT_ENC_UTF8; } if eol < 0 { eol = TEXT_EOL_CRLF; } if eol > TEXT_EOL_CR { eol = TEXT_EOL_CRLF; }
+        q = p + 6; e = q; while load8(e) != 0 { if load8(e) == 13 || load8(e) == 10 { break; } e = e + 1; }
+        len = e - q; if len > 699 { len = 699; } memcpy(g_dialog, q, len); store8(g_dialog + len, 0);
+        pad_recovery_snapshot_path(count); if pad_read_file(g_recovery_snap, pad_tab_text(count), PAD_TAB_CAP) >= 0 {
+            cstr_copy_n(pad_tab_path(count), g_dialog, 700); store64(g_tab_dirty + count * 8, dirty); store64(g_tab_lang + count * 8, SYN_MODE_AUTO); store64(g_tab_encoding + count * 8, enc); store64(g_tab_eol + count * 8, eol);
+            store64(g_tab_sel_a + count * 8, 0); store64(g_tab_sel_b + count * 8, 0); store64(g_tab_scroll_x + count * 8, 0); store64(g_tab_scroll_y + count * 8, 0); pad_bookmarks_reset(count); count = count + 1;
+        }
+        p = pad_recovery_next_line(p);
+    }
+    if count == 0 { pad_recovery_clear(); return 0; } if active < 0 { active = 0; } if active >= count { active = count - 1; }
+    store64(g_tab_count, count); store64(g_tab_current, 0 - 1); store64(g_recovery_active, 1); pad_tab_load(active); pad_set_status(st_recovered); return count;
+}
+
+func pad_build_filter() -> i64 {
+    p = gui_file_filter_first(g_filter, flt_ancl, pat_ancl);
+    p = gui_file_filter_add(p, flt_py, pat_py);
+    p = gui_file_filter_add(p, flt_cs, pat_cs);
+    p = gui_file_filter_add(p, flt_logs, pat_logs);
+    p = gui_file_filter_add(p, flt_data, pat_data);
+    p = gui_file_filter_add(p, flt_all, pat_all);
+    gui_file_filter_done(p);
+    return 0;
+}
+
+func pad_set_path(path: i64) -> i64 {
+    cstr_copy_n(g_curpath, path, 700);
+    if load64(g_path_ed) != 0 { SetWindowTextA(load64(g_path_ed), g_curpath); }
+    pad_update_build_menu();
+    pad_update_status();
+    return 0;
+}
+
+func pad_set_status(text: i64) -> i64 {
+    if load64(g_status) == 0 { return 0; }
+    if strcmp(g_status_last, text) == 0 { return 0; }
+    str_copy(g_status_last, text);
+    SetWindowTextA(load64(g_status), text);
+    return 1;
+}
+
+func calc_is_sep(c: i64) -> i64 {
+    if c == 32 { return 1; }
+    if c == 9 { return 1; }
+    if c == 95 { return 1; }
+    if c == 44 { return 1; }
+    return 0;
+}
+
+func calc_hex_digit(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return c - 48; } }
+    if c >= 65 { if c <= 70 { return 10 + c - 65; } }
+    if c >= 97 { if c <= 102 { return 10 + c - 97; } }
+    return 0 - 1;
+}
+
+func calc_hex_char(v: i64) -> i64 {
+    if v < 10 { return 48 + v; }
+    return 65 + v - 10;
+}
+
+func calc_prior_binary(src: i64, start: i64, endpos: i64) -> i64 {
+    i = start;
+    got = 0;
+    while i < endpos {
+        c = load8(src + i);
+        if calc_is_sep(c) == 0 {
+            if c != 48 {
+                if c != 49 { return 0; }
+            }
+            got = 1;
+        }
+        i = i + 1;
+    }
+    return got;
+}
+
+func calc_detect_base(src: i64, start: i64) -> i64 {
+    store64(g_calc_suffix_pos, 0 - 1);
+    c = load8(src + start);
+    if c == 48 {
+        nx = load8(src + start + 1);
+        if nx == 120 { return 16; }
+        if nx == 88 { return 16; }
+        if nx == 98 { return 2; }
+        if nx == 66 { return 2; }
+    }
+    if c == 36 { return 16; }
+    if c == 37 { return 2; }
+
+    lastpos = 0 - 1;
+    last = 0;
+    hashex = 0;
+    j = start;
+    while load8(src + j) != 0 {
+        ch = load8(src + j);
+        if calc_is_sep(ch) == 0 {
+            lastpos = j;
+            last = ch;
+            d = calc_hex_digit(ch);
+            if d >= 10 { hashex = 1; }
+        }
+        j = j + 1;
+    }
+    if last == 104 { store64(g_calc_suffix_pos, lastpos); return 16; }
+    if last == 72 { store64(g_calc_suffix_pos, lastpos); return 16; }
+    if last == 98 {
+        if calc_prior_binary(src, start, lastpos) != 0 { store64(g_calc_suffix_pos, lastpos); return 2; }
+    }
+    if last == 66 {
+        if calc_prior_binary(src, start, lastpos) != 0 { store64(g_calc_suffix_pos, lastpos); return 2; }
+    }
+    if hashex != 0 { return 16; }
+    return 10;
+}
+
+func calc_parse_value(src: i64) -> i64 {
+    store64(g_calc_ok, 0);
+    i = 0;
+    while calc_is_sep(load8(src + i)) != 0 { i = i + 1; }
+    if load8(src + i) == 43 { i = i + 1; }
+    if load8(src + i) == 45 { return 0; }
+
+    base = calc_detect_base(src, i);
+    if load8(src + i) == 48 {
+        nx = load8(src + i + 1);
+        if nx == 120 { i = i + 2; }
+        else if nx == 88 { i = i + 2; }
+        else if nx == 98 { i = i + 2; }
+        else if nx == 66 { i = i + 2; }
+    }
+    if load8(src + i) == 36 { i = i + 1; }
+    if load8(src + i) == 37 { i = i + 1; }
+
+    v = 0;
+    digits = 0;
+    suffix = load64(g_calc_suffix_pos);
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { break; }
+        if i == suffix { break; }
+        if calc_is_sep(c) != 0 {
+            i = i + 1;
+        } else {
+            d = calc_hex_digit(c);
+            if d < 0 { return 0; }
+            if d >= base { return 0; }
+            v = v * base + d;
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits <= 0 { return 0; }
+    store64(g_calc_ok, 1);
+    store64(g_calc_value, v);
+    return v;
+}
+
+func calc_parse_base(src: i64, base: i64) -> i64 {
+    store64(g_calc_ok, 0);
+    i = 0;
+    while calc_is_sep(load8(src + i)) != 0 { i = i + 1; }
+    if load8(src + i) == 43 { i = i + 1; }
+    if load8(src + i) == 45 { return 0; }
+
+    if base == 16 {
+        if load8(src + i) == 36 { i = i + 1; }
+        if load8(src + i) == 48 {
+            nx = load8(src + i + 1);
+            if nx == 120 { i = i + 2; }
+            else if nx == 88 { i = i + 2; }
+        }
+    }
+    if base == 2 {
+        if load8(src + i) == 37 { i = i + 1; }
+        if load8(src + i) == 48 {
+            nx2 = load8(src + i + 1);
+            if nx2 == 98 { i = i + 2; }
+            else if nx2 == 66 { i = i + 2; }
+        }
+    }
+
+    v = 0;
+    digits = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { break; }
+        if base == 16 {
+            if c == 104 { break; }
+            if c == 72 { break; }
+        }
+        if base == 2 {
+            if c == 98 { break; }
+            if c == 66 { break; }
+        }
+        if calc_is_sep(c) != 0 {
+            i = i + 1;
+        } else {
+            d = calc_hex_digit(c);
+            if d < 0 { return 0; }
+            if d >= base { return 0; }
+            v = v * base + d;
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits <= 0 { return 0; }
+    store64(g_calc_ok, 1);
+    store64(g_calc_value, v);
+    return v;
+}
+
+func calc_parse_bcd(src: i64) -> i64 {
+    store64(g_calc_ok, 0);
+    i = 0;
+    while calc_is_sep(load8(src + i)) != 0 { i = i + 1; }
+    if load8(src + i) == 43 { i = i + 1; }
+    if load8(src + i) == 45 { return 0; }
+    if load8(src + i) == 36 { i = i + 1; }
+    if load8(src + i) == 48 {
+        nx = load8(src + i + 1);
+        if nx == 120 { i = i + 2; }
+        else if nx == 88 { i = i + 2; }
+    }
+    v = 0;
+    digits = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { break; }
+        if c == 104 { break; }
+        if c == 72 { break; }
+        if calc_is_sep(c) != 0 {
+            i = i + 1;
+        } else {
+            d = calc_hex_digit(c);
+            if d < 0 { return 0; }
+            if d > 9 { return 0; }
+            v = v * 10 + d;
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits <= 0 { return 0; }
+    store64(g_calc_ok, 1);
+    store64(g_calc_value, v);
+    return v;
+}
+
+func calc_format_hex(val: i64, dst: i64) -> i64 {
+    p = str_copy(dst, calc_0x);
+    if val == 0 {
+        store8(p, 48);
+        store8(p + 1, 0);
+        return 0;
+    }
+    n = 0;
+    v = val;
+    while v > 0 {
+        store8(g_calc_tmp + n, calc_hex_char(band(v, 15)));
+        v = shr(v, 4);
+        n = n + 1;
+    }
+    i = 0;
+    while i < n {
+        store8(p + i, load8(g_calc_tmp + n - 1 - i));
+        i = i + 1;
+    }
+    store8(p + n, 0);
+    return 0;
+}
+
+func calc_format_bin(val: i64, dst: i64) -> i64 {
+    p = str_copy(dst, calc_0b);
+    if val == 0 {
+        store8(p, 48);
+        store8(p + 1, 0);
+        return 0;
+    }
+    n = 0;
+    v = val;
+    while v > 0 {
+        if band(v, 1) == 0 { store8(g_calc_tmp + n, 48); } else { store8(g_calc_tmp + n, 49); }
+        v = shr(v, 1);
+        n = n + 1;
+    }
+    i = 0;
+    out = 0;
+    while i < n {
+        if i > 0 {
+            rem = n - i;
+            if rem % 4 == 0 {
+                store8(p + out, 32);
+                out = out + 1;
+            }
+        }
+        store8(p + out, load8(g_calc_tmp + n - 1 - i));
+        out = out + 1;
+        i = i + 1;
+    }
+    store8(p + out, 0);
+    return 0;
+}
+
+func calc_format_bcd(decstr: i64, dst: i64) -> i64 {
+    p = str_copy(dst, calc_0x);
+    n = strlen(decstr);
+    if n % 2 == 1 {
+        store8(p, 48);
+        p = p + 1;
+    }
+    i = 0;
+    while i < n {
+        store8(p, load8(decstr + i));
+        p = p + 1;
+        i = i + 1;
+    }
+    store8(p, 0);
+    return 0;
+}
+
+func calc_build_all() -> i64 {
+    p = str_copy(g_calc_all, calc_dec_hdr);
+    p = str_copy(p, g_calc_decbuf);
+    p = str_copy(p, calc_crlf);
+    p = str_copy(p, calc_hex_hdr);
+    p = str_copy(p, g_calc_hexbuf);
+    p = str_copy(p, calc_crlf);
+    p = str_copy(p, calc_bin_hdr);
+    p = str_copy(p, g_calc_binbuf);
+    p = str_copy(p, calc_crlf);
+    p = str_copy(p, calc_bcd_hdr);
+    p = str_copy(p, g_calc_bcdbuf);
+    p = str_copy(p, calc_crlf);
+    store8(p, 0);
+    return 0;
+}
+
+func pad_calc_clear_from(source_id: i64) -> i64 {
+    store64(g_calc_updating, 1);
+    if source_id != ID_CALC_DEC { SetWindowTextA(load64(g_calc_dec_ed), rich_empty); }
+    if source_id != ID_CALC_HEX { SetWindowTextA(load64(g_calc_hex_ed), rich_empty); }
+    if source_id != ID_CALC_BIN { SetWindowTextA(load64(g_calc_bin_ed), rich_empty); }
+    if source_id != ID_CALC_BCD { SetWindowTextA(load64(g_calc_bcd_ed), rich_empty); }
+    SetWindowTextA(load64(g_calc_msg_lbl), st_calc_bad);
+    store64(g_calc_updating, 0);
+    return 0;
+}
+
+func pad_calc_apply_value(v: i64, source_id: i64) -> i64 {
+    store64(g_calc_value, v);
+    store64(g_calc_ok, 1);
+    p = nf_u64dec(v, g_calc_decbuf);
+    store8(p, 0);
+    calc_format_hex(v, g_calc_hexbuf);
+    calc_format_bin(v, g_calc_binbuf);
+    calc_format_bcd(g_calc_decbuf, g_calc_bcdbuf);
+    calc_build_all();
+
+    store64(g_calc_updating, 1);
+    if source_id != ID_CALC_DEC { SetWindowTextA(load64(g_calc_dec_ed), g_calc_decbuf); }
+    if source_id != ID_CALC_HEX { SetWindowTextA(load64(g_calc_hex_ed), g_calc_hexbuf); }
+    if source_id != ID_CALC_BIN { SetWindowTextA(load64(g_calc_bin_ed), g_calc_binbuf); }
+    if source_id != ID_CALC_BCD { SetWindowTextA(load64(g_calc_bcd_ed), g_calc_bcdbuf); }
+    SetWindowTextA(load64(g_calc_msg_lbl), st_calc_done);
+    store64(g_calc_updating, 0);
+    pad_set_status(st_calc_done);
+    return 1;
+}
+
+func pad_calc_from_field(source_id: i64) -> i64 {
+    if load64(g_calc_updating) != 0 { return 0; }
+    if source_id == ID_CALC_DEC {
+        gui_get_text(load64(g_calc_dec_ed), g_calcbuf, 256);
+        v = calc_parse_base(g_calcbuf, 10);
+    } else if source_id == ID_CALC_HEX {
+        gui_get_text(load64(g_calc_hex_ed), g_calcbuf, 256);
+        v = calc_parse_base(g_calcbuf, 16);
+    } else if source_id == ID_CALC_BIN {
+        gui_get_text(load64(g_calc_bin_ed), g_calcbuf, 256);
+        v = calc_parse_base(g_calcbuf, 2);
+    } else if source_id == ID_CALC_BCD {
+        gui_get_text(load64(g_calc_bcd_ed), g_calcbuf, 256);
+        v = calc_parse_bcd(g_calcbuf);
+    } else {
+        return 0;
+    }
+    if load64(g_calc_ok) == 0 {
+        pad_calc_clear_from(source_id);
+        pad_set_status(st_calc_bad);
+        return 0;
+    }
+    return pad_calc_apply_value(v, source_id);
+}
+
+func pad_calc_convert() -> i64 {
+    f = GetFocus();
+    if f == load64(g_calc_dec_ed) { return pad_calc_from_field(ID_CALC_DEC); }
+    if f == load64(g_calc_hex_ed) { return pad_calc_from_field(ID_CALC_HEX); }
+    if f == load64(g_calc_bin_ed) { return pad_calc_from_field(ID_CALC_BIN); }
+    if f == load64(g_calc_bcd_ed) { return pad_calc_from_field(ID_CALC_BCD); }
+    return pad_calc_from_field(ID_CALC_DEC);
+}
+
+func pad_calc_copy() -> i64 {
+    if load64(g_calc_ok) == 0 {
+        if pad_calc_convert() == 0 { return 0; }
+    }
+    calc_build_all();
+    gui_clip_write_text(load64(g_hwnd), g_calc_all, strlen(g_calc_all));
+    SetWindowTextA(load64(g_calc_msg_lbl), st_calc_copied);
+    pad_set_status(st_calc_copied);
+    return 1;
+}
+
+func pad_calc_seed_selection() -> i64 {
+    ed = load64(g_editor);
+    if ed == 0 { return 0; }
+    rich_get_sel(ed, g_sel);
+    a = load32(g_sel + 0);
+    b = load32(g_sel + 4);
+    if b < a { t = a; a = b; b = t; }
+    n = b - a;
+    if n <= 0 { return 0; }
+    if n > 120 { return 0; }
+    pad_read_doc();
+    doc = load64(g_doc_p);
+    i = 0;
+    while i < n {
+        c = load8(doc + a + i);
+        if c == 13 { c = 32; }
+        store8(g_calcbuf + i, c);
+        i = i + 1;
+    }
+    store8(g_calcbuf + n, 0);
+    return 1;
+}
+
+func pad_show_output(show: i64) -> i64 {
+    store64(g_output_visible, show);
+    if load64(g_output) != 0 { ShowWindow(load64(g_output), show); }
+    GetClientRect(load64(g_hwnd), g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    return 0;
+}
+
+func pad_color_output() -> i64 {
+    out = load64(g_output);
+    if out == 0 { return 0; }
+    raw = load64(g_raw_p);
+    doc = load64(g_doc_p);
+    SendMessageA(out, 13, 1048575, raw);
+    editor_strip_lf(doc, raw);
+    dl = strlen(doc);
+
+    rich_get_sel(out, g_sel);
+    rich_get_scroll_pos(out, g_scroll);
+    rich_set_redraw(out, 0);
+    rich_cf_color(g_cf, COLOR_DEFAULT);
+    rich_set_charformat(out, SCF_ALL, g_cf);
+
+    pos = 0;
+    run_start = 0;
+    run_color = 0 - 1;
+    while 1 {
+        L = syn_mode_next(SYN_MODE_LOG, doc, pos);
+        if L == 0 { break; }
+        c = syn_mode_color(SYN_MODE_LOG, load64(syn_ancl_tok_kind));
+        if c != run_color {
+            if pos > run_start { editor_color_range(out, g_crange, g_cf, run_start, pos, run_color); }
+            run_start = pos;
+            run_color = c;
+        }
+        pos = pos + L;
+        if pos >= dl { break; }
+    }
+    if pos > run_start { editor_color_range(out, g_crange, g_cf, run_start, pos, run_color); }
+
+    rich_exset_sel(out, g_sel);
+    rich_set_scroll_pos(out, g_scroll);
+    rich_set_redraw(out, 1);
+    InvalidateRect(out, 0, 1);
+    return 0;
+}
+
+func pad_set_output(text: i64) -> i64 {
+    out = load64(g_output);
+    if out == 0 { return 0; }
+    store64(g_output_loading, 1);
+    SendMessageA(out, 0xCF, 0, 0); # EM_SETREADONLY false
+    SendMessageA(out, 12, 0, text);
+    pad_color_output();
+    SendMessageA(out, 0xCF, 1, 0); # EM_SETREADONLY true
+    store64(g_output_loading, 0);
+    return 0;
+}
+
+func pad_update_status() -> i64 {
+    ed = load64(g_editor);
+    if ed == 0 { return 0; }
+    if load64(g_in_recolor) == 1 { return 0; }
+    rich_get_sel(ed, g_sel);
+    caret = load32(g_sel + 0);
+    other = load32(g_sel + 4);
+    if other < caret { caret = other; }
+    line = rich_line_from_char(ed, caret);
+    start = rich_line_index(ed, line);
+    col = caret - start;
+    if col < 0 { col = 0; }
+    p = str_copy(g_statusbuf, st_ln);
+    p = nf_u64dec(line + 1, p);
+    p = str_copy(p, st_col);
+    p = nf_u64dec(col + 1, p);
+    p = str_copy(p, pad_lang_label());
+    p = str_copy(p, pad_encoding_label());
+    p = str_copy(p, pad_eol_label());
+    if rich_get_modified(ed) != 0 { p = str_copy(p, st_dirty); } else { p = str_copy(p, st_clean); }
+    store8(p, 0);
+    return pad_set_status(g_statusbuf);
+}
+
+func pad_mark_clean() -> i64 {
+    rich_set_modified(load64(g_editor), 0);
+    pad_update_status();
+    return 0;
+}
+
+func pad_read_doc() -> i64 {
+    ed = load64(g_editor);
+    raw = load64(g_raw_p);
+    doc = load64(g_doc_p);
+    SendMessageA(ed, 13, 1048575, raw);
+    return editor_strip_lf(doc, raw);
+}
+
+func pad_match_at(src: i64, pos: i64, needle: i64) -> i64 {
+    if src == 0 || needle == 0 { return 0; }
+    if pos < 0 { return 0; }
+    j = 0;
+    while 1 {
+        c = load8(needle + j);
+        if c == 0 { return 1; }
+        sc = load8(src + pos + j);
+        if sc == 0 { return 0; }
+        if sc != c { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+func pad_find_from(src: i64, needle: i64, start: i64) -> i64 {
+    if src == 0 || needle == 0 { return 0 - 1; }
+    nlen = strlen(needle);
+    if nlen <= 0 { return 0 - 1; }
+    len = strlen(src);
+    if nlen > len { return 0 - 1; }
+    if start < 0 { start = 0; }
+    if start > len { start = len; }
+    i = start;
+    while i <= len - nlen {
+        if pad_match_at(src, i, needle) == 1 { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+func pad_select_range(first: i64, last: i64) -> i64 {
+    ed = load64(g_editor);
+    editor_set_crange(g_crange, first, last);
+    rich_exset_sel(ed, g_crange);
+    SendMessageA(ed, 0xB7, 0, 0); # EM_SCROLLCARET
+    SetFocus(ed);
+    pad_update_status();
+    return 1;
+}
+
+func pad_find_next() -> i64 {
+    gui_get_text(load64(g_find_ed), g_findbuf, 256);
+    if strlen(g_findbuf) <= 0 { pad_set_status(st_find_empty); return 0; }
+    pad_read_doc();
+    rich_get_sel(load64(g_editor), g_sel);
+    start = load32(g_sel + 4);
+    idx = pad_find_from(load64(g_doc_p), g_findbuf, start);
+    if idx < 0 { idx = pad_find_from(load64(g_doc_p), g_findbuf, 0); }
+    if idx < 0 { pad_set_status(st_not_found); return 0; }
+    return pad_select_range(idx, idx + strlen(g_findbuf));
+}
+
+func pad_current_selection_matches() -> i64 {
+    rich_get_sel(load64(g_editor), g_sel);
+    a = load32(g_sel + 0);
+    b = load32(g_sel + 4);
+    if b < a { t = a; a = b; b = t; }
+    if b - a != strlen(g_findbuf) { return 0; }
+    pad_read_doc();
+    return pad_match_at(load64(g_doc_p), a, g_findbuf);
+}
+
+func pad_replace_one() -> i64 {
+    gui_get_text(load64(g_find_ed), g_findbuf, 256);
+    gui_get_text(load64(g_repl_ed), g_replbuf, 256);
+    if strlen(g_findbuf) <= 0 { pad_set_status(st_find_empty); return 0; }
+    if pad_current_selection_matches() == 0 { return pad_find_next(); }
+    SendMessageA(load64(g_editor), 0xC2, 1, g_replbuf); # EM_REPLACESEL, undoable
+    rich_set_modified(load64(g_editor), 1);
+    pad_recolor();
+    pad_find_next();
+    return 1;
+}
+
+func pad_replace_status(count: i64) -> i64 {
+    p = str_copy(g_statusbuf, st_replaced);
+    p = nf_u64dec(count, p);
+    p = str_copy(p, st_matches);
+    store8(p, 0);
+    pad_set_status(g_statusbuf);
+    return 0;
+}
+
+func pad_replace_all() -> i64 {
+    gui_get_text(load64(g_find_ed), g_findbuf, 256);
+    gui_get_text(load64(g_repl_ed), g_replbuf, 256);
+    nlen = strlen(g_findbuf);
+    if nlen <= 0 { pad_set_status(st_find_empty); return 0; }
+
+    raw = load64(g_raw_p);
+    dst = load64(g_filebuf_p);
+    SendMessageA(load64(g_editor), 13, 1048575, raw);
+    i = 0;
+    j = 0;
+    count = 0;
+    while load8(raw + i) != 0 {
+        if pad_match_at(raw, i, g_findbuf) == 1 {
+            k = 0;
+            while load8(g_replbuf + k) != 0 {
+                if j < 1048574 { store8(dst + j, load8(g_replbuf + k)); j = j + 1; }
+                k = k + 1;
+            }
+            i = i + nlen;
+            count = count + 1;
+        } else {
+            if j < 1048574 { store8(dst + j, load8(raw + i)); j = j + 1; }
+            i = i + 1;
+        }
+    }
+    store8(dst + j, 0);
+    if count <= 0 { pad_set_status(st_not_found); return 0; }
+    pad_set_text(dst);
+    rich_set_modified(load64(g_editor), 1);
+    pad_replace_status(count);
+    SetFocus(load64(g_editor));
+    return 1;
+}
+
+func pad_select_line_num(line: i64) -> i64 {
+    if line < 1 { line = 1; }
+    lc = rich_line_count(load64(g_editor));
+    if line > lc { pad_set_status(st_bad_line); return 0; }
+    idx = rich_line_index(load64(g_editor), line - 1);
+    if idx < 0 { pad_set_status(st_bad_line); return 0; }
+    end = 0;
+    if line < lc {
+        end = rich_line_index(load64(g_editor), line);
+        if end < idx { end = idx; }
+    } else {
+        pad_read_doc();
+        end = strlen(load64(g_doc_p));
+    }
+    return pad_select_range(idx, end);
+}
+
+func pad_goto_line() -> i64 {
+    gui_get_text(load64(g_line_ed), g_linebuf, 32);
+    return pad_select_line_num(str_to_int(g_linebuf));
+}
+
+func pad_bookmark_current_line() -> i64 {
+    ed = load64(g_editor); rich_get_sel(ed, g_sel); caret = load32(g_sel);
+    return rich_line_from_char(ed, caret);
+}
+
+func pad_bookmark_find(tab: i64, line: i64) -> i64 {
+    count = load64(g_tab_bookmark_count + tab * 8); base = pad_bookmark_base(tab); i = 0;
+    while i < count { if load64(base + i * 8) == line { return i; } i = i + 1; }
+    return 0 - 1;
+}
+
+func pad_bookmark_line_status(prefix: i64, line: i64) -> i64 {
+    p = str_copy(g_statusbuf, prefix); p = nf_u64dec(line + 1, p); store8(p, 0);
+    return pad_set_status(g_statusbuf);
+}
+
+func pad_bookmark_toggle() -> i64 {
+    tab = load64(g_tab_current); if tab < 0 { return 0; }
+    line = pad_bookmark_current_line(); count = load64(g_tab_bookmark_count + tab * 8); base = pad_bookmark_base(tab); found = pad_bookmark_find(tab, line);
+    if found >= 0 {
+        i = found; while i < count - 1 { store64(base + i * 8, load64(base + (i + 1) * 8)); i = i + 1; }
+        store64(g_tab_bookmark_count + tab * 8, count - 1); pad_bookmark_line_status(st_bookmark_removed, line);
+    } else {
+        if count >= PAD_BOOKMARK_CAP { pad_set_status(st_bookmark_full); return 0; }
+        store64(base + count * 8, line); store64(g_tab_bookmark_count + tab * 8, count + 1); pad_bookmark_line_status(st_bookmark_added, line);
+    }
+    InvalidateRect(load64(g_hwnd), g_gutter, 0); return 1;
+}
+
+func pad_bookmark_jump(direction: i64) -> i64 {
+    tab = load64(g_tab_current); if tab < 0 { return 0; }
+    count = load64(g_tab_bookmark_count + tab * 8); if count <= 0 { pad_set_status(st_bookmark_none); return 0; }
+    current = pad_bookmark_current_line(); lc = rich_line_count(load64(g_editor)); base = pad_bookmark_base(tab); best = 0 - 1; wrap = 0 - 1; i = 0;
+    while i < count {
+        line = load64(base + i * 8);
+        if line >= 0 { if line < lc {
+            if direction > 0 {
+                if wrap < 0 || line < wrap { wrap = line; }
+                if line > current { if best < 0 || line < best { best = line; } }
+            } else {
+                if wrap < 0 || line > wrap { wrap = line; }
+                if line < current { if best < 0 || line > best { best = line; } }
+            }
+        } }
+        i = i + 1;
+    }
+    if best < 0 { best = wrap; } if best < 0 { pad_set_status(st_bookmark_none); return 0; }
+    idx = rich_line_index(load64(g_editor), best); if idx < 0 { pad_set_status(st_bookmark_none); return 0; }
+    pad_select_range(idx, idx); pad_bookmark_line_status(st_bookmark_jump, best); return 1;
+}
+
+func pad_bookmark_clear() -> i64 {
+    tab = load64(g_tab_current); if tab < 0 { return 0; }
+    if load64(g_tab_bookmark_count + tab * 8) <= 0 { pad_set_status(st_bookmark_none); return 0; }
+    pad_bookmarks_reset(tab); InvalidateRect(load64(g_hwnd), g_gutter, 0); pad_set_status(st_bookmark_cleared); return 1;
+}
+
+func pad_draw_bookmarks(hdc: i64) -> i64 {
+    tab = load64(g_tab_current); if tab < 0 { return 0; }
+    count = load64(g_tab_bookmark_count + tab * 8); if count <= 0 { return 0; }
+    ed = load64(g_editor); lc = rich_line_count(ed); base = pad_bookmark_base(tab); gy = load32(g_gutter + 4); bottom = load32(g_gutter + 12); i = 0;
+    while i < count {
+        line = load64(base + i * 8);
+        if line >= 0 { if line < lc {
+            ci = rich_line_index(ed, line);
+            if ci >= 0 { rich_pos_from_char(ed, g_pt, ci); y = editor_sign32(load32(g_pt + 4)); y = gy + y; if y >= gy { if y + 13 < bottom { gdi_fill_xy(hdc, 20, y + 3, 24, y + 13, load64(g_br_accent)); } } }
+        } }
+        i = i + 1;
+    }
+    return count;
+}
+
+func pad_jump_error(buf: i64) -> i64 {
+    i = 0;
+    n1 = 0;
+    scanning = 1;
+    while scanning == 1 {
+        c0 = load8(buf + i);
+        if c0 == 0 { scanning = 0; }
+        if scanning == 1 {
+            if c0 == 108 { if load8(buf + i + 1) == 105 { if load8(buf + i + 2) == 110 { if load8(buf + i + 3) == 101 { if load8(buf + i + 4) == 32 {
+                p = i + 5;
+                num = 0;
+                got = 0;
+                going = 1;
+                while going == 1 {
+                    ch = load8(buf + p);
+                    if ch < 48 { going = 0; }
+                    if ch > 57 { going = 0; }
+                    if going == 1 {
+                        num = num * 10 + (ch - 48);
+                        p = p + 1;
+                        got = 1;
+                    }
+                }
+                if got == 1 { n1 = num; scanning = 0; }
+            } } } } }
+            i = i + 1;
+        }
+    }
+    if n1 <= 0 { return 0; }
+    return pad_select_line_num(n1);
+}
+
+func pad_output_jump() -> i64 {
+    if load64(g_output_loading) != 0 { return 0; }
+    out = load64(g_output); if out == 0 { return 0; }
+    rich_get_sel(out, g_crange); ch = load32(g_crange); line = rich_line_from_char(out, ch);
+    start = rich_line_index(out, line); if start < 0 { return 0; }
+    next = rich_line_index(out, line + 1);
+    raw = load64(g_raw_p); doc = load64(g_doc_p); SendMessageA(out, 13, 1048575, raw); editor_strip_lf(doc, raw);
+    if next < 0 { next = strlen(doc); }
+    n = next - start; if n > 511 { n = 511; } if n <= 0 { return 0; }
+    memcpy(g_fixmsg, doc + start, n); store8(g_fixmsg + n, 0);
+    if pad_files_jump(g_fixmsg) != 0 { return 1; }
+    if pad_jump_error(g_fixmsg) != 0 { pad_set_status(st_diag_jump); SetFocus(load64(g_editor)); return 1; }
+    return 0;
+}
+
+func pad_files_jump(linebuf: i64) -> i64 {
+    p = linebuf; sep = 0 - 1; i = 0; while load8(p + i) != 0 { if load8(p + i) == 124 { sep = i; break; } i = i + 1; }
+    if sep <= 0 { return 0; } if load8(p + sep + 1) != 108 { return 0; } if load8(p + sep + 5) != 32 { return 0; }
+    if sep > 699 { return 0; } memcpy(g_dialog, p, sep); store8(g_dialog + sep, 0);
+    q = sep + 6; line = 0; got = 0; while load8(p + q) >= 48 { if load8(p + q) > 57 { break; } line = line * 10 + load8(p + q) - 48; q = q + 1; got = 1; }
+    if got == 0 { return 0; } if pad_load_path(g_dialog) == 0 { return 0; }
+    pad_select_line_num(line); pad_set_status(st_diag_jump); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_files_supported(path: i64) -> i64 {
+    if pad_ends_with_ci(path, ext_ancl) != 0 { return 1; } if pad_ends_with_ci(path, ext_py) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_cs) != 0 { return 1; } if pad_ends_with_ci(path, ext_log) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_txt) != 0 { return 1; } if pad_ends_with_ci(path, ext_json) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_xml) != 0 { return 1; } if pad_ends_with_ci(path, ext_html) != 0 { return 1; } if pad_ends_with_ci(path, ext_htm) != 0 { return 1; } if pad_ends_with_ci(path, ext_sql) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_md) != 0 { return 1; } if pad_ends_with_ci(path, ext_markdown) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_ini) != 0 { return 1; } if pad_ends_with_ci(path, ext_cfg) != 0 { return 1; }
+    if pad_ends_with_ci(path, ext_ps1) != 0 { return 1; }
+    if pad_ends_with_ci(path, ".c") != 0 { return 1; } if pad_ends_with_ci(path, ".h") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".cpp") != 0 { return 1; } if pad_ends_with_ci(path, ".hpp") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".js") != 0 { return 1; } if pad_ends_with_ci(path, ".ts") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".tsx") != 0 { return 1; } if pad_ends_with_ci(path, ".jsx") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".html") != 0 { return 1; } if pad_ends_with_ci(path, ".css") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".yml") != 0 { return 1; } if pad_ends_with_ci(path, ".yaml") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".toml") != 0 { return 1; } if pad_ends_with_ci(path, ".bat") != 0 { return 1; }
+    if pad_ends_with_ci(path, ".cmd") != 0 { return 1; } if pad_ends_with_ci(path, ".psm1") != 0 { return 1; }
+    return 0;
+}
+
+func pad_files_skip_dir(name: i64) -> i64 {
+    if strcmp(name, ".") == 0 { return 1; } if strcmp(name, "..") == 0 { return 1; }
+    if strcmp(name, ".git") == 0 { return 1; } if strcmp(name, "node_modules") == 0 { return 1; }
+    if strcmp(name, ".venv") == 0 { return 1; } if strcmp(name, "__pycache__") == 0 { return 1; } return 0;
+}
+
+func pad_files_append(src: i64) -> i64 {
+    out = load64(g_files_output_p); used = load64(g_files_out_len); cap = 262143; i = 0;
+    while load8(src + i) != 0 { if used >= cap { store64(g_files_truncated, 1); break; } store8(out + used, load8(src + i)); used = used + 1; i = i + 1; }
+    store8(out + used, 0); store64(g_files_out_len, used); return i;
+}
+
+func pad_files_match_at(src: i64, pos: i64, needle: i64) -> i64 {
+    j = 0; while load8(needle + j) != 0 { a = pad_lower_ascii(load8(src + pos + j)); b = pad_lower_ascii(load8(needle + j)); if a != b { return 0; } j = j + 1; } return 1;
+}
+
+func pad_files_add_result(path: i64, line: i64, src: i64, start: i64, end: i64) -> i64 {
+    pad_files_append(path); pad_files_append("|line "); np = nf_u64dec(line, g_num); store8(np, 0); pad_files_append(g_num); pad_files_append("| ");
+    n = end - start; if n > 180 { n = 180; } i = 0; while i < n { c = load8(src + start + i); if c == 13 || c == 10 { break; } store8(g_fixmsg + i, c); i = i + 1; } store8(g_fixmsg + i, 0);
+    pad_files_append(g_fixmsg); pad_files_append("\r\n"); store64(g_files_count, load64(g_files_count) + 1); return 1;
+}
+
+func pad_files_search_file(path: i64) -> i64 {
+    if load64(g_files_count) >= 500 { store64(g_files_truncated, 1); return 0; }
+    src = load64(g_filebuf_p); n = pad_read_file(path, src, 1048576); if n <= 0 { return 0; }
+    i = 0; while i < n { if load8(src + i) == 0 { return 0; } i = i + 1; }
+    pos = 0; line = 1; while pos < n { start = pos; while pos < n { c = load8(src + pos); if c == 13 || c == 10 { break; } pos = pos + 1; } end = pos;
+        hit = 0; q = start; while q < end { if pad_files_match_at(src, q, g_files_query) != 0 { hit = 1; break; } q = q + 1; }
+        if hit != 0 { pad_files_add_result(path, line, src, start, end); if load64(g_files_count) >= 500 { store64(g_files_truncated, 1); return 1; } }
+        if pos < n { if load8(src + pos) == 13 { pos = pos + 1; } if load8(src + pos) == 10 { pos = pos + 1; } } line = line + 1;
+    }
+    return 1;
+}
+
+func pad_files_scan_dir(dir: i64, depth: i64) -> i64 {
+    if depth >= 12 { return 0; } if load64(g_files_truncated) != 0 { return 0; } if load64(g_files_scanned) >= 5000 { store64(g_files_truncated, 1); return 0; }
+    fd = g_files_find_data + depth * 320; glob = g_files_globs + depth * 700; child = g_files_paths + depth * 700;
+    p = str_copy(glob, dir); if p > glob { if load8(p - 1) != 92 { store8(p, 92); p = p + 1; } } str_copy(p, "*.*");
+    h = FindFirstFileA(glob, fd); if h == 0 - 1 { return 0; }
+    while 1 {
+        name = fd + 44; attr = load32(fd);
+        if band(attr, 16) != 0 {
+            if band(attr, 1024) == 0 { if pad_files_skip_dir(name) == 0 { p = str_copy(child, dir); if load8(p - 1) != 92 { store8(p, 92); p = p + 1; } str_copy(p, name); pad_files_scan_dir(child, depth + 1); } }
+        } else {
+            p = str_copy(child, dir); if load8(p - 1) != 92 { store8(p, 92); p = p + 1; } str_copy(p, name);
+            if pad_files_supported(child) != 0 { store64(g_files_scanned, load64(g_files_scanned) + 1); pad_files_search_file(child); }
+        }
+        if load64(g_files_truncated) != 0 { break; } if FindNextFileA(h, fd) == 0 { break; }
+    }
+    FindClose(h); return 1;
+}
+
+func pad_files_browse() -> i64 {
+    memset(g_files_browse_info, 0, 64); store64(g_files_browse_info, load64(g_hwnd)); store64(g_files_browse_info + 16, g_files_display); store64(g_files_browse_info + 24, folder_title); store32(g_files_browse_info + 32, 0x41);
+    pidl = SHBrowseForFolderA(g_files_browse_info); if pidl == 0 { return 0; } ok = SHGetPathFromIDListA(pidl, g_files_folder); CoTaskMemFree(pidl); if ok == 0 { return 0; }
+    SetWindowTextA(load64(g_files_folder_ed), g_files_folder); return 1;
+}
+
+func pad_files_run() -> i64 {
+    gui_get_text(load64(g_files_find_ed), g_files_query, 256); if load8(g_files_query) == 0 { pad_set_status(st_files_empty); return 0; }
+    gui_get_text(load64(g_files_folder_ed), g_files_folder, 700); if load8(g_files_folder) == 0 { pad_set_status(st_files_folder); return 0; }
+    out = load64(g_files_output_p); store8(out, 0); store64(g_files_count, 0); store64(g_files_scanned, 0); store64(g_files_truncated, 0); store64(g_files_out_len, 0); pad_set_status(st_files_searching);
+    ok = pad_files_scan_dir(g_files_folder, 0); if ok == 0 { if load64(g_files_scanned) == 0 { pad_files_append(st_files_folder); pad_files_append("\r\n"); pad_set_output(out); pad_show_output(1); pad_set_status(st_files_folder); return 0; } } count = load64(g_files_count);
+    if count == 0 { pad_files_append(st_files_none); pad_files_append("\r\n"); } if load64(g_files_truncated) != 0 { pad_files_append("\r\n"); pad_files_append(st_files_limit); pad_files_append("\r\n"); }
+    pad_set_output(out); pad_show_output(1); p = str_copy(g_statusbuf, st_files_done_a); p = nf_u64dec(count, p); store8(p, 0); str_copy(p, st_files_done_b); pad_set_status(g_statusbuf); return count;
+}
+
+func pad_show_find_controls(show: i64) -> i64 {
+    ShowWindow(load64(g_find_lbl), show);
+    ShowWindow(load64(g_find_ed), show);
+    ShowWindow(load64(g_find_btn), show);
+    ShowWindow(load64(g_repl_lbl), show);
+    ShowWindow(load64(g_repl_ed), show);
+    ShowWindow(load64(g_repl_btn), show);
+    ShowWindow(load64(g_all_btn), show);
+    ShowWindow(load64(g_line_lbl), show);
+    ShowWindow(load64(g_line_ed), show);
+    ShowWindow(load64(g_go_btn), show);
+    ShowWindow(load64(g_hide_btn), show);
+    return 0;
+}
+
+func pad_show_calc_controls(show: i64) -> i64 {
+    ShowWindow(load64(g_calc_lbl), 0);
+    ShowWindow(load64(g_calc_in), 0);
+    ShowWindow(load64(g_calc_btn), 0);
+    ShowWindow(load64(g_calc_copy_btn), show);
+    ShowWindow(load64(g_calc_dec_lbl), show);
+    ShowWindow(load64(g_calc_dec_ed), show);
+    ShowWindow(load64(g_calc_hex_lbl), show);
+    ShowWindow(load64(g_calc_hex_ed), show);
+    ShowWindow(load64(g_calc_bin_lbl), show);
+    ShowWindow(load64(g_calc_bin_ed), show);
+    ShowWindow(load64(g_calc_bcd_lbl), show);
+    ShowWindow(load64(g_calc_bcd_ed), show);
+    ShowWindow(load64(g_calc_msg_lbl), 0);
+    ShowWindow(load64(g_calc_hide_btn), show);
+    return 0;
+}
+
+func pad_show_find(mode: i64) -> i64 {
+    store64(g_files_visible, 0); pad_show_files_controls(0);
+    store64(g_calc_visible, 0);
+    pad_show_calc_controls(0);
+    store64(g_find_visible, 1);
+    pad_show_find_controls(1);
+    GetClientRect(load64(g_hwnd), g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    if mode == 2 {
+        SetFocus(load64(g_repl_ed));
+        gui_edit_select_all(load64(g_repl_ed));
+        return 0;
+    }
+    if mode == 3 {
+        SetFocus(load64(g_line_ed));
+        gui_edit_select_all(load64(g_line_ed));
+        return 0;
+    }
+    SetFocus(load64(g_find_ed));
+    gui_edit_select_all(load64(g_find_ed));
+    return 0;
+}
+
+func pad_hide_find() -> i64 {
+    store64(g_find_visible, 0);
+    pad_show_find_controls(0);
+    GetClientRect(load64(g_hwnd), g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    SetFocus(load64(g_editor));
+    return 0;
+}
+
+func pad_show_calc() -> i64 {
+    store64(g_files_visible, 0); pad_show_files_controls(0);
+    store64(g_find_visible, 0);
+    pad_show_find_controls(0);
+    store64(g_calc_visible, 1);
+    pad_show_calc_controls(1);
+    seeded = pad_calc_seed_selection();
+    ok = 0;
+    if seeded != 0 {
+        v = calc_parse_value(g_calcbuf);
+        if load64(g_calc_ok) != 0 { pad_calc_apply_value(v, 0); ok = 1; }
+    }
+    if ok == 0 { pad_calc_apply_value(0, 0); }
+    GetClientRect(load64(g_hwnd), g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    SetFocus(load64(g_calc_dec_ed));
+    gui_edit_select_all(load64(g_calc_dec_ed));
+    return 0;
+}
+
+func pad_hide_calc() -> i64 {
+    store64(g_calc_visible, 0);
+    pad_show_calc_controls(0);
+    GetClientRect(load64(g_hwnd), g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    SetFocus(load64(g_editor));
+    return 0;
+}
+
+func pad_show_files_controls(show: i64) -> i64 {
+    ShowWindow(load64(g_files_find_lbl), show); ShowWindow(load64(g_files_find_ed), show);
+    ShowWindow(load64(g_files_folder_lbl), show); ShowWindow(load64(g_files_folder_ed), show);
+    ShowWindow(load64(g_files_browse_btn), show); ShowWindow(load64(g_files_search_btn), show); ShowWindow(load64(g_files_hide_btn), show); return 0;
+}
+
+func pad_show_files() -> i64 {
+    store64(g_find_visible, 0); pad_show_find_controls(0); store64(g_calc_visible, 0); pad_show_calc_controls(0);
+    store64(g_files_visible, 1); pad_show_files_controls(1);
+    if load8(g_files_folder) == 0 { if strcmp(g_curpath, untitled) != 0 { pad_parent(g_files_folder, g_curpath); } else { cstr_copy_n(g_files_folder, g_rootdir, 700); } SetWindowTextA(load64(g_files_folder_ed), g_files_folder); }
+    GetClientRect(load64(g_hwnd), g_rect); pad_reflow(load32(g_rect + 8), load32(g_rect + 12)); pad_show_output(1);
+    pad_set_status(st_files_ready); SetFocus(load64(g_files_find_ed)); gui_edit_select_all(load64(g_files_find_ed)); return 1;
+}
+
+func pad_hide_files() -> i64 {
+    store64(g_files_visible, 0); pad_show_files_controls(0); pad_show_output(0);
+    GetClientRect(load64(g_hwnd), g_rect); pad_reflow(load32(g_rect + 8), load32(g_rect + 12)); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_compare_make_label() -> i64 {
+    src = g_compare_path; last = pad_last_bs(src); if last >= 0 { src = src + last + 1; }
+    p = str_copy(g_compare_labelbuf, txt_compare); cstr_copy_n(p, src, 680); return g_compare_labelbuf;
+}
+
+func pad_compare_show_controls(show: i64) -> i64 {
+    ShowWindow(load64(g_compare), show); ShowWindow(load64(g_compare_label), show); ShowWindow(load64(g_compare_close), show); return 0;
+}
+
+func pad_compare_recolor() -> i64 {
+    ed = load64(g_compare); if ed == 0 { return 0; }
+    store64(g_in_recolor, 1); SendMessageA(ed, 0xCF, 0, 0);
+    raw = load64(g_raw_p); doc = load64(g_doc_p); SendMessageA(ed, 13, 1048575, raw); editor_strip_lf(doc, raw); dl = strlen(doc);
+    rich_get_sel(ed, g_compare_sel); rich_get_scroll_pos(ed, g_compare_scroll); rich_set_redraw(ed, 0);
+    rich_cf_color(g_cf, COLOR_DEFAULT); rich_set_charformat(ed, SCF_ALL, g_cf);
+    mode = pad_detect_lang(g_compare_path); pos = 0; run_start = 0; run_color = 0 - 1;
+    while 1 {
+        L = syn_mode_next(mode, doc, pos); if L == 0 { break; }
+        c = syn_mode_color(mode, load64(syn_ancl_tok_kind));
+        if c != run_color { if pos > run_start { editor_color_range(ed, g_crange, g_cf, run_start, pos, run_color); } run_start = pos; run_color = c; }
+        pos = pos + L; if pos >= dl { break; }
+    }
+    if pos > run_start { editor_color_range(ed, g_crange, g_cf, run_start, pos, run_color); }
+    rich_exset_sel(ed, g_compare_sel); rich_set_scroll_pos(ed, g_compare_scroll); rich_set_redraw(ed, 1); rich_set_modified(ed, 0); SendMessageA(ed, 0xCF, 1, 0);
+    InvalidateRect(ed, 0, 1); store64(g_in_recolor, 0); return 1;
+}
+
+func pad_compare_open() -> i64 {
+    memset(g_dialog, 0, 700);
+    if gui_open_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog, 700, 0, compare_title, 0x1804) == 0 { return 0; }
+    fb = load64(g_raw_p); if pad_read_document(g_dialog, fb, PAD_TAB_CAP) < 0 { pad_set_status(st_loadfail); return 0; }
+    cstr_copy_n(g_compare_path, g_dialog, 700); SendMessageA(load64(g_compare), 0xCF, 0, 0); pad_rich_set_utf8(load64(g_compare), fb); pad_compare_recolor();
+    SetWindowTextA(load64(g_compare_label), pad_compare_make_label()); store64(g_compare_visible, 1); pad_compare_show_controls(1);
+    GetClientRect(load64(g_hwnd), g_rect); pad_reflow(load32(g_rect + 8), load32(g_rect + 12)); pad_set_status(st_compare_loaded); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_compare_hide() -> i64 {
+    if load64(g_compare_visible) == 0 { return 0; }
+    store64(g_compare_visible, 0); pad_compare_show_controls(0); GetClientRect(load64(g_hwnd), g_rect); pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    pad_set_status(st_compare_closed); SetFocus(load64(g_editor)); return 1;
+}
+
+func pad_out_path() -> i64 {
+    last = pad_last_bs(g_curpath);
+    if last < 0 { return 0; }
+    srclen = strlen(g_curpath);
+
+    pad_join(g_bindir, g_rootdir, s_bindir);
+    CreateDirectoryA(g_bindir, 0);
+
+    k = str_copy(g_outpath, g_bindir);
+    store8(k, 92);
+    k = k + 1;
+    bstart = last + 1;
+    dotpos = 0 - 1;
+    m = bstart;
+    while m < srclen {
+        if load8(g_curpath + m) == 46 { dotpos = m; }
+        m = m + 1;
+    }
+    bend = srclen;
+    if dotpos != 0 - 1 { if dotpos > bstart { bend = dotpos; } }
+    m = bstart;
+    while m < bend {
+        store8(k, load8(g_curpath + m));
+        k = k + 1;
+        m = m + 1;
+    }
+    str_copy(k, s_exe_ext);
+    return 1;
+}
+
+func pad_compile_cmd() -> i64 {
+    c = str_copy(g_cmd, q);
+    c = str_copy(c, g_compiler);
+    c = str_copy(c, qspq);
+    c = str_copy(c, g_curpath);
+    c = str_copy(c, qspq);
+    c = str_copy(c, g_outpath);
+    str_copy(c, q);
+    return 0;
+}
+
+func pad_run_cmd() -> i64 {
+    c = str_copy(g_runcmd, q);
+    c = str_copy(c, g_outpath);
+    str_copy(c, q);
+    return 0;
+}
+
+func pad_fix_cmd(write_mode: i64) -> i64 {
+    c = str_copy(g_cmd, q);
+    c = str_copy(c, g_compiler);
+    c = str_copy(c, "\" --fix");
+    if write_mode != 0 { c = str_copy(c, " --write"); }
+    c = str_copy(c, " \"");
+    c = str_copy(c, g_curpath);
+    str_copy(c, q);
+    return 0;
+}
+
+func pad_fix_count(buf: i64) -> i64 {
+    i = 0;
+    while load8(buf + i) != 0 {
+        if load8(buf + i) == 58 {
+            if load8(buf + i + 1) == 32 {
+                p = i + 2;
+                num = 0;
+                got = 0;
+                going = 1;
+                while going == 1 {
+                    ch = load8(buf + p);
+                    if ch < 48 { going = 0; }
+                    if ch > 57 { going = 0; }
+                    if going == 1 {
+                        num = num * 10 + (ch - 48);
+                        p = p + 1;
+                        got = 1;
+                    }
+                }
+                if got == 1 { return num; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func pad_append_exit(dst: i64, code: i64) -> i64 {
+    p = dst + strlen(dst);
+    p = str_copy(p, out_exit);
+    p = nf_u64dec(code, p);
+    str_copy(p, out_close);
+    return 0;
+}
+
+func pad_require_ancl() -> i64 {
+    if pad_is_ancl_path(g_curpath) != 0 { return 1; }
+    pad_set_status(st_ancl_only);
+    pad_show_output(1);
+    pad_set_output(st_ancl_only);
+    return 0;
+}
+
+func pad_fix_current() -> i64 {
+    if pad_require_ancl() == 0 { return 0; }
+    if load8(g_curpath) == 0 { if pad_save_as_dialog() == 0 { pad_set_status(st_no_file); return 0; } }
+    if strcmp(g_curpath, untitled) == 0 { if pad_save_as_dialog() == 0 { pad_set_status(st_no_file); return 0; } }
+    if pad_save() == 0 { return 0; }
+
+    out = load64(g_filebuf_p);
+    pad_show_output(1);
+    if GetFileAttributesA(g_compiler) == 0xFFFFFFFF {
+        p = str_copy(out, out_no_compiler);
+        p = str_copy(p, g_compiler);
+        str_copy(p, out_bundle_hint);
+        pad_set_output(out);
+        pad_set_status(st_launch_fail);
+        return 0;
+    }
+
+    pad_set_status(st_fixing);
+    pad_fix_cmd(0);
+    n = pcap_run_capture(g_cmd, out, 262144);
+    if n < 0 {
+        pad_set_status(st_launch_fail);
+        pad_set_output(st_launch_fail);
+        return 0;
+    }
+    pad_set_output(out);
+    cnt = pad_fix_count(out);
+    if cnt <= 0 {
+        str_copy(out + strlen(out), out_fix_none);
+        pad_set_output(out);
+        pad_set_status(st_fix_none);
+        return 0;
+    }
+
+    p = str_copy(g_fixmsg, fix_q_a);
+    p = nf_u64dec(cnt, p);
+    str_copy(p, fix_q_b);
+    if MessageBoxA(load64(g_hwnd), g_fixmsg, fix_title, 0x24) != 6 {
+        str_copy(out + strlen(out), out_fix_cancel);
+        pad_set_output(out);
+        pad_set_status(st_fix_cancel);
+        return 0;
+    }
+
+    pad_fix_cmd(1);
+    n2 = pcap_run_capture(g_cmd, out, 262144);
+    if n2 < 0 {
+        pad_set_status(st_launch_fail);
+        pad_set_output(st_launch_fail);
+        return 0;
+    }
+    pad_set_output(out);
+    pad_tab_reload_current();
+    pad_set_status(st_fixed);
+    pad_recolor_chars(0, 0 - 1);
+    return 1;
+}
+
+func pad_compile_current(run_after: i64) -> i64 {
+    if pad_require_ancl() == 0 { return 0; }
+    if load8(g_curpath) == 0 { if pad_save_as_dialog() == 0 { pad_set_status(st_no_file); return 0; } }
+    if strcmp(g_curpath, untitled) == 0 { if pad_save_as_dialog() == 0 { pad_set_status(st_no_file); return 0; } }
+    if pad_save() == 0 { return 0; }
+    if pad_out_path() == 0 { pad_set_status(st_no_file); return 0; }
+    pad_compile_cmd();
+
+    out = load64(g_filebuf_p);
+    runout = out + 262144;
+    pad_show_output(1);
+    if GetFileAttributesA(g_compiler) == 0xFFFFFFFF {
+        p = str_copy(out, out_no_compiler);
+        p = str_copy(p, g_compiler);
+        str_copy(p, out_bundle_hint);
+        pad_set_output(out);
+        pad_set_status(st_launch_fail);
+        return 0;
+    }
+    pad_set_status(st_compiling);
+    str_copy(out, out_compile);
+    pad_set_output(out);
+
+    n = pcap_run_capture(g_cmd, out, 262144);
+    if n < 0 {
+        pad_set_status(st_launch_fail);
+        pad_set_output(st_launch_fail);
+        return 0;
+    }
+    pad_set_output(out);
+    if pcap_last_exit() != 0 {
+        pad_set_status(st_compile_fail);
+        pad_jump_error(out);
+        return 0;
+    }
+    pad_set_status(st_compile_ok);
+
+    if run_after == 0 { return 1; }
+    pad_run_cmd();
+    p = out + strlen(out);
+    p = str_copy(p, out_run);
+    store8(p, 0);
+    pad_set_output(out);
+    pad_set_status(st_running);
+    n2 = pcap_run_capture(g_runcmd, runout, 262144);
+    if n2 < 0 {
+        p = str_copy(out + strlen(out), st_launch_fail);
+        store8(p, 0);
+        pad_set_output(out);
+        pad_set_status(st_launch_fail);
+        return 0;
+    }
+    p = str_copy(out + strlen(out), runout);
+    store8(p, 0);
+    pad_append_exit(out, pcap_last_exit());
+    pad_set_output(out);
+    pad_set_status(st_run_done);
+    return 1;
+}
+
+func pad_recolor_chars(cstart: i64, cend: i64) -> i64 {
+    ed = load64(g_editor);
+    if ed == 0 { return 0; }
+    if load64(g_in_recolor) == 1 { return 0; }
+    store64(g_in_recolor, 1);
+
+    svm = rich_get_modified(ed);
+    doc = load64(g_doc_p);
+    pad_read_doc();
+    dl = strlen(doc);
+    if cstart < 0 { cstart = 0; }
+    if cend < 0 { cend = dl; }
+    if cend > dl { cend = dl; }
+
+    rich_get_sel(ed, g_sel);
+    rich_get_scroll_pos(ed, g_scroll);
+    rich_set_redraw(ed, 0);
+
+    mode = pad_effective_lang();
+    pos = cstart;
+    run_start = cstart;
+    run_color = 0 - 1;
+    while 1 {
+        L = syn_mode_next(mode, doc, pos);
+        if L == 0 { break; }
+        if pos >= cend { break; }
+        c = syn_mode_color(mode, load64(syn_ancl_tok_kind));
+        if c != run_color {
+            if pos > run_start { editor_color_range(ed, g_crange, g_cf, run_start, pos, run_color); }
+            run_start = pos;
+            run_color = c;
+        }
+        pos = pos + L;
+    }
+    if pos > run_start { editor_color_range(ed, g_crange, g_cf, run_start, pos, run_color); }
+
+    rich_exset_sel(ed, g_sel);
+    rich_set_scroll_pos(ed, g_scroll);
+    rich_set_redraw(ed, 1);
+    rich_set_modified(ed, svm);
+    InvalidateRect(ed, 0, 1);
+    InvalidateRect(load64(g_hwnd), g_gutter, 0);
+    store64(g_in_recolor, 0);
+    return 0;
+}
+
+func pad_recolor() -> i64 {
+    ed = load64(g_editor);
+    if ed == 0 { return 0; }
+    first = rich_get_first_visible_line(ed);
+    lc = rich_line_count(ed);
+    top = first - 12;
+    if top < 0 { top = 0; }
+    bot = first + 96;
+    if bot > lc { bot = lc; }
+    cstart = rich_line_index(ed, top);
+    if cstart < 0 { cstart = 0; }
+    cend = 0 - 1;
+    if bot < lc {
+        ci = rich_line_index(ed, bot);
+        if ci >= 0 { cend = ci; }
+    }
+    pad_recolor_chars(cstart, cend);
+    pad_update_status();
+    return 0;
+}
+
+func pad_recolor_line_at(pos: i64) -> i64 {
+    if pos < 0 { return 0; } ed = load64(g_editor); line = rich_line_from_char(ed, pos);
+    start = rich_line_index(ed, line); if start < 0 { return 0; }
+    end = rich_line_index(ed, line + 1); if end < 0 { pad_read_doc(); end = strlen(load64(g_doc_p)); }
+    return pad_recolor_chars(start, end);
+}
+
+func pad_bracket_pair(ch: i64) -> i64 {
+    if ch == 40 { return 41; } if ch == 91 { return 93; } if ch == 123 { return 125; }
+    if ch == 41 { return 40; } if ch == 93 { return 91; } if ch == 125 { return 123; }
+    return 0;
+}
+
+func pad_bracket_update() -> i64 {
+    if load64(g_loading) != 0 { return 0; } if load64(g_in_recolor) != 0 { return 0; } if load64(g_in_bracket) != 0 { return 0; }
+    olda = load64(g_bracket_a); oldb = load64(g_bracket_b); store64(g_bracket_a, 0 - 1); store64(g_bracket_b, 0 - 1);
+    if olda >= 0 { pad_recolor_line_at(olda); } if oldb >= 0 { pad_recolor_line_at(oldb); }
+    ed = load64(g_editor); rich_get_sel(ed, g_sel); if load32(g_sel) != load32(g_sel + 4) { return 0; } caret = load32(g_sel); doc = load64(g_doc_p); pad_read_doc(); dl = strlen(doc);
+    pos = caret; ch = 0; if pos < dl { ch = load8(doc + pos); }
+    if pad_bracket_pair(ch) == 0 { pos = caret - 1; if pos >= 0 { ch = load8(doc + pos); } }
+    pair = pad_bracket_pair(ch); if pair == 0 { return 0; }
+    direction = 1; if ch == 41 || ch == 93 || ch == 125 { direction = 0 - 1; }
+    depth = 1; i = pos + direction; match = 0 - 1;
+    while i >= 0 { if i >= dl { break; } c = load8(doc + i); if c == ch { depth = depth + 1; } if c == pair { depth = depth - 1; if depth == 0 { match = i; break; } } i = i + direction; }
+    if match < 0 { return 0; }
+    store64(g_in_bracket, 1);
+    store64(g_bracket_a, pos); store64(g_bracket_b, match); rich_get_sel(ed, g_bracket_sel); rich_get_scroll_pos(ed, g_bracket_scroll); rich_set_redraw(ed, 0);
+    editor_color_range(ed, g_crange, g_cf, pos, pos + 1, COLOR_ACCENT); editor_color_range(ed, g_crange, g_cf, match, match + 1, COLOR_ACCENT);
+    rich_exset_sel(ed, g_bracket_sel); rich_set_scroll_pos(ed, g_bracket_scroll); rich_set_redraw(ed, 1); InvalidateRect(ed, 0, 1); store64(g_in_bracket, 0); return 1;
+}
+
+func pad_set_text(src: i64) -> i64 {
+    store64(g_loading, 1);
+    pad_rich_set_utf8(load64(g_editor), src);
+    rich_cf_color(g_cf, COLOR_DEFAULT);
+    rich_set_charformat(load64(g_editor), SCF_ALL, g_cf);
+    pad_recolor_chars(0, 0 - 1);
+    store64(g_bracket_a, 0 - 1); store64(g_bracket_b, 0 - 1);
+    store64(g_loading, 0);
+    return 0;
+}
+
+func pad_new() -> i64 {
+    if pad_tab_add(untitled, rich_empty, 0, TEXT_ENC_UTF8, TEXT_EOL_CRLF) == 0 { return 0; }
+    pad_set_status(st_new);
+    SetFocus(load64(g_editor));
+    return 1;
+}
+
+func pad_close_document() -> i64 {
+    if rich_get_modified(load64(g_editor)) != 0 {
+        if MessageBoxA(load64(g_hwnd), close_modified, close_title, 0x34) != 6 { return 0; }
+    }
+    idx = load64(g_tab_current); count = load64(g_tab_count); if idx < 0 { return 0; }
+    removed = pad_tab_text(idx); i = idx;
+    while i < count - 1 {
+        cstr_copy_n(pad_tab_path(i), pad_tab_path(i + 1), 700); store64(g_tab_texts + i * 8, pad_tab_text(i + 1));
+        store64(g_tab_dirty + i * 8, load64(g_tab_dirty + (i + 1) * 8)); store64(g_tab_lang + i * 8, load64(g_tab_lang + (i + 1) * 8));
+        store64(g_tab_encoding + i * 8, load64(g_tab_encoding + (i + 1) * 8)); store64(g_tab_eol + i * 8, load64(g_tab_eol + (i + 1) * 8));
+        store64(g_tab_sel_a + i * 8, load64(g_tab_sel_a + (i + 1) * 8)); store64(g_tab_sel_b + i * 8, load64(g_tab_sel_b + (i + 1) * 8));
+        store64(g_tab_scroll_x + i * 8, load64(g_tab_scroll_x + (i + 1) * 8)); store64(g_tab_scroll_y + i * 8, load64(g_tab_scroll_y + (i + 1) * 8)); pad_bookmarks_copy(i, i + 1); i = i + 1;
+    }
+    store64(g_tab_texts + (count - 1) * 8, removed); store8(removed, 0); store8(pad_tab_path(count - 1), 0); pad_bookmarks_reset(count - 1); count = count - 1; store64(g_tab_count, count);
+    if count == 0 { store64(g_tab_count, 1); pad_tab_init(0, untitled, rich_empty, 0, TEXT_ENC_UTF8, TEXT_EOL_CRLF); idx = 0; } else { if idx >= count { idx = count - 1; } }
+    store64(g_tab_current, 0 - 1); pad_tab_load(idx);
+    pad_set_output(rich_empty);
+    pad_show_output(0);
+    pad_hide_find();
+    pad_hide_calc();
+    pad_set_status(st_closed);
+    SetFocus(load64(g_editor));
+    pad_recovery_save();
+    return 1;
+}
+
+func pad_load_starter(name: i64) -> i64 {
+    p = str_copy(g_starter, g_rootdir);
+    p = str_copy(p, s_starters);
+    str_copy(p, name);
+
+    fb = load64(g_raw_p);
+    n = pad_read_document(g_starter, fb, PAD_TAB_CAP);
+    if n < 0 { pad_set_status(st_loadfail); return 0; }
+
+    if pad_tab_add(untitled, fb, 1, load64(g_detect_encoding), load64(g_detect_eol)) == 0 { return 0; }
+    pad_set_status(st_starter);
+    SetFocus(load64(g_editor));
+    return 1;
+}
+
+func pad_insert_import(snippet: i64) -> i64 {
+    ed = load64(g_editor);
+    if ed == 0 { return 0; }
+    editor_set_crange(g_crange, 0, 0);
+    rich_exset_sel(ed, g_crange);
+    SendMessageA(ed, 0xC2, 1, snippet); # EM_REPLACESEL, undoable
+    rich_set_modified(ed, 1);
+    pad_recolor_chars(0, 0 - 1);
+    pad_set_status(st_imported);
+    SetFocus(ed);
+    return 1;
+}
+
+func pad_load_path(path: i64) -> i64 {
+    cstr_copy_n(g_load_path, path, 700);
+    existing = pad_tab_find(g_load_path); if existing >= 0 { pad_tab_activate(existing); return 1; }
+    fb = load64(g_raw_p);
+    n = pad_read_document(g_load_path, fb, PAD_TAB_CAP);
+    if n < 0 { pad_set_status(st_loadfail); return 0; }
+    if pad_tab_add(g_load_path, fb, 0, load64(g_detect_encoding), load64(g_detect_eol)) == 0 { return 0; }
+    pad_set_status(st_loaded);
+    pad_recent_push(g_load_path);
+    SetFocus(load64(g_editor));
+    return 1;
+}
+
+func pad_load_sample() -> i64 {
+    if pad_load_path(g_sample) != 0 {
+        pad_set_status(st_sample);
+        return 1;
+    }
+    pad_tab_add(untitled, seed_src, 0, TEXT_ENC_UTF8, TEXT_EOL_CRLF);
+    pad_set_status(st_sample);
+    SetFocus(load64(g_editor));
+    return 1;
+}
+
+func pad_save_path(path: i64) -> i64 {
+    raw = load64(g_raw_p); len = pad_rich_get_utf8(load64(g_editor), raw, PAD_TAB_CAP); if len < 0 { pad_set_status(st_savefail); return 0; }
+    doc = load64(g_doc_p); norm = text_normalize_eol(raw, doc, PAD_TAB_CAP, load64(g_eol_mode)); if norm < 0 { pad_set_status(st_savefail); return 0; }
+    fb = load64(g_filebuf_p); bytes = text_encode_from_utf8(doc, norm, load64(g_encoding_mode), fb, PAD_FILE_CAP, load64(g_wide_p), PAD_TAB_CAP);
+    if bytes < 0 { pad_set_status(st_savefail); return 0; }
+    ok = pad_write_file(path, fb, bytes);
+    if ok == 0 { pad_set_status(st_savefail); return 0; }
+    pad_set_path(path);
+    i = load64(g_tab_current); if i >= 0 { cstr_copy_n(pad_tab_path(i), path, 700); store64(g_tab_dirty + i * 8, 0); }
+    pad_recolor_chars(0, 0 - 1);
+    pad_mark_clean();
+    pad_set_status(st_saved);
+    pad_recent_push(path);
+    pad_tabs_refresh(); pad_session_save(); pad_recovery_save();
+    return 1;
+}
+
+func pad_open_dialog() -> i64 {
+    memset(g_dialog, 0, 700);
+    if gui_open_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog, 700, 0, title_app, 0x1804) == 0 { return 0; }
+    return pad_load_path(g_dialog);
+}
+
+func pad_save_as_dialog() -> i64 {
+    str_copy(g_dialog, g_curpath);
+    if strcmp(g_dialog, untitled) == 0 { store8(g_dialog, 0); }
+    if gui_save_file_dialog(g_ofn, load64(g_hwnd), g_filter, g_dialog, 700, 0, title_app, defext_ancl, 0x806) == 0 { return 0; }
+    return pad_save_path(g_dialog);
+}
+
+func pad_save() -> i64 {
+    if load8(g_curpath) == 0 { return pad_save_as_dialog(); }
+    if strcmp(g_curpath, untitled) == 0 { return pad_save_as_dialog(); }
+    return pad_save_path(g_curpath);
+}
+
+func pad_make_button(hwnd: i64, id: i64, text: i64, x: i64, y: i64, w: i64) -> i64 {
+    h = CreateWindowExA(0, gui_button, text, 0x5000000B, x, y, w, 25, hwnd, id, load64(g_hinst), 0);
+    gui_set_font(h, load64(g_font_ui));
+    return h;
+}
+
+func pad_button_label(id: i64) -> i64 {
+    if id >= ID_TAB_1 { if id <= ID_TAB_8 { return pad_tab_label(id - ID_TAB_1); } }
+    if id >= ID_TAB_CLOSE_1 { if id <= ID_TAB_CLOSE_8 { return txt_tab_close; } }
+    if id == ID_MENU_FILE { return mtop_file; }
+    if id == ID_MENU_EDIT { return mtop_edit; }
+    if id == ID_MENU_BUILD { return mtop_build; }
+    if id == ID_MENU_VIEW { return mtop_view; }
+    if id == ID_MENU_HELP { return mtop_help; }
+    if id == ID_FIND_NEXT { return txt_next; }
+    if id == ID_REPL_ONE { return txt_repl; }
+    if id == ID_REPL_ALL { return txt_all; }
+    if id == ID_GO_LINE { return txt_go; }
+    if id == ID_FIND_HIDE { return txt_close; }
+    if id == ID_CALC_CONVERT { return txt_convert; }
+    if id == ID_CALC_COPY { return txt_copy; }
+    if id == ID_CALC_HIDE { return txt_close; }
+    if id == ID_FIND_FILES_BROWSE { return txt_browse; }
+    if id == ID_FIND_FILES_SEARCH { return txt_search; }
+    if id == ID_FIND_FILES_HIDE { return txt_close; }
+    if id == ID_COMPARE_HIDE { return txt_close; }
+    return rich_empty;
+}
+
+func pad_draw_button(lp: i64) -> i64 {
+    id = load32(lp + 4); state = load32(lp + 16); hdc = load64(lp + 32); rc = lp + 40;
+    if id >= ID_TAB_1 { if id <= ID_TAB_8 {
+        br = load64(g_br_button); if id - ID_TAB_1 == load64(g_tab_current) { br = load64(g_br_panel); } else { if band(state, 1) != 0 { br = load64(g_br_hover); } }
+        FillRect(hdc, rc, br); op = SelectObject(hdc, load64(g_pen_line));
+        gdi_line(hdc, load32(rc), load32(rc + 12) - 1, load32(rc + 8), load32(rc + 12) - 1, load64(g_pen_line));
+        if id - ID_TAB_1 == load64(g_tab_current) { gdi_line(hdc, load32(rc), load32(rc + 12) - 2, load32(rc + 8), load32(rc + 12) - 2, load64(g_pen_acc)); }
+        SelectObject(hdc, op); of = SelectObject(hdc, load64(g_font_ui)); SetBkMode(hdc, 1); SetTextColor(hdc, COLOR_TEXT); DrawTextA(hdc, pad_button_label(id), 0 - 1, rc, 0x8025); SelectObject(hdc, of); return 1;
+    } }
+    if id >= ID_TAB_CLOSE_1 { if id <= ID_TAB_CLOSE_8 {
+        idx = id - ID_TAB_CLOSE_1; br = load64(g_br_button); if idx == load64(g_tab_current) { br = load64(g_br_panel); } if band(state, 1) != 0 { br = load64(g_br_hover); }
+        FillRect(hdc, rc, br); gdi_line(hdc, load32(rc), load32(rc + 12) - 1, load32(rc + 8), load32(rc + 12) - 1, load64(g_pen_line));
+        if idx == load64(g_tab_current) { gdi_line(hdc, load32(rc), load32(rc + 12) - 2, load32(rc + 8), load32(rc + 12) - 2, load64(g_pen_acc)); }
+        of = SelectObject(hdc, load64(g_font_ui)); SetBkMode(hdc, 1); SetTextColor(hdc, COLOR_DIM); DrawTextA(hdc, txt_tab_close, 0 - 1, rc, 0x25); SelectObject(hdc, of); return 1;
+    } }
+    br = load64(g_br_button); if band(state, 1) != 0 { br = load64(g_br_hover); }
+    FillRect(hdc, rc, load64(g_br_panel));
+    ob = SelectObject(hdc, br); op = SelectObject(hdc, load64(g_pen_line));
+    RoundRect(hdc, load32(rc), load32(rc + 4), load32(rc + 8), load32(rc + 12), 6, 6);
+    SelectObject(hdc, op); SelectObject(hdc, ob);
+    of = SelectObject(hdc, load64(g_font_ui)); SetBkMode(hdc, 1); SetTextColor(hdc, COLOR_TEXT);
+    DrawTextA(hdc, pad_button_label(id), 0 - 1, rc, 0x25); SelectObject(hdc, of); return 1;
+}
+
+func pad_menu_drop(button: i64, menu: i64) -> i64 {
+    gui_menu_drop(load64(g_hwnd), button, menu, g_rect); return 0;
+}
+
+func pad_open_guide() -> i64 {
+    n = pad_exedir(g_guide_path); str_copy(g_guide_path + n, guide_suffix);
+    rv = ShellExecuteA(load64(g_hwnd), op_open, g_guide_path, 0, 0, 5);
+    if rv <= 32 { pad_set_status(st_noguide); MessageBoxA(load64(g_hwnd), st_noguide, about_title, 0x30); }
+    return 0;
+}
+
+func pad_build_file_menu() -> i64 {
+    old = load64(g_menu_file); if old != 0 { DestroyMenu(old); }
+    mf = gui_menu_create();
+    gui_menu_item(mf, ID_NEW, mi_new); gui_menu_popup(mf, load64(g_menu_starter), mi_new_starter); gui_menu_item(mf, ID_OPEN, mi_open); gui_menu_item(mf, ID_CLOSE, mi_close);
+    gui_menu_sep(mf); gui_menu_item(mf, ID_SAVE, mi_save); gui_menu_item(mf, ID_SAVEAS, mi_saveas);
+    gui_menu_sep(mf); gui_menu_item(mf, ID_RECENT_NONE, mi_recent); gui_menu_enable(mf, ID_RECENT_NONE, 0);
+    count = load64(g_recent_count); i = 0;
+    while i < count { gui_menu_item(mf, ID_RECENT_1 + i, pad_recent_label(i)); i = i + 1; }
+    if count == 0 { gui_menu_item(mf, ID_RECENT_1, mi_recent_none); gui_menu_enable(mf, ID_RECENT_1, 0); }
+    gui_menu_sep(mf); gui_menu_item(mf, ID_SAMPLE, mi_sample); gui_menu_sep(mf); gui_menu_item(mf, ID_EXIT, mi_exit);
+    store64(g_menu_file, mf); return mf;
+}
+
+func pad_build_menus() -> i64 {
+    ms = gui_menu_create();
+    gui_menu_item(ms, ID_ST_MODBUS, mi_st_modbus);
+    gui_menu_item(ms, ID_ST_MQTT, mi_st_mqtt);
+    gui_menu_item(ms, ID_ST_SQLITE, mi_st_sqlite);
+    gui_menu_sep(ms);
+    gui_menu_item(ms, ID_ST_BACNET, mi_st_bacnet);
+    gui_menu_item(ms, ID_ST_DNP3, mi_st_dnp3);
+    gui_menu_item(ms, ID_ST_EIP, mi_st_eip);
+    gui_menu_item(ms, ID_ST_FINS, mi_st_fins);
+    gui_menu_item(ms, ID_ST_IEC104, mi_st_iec104);
+    gui_menu_item(ms, ID_ST_OPCUA, mi_st_opcua);
+    gui_menu_item(ms, ID_ST_S7, mi_st_s7);
+    store64(g_menu_starter, ms);
+
+    pad_build_file_menu();
+
+    mi = gui_menu_create();
+    gui_menu_item(mi, ID_IMP_CSTRING, mi_imp_cstring);
+    gui_menu_item(mi, ID_IMP_NUMFMT, mi_imp_numfmt);
+    gui_menu_item(mi, ID_IMP_PROCESS, mi_imp_process);
+    gui_menu_item(mi, ID_IMP_CAPTURE, mi_imp_capture);
+    gui_menu_sep(mi);
+    gui_menu_item(mi, ID_IMP_SQLITE, mi_imp_sqlite);
+    gui_menu_item(mi, ID_IMP_MQTT, mi_imp_mqtt);
+    gui_menu_sep(mi);
+    gui_menu_item(mi, ID_IMP_GUI, mi_imp_gui);
+    gui_menu_item(mi, ID_IMP_GDI, mi_imp_gdi);
+    gui_menu_item(mi, ID_IMP_RICH, mi_imp_rich);
+    gui_menu_item(mi, ID_IMP_SYNTAX, mi_imp_syntax);
+    store64(g_menu_import, mi);
+
+    me = gui_menu_create();
+    gui_menu_item(me, ID_UNDO, mi_undo);
+    gui_menu_item(me, ID_REDO, mi_redo);
+    gui_menu_sep(me);
+    gui_menu_item(me, ID_CUT, mi_cut);
+    gui_menu_item(me, ID_COPY, mi_copy);
+    gui_menu_item(me, ID_PASTE, mi_paste);
+    gui_menu_item(me, ID_SELECTALL, mi_all);
+    gui_menu_sep(me);
+    gui_menu_popup(me, mi, mi_insert_import);
+    gui_menu_sep(me);
+    gui_menu_item(me, ID_FIND_SHOW, mi_find);
+    gui_menu_item(me, ID_FIND_NEXT, mi_findnext);
+    gui_menu_item(me, ID_REPL_SHOW, mi_replace);
+    gui_menu_item(me, ID_GOTO_SHOW, mi_goto);
+    gui_menu_item(me, ID_FIND_FILES_SHOW, mi_findfiles);
+    gui_menu_sep(me);
+    gui_menu_item(me, ID_BOOKMARK_TOGGLE, mi_bookmark_toggle);
+    gui_menu_item(me, ID_BOOKMARK_NEXT, mi_bookmark_next);
+    gui_menu_item(me, ID_BOOKMARK_PREV, mi_bookmark_prev);
+    gui_menu_item(me, ID_BOOKMARK_CLEAR, mi_bookmark_clear);
+    store64(g_menu_edit, me);
+
+    mbu = gui_menu_create();
+    gui_menu_item(mbu, ID_BUILD_COMPILE, mi_compile);
+    gui_menu_item(mbu, ID_BUILD_RUN, mi_run);
+    gui_menu_item(mbu, ID_BUILD_FIX, mi_fix);
+    gui_menu_sep(mbu);
+    gui_menu_item(mbu, ID_OUTPUT_SHOW, mi_showout);
+    gui_menu_item(mbu, ID_OUTPUT_HIDE, mi_hideout);
+    store64(g_menu_build, mbu);
+    pad_update_build_menu();
+
+    menc = gui_menu_create();
+    gui_menu_item(menc, ID_ENC_ANSI, mi_enc_ansi);
+    gui_menu_item(menc, ID_ENC_UTF8, mi_enc_utf8);
+    gui_menu_item(menc, ID_ENC_UTF8_BOM, mi_enc_utf8_bom);
+    gui_menu_item(menc, ID_ENC_UTF16, mi_enc_utf16);
+    store64(g_menu_encoding, menc);
+
+    meol = gui_menu_create();
+    gui_menu_item(meol, ID_EOL_CRLF, mi_eol_crlf);
+    gui_menu_item(meol, ID_EOL_LF, mi_eol_lf);
+    gui_menu_item(meol, ID_EOL_CR, mi_eol_cr);
+    store64(g_menu_eol, meol);
+
+    mv = gui_menu_create();
+    gui_menu_item(mv, ID_CALC_SHOW, mi_calc);
+    gui_menu_item(mv, ID_COMPARE_SHOW, mi_compare);
+    gui_menu_item(mv, ID_COMPARE_HIDE, mi_compare_close);
+    gui_menu_sep(mv);
+    gui_menu_popup(mv, menc, mi_encoding);
+    gui_menu_popup(mv, meol, mi_line_endings);
+    gui_menu_sep(mv);
+    gui_menu_item(mv, ID_LANG_AUTO, mi_lang_auto);
+    gui_menu_item(mv, ID_LANG_ANCL, mi_lang_ancl);
+    gui_menu_item(mv, ID_LANG_PY, mi_lang_py);
+    gui_menu_item(mv, ID_LANG_CS, mi_lang_cs);
+    gui_menu_item(mv, ID_LANG_LOG, mi_lang_log);
+    gui_menu_item(mv, ID_LANG_TXT, mi_lang_txt);
+    gui_menu_sep(mv);
+    gui_menu_item(mv, ID_LANG_JSON, mi_lang_json);
+    gui_menu_item(mv, ID_LANG_XML, mi_lang_xml);
+    gui_menu_item(mv, ID_LANG_HTML, mi_lang_html);
+    gui_menu_item(mv, ID_LANG_SQL, mi_lang_sql);
+    gui_menu_item(mv, ID_LANG_MD, mi_lang_md);
+    gui_menu_item(mv, ID_LANG_INI, mi_lang_ini);
+    gui_menu_item(mv, ID_LANG_PS, mi_lang_ps);
+    gui_menu_sep(mv);
+    gui_menu_item(mv, ID_RECOLOR, mi_recolor);
+    gui_menu_item(mv, ID_GUTTER, mi_gutter);
+    store64(g_menu_view, mv);
+    pad_update_format_menu();
+
+    mh = gui_menu_create();
+    gui_menu_item(mh, ID_GUIDE, mi_guide);
+    gui_menu_item(mh, ID_HELP_KEYS, mi_shortcuts);
+    gui_menu_item(mh, ID_BUNDLE, mi_bundle);
+    gui_menu_sep(mh);
+    gui_menu_item(mh, ID_ABOUT, mi_about);
+    store64(g_menu_help, mh);
+
+    return 0;
+}
+
+func pad_command(id: i64) -> i64 {
+    if id == ID_MENU_FILE { pad_build_file_menu(); pad_menu_drop(load64(g_mb_file), load64(g_menu_file)); return 0; }
+    if id == ID_MENU_EDIT { pad_menu_drop(load64(g_mb_edit), load64(g_menu_edit)); return 0; }
+    if id == ID_MENU_BUILD { pad_menu_drop(load64(g_mb_build), load64(g_menu_build)); return 0; }
+    if id == ID_MENU_VIEW { pad_update_format_menu(); pad_menu_drop(load64(g_mb_view), load64(g_menu_view)); return 0; }
+    if id == ID_MENU_HELP { pad_menu_drop(load64(g_mb_help), load64(g_menu_help)); return 0; }
+    if id >= ID_TAB_1 { if id <= ID_TAB_8 { pad_tab_activate(id - ID_TAB_1); return 0; } }
+    if id >= ID_TAB_CLOSE_1 { if id <= ID_TAB_CLOSE_8 { idx = id - ID_TAB_CLOSE_1; if idx < load64(g_tab_count) { pad_tab_activate(idx); pad_close_document(); } return 0; } }
+    if id == ID_NEW { pad_new(); return 0; }
+    if id == ID_OPEN { pad_open_dialog(); return 0; }
+    if id == ID_CLOSE { pad_close_document(); return 0; }
+    if id >= ID_RECENT_1 { if id <= ID_RECENT_3 { idx = id - ID_RECENT_1; if idx < load64(g_recent_count) { cstr_copy_n(g_dialog, g_recent_paths + idx * 700, 700); pad_load_path(g_dialog); } return 0; } }
+    if id == ID_SAVE { pad_save(); return 0; }
+    if id == ID_SAVEAS { pad_save_as_dialog(); return 0; }
+    if id == ID_SAMPLE { pad_load_sample(); return 0; }
+    if id == ID_ST_MODBUS { pad_load_starter(fn_modbus); return 0; }
+    if id == ID_ST_MQTT { pad_load_starter(fn_mqtt); return 0; }
+    if id == ID_ST_SQLITE { pad_load_starter(fn_sqlite); return 0; }
+    if id == ID_ST_BACNET { pad_load_starter(fn_bacnet); return 0; }
+    if id == ID_ST_DNP3 { pad_load_starter(fn_dnp3); return 0; }
+    if id == ID_ST_EIP { pad_load_starter(fn_eip); return 0; }
+    if id == ID_ST_FINS { pad_load_starter(fn_fins); return 0; }
+    if id == ID_ST_IEC104 { pad_load_starter(fn_iec104); return 0; }
+    if id == ID_ST_OPCUA { pad_load_starter(fn_opcua); return 0; }
+    if id == ID_ST_S7 { pad_load_starter(fn_s7); return 0; }
+    if id == ID_EXIT { SendMessageA(load64(g_hwnd), 16, 0, 0); return 0; }
+    if id == ID_UNDO { rich_undo(load64(g_editor)); pad_update_status(); return 0; }
+    if id == ID_REDO { rich_redo(load64(g_editor)); pad_update_status(); return 0; }
+    if id == ID_CUT { rich_cut(load64(g_editor)); return 0; }
+    if id == ID_COPY { rich_copy(load64(g_editor)); return 0; }
+    if id == ID_PASTE { rich_paste(load64(g_editor)); return 0; }
+    if id == ID_SELECTALL { rich_select_all(load64(g_editor)); return 0; }
+    if id == ID_IMP_CSTRING { pad_insert_import(imp_cstring); return 0; }
+    if id == ID_IMP_NUMFMT { pad_insert_import(imp_numfmt); return 0; }
+    if id == ID_IMP_PROCESS { pad_insert_import(imp_process); return 0; }
+    if id == ID_IMP_CAPTURE { pad_insert_import(imp_capture); return 0; }
+    if id == ID_IMP_SQLITE { pad_insert_import(imp_sqlite); return 0; }
+    if id == ID_IMP_MQTT { pad_insert_import(imp_mqtt); return 0; }
+    if id == ID_IMP_GUI { pad_insert_import(imp_gui); return 0; }
+    if id == ID_IMP_GDI { pad_insert_import(imp_gdi); return 0; }
+    if id == ID_IMP_RICH { pad_insert_import(imp_rich); return 0; }
+    if id == ID_IMP_SYNTAX { pad_insert_import(imp_syntax); return 0; }
+    if id == ID_FIND_SHOW { pad_show_find(1); return 0; }
+    if id == ID_FIND_NEXT { pad_find_next(); return 0; }
+    if id == ID_REPL_SHOW { pad_show_find(2); return 0; }
+    if id == ID_REPL_ONE { pad_replace_one(); return 0; }
+    if id == ID_REPL_ALL { pad_replace_all(); return 0; }
+    if id == ID_GOTO_SHOW { pad_show_find(3); return 0; }
+    if id == ID_GO_LINE { pad_goto_line(); return 0; }
+    if id == ID_FIND_HIDE { pad_hide_find(); return 0; }
+    if id == ID_FIND_FILES_SHOW { pad_show_files(); return 0; }
+    if id == ID_FIND_FILES_SEARCH { pad_files_run(); return 0; }
+    if id == ID_FIND_FILES_BROWSE { pad_files_browse(); return 0; }
+    if id == ID_FIND_FILES_HIDE { pad_hide_files(); return 0; }
+    if id == ID_BOOKMARK_TOGGLE { pad_bookmark_toggle(); return 0; }
+    if id == ID_BOOKMARK_NEXT { pad_bookmark_jump(1); return 0; }
+    if id == ID_BOOKMARK_PREV { pad_bookmark_jump(0 - 1); return 0; }
+    if id == ID_BOOKMARK_CLEAR { pad_bookmark_clear(); return 0; }
+    if id == ID_BUILD_COMPILE { pad_compile_current(0); return 0; }
+    if id == ID_BUILD_RUN { pad_compile_current(1); return 0; }
+    if id == ID_BUILD_FIX { pad_fix_current(); return 0; }
+    if id == ID_OUTPUT_SHOW { pad_show_output(1); return 0; }
+    if id == ID_OUTPUT_HIDE { pad_show_output(0); return 0; }
+    if id == ID_CALC_SHOW { pad_show_calc(); return 0; }
+    if id == ID_CALC_CONVERT { pad_calc_convert(); return 0; }
+    if id == ID_CALC_COPY { pad_calc_copy(); return 0; }
+    if id == ID_CALC_HIDE { pad_hide_calc(); return 0; }
+    if id == ID_COMPARE_SHOW { pad_compare_open(); return 0; }
+    if id == ID_COMPARE_HIDE { pad_compare_hide(); return 0; }
+    if id == ID_ENC_ANSI { pad_set_encoding(TEXT_ENC_ANSI); return 0; }
+    if id == ID_ENC_UTF8 { pad_set_encoding(TEXT_ENC_UTF8); return 0; }
+    if id == ID_ENC_UTF8_BOM { pad_set_encoding(TEXT_ENC_UTF8_BOM); return 0; }
+    if id == ID_ENC_UTF16 { pad_set_encoding(TEXT_ENC_UTF16_LE); return 0; }
+    if id == ID_EOL_CRLF { pad_set_eol(TEXT_EOL_CRLF); return 0; }
+    if id == ID_EOL_LF { pad_set_eol(TEXT_EOL_LF); return 0; }
+    if id == ID_EOL_CR { pad_set_eol(TEXT_EOL_CR); return 0; }
+    if id == ID_LANG_AUTO { pad_set_lang(SYN_MODE_AUTO); return 0; }
+    if id == ID_LANG_ANCL { pad_set_lang(SYN_MODE_ANCL); return 0; }
+    if id == ID_LANG_PY { pad_set_lang(SYN_MODE_PYTHON); return 0; }
+    if id == ID_LANG_CS { pad_set_lang(SYN_MODE_CSHARP); return 0; }
+    if id == ID_LANG_LOG { pad_set_lang(SYN_MODE_LOG); return 0; }
+    if id == ID_LANG_TXT { pad_set_lang(SYN_MODE_TEXT); return 0; }
+    if id == ID_LANG_JSON { pad_set_lang(SYN_MODE_JSON); return 0; }
+    if id == ID_LANG_XML { pad_set_lang(SYN_MODE_XML); return 0; }
+    if id == ID_LANG_HTML { pad_set_lang(SYN_MODE_HTML); return 0; }
+    if id == ID_LANG_SQL { pad_set_lang(SYN_MODE_SQL); return 0; }
+    if id == ID_LANG_MD { pad_set_lang(SYN_MODE_MARKDOWN); return 0; }
+    if id == ID_LANG_INI { pad_set_lang(SYN_MODE_INI); return 0; }
+    if id == ID_LANG_PS { pad_set_lang(SYN_MODE_POWERSHELL); return 0; }
+    if id == ID_RECOLOR { pad_recolor_chars(0, 0 - 1); pad_update_status(); return 0; }
+    if id == ID_GUTTER { InvalidateRect(load64(g_hwnd), g_gutter, 0); return 0; }
+    if id == ID_GUIDE { pad_open_guide(); return 0; }
+    if id == ID_HELP_KEYS { MessageBoxA(load64(g_hwnd), shortcuts_text, about_title, 0x40); return 0; }
+    if id == ID_BUNDLE { MessageBoxA(load64(g_hwnd), bundle_text, bundle_title, 0x40); return 0; }
+    if id == ID_ABOUT { MessageBoxA(load64(g_hwnd), about_text, about_title, 0x40); return 0; }
+    return 0;
+}
+
+func pad_handle_key(vk: i64, ctrl: i64, shft: i64) -> i64 {
+    if vk == 0x70 { pad_command(ID_GUIDE); return 1; }
+    if vk == 0x71 { if ctrl != 0 { pad_command(ID_BOOKMARK_TOGGLE); } else { if shft != 0 { pad_command(ID_BOOKMARK_PREV); } else { pad_command(ID_BOOKMARK_NEXT); } } return 1; }
+    if vk == 0x72 { pad_command(ID_FIND_NEXT); return 1; }
+    if vk == 0x74 { pad_command(ID_BUILD_RUN); return 1; }
+    if vk == 0x1B {
+        if load64(g_find_visible) != 0 { pad_command(ID_FIND_HIDE); return 1; }
+        if load64(g_calc_visible) != 0 { pad_command(ID_CALC_HIDE); return 1; }
+        if load64(g_files_visible) != 0 { pad_command(ID_FIND_FILES_HIDE); return 1; }
+    }
+    if vk == 13 {
+        f = GetFocus();
+        if f == load64(g_find_ed) { pad_command(ID_FIND_NEXT); return 1; }
+        if f == load64(g_repl_ed) { pad_command(ID_REPL_ONE); return 1; }
+        if f == load64(g_line_ed) { pad_command(ID_GO_LINE); return 1; }
+        if f == load64(g_calc_dec_ed) { pad_calc_from_field(ID_CALC_DEC); return 1; }
+        if f == load64(g_calc_hex_ed) { pad_calc_from_field(ID_CALC_HEX); return 1; }
+        if f == load64(g_calc_bin_ed) { pad_calc_from_field(ID_CALC_BIN); return 1; }
+        if f == load64(g_calc_bcd_ed) { pad_calc_from_field(ID_CALC_BCD); return 1; }
+        if f == load64(g_files_find_ed) { pad_files_run(); return 1; }
+        if f == load64(g_files_folder_ed) { pad_files_run(); return 1; }
+    }
+    if ctrl == 0 { return 0; }
+    if vk == 9 {
+        count = load64(g_tab_count); if count > 1 { next = load64(g_tab_current) + 1; if shft != 0 { next = load64(g_tab_current) - 1; } if next >= count { next = 0; } if next < 0 { next = count - 1; } pad_tab_activate(next); }
+        return 1;
+    }
+    if vk == 78 { pad_command(ID_NEW); return 1; }
+    if vk == 79 { pad_command(ID_OPEN); return 1; }
+    if vk == 87 { pad_command(ID_CLOSE); return 1; }
+    if vk == 83 {
+        if shft != 0 { pad_command(ID_SAVEAS); } else { pad_command(ID_SAVE); }
+        return 1;
+    }
+    if vk == 66 {
+        if shft != 0 { pad_command(ID_BUILD_FIX); } else { pad_command(ID_BUILD_COMPILE); }
+        return 1;
+    }
+    if vk == 90 { pad_command(ID_UNDO); return 1; }
+    if vk == 89 { pad_command(ID_REDO); return 1; }
+    if vk == 88 { pad_command(ID_CUT); return 1; }
+    if vk == 67 { pad_command(ID_COPY); return 1; }
+    if vk == 86 { pad_command(ID_PASTE); return 1; }
+    if vk == 65 { pad_command(ID_SELECTALL); return 1; }
+    if vk == 70 { if shft != 0 { pad_command(ID_FIND_FILES_SHOW); } else { pad_command(ID_FIND_SHOW); } return 1; }
+    if vk == 72 { pad_command(ID_REPL_SHOW); return 1; }
+    if vk == 71 { pad_command(ID_GOTO_SHOW); return 1; }
+    if vk == 75 {
+        if shft != 0 { pad_command(ID_CALC_SHOW); return 1; }
+    }
+    return 0;
+}
+
+func pad_message_loop() -> i64 {
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        skip = 0;
+        if gui_msg_is_keydown(g_msg) != 0 {
+            skip = pad_handle_key(gui_msg_vk(g_msg), gui_key_down(0x11), gui_key_down(0x10));
+        }
+        if skip == 0 {
+            TranslateMessage(g_msg);
+            DispatchMessageA(g_msg);
+        }
+    }
+    return 0;
+}
+
+func pad_reflow(w: i64, h: i64) -> i64 {
+    if w < 920 { w = 920; }
+    if h < 480 { h = 480; }
+    tab_y = 118; top = 148;
+    if load64(g_find_visible) != 0 { tab_y = 152; top = 182; }
+    if load64(g_calc_visible) != 0 { tab_y = 152; top = 182; }
+    if load64(g_files_visible) != 0 { tab_y = 152; top = 182; }
+    bottom = h - 54;
+    out_top = bottom;
+    if load64(g_output_visible) != 0 {
+        out_top = bottom - 140;
+        bottom = out_top - 10;
+    }
+    left_right = w - 18; right_left = w;
+    if load64(g_compare_visible) != 0 { half = (w - 46) / 2; left_right = 18 + half; right_left = left_right + 10; gdi_rect_set(g_compare_gutter, right_left, top, right_left + 42, bottom); }
+    gdi_rect_set(g_gutter, 18, top, 60, bottom);
+    if load64(g_path_ed) != 0 { MoveWindow(load64(g_path_ed), 82, 81, w - 98, 24, 1); }
+    if load64(g_find_lbl) != 0 { MoveWindow(load64(g_find_lbl), 18, 121, 36, 20, 1); }
+    if load64(g_find_ed) != 0 { MoveWindow(load64(g_find_ed), 56, 117, 180, 24, 1); }
+    if load64(g_find_btn) != 0 { MoveWindow(load64(g_find_btn), 240, 116, 54, 25, 1); }
+    if load64(g_repl_lbl) != 0 { MoveWindow(load64(g_repl_lbl), 304, 121, 54, 20, 1); }
+    if load64(g_repl_ed) != 0 { MoveWindow(load64(g_repl_ed), 362, 117, 180, 24, 1); }
+    if load64(g_repl_btn) != 0 { MoveWindow(load64(g_repl_btn), 546, 116, 68, 25, 1); }
+    if load64(g_all_btn) != 0 { MoveWindow(load64(g_all_btn), 618, 116, 42, 25, 1); }
+    if load64(g_line_lbl) != 0 { MoveWindow(load64(g_line_lbl), 674, 121, 32, 20, 1); }
+    if load64(g_line_ed) != 0 { MoveWindow(load64(g_line_ed), 710, 117, 54, 24, 1); }
+    if load64(g_go_btn) != 0 { MoveWindow(load64(g_go_btn), 768, 116, 42, 25, 1); }
+    if load64(g_hide_btn) != 0 { MoveWindow(load64(g_hide_btn), w - 50, 116, 34, 25, 1); }
+    if load64(g_calc_lbl) != 0 { MoveWindow(load64(g_calc_lbl), 18, 121, 42, 20, 1); }
+    if load64(g_calc_in) != 0 { MoveWindow(load64(g_calc_in), 64, 117, 180, 24, 1); }
+    if load64(g_calc_btn) != 0 { MoveWindow(load64(g_calc_btn), 250, 116, 68, 25, 1); }
+    if load64(g_calc_copy_btn) != 0 { MoveWindow(load64(g_calc_copy_btn), w - 124, 116, 60, 25, 1); }
+    if load64(g_calc_msg_lbl) != 0 { MoveWindow(load64(g_calc_msg_lbl), 390, 121, w - 458, 20, 1); }
+    if load64(g_calc_hide_btn) != 0 { MoveWindow(load64(g_calc_hide_btn), w - 58, 116, 34, 25, 1); }
+    if load64(g_calc_dec_lbl) != 0 { MoveWindow(load64(g_calc_dec_lbl), 18, 121, 28, 20, 1); }
+    if load64(g_calc_dec_ed) != 0 { MoveWindow(load64(g_calc_dec_ed), 50, 117, 128, 24, 1); }
+    if load64(g_calc_hex_lbl) != 0 { MoveWindow(load64(g_calc_hex_lbl), 186, 121, 28, 20, 1); }
+    if load64(g_calc_hex_ed) != 0 { MoveWindow(load64(g_calc_hex_ed), 218, 117, 128, 24, 1); }
+    if load64(g_calc_bin_lbl) != 0 { MoveWindow(load64(g_calc_bin_lbl), 354, 121, 24, 20, 1); }
+    if load64(g_calc_bin_ed) != 0 { MoveWindow(load64(g_calc_bin_ed), 382, 117, 220, 24, 1); }
+    if load64(g_calc_bcd_lbl) != 0 { MoveWindow(load64(g_calc_bcd_lbl), 610, 121, 32, 20, 1); }
+    if load64(g_calc_bcd_ed) != 0 { MoveWindow(load64(g_calc_bcd_ed), 646, 117, w - 784, 24, 1); }
+    if load64(g_files_find_lbl) != 0 { MoveWindow(load64(g_files_find_lbl), 18, 121, 30, 20, 1); }
+    if load64(g_files_find_ed) != 0 { MoveWindow(load64(g_files_find_ed), 52, 117, 180, 24, 1); }
+    if load64(g_files_folder_lbl) != 0 { MoveWindow(load64(g_files_folder_lbl), 244, 121, 44, 20, 1); }
+    if load64(g_files_folder_ed) != 0 { MoveWindow(load64(g_files_folder_ed), 292, 117, w - 496, 24, 1); }
+    if load64(g_files_browse_btn) != 0 { MoveWindow(load64(g_files_browse_btn), w - 196, 116, 66, 25, 1); }
+    if load64(g_files_search_btn) != 0 { MoveWindow(load64(g_files_search_btn), w - 124, 116, 68, 25, 1); }
+    if load64(g_files_hide_btn) != 0 { MoveWindow(load64(g_files_hide_btn), w - 50, 116, 34, 25, 1); }
+    count = load64(g_tab_count); tw = 180; avail = w - 36; min_tw = 90; if load64(g_compare_visible) != 0 { avail = left_right - 18; min_tw = 50; }
+    if count > 0 { if tw * count > avail { tw = avail / count; } } if tw < min_tw { tw = min_tw; }
+    i = 0; while i < PAD_MAX_TABS {
+        htab = load64(g_tab_buttons + i * 8); hclose = load64(g_tab_close_buttons + i * 8);
+        if htab != 0 { MoveWindow(htab, 18 + i * tw, tab_y, tw - 26, 26, 1); }
+        if hclose != 0 { MoveWindow(hclose, 18 + (i + 1) * tw - 26, tab_y, 26, 26, 1); }
+        i = i + 1;
+    }
+    if load64(g_editor) != 0 { MoveWindow(load64(g_editor), 60, top, left_right - 60, bottom - top, 1); }
+    if load64(g_compare_visible) != 0 {
+        if load64(g_compare_label) != 0 { MoveWindow(load64(g_compare_label), right_left + 8, tab_y + 4, w - right_left - 62, 20, 1); }
+        if load64(g_compare_close) != 0 { MoveWindow(load64(g_compare_close), w - 50, tab_y, 34, 26, 1); }
+        if load64(g_compare) != 0 { MoveWindow(load64(g_compare), right_left + 42, top, w - right_left - 60, bottom - top, 1); }
+    }
+    if load64(g_output) != 0 { MoveWindow(load64(g_output), 16, out_top, w - 32, 140, 1); }
+    if load64(g_status) != 0 { MoveWindow(load64(g_status), 18, h - 34, w - 36, 22, 1); }
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func create_controls(hwnd: i64) -> i64 {
+    store64(g_hwnd, hwnd);
+    hinst = load64(g_hinst);
+    f = load64(g_font_ui);
+
+    h = pad_make_button(hwnd, ID_MENU_FILE, mtop_file, 18, 49, 52); store64(g_mb_file, h);
+    h = pad_make_button(hwnd, ID_MENU_EDIT, mtop_edit, 74, 49, 52); store64(g_mb_edit, h);
+    h = pad_make_button(hwnd, ID_MENU_BUILD, mtop_build, 130, 49, 58); store64(g_mb_build, h);
+    h = pad_make_button(hwnd, ID_MENU_VIEW, mtop_view, 192, 49, 54); store64(g_mb_view, h);
+    h = pad_make_button(hwnd, ID_MENU_HELP, mtop_help, 250, 49, 56); store64(g_mb_help, h);
+
+    gui_set_font(gui_static_text(hwnd, hinst, txt_path, 18, 85, 42, 20), f);
+    h = gui_edit_text(hwnd, hinst, ID_PATH, untitled, 82, 81, 900, 24);
+    store64(g_path_ed, h);
+    gui_set_font(h, f);
+
+    i = 0; while i < PAD_MAX_TABS {
+        h = pad_make_button(hwnd, ID_TAB_1 + i, rich_empty, 18 + i * 120, 118, 94); store64(g_tab_buttons + i * 8, h); ShowWindow(h, 0);
+        h = pad_make_button(hwnd, ID_TAB_CLOSE_1 + i, txt_tab_close, 112 + i * 120, 118, 26); store64(g_tab_close_buttons + i * 8, h); ShowWindow(h, 0); i = i + 1;
+    }
+    h = gui_static_text(hwnd, hinst, txt_compare, 560, 122, 420, 20); store64(g_compare_label, h); gui_set_font(h, f); ShowWindow(h, 0);
+    h = pad_make_button(hwnd, ID_COMPARE_HIDE, txt_close, 946, 118, 34); store64(g_compare_close, h); ShowWindow(h, 0);
+
+    h = gui_static_text(hwnd, hinst, txt_find, 18, 121, 30, 20); store64(g_files_find_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 306, rich_empty, 52, 117, 180, 24); store64(g_files_find_ed, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_folder, 244, 121, 44, 20); store64(g_files_folder_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 307, rich_empty, 292, 117, 500, 24); store64(g_files_folder_ed, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_FIND_FILES_BROWSE, txt_browse, 800, 116, 66); store64(g_files_browse_btn, h);
+    h = pad_make_button(hwnd, ID_FIND_FILES_SEARCH, txt_search, 872, 116, 68); store64(g_files_search_btn, h);
+    h = pad_make_button(hwnd, ID_FIND_FILES_HIDE, txt_close, 946, 116, 34); store64(g_files_hide_btn, h); pad_show_files_controls(0);
+
+    h = gui_static_text(hwnd, hinst, txt_find, 18, 51, 36, 20);
+    store64(g_find_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 301, rich_empty, 56, 47, 180, 24);
+    store64(g_find_ed, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_FIND_NEXT, txt_next, 240, 116, 54);
+    store64(g_find_btn, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_replace, 304, 51, 54, 20);
+    store64(g_repl_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 302, rich_empty, 362, 47, 180, 24);
+    store64(g_repl_ed, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_REPL_ONE, txt_repl, 546, 116, 68);
+    store64(g_repl_btn, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_REPL_ALL, txt_all, 618, 116, 42);
+    store64(g_all_btn, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_line, 674, 51, 32, 20);
+    store64(g_line_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 303, rich_empty, 710, 47, 54, 24);
+    store64(g_line_ed, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_GO_LINE, txt_go, 768, 116, 42);
+    store64(g_go_btn, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_FIND_HIDE, txt_close, 820, 116, 34);
+    store64(g_hide_btn, h); gui_set_font(h, f);
+    pad_show_find_controls(0);
+
+    h = gui_static_text(hwnd, hinst, txt_value, 18, 51, 42, 20);
+    store64(g_calc_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, 305, calc_zero, 64, 47, 180, 24);
+    store64(g_calc_in, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_CALC_CONVERT, txt_convert, 250, 116, 68);
+    store64(g_calc_btn, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_CALC_COPY, txt_copy, 324, 116, 54);
+    store64(g_calc_copy_btn, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, st_calc_ready, 390, 51, 440, 20);
+    store64(g_calc_msg_lbl, h); gui_set_font(h, f);
+    h = pad_make_button(hwnd, ID_CALC_HIDE, txt_close, 820, 116, 34);
+    store64(g_calc_hide_btn, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_dec, 18, 82, 28, 20);
+    store64(g_calc_dec_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, ID_CALC_DEC, rich_empty, 50, 78, 128, 24);
+    store64(g_calc_dec_ed, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_hex, 186, 82, 28, 20);
+    store64(g_calc_hex_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, ID_CALC_HEX, rich_empty, 218, 78, 128, 24);
+    store64(g_calc_hex_ed, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_bin, 354, 82, 24, 20);
+    store64(g_calc_bin_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, ID_CALC_BIN, rich_empty, 382, 78, 220, 24);
+    store64(g_calc_bin_ed, h); gui_set_font(h, f);
+    h = gui_static_text(hwnd, hinst, txt_bcd, 610, 82, 32, 20);
+    store64(g_calc_bcd_lbl, h); gui_set_font(h, f);
+    h = gui_edit_text(hwnd, hinst, ID_CALC_BCD, rich_empty, 646, 78, 240, 24);
+    store64(g_calc_bcd_ed, h); gui_set_font(h, f);
+    pad_show_calc_controls(0);
+
+    ed = rich_create(hwnd, hinst, ID_EDITOR, 60, 48, 900, 600);
+    store64(g_editor, ed);
+    gui_set_font(ed, load64(g_font_code));
+    rich_limit_text(ed, 1048576);
+    rich_set_bg(ed, COLOR_EDITOR);
+    rich_set_event_mask(ed, 0x00080005);
+    rich_cf_color(g_cf, COLOR_DEFAULT);
+    rich_set_charformat(ed, SCF_ALL, g_cf);
+
+    cmp = rich_create(hwnd, hinst, ID_COMPARE_EDITOR, 560, 148, 420, 500);
+    store64(g_compare, cmp); gui_set_font(cmp, load64(g_font_code)); rich_limit_text(cmp, 1048576); rich_set_bg(cmp, COLOR_EDITOR); rich_set_event_mask(cmp, 0x00080005); SendMessageA(cmp, 0xCF, 1, 0); ShowWindow(cmp, 0);
+
+    out = rich_create(hwnd, hinst, 304, 16, 590, 900, 120);
+    store64(g_output, out);
+    gui_set_font(out, load64(g_font_code));
+    rich_set_bg(out, COLOR_EDITOR);
+    rich_set_event_mask(out, 0x00080005);
+    SendMessageA(out, 0xCF, 1, 0);
+    ShowWindow(out, 0);
+
+    h = gui_static_text(hwnd, hinst, st_ready, 16, 670, 900, 22);
+    store64(g_status, h);
+    gui_set_font(h, f);
+
+    GetClientRect(hwnd, g_rect);
+    pad_reflow(load32(g_rect + 8), load32(g_rect + 12));
+    if pad_recovery_restore() == 0 { if pad_session_restore() == 0 { pad_load_sample(); } }
+    i = load64(g_tab_current); if i >= 0 { cstr_copy_n(g_curpath, pad_tab_path(i), 700); SetWindowTextA(load64(g_path_ed), g_curpath); pad_update_build_menu(); pad_update_status(); }
+    SetTimer(hwnd, 10, 15000, 0);
+    return 0;
+}
+
+func MainWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { create_controls(hwnd); return 0; }
+
+    if msg == 43 { return pad_draw_button(lp); }
+
+    if msg == 5 {
+        pad_reflow(gui_loword(lp), gui_hiword(lp));
+        return 0;
+    }
+
+    if msg == 273 {
+        id = gui_loword(wp);
+        if id == ID_EDITOR {
+            if load64(g_in_recolor) == 1 { return 0; }
+            ncode = gui_hiword(wp);
+            if ncode == 768 {
+                if load64(g_loading) == 0 { SetTimer(hwnd, 7, 120, 0); }
+                if load64(g_loading) == 0 { i = load64(g_tab_current); if i >= 0 { dirty = rich_get_modified(load64(g_editor)); if dirty != load64(g_tab_dirty + i * 8) { store64(g_tab_dirty + i * 8, dirty); pad_tabs_refresh(); } } }
+                InvalidateRect(hwnd, g_gutter, 0);
+                pad_update_status();
+            }
+            if ncode == 1538 {
+                InvalidateRect(hwnd, g_gutter, 0);
+                if load64(g_in_recolor) == 0 {
+                    if load64(g_scroll_pend) == 0 {
+                        store64(g_scroll_pend, 1);
+                        SetTimer(hwnd, 8, 40, 0);
+                    }
+                }
+            }
+            return 0;
+        }
+        if id == ID_COMPARE_EDITOR { if gui_hiword(wp) == 1538 { InvalidateRect(hwnd, g_compare_gutter, 0); } return 0; }
+        ncode2 = gui_hiword(wp);
+        if load64(g_calc_visible) != 0 {
+            if ncode2 == 768 {
+                if id == ID_CALC_DEC { pad_calc_from_field(ID_CALC_DEC); return 0; }
+                if id == ID_CALC_HEX { pad_calc_from_field(ID_CALC_HEX); return 0; }
+                if id == ID_CALC_BIN { pad_calc_from_field(ID_CALC_BIN); return 0; }
+                if id == ID_CALC_BCD { pad_calc_from_field(ID_CALC_BCD); return 0; }
+            }
+        }
+        pad_command(id);
+        return 0;
+    }
+
+    if msg == 78 {
+        if load64(lp + 0) == load64(g_editor) {
+            if load64(g_in_recolor) == 1 || load64(g_in_bracket) == 1 { return 0; }
+            if load32(lp + 16) == 0x702 { pad_update_status(); pad_bracket_update(); return 0; }
+        }
+        if load64(lp + 0) == load64(g_output) { if load32(lp + 16) == 0x702 { pad_output_jump(); return 0; } }
+        return 0;
+    }
+
+    if msg == 275 {
+        if wp == 7 {
+            KillTimer(hwnd, 7);
+            pad_recolor();
+        }
+        if wp == 8 {
+            KillTimer(hwnd, 8);
+            store64(g_scroll_pend, 0);
+            pad_recolor();
+        }
+        if wp == 10 { pad_recovery_save(); }
+        return 0;
+    }
+
+    if msg == 307 {
+        if lp == load64(g_editor) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_path_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_find_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_repl_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_line_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_calc_in) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_calc_dec_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_calc_hex_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_calc_bin_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_calc_bcd_ed) {
+            SetTextColor(wp, COLOR_DEFAULT);
+            SetBkColor(wp, COLOR_EDITOR);
+            return load64(g_br_editor);
+        }
+        if lp == load64(g_files_find_ed) {
+            SetTextColor(wp, COLOR_DEFAULT); SetBkColor(wp, COLOR_EDITOR); return load64(g_br_editor);
+        }
+        if lp == load64(g_files_folder_ed) {
+            SetTextColor(wp, COLOR_DEFAULT); SetBkColor(wp, COLOR_EDITOR); return load64(g_br_editor);
+        }
+        SetTextColor(wp, COLOR_TEXT);
+        SetBkColor(wp, COLOR_PANEL);
+        return load64(g_br_panel);
+    }
+
+    if msg == 312 {
+        SetTextColor(wp, COLOR_TEXT);
+        SetBkColor(wp, COLOR_PANEL);
+        return load64(g_br_panel);
+    }
+
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        etop = 118; pbot = 110;
+        if load64(g_find_visible) != 0 { etop = 152; pbot = 144; }
+        if load64(g_calc_visible) != 0 { etop = 152; pbot = 144; }
+        if load64(g_files_visible) != 0 { etop = 152; pbot = 144; }
+        ebot = h - 54; out_top = ebot;
+        if load64(g_output_visible) != 0 { out_top = ebot - 140; ebot = out_top - 10; }
+        gdi_fill_xy(hdc, 0, 0, w, h, load64(g_br_bg));
+        gdi_fill_xy(hdc, 0, 0, w, 38, load64(g_br_panel));
+        gdi_line(hdc, 0, 38, w, 38, load64(g_pen_acc));
+        gdi_text_out(hdc, 18, 8, title_app, COLOR_TEXT, load64(g_font_bold));
+        gdi_text_out(hdc, 112, 11, title_sub, COLOR_DIM, load64(g_font_ui));
+        gdi_fill_frame_rect(hdc, 12, 42, w - 16, pbot, load64(g_br_panel), load64(g_pen_line));
+        gdi_fill_frame_rect(hdc, 12, etop - 6, w - 16, ebot + 6, load64(g_br_panel), load64(g_pen_line));
+        if load64(g_output_visible) != 0 { gdi_fill_frame_rect(hdc, 12, out_top - 6, w - 16, out_top + 146, load64(g_br_panel), load64(g_pen_line)); }
+        gdi_fill_frame_rect(hdc, 12, h - 42, w - 16, h - 6, load64(g_br_panel), load64(g_pen_line));
+        editor_draw_line_numbers(hdc, load64(g_editor), g_gutter, g_pt, g_num, load64(g_font_code), load64(g_br_gutter), COLOR_DIM);
+        pad_draw_bookmarks(hdc);
+        if load64(g_compare_visible) != 0 {
+            xsplit = load32(g_compare_gutter) - 5; gdi_line(hdc, xsplit, load32(g_compare_gutter + 4), xsplit, load32(g_compare_gutter + 12), load64(g_pen_line));
+            editor_draw_line_numbers(hdc, load64(g_compare), g_compare_gutter, g_pt, g_num, load64(g_font_code), load64(g_br_gutter), COLOR_DIM);
+        }
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 16 {
+        pad_tab_save_current(); dirty_count = 0; i = 0; while i < load64(g_tab_count) { if load64(g_tab_dirty + i * 8) != 0 { dirty_count = dirty_count + 1; } i = i + 1; }
+        if dirty_count > 0 { if MessageBoxA(hwnd, exit_modified, exit_title, 0x34) != 6 { return 0; } }
+        pad_session_save(); pad_recovery_clear(); DestroyWindow(hwnd); return 0;
+    }
+    if msg == 20 { return 1; }
+    if msg == 2 { PostQuitMessage(0); return 0; }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func main() -> i32 {
+    store64(g_encoding_mode, TEXT_ENC_UTF8); store64(g_eol_mode, TEXT_EOL_CRLF);
+    pad_build_filter();
+    pad_init_paths();
+    pad_recent_load();
+    store64(g_raw_p, alloc(1048576));
+    store64(g_doc_p, alloc(1048576));
+    store64(g_filebuf_p, alloc(PAD_FILE_CAP));
+    store64(g_wide_p, alloc(PAD_FILE_CAP));
+    store64(g_files_output_p, alloc(262144));
+    if load64(g_raw_p) == 0 { return 1; }
+    if load64(g_doc_p) == 0 { return 1; }
+    if load64(g_filebuf_p) == 0 { return 1; }
+    if load64(g_wide_p) == 0 { return 1; }
+    if load64(g_files_output_p) == 0 { return 1; }
+    store64(g_tab_current, 0 - 1); i = 0; while i < PAD_MAX_TABS { p = alloc(PAD_TAB_CAP); if p == 0 { return 1; } store64(g_tab_texts + i * 8, p); store8(p, 0); i = i + 1; }
+    store64(g_bracket_a, 0 - 1); store64(g_bracket_b, 0 - 1);
+
+    store64(g_br_bg, CreateSolidBrush(COLOR_BG));
+    store64(g_br_panel, CreateSolidBrush(COLOR_PANEL));
+    store64(g_br_editor, CreateSolidBrush(COLOR_EDITOR));
+    store64(g_br_gutter, CreateSolidBrush(COLOR_PANEL));
+    store64(g_br_button, CreateSolidBrush(COLOR_BUTTON));
+    store64(g_br_hover, CreateSolidBrush(COLOR_HOVER));
+    store64(g_br_accent, CreateSolidBrush(COLOR_ACCENT));
+    store64(g_pen_line, CreatePen(0, 1, COLOR_LINE));
+    store64(g_pen_acc, CreatePen(0, 2, COLOR_ACCENT));
+    store64(g_font_ui, gdi_make_font(0 - 14, 400, face_ui));
+    store64(g_font_bold, gdi_make_font(0 - 16, 700, face_ui));
+    store64(g_font_code, gdi_make_font(0 - 16, 400, face_code));
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    gui_init_common_controls(1);
+    gui_register_class(g_wc, cls_main, &MainWndProc, hinst, cursor, load64(g_br_bg));
+    pad_build_menus();
+
+    hwnd = CreateWindowExA(0, cls_main, title_app, 0x16CF0000, 120, 80, 1080, 760, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    if hwnd == 0 { return 1; }
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    pad_message_loop();
+
+    gdi_delete(load64(g_font_ui));
+    gdi_delete(load64(g_font_bold));
+    gdi_delete(load64(g_font_code));
+    gdi_delete(load64(g_br_bg));
+    gdi_delete(load64(g_br_panel));
+    gdi_delete(load64(g_br_editor));
+    gdi_delete(load64(g_br_gutter));
+    gdi_delete(load64(g_br_button));
+    gdi_delete(load64(g_br_hover));
+    gdi_delete(load64(g_br_accent));
+    gdi_delete(load64(g_pen_line));
+    gdi_delete(load64(g_pen_acc));
+    free(load64(g_raw_p));
+    free(load64(g_doc_p));
+    free(load64(g_filebuf_p));
+    free(load64(g_wide_p));
+    free(load64(g_files_output_p));
+    i = 0; while i < PAD_MAX_TABS { free(load64(g_tab_texts + i * 8)); i = i + 1; }
+    return 0;
+}

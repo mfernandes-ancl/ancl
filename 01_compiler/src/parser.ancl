@@ -1,0 +1,2900 @@
+# =====================================================================
+#  parser.ancl  -  Recursive descent parser for anclc2
+#
+#  Builds a flat AST using parallel arrays indexed by node ID.
+#  Import lexer.ancl before this file.
+# =====================================================================
+import "lexer.ancl";
+
+@DATA
+
+# --- AST node kind constants ---
+ND_INT:      i64 = 1;
+ND_STR:      i64 = 2;
+ND_VAR:      i64 = 3;
+ND_BINARY:   i64 = 4;
+ND_CALL:     i64 = 5;
+ND_ADDR:     i64 = 6;
+ND_FLOAT:    i64 = 7;     # f64 literal; g_nd_ival holds the raw IEEE-754 bits
+
+ST_ASSIGN:   i64 = 10;
+ST_IF:       i64 = 11;
+ST_LOOP:     i64 = 12;
+ST_RETURN:   i64 = 13;
+ST_SYSCALL:  i64 = 14;
+ST_EXPRSTMT: i64 = 15;
+ST_BREAK:    i64 = 16;
+ST_CONTINUE: i64 = 17;
+
+# --- AST node parallel arrays (32768 nodes * 8 bytes = 262144) ---
+g_nd_kind:    buf = 262144;
+g_nd_ival:    buf = 262144;
+g_nd_a:       buf = 262144;
+g_nd_b:       buf = 262144;
+g_nd_c:       buf = 262144;
+g_nd_name:    buf = 262144;
+g_nd_namelen: buf = 262144;
+g_nd_isfloat: buf = 262144;   # per-node: 1 if the value is an f64 (lives in XMM0); set by the float-stamping pass
+g_nd_count:   buf = 8;
+
+# --- Program-level function table (512 fns * 8 bytes = 4096) ---
+# (raised 256->512 for the Linux self-host: anclc2_all_linux.ancl has ~263 funcs)
+g_fn_name:      buf = 4096;
+g_fn_namelen:   buf = 4096;
+g_fn_body:      buf = 4096;
+g_fn_stmtcount: buf = 4096;
+g_fn_nparams:   buf = 4096;
+g_fn_rettype:   buf = 4096;
+g_fn_count:     buf = 8;
+
+# fn_params: 512 fns * 8 params * 2 slots (name_off, name_len) = 8192 * 8 = 65536 bytes
+# layout: fn*128 + param*16 + 0 = name_off, fn*128 + param*16 + 8 = name_len
+g_fn_params:    buf = 65536;
+# f64 signature info (Win64 XMM calling convention):
+g_fn_retfloat:  buf = 4096;     # 1 if the function returns f64/f32 (-> result in XMM0)
+g_fn_pfloat:    buf = 32768;    # per fn, per param float flag; layout fn*64 + param*8 (8 params max)
+
+# --- @DATA variable table (512 vars * 8 bytes = 4096) ---
+g_dv_name:    buf = 4096;
+g_dv_namelen: buf = 4096;
+g_dv_type:    buf = 4096;
+g_dv_ival:    buf = 4096;
+g_dv_strid:   buf = 4096;
+g_dv_bufsize: buf = 4096;
+g_dv_isfloat: buf = 4096;     # 1 if this @DATA const is an f64/f32 (g_dv_ival holds IEEE-754 bits)
+g_dv_count:   buf = 8;
+g_arr_scratch: buf = 65536;   # scratch for building @DATA array byte blobs (interned as .rdata strings)
+
+# g_dv_type values:
+DV_I64:  i64 = 0;
+DV_STR:  i64 = 1;
+DV_BUF:  i64 = 2;
+DV_I32:  i64 = 3;
+DV_PTR:  i64 = 4;
+DV_I8:   i64 = 5;
+DV_I16:  i64 = 6;
+DV_F64:  i64 = 7;
+DV_F32:  i64 = 8;
+
+# --- String literal table (1024 strings; content pool 128KB) ---
+g_strings:   buf = 131072;
+g_str_off:   buf = 8192;
+g_str_len:   buf = 8192;
+g_str_count: buf = 8;
+g_str_next:  buf = 8;
+
+# --- Extern declarations ---
+g_ext_fn:    buf = 2048;
+g_ext_fnlen: buf = 2048;
+g_ext_dll:   buf = 2048;
+g_ext_dlllen:buf = 2048;
+g_ext_ptr:   buf = 2048;
+g_ext_float: buf = 2048;     # 1 if the extern returns f64/f32 (result in XMM0; no sign-extend)
+g_ext_count: buf = 8;
+
+# --- Struct declarations (compile-time only; for sizeof + Struct.field) ---
+# Flat parallel-array design, mirroring the AST arrays.
+#   struct N owns fields [g_struct_ffield[N] .. g_struct_ffield[N]+g_struct_nfields[N])
+g_struct_name:    buf = 512;   # i64[64] - pool offset of struct name
+g_struct_namelen: buf = 512;   # i64[64] - length of struct name
+g_struct_size:    buf = 512;   # i64[64] - total size (8-byte rounded)
+g_struct_ffield:  buf = 512;   # i64[64] - index of first field in g_field_*
+g_struct_nfields: buf = 512;   # i64[64] - number of fields
+g_struct_count:   buf = 8;
+
+g_field_name:   buf = 4096;   # i64[512] - pool offset of field name
+g_field_namelen:buf = 4096;   # i64[512] - length of field name
+g_field_off:    buf = 4096;   # i64[512] - byte offset within struct
+g_field_count:  buf = 8;
+
+# side-channel: par_typesize writes the parsed type's alignment here
+g_par_typealign: buf = 8;
+
+# --- Parser state ---
+g_par_pos: buf = 8;
+
+# --- Error strings ---
+par_err_expect: str = "[par] unexpected token\n";
+par_err_nd:     str = "[par] too many AST nodes\n";
+par_err_fn:     str = "[par] too many functions\n";
+par_err_dv:     str = "[par] too many data vars\n";
+par_err_str:    str = "[par] too many strings\n";
+par_err_ext:    str = "[par] too many externs\n";
+par_err_struct: str = "[par] too many structs/fields\n";
+par_err_type:   str = "[par] unknown type in sizeof\n";
+par_err_nostr:  str = "[par] not a struct in .field\n";
+par_err_nofld:  str = "[par] no such struct field\n";
+par_err_cexpr:  str = "[par] bad const-expr in @DATA initializer\n";
+par_err_arr:    str = "[par] bad @DATA array decl (type/length)\n";
+
+# --- tool registry (feature #2): a `tool` is a func PLUS a JSON-Schema descriptor ---
+g_tool_count:     buf = 8;       # number of `tool` decls
+g_tool_fnidx:     buf = 2048;    # 256 tools: function index (into g_fn_*) per tool
+g_tool_namesid:   buf = 2048;    # interned name string id per tool
+g_tool_schemasid: buf = 2048;    # interned per-tool schema-object string id
+g_tools_json_sid: buf = 8;       # interned "[{...},...]" array string id (built post-parse)
+g_tool_schemabuf: buf = 8192;    # scratch: one tool's schema object
+g_tool_propbuf:   buf = 8192;    # scratch: "properties" body
+g_tool_reqbuf:    buf = 2048;    # scratch: "required" body
+g_tool_jsonbuf:   buf = 65536;   # scratch: the full array
+
+# JSON fragments (Anthropic tool-use format)
+j_open:  str = "{\"name\":\"";
+j_desc:  str = "\",\"description\":\"";
+j_props: str = "\",\"input_schema\":{\"type\":\"object\",\"properties\":{";
+j_q:     str = "\"";
+j_pmid:  str = "\":{\"type\":\"";
+j_pend:  str = "\"}";
+j_comma: str = ",";
+j_req:   str = "},\"required\":[";
+j_close: str = "]}}";
+# type-name literals (param type -> JSON type)
+ty_i8:  str = "i8";
+ty_i16: str = "i16";
+ty_i32: str = "i32";
+ty_i64: str = "i64";
+ty_f32: str = "f32";
+ty_f64: str = "f64";
+jt_integer: str = "integer";
+jt_number:  str = "number";
+jt_string:  str = "string";
+
+# --- prompt literals (feature #3): desugar to a func that calls ai_request ---
+# interned-once pool offsets of the helper identifiers the desugared body references
+g_pid_e:      buf = 8;
+g_pid_strcpy: buf = 8;
+g_pid_itoa:   buf = 8;
+g_pid_strlen: buf = 8;
+g_pid_airq:   buf = 8;
+g_pid_pbuild: buf = 8;
+g_pid_preply: buf = 8;
+g_pid_done:   buf = 8;
+pid_e_s:      str = "e";
+pid_strcpy_s: str = "str_copy";
+pid_itoa_s:   str = "int_to_str";
+pid_strlen_s: str = "strlen";
+pid_airq_s:   str = "ai_request";
+pid_pbuild_s: str = "__prompt_build";
+pid_preply_s: str = "__prompt_reply";
+prompt_kw:    str = "prompt";
+prompt_err_ret: str = "[par] a prompt must return str or ptr\n";
+prompt_err_hole: str = "[par] prompt hole is not a parameter\n";
+# scratch for template splitting + body synthesis
+g_prompt_pisint: buf = 64;     # per-param: 1 if i8..i64 hole substitutes via int_to_str
+g_prompt_segbuf: buf = 16384;  # current literal segment being assembled
+g_prompt_segids: buf = 512;    # interned string id per segment (<=64)
+g_prompt_holes:  buf = 512;    # param index per hole (<=64)
+g_pchain_first:  buf = 8;      # synthesized statement-chain state
+g_pchain_last:   buf = 8;
+g_pchain_cnt:    buf = 8;
+
+# --- feature #4: p.field / a[i] (typed locals; desugar to load/store) ---
+# par_typesize side-channel: a COMPACT type. kind 0=plain scalar, 1=struct-pointer/value
+# (dottable; aux=struct index), 2=scalar-pointer/array (indexable; aux=element width=stride).
+g_pt_kind:   buf = 8;
+g_pt_aux:    buf = 8;
+g_pt_width:  buf = 8;          # value load/store width (8 for ptr; N for scalar) -> p.field width
+g_pt_isaddr: buf = 8;          # 1 if array/struct-value field (.field yields its address)
+# struct field types, parallel to g_field_off
+g_field_width:  buf = 4096;
+g_field_isaddr: buf = 4096;
+# feature #4 v1.1 chaining: each field's COMPACT result type (par_typesize side-channel),
+# so a `.field` step knows whether the value is itself dottable/indexable for the next step.
+g_field_kind:   buf = 4096;    # 0 plain scalar, 1 struct-ptr (aux=struct index), 2 scalar-ptr/array (aux=elem width)
+g_field_aux:    buf = 4096;
+# per-function typed-local table (name -> compact type), reset per function body
+g_lt_noff:  buf = 512;
+g_lt_nlen:  buf = 512;
+g_lt_kind:  buf = 512;
+g_lt_aux:   buf = 512;
+g_lt_count: buf = 8;
+# interned load/store intrinsic names (for the synthesized .field/[i] nodes)
+ld8_s:  str = "load8";   ld16_s: str = "load16";  ld32_s: str = "load32";  ld64_s: str = "load64";
+st8_s:  str = "store8";  st16_s: str = "store16"; st32_s: str = "store32"; st64_s: str = "store64";
+g_ld_off:  buf = 64;           # 8 entries: load8/16/32/64, store8/16/32/64
+g_ld_len:  buf = 64;
+g_ld_done: buf = 8;
+fld_err_ann: str = "[par] .field/[i] needs a typed local (annotate `p: *Struct` / `a: *i32`)\n";
+
+# --- feature #5: sum types (tagged unions) + match ---
+# par_typesize also reports whether the type is a *Sum (g_pt_sum = sum index, else -1),
+# and the per-function typed-local table records it (g_lt_sum) so `match` can detect a sum scrutinee.
+g_pt_sum:  buf = 8;            # sum index for *Sum / bare Sum, else -1
+g_lt_sum:  buf = 512;          # parallel to g_lt_*: sum index of a sum-typed local, else -1
+# sum tables (mirror g_struct_*): sum N owns variants [g_sum_fvar[N] .. +g_sum_nvar[N])
+g_sum_name:    buf = 512;      # i64[64] pool offset of sum name
+g_sum_namelen: buf = 512;
+g_sum_block:   buf = 512;      # i64[64] block size (8 tag + max payload, 8-aligned)
+g_sum_fvar:    buf = 512;      # i64[64] index of first variant in g_var_*
+g_sum_nvar:    buf = 512;      # i64[64] variant count
+g_sum_count:   buf = 8;
+# variant tables: variant V owns fields [g_var_ffield[V] .. +g_var_nfields[V])
+g_var_name:    buf = 2048;     # i64[256] pool offset of variant name
+g_var_namelen: buf = 2048;
+g_var_tag:     buf = 2048;     # i64[256] variant index (the tag value)
+g_var_ffield:  buf = 2048;     # i64[256] first field in g_vf_*
+g_var_nfields: buf = 2048;
+g_var_makeroff:buf = 2048;     # i64[256] pool offset of the synthesized maker fn name
+g_var_makerlen:buf = 2048;
+g_var_count:   buf = 8;
+# variant-field tables (the payload fields of each variant)
+g_vf_name:    buf = 4096;      # i64[512] pool offset of field name
+g_vf_namelen: buf = 4096;
+g_vf_off:     buf = 4096;      # i64[512] byte offset within the block (>=8)
+g_vf_width:   buf = 4096;      # i64[512] load/store width
+g_vf_count:   buf = 8;
+# interned helper idents for makers + scratch for building maker names
+sum_kw:    str = "sum";
+mk_pre_s:  str = "__sum_";     # maker name prefix
+mk_sep_s:  str = "_";          # sum_variant separator
+alloc_s:   str = "alloc";
+pvar_s:    str = "__p";        # maker's pointer local (avoids a field named `p`)
+match_kw:  str = "match";
+g_sum_ids_done: buf = 8;       # interned-once flag
+g_id_alloc_off: buf = 8;       # pool ref of "alloc"
+g_id_alloc_len: buf = 8;
+g_id_p_off:     buf = 8;       # pool ref of "__p"
+g_id_p_len:     buf = 8;
+g_mk_scratch:   buf = 256;     # scratch buffer for building "__sum_Sum_Variant"
+sum_err_var: str = "[par] unknown sum variant in construction/match\n";
+
+# SC4: the `intent` oracle (L3). A contextual top-level keyword (like prompt/sum).
+#   intent NAME { goal: "..."; case fn(args) => expected; ... }
+# Backport of compiler/anclc.cpp parseIntent()/synthesizeCheckRunner(); dormant unless
+# used, so the anclc3==anclc4 fixpoint is unaffected.
+intent_kw:   str = "intent";
+int_pre_s:   str = "__intent_";    # synthetic checker-name prefix
+int_rt_s:    str = "i64";          # checker return type (g_fn_rettype slot; codegen ignores it)
+int_main_s:  str = "main";         # --check synthesizes a fresh entry `main`
+int_a_s:     str = "__a";          # actual-result temp local
+int_e_s:     str = "__e";          # expected-value temp local
+int_r_s:     str = "r";            # runner result temp local
+ce_s0:       str = "intent ";
+ce_s1:       str = " case ";
+ce_s2:       str = ": expected ";
+ce_s3:       str = " got ";
+ce_nl:       str = "\n";
+ce_ok:       str = "all intents OK\n";
+g_int_scratch:  buf = 256;         # scratch for building "__intent_<name>"
+g_intent_off:   buf = 512;         # i64[64] pool offset of each checker name
+g_intent_len:   buf = 512;         # i64[64] checker-name length
+g_intent_count: buf = 8;
+
+# SC1 F1/F2: parser-side error recovery (missing-token insertion under --fix).
+# All INERT during a normal compile: g_recover is set ONLY by the main.ancl --fix
+# driver while it re-parses; par_expect poisons instead of ExitProcess only then.
+# A valid self-compile never sets g_recover, so g_perr stays 0 -> codegen unchanged
+# -> the anclc3==anclc4 fixpoint is preserved.
+g_recover:  buf = 8;   # 1 while the --fix driver is parsing (par_expect recovers, never exits)
+g_perr:     buf = 8;   # poison flag: 1 after the FIRST recoverable missing-token error
+g_exp_tok:  buf = 8;   # the expected token kind that was missing
+g_exp_off:  buf = 8;   # source byte offset (in the fix buffer) to splice the inserted token
+
+@CODE
+
+# ----------------------------------------------------------------
+#  nd_alloc(kind) -> node id   (0 is reserved = null/empty)
+# ----------------------------------------------------------------
+func nd_alloc(kind: i64) -> i64 {
+    n = load64(g_nd_count);
+    n = n + 1;
+    if n >= 32766 { syscall 1, par_err_nd; return 0; }
+    store64(g_nd_count, n);
+    base = n * 8;
+    store64(g_nd_kind    + base, kind);
+    store64(g_nd_ival    + base, 0);
+    store64(g_nd_a       + base, 0);
+    store64(g_nd_b       + base, 0);
+    store64(g_nd_c       + base, 0);
+    store64(g_nd_name    + base, 0);
+    store64(g_nd_namelen + base, 0);
+    return n;
+}
+
+# ----------------------------------------------------------------
+#  str_intern(ptr, len) -> string id
+#  Adds a string literal to g_strings, returns its id.
+# ----------------------------------------------------------------
+func str_intern(p: i64, len: i64) -> i64 {
+    id  = load64(g_str_count);
+    off = load64(g_str_next);
+    if id >= 1023 { syscall 1, par_err_str; return 0; }
+    # copy bytes into g_strings
+    i = 0;
+    while i < len {
+        store8(g_strings + off + i, load8(p + i));
+        i = i + 1;
+    }
+    store8(g_strings + off + len, 0);   # NUL terminator
+    store64(g_str_off + id * 8, off);
+    store64(g_str_len + id * 8, len);
+    store64(g_str_count, id + 1);
+    store64(g_str_next,  off + len + 1);
+    return id;
+}
+
+# ----------------------------------------------------------------
+#  pool_intern(p, len) -> offset in g_str_pool
+#  Adds identifier/name text; returns byte offset.
+# ----------------------------------------------------------------
+func pool_intern(p: i64, len: i64) -> i64 {
+    off = load64(g_str_pool_off);
+    i   = 0;
+    while i < len {
+        store8(g_str_pool + off + i, load8(p + i));
+        i = i + 1;
+    }
+    store8(g_str_pool + off + len, 0);
+    store64(g_str_pool_off, off + len + 1);
+    return off;
+}
+
+# ----------------------------------------------------------------
+#  par_name_is(name_off, name_len, lit) -> 1 if pool slice == lit
+#  Length-aware comparison of a (NON null-terminated) g_str_pool
+#  name slice against a null-terminated C-string literal.  Mirrors
+#  codegen's cg_fname_is (parser cannot call into codegen).
+# ----------------------------------------------------------------
+func par_name_is(name_off: i64, name_len: i64, lit: i64) -> i64 {
+    i = 0;
+    while i < name_len {
+        if load8(lit + i) == 0 { return 0; }
+        if load8(g_str_pool + name_off + i) != load8(lit + i) { return 0; }
+        i = i + 1;
+    }
+    if load8(lit + name_len) != 0 { return 0; }
+    return 1;
+}
+
+# ----------------------------------------------------------------
+#  par_pool_eq(oa, la, ob, lb) -> 1 if two pool slices are equal
+# ----------------------------------------------------------------
+func par_pool_eq(oa: i64, la: i64, ob: i64, lb: i64) -> i64 {
+    if la != lb { return 0; }
+    i = 0;
+    while i < la {
+        if load8(g_str_pool + oa + i) != load8(g_str_pool + ob + i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ----------------------------------------------------------------
+#  par_align_up(v, a) -> v rounded up to a multiple of a
+# ----------------------------------------------------------------
+func par_align_up(v: i64, a: i64) -> i64 {
+    if a <= 1 { return v; }
+    return (v + a - 1) / a * a;
+}
+
+# ----------------------------------------------------------------
+#  par_struct_find(name_off, name_len) -> struct index or -1
+# ----------------------------------------------------------------
+func par_struct_find(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_struct_count);
+    i = 0;
+    while i < n {
+        if par_pool_eq(load64(g_struct_name + i*8), load64(g_struct_namelen + i*8), name_off, name_len) == 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# feature #5: find a sum type by name -> index or -1 (mirrors par_struct_find)
+func par_sum_find(name_off: i64, name_len: i64) -> i64 {
+    n = load64(g_sum_count);
+    i = 0;
+    while i < n {
+        if par_pool_eq(load64(g_sum_name + i*8), load64(g_sum_namelen + i*8), name_off, name_len) == 1 { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+# find a variant of sum si by name -> GLOBAL variant index or -1
+func par_variant_find(si: i64, name_off: i64, name_len: i64) -> i64 {
+    base = load64(g_sum_fvar + si*8);
+    nv   = load64(g_sum_nvar + si*8);
+    i = 0;
+    while i < nv {
+        vi = base + i;
+        if par_pool_eq(load64(g_var_name + vi*8), load64(g_var_namelen + vi*8), name_off, name_len) == 1 { return vi; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+# intern the maker helper idents (alloc, __p) into the pool once
+func sum_ensure_ids() -> i64 {
+    if load64(g_sum_ids_done) == 1 { return 0; }
+    store64(g_id_alloc_off, pool_intern(alloc_s, strlen(alloc_s)));  store64(g_id_alloc_len, strlen(alloc_s));
+    store64(g_id_p_off,     pool_intern(pvar_s,  strlen(pvar_s)));   store64(g_id_p_len,     strlen(pvar_s));
+    store64(g_sum_ids_done, 1);
+    return 0;
+}
+# build "__sum_<Sum>_<Variant>" into the pool; store its ref into g_var_maker*[vi]
+func sum_build_maker_name(vi: i64, soff: i64, slen: i64, voff: i64, vlen: i64) -> i64 {
+    o = 0;
+    plen = strlen(mk_pre_s);
+    i = 0; while i < plen { store8(g_mk_scratch + o, load8(mk_pre_s + i)); o = o + 1; i = i + 1; }
+    i = 0; while i < slen { store8(g_mk_scratch + o, load8(g_str_pool + soff + i)); o = o + 1; i = i + 1; }
+    store8(g_mk_scratch + o, 95); o = o + 1;          # '_'
+    i = 0; while i < vlen { store8(g_mk_scratch + o, load8(g_str_pool + voff + i)); o = o + 1; i = i + 1; }
+    store64(g_var_makeroff + vi*8, pool_intern(g_mk_scratch, o));
+    store64(g_var_makerlen + vi*8, o);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_field_off(struct_idx, fld_off, fld_len) -> byte offset or -1
+# ----------------------------------------------------------------
+func par_field_off(si: i64, fld_off: i64, fld_len: i64) -> i64 {
+    base = load64(g_struct_ffield  + si*8);
+    nf   = load64(g_struct_nfields + si*8);
+    i = 0;
+    while i < nf {
+        idx = base + i;
+        if par_pool_eq(load64(g_field_name + idx*8), load64(g_field_namelen + idx*8), fld_off, fld_len) == 1 {
+            return load64(g_field_off + idx*8);
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# feature #4: field array-index (to read g_field_off/width/isaddr) or -1
+func par_field_index(si: i64, fld_off: i64, fld_len: i64) -> i64 {
+    base = load64(g_struct_ffield  + si*8);
+    nf   = load64(g_struct_nfields + si*8);
+    i = 0;
+    while i < nf {
+        idx = base + i;
+        if par_pool_eq(load64(g_field_name + idx*8), load64(g_field_namelen + idx*8), fld_off, fld_len) == 1 {
+            return idx;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+#  Parser token accessors
+# ----------------------------------------------------------------
+func par_init() -> i64 {
+    store64(g_nd_count, 0);
+    store64(g_fn_count, 0);
+    store64(g_dv_count, 0);
+    store64(g_str_count, 0);
+    store64(g_str_next, 0);
+    store64(g_ext_count, 0);
+    store64(g_struct_count, 0);
+    store64(g_field_count, 0);
+    store64(g_sum_count, 0);          # feature #5
+    store64(g_var_count, 0);
+    store64(g_vf_count, 0);
+    store64(g_intent_count, 0);       # SC4
+    store64(g_par_pos, 0);
+    return 0;
+}
+
+func par_peek() -> i64 {
+    pos = load64(g_par_pos);
+    return load64(g_tok_kind + pos * 8);
+}
+
+func par_cur_ival() -> i64 {
+    pos = load64(g_par_pos);
+    return load64(g_tok_ival + pos * 8);
+}
+
+func par_cur_toff() -> i64 {
+    pos = load64(g_par_pos);
+    return load64(g_tok_toff + pos * 8);
+}
+
+func par_cur_tlen() -> i64 {
+    pos = load64(g_par_pos);
+    return load64(g_tok_tlen + pos * 8);
+}
+
+func par_cur_line() -> i64 {
+    pos = load64(g_par_pos);
+    return load64(g_tok_line + pos * 8);
+}
+
+func par_advance() -> i64 {
+    pos = load64(g_par_pos);
+    store64(g_par_pos, pos + 1);
+    return 0;
+}
+
+func par_accept(kind: i64) -> i64 {
+    if par_peek() == kind { par_advance(); return 1; }
+    return 0;
+}
+
+func par_expect(kind: i64) -> i64 {
+    if par_peek() != kind {
+        if load64(g_recover) != 0 {
+            # SC1 F1/F2: recoverable missing token. Poison + record the FIRST error's
+            # expected kind and the source splice point (start of the failing token).
+            # Do NOT advance, do NOT exit; the parser's loops unwind on g_perr and the
+            # --fix driver inserts the token text + re-parses.
+            if load64(g_perr) == 0 {
+                store64(g_perr, 1);
+                store64(g_exp_tok, kind);
+                store64(g_exp_off, load64(g_tok_srcoff + load64(g_par_pos) * 8));
+            }
+            return 0;
+        }
+        syscall 1, par_err_expect;
+        ExitProcess(1);
+        return 0;
+    }
+    par_advance();
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_typesize() -> total byte size of a type spec; writes the
+#  base alignment into g_par_typealign.  Mirrors anclc.cpp
+#  parseTypeSize: handles *T pointers, built-in scalars, struct
+#  names, and T[N] arrays (N is a compile-time integer literal).
+# ----------------------------------------------------------------
+func par_scalarwidth(toff: i64, tlen: i64) -> i64 {
+    if par_name_is(toff, tlen, "i8")  == 1 { return 1; }
+    if par_name_is(toff, tlen, "i16") == 1 { return 2; }
+    if par_name_is(toff, tlen, "i32") == 1 { return 4; }
+    if par_name_is(toff, tlen, "f32") == 1 { return 4; }
+    return 8;   # i64/f64/ptr/str/unknown
+}
+
+func par_typesize() -> i64 {
+    base  = 8;
+    align = 8;
+    isptr = 0;
+    eltoff = 0;
+    eltlen = 0;
+
+    # *T  -> pointer (8 bytes); capture the pointee name
+    if par_peek() == TOK_STAR {
+        par_advance();
+        if par_peek() == TOK_IDENT {
+            eltoff = par_cur_toff();
+            eltlen = par_cur_tlen();
+            par_advance();
+        }
+        base = 8; align = 8; isptr = 1;
+    }
+    if isptr == 0 {
+        if par_peek() == TOK_IDENT {
+            eltoff = par_cur_toff();
+            eltlen = par_cur_tlen();
+            par_advance();
+            si = par_struct_find(eltoff, eltlen);
+            if si != 0 - 1 {
+                base = load64(g_struct_size + si * 8);
+                align = 8;
+            }
+            if si == 0 - 1 {
+                if par_name_is(eltoff, eltlen, "i8")  == 1 { base = 1; align = 1; }
+                if par_name_is(eltoff, eltlen, "i16") == 1 { base = 2; align = 2; }
+                if par_name_is(eltoff, eltlen, "i32") == 1 { base = 4; align = 4; }
+                if par_name_is(eltoff, eltlen, "f32") == 1 { base = 4; align = 4; }
+                if par_name_is(eltoff, eltlen, "i64") == 1 { base = 8; align = 8; }
+                if par_name_is(eltoff, eltlen, "f64") == 1 { base = 8; align = 8; }
+                if par_name_is(eltoff, eltlen, "ptr") == 1 { base = 8; align = 8; }
+                if par_name_is(eltoff, eltlen, "str") == 1 { base = 8; align = 8; }
+            }
+        }
+    }
+
+    # compact type for the NON-array base
+    sidx = par_struct_find(eltoff, eltlen);
+    sumx = par_sum_find(eltoff, eltlen);     # feature #5: sum index or -1
+    ptkind = 0; ptaux = 0; ptwidth = base; ptisaddr = 0;
+    if isptr == 1 {
+        ptwidth = 8;
+        if sumx == 0 - 1 {                                                  # (a *Sum stays plain -> match, not .field/[i])
+            if sidx != 0 - 1 { ptkind = 1; ptaux = sidx; }                  # *Struct -> dottable
+            if sidx == 0 - 1 { ptkind = 2; ptaux = par_scalarwidth(eltoff, eltlen); }  # *scalar -> indexable
+        }
+    }
+    if isptr == 0 {
+        if sidx != 0 - 1 { ptkind = 1; ptaux = sidx; ptwidth = 8; ptisaddr = 1; }  # struct value -> dottable, addr
+        # bare sum value -> ptkind stays 0 (plain); g_pt_sum carries the sum index
+    }
+
+    total = base;
+    # T[N] array  (N is an integer literal)
+    if par_peek() == TOK_LBRACKET {
+        par_advance();
+        cnt = par_cur_ival();
+        par_expect(TOK_INT);
+        par_expect(TOK_RBRACKET);
+        total = base * cnt;
+        ptisaddr = 1; ptwidth = 8;
+        ptkind = 0; ptaux = 0;
+        if isptr == 0 {
+            if sidx == 0 - 1 { ptkind = 2; ptaux = base; }                 # scalar[N] indexable (base = scalar width)
+        }
+    }
+
+    store64(g_par_typealign, align);
+    store64(g_pt_kind,   ptkind);
+    store64(g_pt_aux,    ptaux);
+    store64(g_pt_width,  ptwidth);
+    store64(g_pt_isaddr, ptisaddr);
+    store64(g_pt_sum,    sumx);       # feature #5
+    return total;
+}
+
+# ----------------------------------------------------------------
+#  par_term() -> node id   (highest precedence: atoms)
+# ----------------------------------------------------------------
+func par_term() -> i64 {
+    k = par_peek();
+
+    # float literal (g_tok_ival carries the raw IEEE-754 bits from the lexer)
+    if k == TOK_FLOAT {
+        nd = nd_alloc(ND_FLOAT);
+        store64(g_nd_ival    + nd * 8, par_cur_ival());
+        store64(g_nd_isfloat + nd * 8, 1);
+        par_advance();
+        return nd;
+    }
+
+    # integer literal
+    if k == TOK_INT {
+        nd = nd_alloc(ND_INT);
+        store64(g_nd_ival + nd * 8, par_cur_ival());
+        par_advance();
+        return nd;
+    }
+
+    # string literal
+    if k == TOK_STR {
+        toff = par_cur_toff();
+        tlen = par_cur_tlen();
+        sid  = str_intern(g_str_pool + toff, tlen);
+        nd   = nd_alloc(ND_STR);
+        store64(g_nd_ival + nd * 8, sid);
+        par_advance();
+        return nd;
+    }
+
+    # parenthesised expression
+    if k == TOK_LPAREN {
+        par_advance();
+        nd = par_expr();
+        par_expect(TOK_RPAREN);
+        return nd;
+    }
+
+    # M5: raw syscall(...) in expression position (e.g. `fd = syscall(2, path, fl, md)`)
+    # -> ND_CALL named "syscall". The legacy `syscall N, ...;` print form is statement-only.
+    if k == TOK_KWSYSCALL {
+        sys_toff = par_cur_toff();
+        sys_tlen = par_cur_tlen();
+        par_advance();
+        par_expect(TOK_LPAREN);
+        nd = nd_alloc(ND_CALL);
+        store64(g_nd_name    + nd * 8, sys_toff);
+        store64(g_nd_namelen + nd * 8, sys_tlen);
+        first_arg = 0; last_arg = 0;
+        if par_peek() != TOK_RPAREN {
+            going = 1;
+            while going == 1 {
+                arg = par_expr();
+                if first_arg == 0 { first_arg = arg; }
+                if last_arg  != 0 { store64(g_nd_c + last_arg * 8, arg); }
+                last_arg = arg;
+                if par_peek() == TOK_COMMA { par_advance(); }
+                else { going = 0; }
+                if par_peek() == TOK_END { going = 0; }
+            }
+        }
+        par_expect(TOK_RPAREN);
+        store64(g_nd_a + nd * 8, first_arg);
+        return nd;
+    }
+
+    # address-of:  &name
+    if k == TOK_AMP {
+        par_advance();
+        nd  = nd_alloc(ND_ADDR);
+        off = par_cur_toff();
+        ln  = par_cur_tlen();
+        store64(g_nd_name    + nd * 8, off);
+        store64(g_nd_namelen + nd * 8, ln);
+        par_expect(TOK_IDENT);
+        return nd;
+    }
+
+    # unary minus  -> (0 - term)
+    if k == TOK_MINUS {
+        par_advance();
+        rhs = par_term();
+        nd  = nd_alloc(ND_BINARY);
+        lhs = nd_alloc(ND_INT);
+        store64(g_nd_ival + lhs * 8, 0);
+        store64(g_nd_ival + nd  * 8, 45);   # '-'
+        store64(g_nd_a    + nd  * 8, lhs);
+        store64(g_nd_b    + nd  * 8, rhs);
+        return nd;
+    }
+
+    # unary bang  -> (term == 0)
+    if k == TOK_BANG {
+        par_advance();
+        lhs = par_term();
+        nd  = nd_alloc(ND_BINARY);
+        rhs = nd_alloc(ND_INT);
+        store64(g_nd_ival + rhs * 8, 0);
+        store64(g_nd_ival + nd  * 8, 101);  # 'e' == equal
+        store64(g_nd_a    + nd  * 8, lhs);
+        store64(g_nd_b    + nd  * 8, rhs);
+        return nd;
+    }
+
+    # identifier: variable, call, struct.field access, sizeof
+    if k == TOK_IDENT {
+        toff = par_cur_toff();
+        tlen = par_cur_tlen();
+        par_advance();
+
+        # sizeof(typespec) -> compile-time integer
+        if par_name_is(toff, tlen, "sizeof") == 1 {
+            if par_peek() == TOK_LPAREN {
+                par_advance();
+                sz = par_typesize();
+                par_expect(TOK_RPAREN);
+                nd = nd_alloc(ND_INT);
+                store64(g_nd_ival + nd * 8, sz);
+                return nd;
+            }
+        }
+
+        # feature #5: sum construction  SumName.Variant  or  SumName.Variant(args)
+        if par_peek() == TOK_DOT {
+            smx = par_sum_find(toff, tlen);
+            if smx != 0 - 1 {
+                par_advance();                              # '.'
+                vnoff = par_cur_toff(); vnlen = par_cur_tlen();
+                par_expect(TOK_IDENT);
+                vix = par_variant_find(smx, vnoff, vnlen);
+                if vix == 0 - 1 { syscall 1, sum_err_var; ExitProcess(1); }
+                nd = nd_alloc(ND_CALL);                     # call the synthesized maker
+                store64(g_nd_name    + nd * 8, load64(g_var_makeroff + vix*8));
+                store64(g_nd_namelen + nd * 8, load64(g_var_makerlen + vix*8));
+                first_arg = 0; last_arg = 0;
+                if par_peek() == TOK_LPAREN {
+                    par_advance();
+                    if par_peek() != TOK_RPAREN {
+                        going = 1;
+                        while going == 1 {
+                            arg = par_expr();
+                            if first_arg == 0 { first_arg = arg; }
+                            if last_arg  != 0 { store64(g_nd_c + last_arg * 8, arg); }
+                            last_arg = arg;
+                            if par_peek() == TOK_COMMA { par_advance(); }
+                            else { going = 0; }
+                            if par_peek() == TOK_END { going = 0; }
+                        }
+                    }
+                    par_expect(TOK_RPAREN);
+                }
+                store64(g_nd_a + nd * 8, first_arg);
+                return nd;
+            }
+        }
+        # StructName.field -> compile-time byte offset (single level, unchanged)
+        if par_peek() == TOK_DOT {
+            sidx0 = par_struct_find(toff, tlen);
+            if sidx0 != 0 - 1 {
+                par_advance();
+                ftoff = par_cur_toff();
+                ftlen = par_cur_tlen();
+                par_expect(TOK_IDENT);
+                foff = par_field_off(sidx0, ftoff, ftlen);
+                if foff == 0 - 1 { syscall 1, par_err_nofld; ExitProcess(1); }
+                nd = nd_alloc(ND_INT);
+                store64(g_nd_ival + nd * 8, foff);
+                return nd;
+            }
+        }
+        # feature #4 v1.1: typed local followed by a postfix .field / [i] CHAIN
+        #   p.next.tag  /  rows[i].field  /  bus.ports[i]  /  grid[i].ports[j]
+        # Thread a running compact type (ctk,cta): a scalar/pointer step LOADS, a
+        # struct/array step yields the ADDRESS (so the next . / [ chains off it).
+        is_chain = 0;
+        if par_peek() == TOK_DOT      { is_chain = 1; }
+        if par_peek() == TOK_LBRACKET { is_chain = 1; }
+        if is_chain == 1 {
+            li = lt_find(toff, tlen);
+            if li == 0 - 1 { syscall 1, fld_err_ann; ExitProcess(1); }
+            cnode = nd_var(toff, tlen);
+            ctk = load64(g_lt_kind + li * 8);
+            cta = load64(g_lt_aux  + li * 8);
+            going = 1;
+            while going == 1 {
+                going = 0;
+                pk = par_peek();
+                if pk == TOK_DOT {
+                    par_advance();
+                    ftoff = par_cur_toff();
+                    ftlen = par_cur_tlen();
+                    par_expect(TOK_IDENT);
+                    if ctk != 1 { syscall 1, fld_err_ann; ExitProcess(1); }
+                    fidx = par_field_index(cta, ftoff, ftlen);
+                    if fidx == 0 - 1 { syscall 1, par_err_nofld; ExitProcess(1); }
+                    faddr = nd_binary(43, cnode, nd_int(load64(g_field_off + fidx * 8)));
+                    if load64(g_field_isaddr + fidx * 8) == 1 { cnode = faddr; }            # nested struct / array field -> address
+                    else { cnode = nd_load(load64(g_field_width + fidx * 8), faddr); }      # scalar / pointer field -> load
+                    ctk = load64(g_field_kind + fidx * 8);
+                    cta = load64(g_field_aux  + fidx * 8);
+                    going = 1;
+                }
+                if pk == TOK_LBRACKET {
+                    par_advance();
+                    ix = par_expr();
+                    par_expect(TOK_RBRACKET);
+                    if ctk == 0 { syscall 1, fld_err_ann; ExitProcess(1); }
+                    if ctk == 1 {                                                          # struct element -> address; ct stays *Struct
+                        istr = load64(g_struct_size + cta * 8);
+                        cnode = nd_binary(43, cnode, nd_binary(42, ix, nd_int(istr)));
+                    }
+                    if ctk == 2 {                                                          # scalar element -> load; chain ends
+                        cnode = nd_load(cta, nd_binary(43, cnode, nd_binary(42, ix, nd_int(cta))));
+                        ctk = 0;
+                        cta = 0;
+                    }
+                    going = 1;
+                }
+            }
+            return cnode;
+        }
+
+        # function call: name(args...)
+        if par_peek() == TOK_LPAREN {
+            par_advance();
+            nd = nd_alloc(ND_CALL);
+            store64(g_nd_name    + nd * 8, toff);
+            store64(g_nd_namelen + nd * 8, tlen);
+            # args stored as linked list: g_nd_a = first arg node, each node g_nd_c = next.
+            # (Must use g_nd_c, not g_nd_b: ND_BINARY uses g_nd_b for its RHS, so a
+            #  binary expression passed as an argument would otherwise corrupt the chain.)
+            first_arg = 0;
+            last_arg  = 0;
+            if par_peek() != TOK_RPAREN {
+                going = 1;
+                while going == 1 {
+                    arg = par_expr();
+                    if first_arg == 0 { first_arg = arg; }
+                    if last_arg  != 0 { store64(g_nd_c + last_arg * 8, arg); }
+                    last_arg = arg;
+                    if par_peek() == TOK_COMMA { par_advance(); }
+                    else { going = 0; }
+                    if par_peek() == TOK_END { going = 0; }
+                }
+            }
+            par_expect(TOK_RPAREN);
+            store64(g_nd_a + nd * 8, first_arg);
+            return nd;
+        }
+
+        # variable
+        nd = nd_alloc(ND_VAR);
+        store64(g_nd_name    + nd * 8, toff);
+        store64(g_nd_namelen + nd * 8, tlen);
+        return nd;
+    }
+
+    # fallback: return 0
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_mul() -> node  (*, /, %)
+# ----------------------------------------------------------------
+func par_mul() -> i64 {
+    l = par_term();
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        going = 0;
+        k = par_peek();
+        op = 0;
+        if k == TOK_STAR    { op = 42;  going = 1; }   # '*'
+        if k == TOK_SLASH   { op = 47;  going = 1; }   # '/'
+        if k == TOK_PERCENT { op = 109; going = 1; }   # 'm'
+        if going == 1 {
+            par_advance();
+            r  = par_term();
+            nd = nd_alloc(ND_BINARY);
+            store64(g_nd_ival + nd * 8, op);
+            store64(g_nd_a    + nd * 8, l);
+            store64(g_nd_b    + nd * 8, r);
+            l = nd;
+        }
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_add() -> node  (+, -)
+# ----------------------------------------------------------------
+func par_add() -> i64 {
+    l = par_mul();
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        going = 0;
+        k = par_peek();
+        op = 0;
+        if k == TOK_PLUS  { op = 43; going = 1; }   # '+'
+        if k == TOK_MINUS { op = 45; going = 1; }   # '-'
+        if going == 1 {
+            par_advance();
+            r  = par_mul();
+            nd = nd_alloc(ND_BINARY);
+            store64(g_nd_ival + nd * 8, op);
+            store64(g_nd_a    + nd * 8, l);
+            store64(g_nd_b    + nd * 8, r);
+            l = nd;
+        }
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_shift() -> node  (<<, >>)   binds tighter than < ; looser than +
+# ----------------------------------------------------------------
+func par_shift() -> i64 {
+    l = par_add();
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        going = 0;
+        k = par_peek();
+        op = 0;
+        if k == TOK_SHL { op = 83; going = 1; }   # 'S' shl
+        if k == TOK_SHR { op = 82; going = 1; }   # 'R' shr
+        if going == 1 {
+            par_advance();
+            r  = par_add();
+            nd = nd_alloc(ND_BINARY);
+            store64(g_nd_ival + nd * 8, op);
+            store64(g_nd_a    + nd * 8, l);
+            store64(g_nd_b    + nd * 8, r);
+            l = nd;
+        }
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_compare() -> node  (==, !=, <, <=, >, >=)
+# ----------------------------------------------------------------
+func par_compare() -> i64 {
+    l = par_shift();
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        going = 0;
+        k = par_peek();
+        op = 0;
+        if k == TOK_EQEQ { op = 101; going = 1; }   # 'e'
+        if k == TOK_NE   { op = 110; going = 1; }   # 'n'
+        if k == TOK_LT   { op = 108; going = 1; }   # 'l'
+        if k == TOK_LE   { op = 76;  going = 1; }   # 'L'
+        if k == TOK_GT   { op = 103; going = 1; }   # 'g'
+        if k == TOK_GE   { op = 71;  going = 1; }   # 'G'
+        if going == 1 {
+            par_advance();
+            r  = par_shift();
+            nd = nd_alloc(ND_BINARY);
+            store64(g_nd_ival + nd * 8, op);
+            store64(g_nd_a    + nd * 8, l);
+            store64(g_nd_b    + nd * 8, r);
+            l = nd;
+        }
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_bitand() -> node  (&)   binds tighter than == ; looser than ^
+# ----------------------------------------------------------------
+func par_bitand() -> i64 {
+    l = par_compare();
+    while par_peek() == TOK_AMP {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        par_advance();
+        r  = par_compare();
+        nd = nd_alloc(ND_BINARY);
+        store64(g_nd_ival + nd * 8, 38);   # '&'
+        store64(g_nd_a    + nd * 8, l);
+        store64(g_nd_b    + nd * 8, r);
+        l = nd;
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_bitxor() -> node  (^)
+# ----------------------------------------------------------------
+func par_bitxor() -> i64 {
+    l = par_bitand();
+    while par_peek() == TOK_CARET {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        par_advance();
+        r  = par_bitand();
+        nd = nd_alloc(ND_BINARY);
+        store64(g_nd_ival + nd * 8, 94);   # '^'
+        store64(g_nd_a    + nd * 8, l);
+        store64(g_nd_b    + nd * 8, r);
+        l = nd;
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_bitor() -> node  (|)
+# ----------------------------------------------------------------
+func par_bitor() -> i64 {
+    l = par_bitxor();
+    while par_peek() == TOK_PIPE {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        par_advance();
+        r  = par_bitxor();
+        nd = nd_alloc(ND_BINARY);
+        store64(g_nd_ival + nd * 8, 124);  # '|'
+        store64(g_nd_a    + nd * 8, l);
+        store64(g_nd_b    + nd * 8, r);
+        l = nd;
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_and() -> node  (&&)
+# ----------------------------------------------------------------
+func par_and() -> i64 {
+    l = par_bitor();
+    while par_peek() == TOK_ANDAND {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        par_advance();
+        r  = par_bitor();
+        nd = nd_alloc(ND_BINARY);
+        store64(g_nd_ival + nd * 8, 97);   # 'a'
+        store64(g_nd_a    + nd * 8, l);
+        store64(g_nd_b    + nd * 8, r);
+        l = nd;
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_or() -> node  (||)
+# ----------------------------------------------------------------
+func par_or() -> i64 {
+    l = par_and();
+    while par_peek() == TOK_OROR {
+        if load64(g_perr) != 0 { return l; }   # F1/F2: bail on poison, return partial LHS
+        par_advance();
+        r  = par_and();
+        nd = nd_alloc(ND_BINARY);
+        store64(g_nd_ival + nd * 8, 111);  # 'o'
+        store64(g_nd_a    + nd * 8, l);
+        store64(g_nd_b    + nd * 8, r);
+        l = nd;
+    }
+    return l;
+}
+
+# ----------------------------------------------------------------
+#  par_expr() -> node
+# ----------------------------------------------------------------
+func par_expr() -> i64 {
+    return par_or();
+}
+
+# ----------------------------------------------------------------
+#  par_stmt(fn_idx) -> node id of statement
+# ----------------------------------------------------------------
+func par_stmt(fn_idx: i64) -> i64 {
+    k = par_peek();
+
+    # if / else
+    if k == TOK_KWIF {
+        par_advance();
+        nd = nd_alloc(ST_IF);
+        cond = par_expr();
+        store64(g_nd_a + nd * 8, cond);
+        par_expect(TOK_LBRACE);
+        # parse then-body as linked list of stmts
+        first_then = 0; last_then = 0; cnt_then = 0;
+        while par_peek() != TOK_RBRACE {
+            if par_peek() == TOK_END { return nd; }
+            if load64(g_perr) != 0 { return nd; }   # F1/F2: bail on poison
+            s = par_stmt(fn_idx);
+            if first_then == 0 { first_then = s; }
+            if last_then  != 0 { store64(g_nd_c + last_then * 8, s); }
+            last_then = s; cnt_then = cnt_then + 1;
+        }
+        par_expect(TOK_RBRACE);
+        # g_nd_b = then-head, g_nd_ival = then-count
+        store64(g_nd_b    + nd * 8, first_then);
+        store64(g_nd_ival + nd * 8, cnt_then);
+        # optional else.
+        # NOTE: the else-branch HEAD is stored in the ST_IF node's g_nd_name
+        # (an otherwise-unused slot for statements), NOT in g_nd_c.  g_nd_c is
+        # the statement sibling link; storing the else-head there would collide
+        # for  else { if ... }  (the inner-if's own g_nd_c else-link would be
+        # mistaken for a sibling of the outer else-body).
+        if par_peek() == TOK_KWELSE {
+            par_advance();
+            # else if -> nested
+            if par_peek() == TOK_KWIF {
+                esi = par_stmt(fn_idx);
+                store64(g_nd_name + nd * 8, esi);
+            }
+            if par_peek() != TOK_KWIF {
+                par_expect(TOK_LBRACE);
+                first_el = 0; last_el = 0;
+                while par_peek() != TOK_RBRACE {
+                    if par_peek() == TOK_END { return nd; }
+                    if load64(g_perr) != 0 { return nd; }   # F1/F2: bail on poison
+                    s = par_stmt(fn_idx);
+                    if first_el == 0 { first_el = s; }
+                    if last_el  != 0 { store64(g_nd_c + last_el * 8, s); }
+                    last_el = s;
+                }
+                par_expect(TOK_RBRACE);
+                store64(g_nd_name + nd * 8, first_el);
+            }
+        }
+        return nd;
+    }
+
+    # while / loop
+    if k == TOK_KWWHILE { par_advance(); }
+    if k == TOK_KWLOOP  { par_advance(); k = TOK_KWWHILE; }
+    if k == TOK_KWWHILE {
+        nd = nd_alloc(ST_LOOP);
+        cond = par_expr();
+        store64(g_nd_a + nd * 8, cond);
+        par_expect(TOK_LBRACE);
+        first_s = 0; last_s = 0; cnt_s = 0;
+        while par_peek() != TOK_RBRACE {
+            if par_peek() == TOK_END { return nd; }
+            if load64(g_perr) != 0 { return nd; }   # F1/F2: bail on poison
+            s = par_stmt(fn_idx);
+            if first_s == 0 { first_s = s; }
+            if last_s  != 0 { store64(g_nd_c + last_s * 8, s); }
+            last_s = s; cnt_s = cnt_s + 1;
+        }
+        par_expect(TOK_RBRACE);
+        store64(g_nd_b    + nd * 8, first_s);
+        store64(g_nd_ival + nd * 8, cnt_s);
+        return nd;
+    }
+
+    # return
+    if k == TOK_KWRETURN {
+        par_advance();
+        nd = nd_alloc(ST_RETURN);
+        e  = par_expr();
+        store64(g_nd_a + nd * 8, e);
+        par_expect(TOK_SEMI);
+        return nd;
+    }
+
+    # break
+    if k == TOK_KWBREAK {
+        par_advance();
+        par_expect(TOK_SEMI);
+        return nd_alloc(ST_BREAK);
+    }
+
+    # continue
+    if k == TOK_KWCONTINUE {
+        par_advance();
+        par_expect(TOK_SEMI);
+        return nd_alloc(ST_CONTINUE);
+    }
+
+    # syscall
+    if k == TOK_KWSYSCALL {
+        sys_toff = par_cur_toff();
+        sys_tlen = par_cur_tlen();
+        par_advance();
+        # M5: raw `syscall(nr, a0..a5)` CALL form (statement) -> ND_CALL named "syscall"
+        # (the keyword token's pooled text IS "syscall"). The legacy `syscall N, args;`
+        # PRINT form (next token is an INT) is byte-preserved -> the PE fixpoint is unaffected.
+        if par_peek() == TOK_LPAREN {
+            par_advance();
+            nd   = nd_alloc(ST_EXPRSTMT);
+            call = nd_alloc(ND_CALL);
+            store64(g_nd_name    + call * 8, sys_toff);
+            store64(g_nd_namelen + call * 8, sys_tlen);
+            first_a = 0; last_a = 0;
+            if par_peek() != TOK_RPAREN {
+                going = 1;
+                while going == 1 {
+                    if load64(g_perr) != 0 { going = 0; }
+                    arg = par_expr();
+                    if first_a == 0 { first_a = arg; }
+                    if last_a  != 0 { store64(g_nd_c + last_a * 8, arg); }
+                    last_a = arg;
+                    if par_peek() == TOK_COMMA { par_advance(); }
+                    else { going = 0; }
+                    if par_peek() == TOK_END { going = 0; }
+                }
+            }
+            par_expect(TOK_RPAREN);
+            par_expect(TOK_SEMI);
+            store64(g_nd_a + call * 8, first_a);
+            store64(g_nd_a + nd   * 8, call);
+            return nd;
+        }
+        nd = nd_alloc(ST_SYSCALL);
+        sysno = par_cur_ival();
+        par_expect(TOK_INT);
+        store64(g_nd_ival + nd * 8, sysno);
+        first_a = 0; last_a = 0; cnt_a = 0;
+        while par_peek() == TOK_COMMA {
+            if load64(g_perr) != 0 { return nd; }   # F1/F2: bail on poison
+            par_advance();
+            arg = par_expr();
+            if first_a == 0 { first_a = arg; }
+            if last_a  != 0 { store64(g_nd_c + last_a * 8, arg); }   # arg-next via g_nd_c (see par_term note)
+            last_a = arg; cnt_a = cnt_a + 1;
+        }
+        par_expect(TOK_SEMI);
+        store64(g_nd_a + nd * 8, first_a);
+        return nd;
+    }
+
+    # identifier -> assignment or expression-statement (call)
+    if k == TOK_IDENT {
+        toff = par_cur_toff();
+        tlen = par_cur_tlen();
+        par_advance();
+
+        # feature #5: `match` is contextual -- a keyword only when followed by an identifier
+        # (the scrutinee). `match = …` / `match(…)` keep `match` as an ordinary identifier.
+        if par_name_is(toff, tlen, match_kw) == 1 {
+            if par_peek() == TOK_IDENT { return par_match(fn_idx); }
+        }
+
+        # function call as statement
+        if par_peek() == TOK_LPAREN {
+            par_advance();
+            nd = nd_alloc(ST_EXPRSTMT);
+            call = nd_alloc(ND_CALL);
+            store64(g_nd_name    + call * 8, toff);
+            store64(g_nd_namelen + call * 8, tlen);
+            first_a = 0; last_a = 0;
+            if par_peek() != TOK_RPAREN {
+                going = 1;
+                while going == 1 {
+                    if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison
+                    arg = par_expr();
+                    if first_a == 0 { first_a = arg; }
+                    if last_a  != 0 { store64(g_nd_c + last_a * 8, arg); }   # arg-next via g_nd_c (see par_term note)
+                    last_a = arg;
+                    if par_peek() == TOK_COMMA { par_advance(); }
+                    else { going = 0; }
+                    if par_peek() == TOK_END { going = 0; }
+                }
+            }
+            par_expect(TOK_RPAREN);
+            par_expect(TOK_SEMI);
+            store64(g_nd_a + call * 8, first_a);
+            store64(g_nd_a + nd   * 8, call);
+            return nd;
+        }
+
+        # feature #4: typed local declaration  `name : type = expr ;`
+        if par_peek() == TOK_COLON {
+            par_advance();
+            par_typesize();                                   # fills g_pt_kind/aux side-channel
+            lt_add(toff, tlen, load64(g_pt_kind), load64(g_pt_aux));
+            par_expect(TOK_ASSIGN);
+            nd = nd_alloc(ST_ASSIGN);
+            store64(g_nd_name    + nd * 8, toff);
+            store64(g_nd_namelen + nd * 8, tlen);
+            e = par_expr();
+            store64(g_nd_a + nd * 8, e);
+            par_expect(TOK_SEMI);
+            return nd;
+        }
+        # feature #4 v1.1: typed-local field/index STORE, possibly CHAINED:
+        #   p.field = v ;  p.next.tag = v ;  a[i] = v ;  rows[i].field = v ;
+        # Navigate the chain; the FINAL step (the access followed by '=') becomes a store.
+        is_chain = 0;
+        if par_peek() == TOK_DOT      { is_chain = 1; }
+        if par_peek() == TOK_LBRACKET { is_chain = 1; }
+        if is_chain == 1 {
+            li = lt_find(toff, tlen);
+            if li == 0 - 1 { syscall 1, fld_err_ann; ExitProcess(1); }
+            cnode = nd_var(toff, tlen);
+            ctk = load64(g_lt_kind + li * 8);
+            cta = load64(g_lt_aux  + li * 8);
+            sresult = 0;
+            sdone = 0;
+            while sdone == 0 {
+                if load64(g_perr) != 0 { sdone = 1; }   # F1/F2: bail on poison
+                pk = par_peek();
+                if pk != TOK_DOT {
+                    if pk != TOK_LBRACKET {
+                        if load64(g_perr) == 0 { syscall 1, par_err_expect; ExitProcess(1); }
+                        sdone = 1;
+                    }
+                }
+                if pk == TOK_DOT {
+                    par_advance();
+                    ftoff = par_cur_toff();
+                    ftlen = par_cur_tlen();
+                    par_expect(TOK_IDENT);
+                    if ctk != 1 { syscall 1, fld_err_ann; ExitProcess(1); }
+                    fidx = par_field_index(cta, ftoff, ftlen);
+                    if fidx == 0 - 1 { syscall 1, par_err_nofld; ExitProcess(1); }
+                    faddr = nd_binary(43, cnode, nd_int(load64(g_field_off + fidx * 8)));
+                    if par_peek() == TOK_ASSIGN {
+                        par_advance();
+                        rhs = par_expr();
+                        par_expect(TOK_SEMI);
+                        sresult = nd_store(load64(g_field_width + fidx * 8), faddr, rhs);
+                        sdone = 1;
+                    }
+                    if sdone == 0 {
+                        if load64(g_field_isaddr + fidx * 8) == 1 { cnode = faddr; }
+                        else { cnode = nd_load(load64(g_field_width + fidx * 8), faddr); }
+                        ctk = load64(g_field_kind + fidx * 8);
+                        cta = load64(g_field_aux  + fidx * 8);
+                    }
+                }
+                if pk == TOK_LBRACKET {
+                    par_advance();
+                    ix = par_expr();
+                    par_expect(TOK_RBRACKET);
+                    if ctk == 0 { syscall 1, fld_err_ann; ExitProcess(1); }
+                    istr = cta;
+                    if ctk == 1 { istr = load64(g_struct_size + cta * 8); }
+                    iaddr = nd_binary(43, cnode, nd_binary(42, ix, nd_int(istr)));
+                    if par_peek() == TOK_ASSIGN {
+                        if ctk == 1 { syscall 1, fld_err_ann; ExitProcess(1); }   # cannot store a struct element directly
+                        par_advance();
+                        rhs = par_expr();
+                        par_expect(TOK_SEMI);
+                        sresult = nd_store(cta, iaddr, rhs);
+                        sdone = 1;
+                    }
+                    if sdone == 0 {
+                        if ctk == 1 { cnode = iaddr; }
+                        else { cnode = nd_load(cta, iaddr); ctk = 0; cta = 0; }
+                    }
+                }
+            }
+            nd = nd_alloc(ST_EXPRSTMT);
+            store64(g_nd_a + nd * 8, sresult);
+            return nd;
+        }
+
+        # assignment
+        nd = nd_alloc(ST_ASSIGN);
+        store64(g_nd_name    + nd * 8, toff);
+        store64(g_nd_namelen + nd * 8, tlen);
+        par_expect(TOK_ASSIGN);
+        e = par_expr();
+        store64(g_nd_a + nd * 8, e);
+        par_expect(TOK_SEMI);
+        return nd;
+    }
+
+    # unknown statement
+    syscall 1, par_err_expect;
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  tool-schema string builders (append into `buf` at `off`, return new off)
+# ----------------------------------------------------------------
+func tb_puts(buf: i64, off: i64, cstr: i64) -> i64 {       # append a C-string
+    i = 0;
+    while load8(cstr + i) != 0 {
+        store8(buf + off + i, load8(cstr + i));
+        i = i + 1;
+    }
+    return off + i;
+}
+func tb_putpool(buf: i64, off: i64, pooloff: i64, poollen: i64) -> i64 {   # append a g_str_pool slice
+    i = 0;
+    while i < poollen {
+        store8(buf + off + i, load8(g_str_pool + pooloff + i));
+        i = i + 1;
+    }
+    return off + poollen;
+}
+func tb_putbuf(buf: i64, off: i64, src: i64, srclen: i64) -> i64 {         # append a raw buffer slice
+    i = 0;
+    while i < srclen {
+        store8(buf + off + i, load8(src + i));
+        i = i + 1;
+    }
+    return off + srclen;
+}
+func tb_putesc(buf: i64, off: i64, pooloff: i64, poollen: i64) -> i64 {    # append a g_str_pool slice, JSON-escaped
+    i = 0;
+    while i < poollen {
+        c = load8(g_str_pool + pooloff + i);
+        if c == 34 { store8(buf + off, 92); store8(buf + off + 1, 34);  off = off + 2; }   # \"
+        if c == 92 { store8(buf + off, 92); store8(buf + off + 1, 92);  off = off + 2; }   # \\
+        if c == 10 { store8(buf + off, 92); store8(buf + off + 1, 110); off = off + 2; }   # \n
+        if c == 13 { store8(buf + off, 92); store8(buf + off + 1, 114); off = off + 2; }   # \r
+        if c == 9  { store8(buf + off, 92); store8(buf + off + 1, 116); off = off + 2; }   # \t
+        if c != 34 { if c != 92 { if c != 10 { if c != 13 { if c != 9 {
+            store8(buf + off, c); off = off + 1;
+        } } } } }
+        i = i + 1;
+    }
+    return off;
+}
+
+# param ANCL type (pool slice) -> JSON-schema type C-string
+func tool_jtype(toff: i64, tlen: i64) -> i64 {
+    if par_name_is(toff, tlen, ty_i8)  == 1 { return jt_integer; }
+    if par_name_is(toff, tlen, ty_i16) == 1 { return jt_integer; }
+    if par_name_is(toff, tlen, ty_i32) == 1 { return jt_integer; }
+    if par_name_is(toff, tlen, ty_i64) == 1 { return jt_integer; }
+    if par_name_is(toff, tlen, ty_f32) == 1 { return jt_number; }
+    if par_name_is(toff, tlen, ty_f64) == 1 { return jt_number; }
+    return jt_string;          # str / ptr / struct* -> opaque "string"
+}
+
+# ----------------------------------------------------------------
+#  par_tool() -> function index
+#  Parses like par_func (so the tool is a normal callable function),
+#  PLUS records a JSON-Schema descriptor for the tool registry.
+# ----------------------------------------------------------------
+func par_tool() -> i64 {
+    par_expect(TOK_KWTOOL);
+
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+    ti = load64(g_tool_count);
+
+    # function name
+    toff = par_cur_toff();
+    tlen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+    store64(g_fn_name    + fi * 8, toff);
+    store64(g_fn_namelen + fi * 8, tlen);
+
+    # schema so far:  {"name":"<name>","description":"
+    so = 0;
+    so = tb_puts(g_tool_schemabuf, so, j_open);
+    so = tb_putpool(g_tool_schemabuf, so, toff, tlen);
+    so = tb_puts(g_tool_schemabuf, so, j_desc);
+
+    # parameter list -> accumulate properties + required into scratch buffers
+    par_expect(TOK_LPAREN);
+    np = 0;
+    po = 0;
+    ro = 0;
+    store64(g_lt_count, 0);                  # feature #4: reset the typed-local table for this body
+    if par_peek() != TOK_RPAREN {
+        going = 1;
+        while going == 1 {
+            if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (par_expect stops advancing -> would spin)
+            ptoff = par_cur_toff();
+            ptlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            par_expect(TOK_COLON);
+            tytoff = par_cur_toff();
+            tytlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            lt_seed_param(ptoff, ptlen, tytoff, tytlen);   # feature #4
+            store64(g_fn_params + fi * 128 + np * 16 + 0, ptoff);
+            store64(g_fn_params + fi * 128 + np * 16 + 8, ptlen);
+            if np > 0 {
+                po = tb_puts(g_tool_propbuf, po, j_comma);
+                ro = tb_puts(g_tool_reqbuf,  ro, j_comma);
+            }
+            # "pname":{"type":"<jtype>"}
+            po = tb_puts(g_tool_propbuf, po, j_q);
+            po = tb_putpool(g_tool_propbuf, po, ptoff, ptlen);
+            po = tb_puts(g_tool_propbuf, po, j_pmid);
+            po = tb_puts(g_tool_propbuf, po, tool_jtype(tytoff, tytlen));
+            po = tb_puts(g_tool_propbuf, po, j_pend);
+            # "pname"
+            ro = tb_puts(g_tool_reqbuf, ro, j_q);
+            ro = tb_putpool(g_tool_reqbuf, ro, ptoff, ptlen);
+            ro = tb_puts(g_tool_reqbuf, ro, j_q);
+            np = np + 1;
+            if par_peek() == TOK_COMMA { par_advance(); }
+            if par_peek() == TOK_RPAREN { going = 0; }
+            if par_peek() == TOK_ARROW  { going = 0; }   # F1/F2: '->' ends the param list, so a missing ')' heals AS ')' (not as a bogus IDENT)
+            if par_peek() == TOK_END    { going = 0; }
+        }
+    }
+    par_expect(TOK_RPAREN);
+    store64(g_fn_nparams + fi * 8, np);
+
+    # return type
+    par_expect(TOK_ARROW);
+    rt = par_cur_toff();
+    par_expect(TOK_IDENT);
+    store64(g_fn_rettype + fi * 8, rt);
+
+    # optional description string (fills the "description" value)
+    if par_peek() == TOK_STR {
+        dtoff = par_cur_toff();
+        dtlen = par_cur_tlen();
+        par_advance();
+        so = tb_putesc(g_tool_schemabuf, so, dtoff, dtlen);
+    }
+
+    # finish schema:  ","input_schema":{...,"properties":{<props>},"required":[<req>]}}
+    so = tb_puts(g_tool_schemabuf, so, j_props);
+    so = tb_putbuf(g_tool_schemabuf, so, g_tool_propbuf, po);
+    so = tb_puts(g_tool_schemabuf, so, j_req);
+    so = tb_putbuf(g_tool_schemabuf, so, g_tool_reqbuf, ro);
+    so = tb_puts(g_tool_schemabuf, so, j_close);
+
+    # intern the name + the per-tool schema; record the registry entry
+    nsid = str_intern(g_str_pool + toff, tlen);
+    ssid = str_intern(g_tool_schemabuf, so);
+    store64(g_tool_fnidx     + ti * 8, fi);
+    store64(g_tool_namesid   + ti * 8, nsid);
+    store64(g_tool_schemasid + ti * 8, ssid);
+    store64(g_tool_count, ti + 1);
+
+    # body (identical to par_func)
+    par_expect(TOK_LBRACE);
+    first_s = 0; last_s = 0; cnt_s = 0;
+    while par_peek() != TOK_RBRACE {
+        if par_peek() == TOK_END { par_expect(TOK_RBRACE); return 0 - 1; }
+        if load64(g_perr) != 0 { return 0 - 1; }   # F1/F2: bail on poison
+        s = par_stmt(fi);
+        if first_s == 0 { first_s = s; }
+        if last_s  != 0 { store64(g_nd_c + last_s * 8, s); }
+        last_s = s; cnt_s = cnt_s + 1;
+    }
+    par_expect(TOK_RBRACE);
+
+    store64(g_fn_body      + fi * 8, first_s);
+    store64(g_fn_stmtcount + fi * 8, cnt_s);
+    store64(g_fn_count, fi + 1);
+    return fi;
+}
+
+# Build the "[{schema},...]" array string from all per-tool schemas. Call once
+# after par_program (no-op when no tools were declared).
+func build_tool_registry() -> i64 {
+    nt = load64(g_tool_count);
+    if nt == 0 { return 0; }
+    bo = 0;
+    store8(g_tool_jsonbuf + bo, 91); bo = bo + 1;        # '['
+    k = 0;
+    while k < nt {
+        if k > 0 { store8(g_tool_jsonbuf + bo, 44); bo = bo + 1; }   # ','
+        sid  = load64(g_tool_schemasid + k * 8);
+        soff = load64(g_str_off + sid * 8);
+        slen = load64(g_str_len + sid * 8);
+        i = 0;
+        while i < slen {
+            store8(g_tool_jsonbuf + bo + i, load8(g_strings + soff + i));
+            i = i + 1;
+        }
+        bo = bo + slen;
+        k = k + 1;
+    }
+    store8(g_tool_jsonbuf + bo, 93); bo = bo + 1;        # ']'
+    jsid = str_intern(g_tool_jsonbuf, bo);
+    store64(g_tools_json_sid, jsid);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  prompt literals (feature #3): a `prompt` desugars to an ordinary
+#  function (built as flat AST nodes) that substitutes {param} holes
+#  into __prompt_build, calls ai_request(build, reply), returns reply.
+# ----------------------------------------------------------------
+func prompt_ensure_ids() -> i64 {
+    if load64(g_pid_done) == 1 { return 0; }
+    store64(g_pid_e,      pool_intern(pid_e_s,      strlen(pid_e_s)));
+    store64(g_pid_strcpy, pool_intern(pid_strcpy_s, strlen(pid_strcpy_s)));
+    store64(g_pid_itoa,   pool_intern(pid_itoa_s,   strlen(pid_itoa_s)));
+    store64(g_pid_strlen, pool_intern(pid_strlen_s, strlen(pid_strlen_s)));
+    store64(g_pid_airq,   pool_intern(pid_airq_s,   strlen(pid_airq_s)));
+    store64(g_pid_pbuild, pool_intern(pid_pbuild_s, strlen(pid_pbuild_s)));
+    store64(g_pid_preply, pool_intern(pid_preply_s, strlen(pid_preply_s)));
+    store64(g_pid_done, 1);
+    return 0;
+}
+
+# flat-AST node builders (mirror the inline node construction elsewhere in the parser)
+func nd_var(off: i64, len: i64) -> i64 {
+    nd = nd_alloc(ND_VAR);
+    store64(g_nd_name    + nd * 8, off);
+    store64(g_nd_namelen + nd * 8, len);
+    return nd;
+}
+func nd_strlit(sid: i64) -> i64 {
+    nd = nd_alloc(ND_STR);
+    store64(g_nd_ival + nd * 8, sid);
+    return nd;
+}
+func nd_call1(noff: i64, nlen: i64, a: i64) -> i64 {
+    nd = nd_alloc(ND_CALL);
+    store64(g_nd_name    + nd * 8, noff);
+    store64(g_nd_namelen + nd * 8, nlen);
+    store64(g_nd_a + nd * 8, a);
+    store64(g_nd_c + a  * 8, 0);
+    return nd;
+}
+func nd_call2(noff: i64, nlen: i64, a: i64, b: i64) -> i64 {
+    nd = nd_alloc(ND_CALL);
+    store64(g_nd_name    + nd * 8, noff);
+    store64(g_nd_namelen + nd * 8, nlen);
+    store64(g_nd_a + nd * 8, a);     # first arg
+    store64(g_nd_c + a  * 8, b);     # arg chain a -> b  (args link via g_nd_c)
+    store64(g_nd_c + b  * 8, 0);     # b is last
+    return nd;
+}
+func nd_binary(op: i64, a: i64, b: i64) -> i64 {
+    nd = nd_alloc(ND_BINARY);
+    store64(g_nd_ival + nd * 8, op);
+    store64(g_nd_a    + nd * 8, a);
+    store64(g_nd_b    + nd * 8, b);
+    return nd;
+}
+func nd_assign(noff: i64, nlen: i64, val: i64) -> i64 {
+    nd = nd_alloc(ST_ASSIGN);
+    store64(g_nd_name    + nd * 8, noff);
+    store64(g_nd_namelen + nd * 8, nlen);
+    store64(g_nd_a + nd * 8, val);
+    return nd;
+}
+func nd_exprstmt(e: i64) -> i64 {
+    nd = nd_alloc(ST_EXPRSTMT);
+    store64(g_nd_a + nd * 8, e);
+    return nd;
+}
+func nd_return(e: i64) -> i64 {
+    nd = nd_alloc(ST_RETURN);
+    store64(g_nd_a + nd * 8, e);
+    return nd;
+}
+# SC4: a single-arg `syscall 1, <expr>` (print) statement node.
+func nd_syscall1(arg: i64) -> i64 {
+    nd = nd_alloc(ST_SYSCALL);
+    store64(g_nd_ival + nd * 8, 1);     # syscall #1 = print
+    store64(g_nd_a    + nd * 8, arg);
+    store64(g_nd_c    + arg * 8, 0);     # exactly one syscall arg
+    return nd;
+}
+
+# ---- feature #4 helpers: typed-local table + load/store node builders ----
+func nd_int(v: i64) -> i64 {
+    nd = nd_alloc(ND_INT);
+    store64(g_nd_ival + nd * 8, v);
+    return nd;
+}
+func ldst_ensure() -> i64 {
+    if load64(g_ld_done) == 1 { return 0; }
+    store64(g_ld_off + 0*8, pool_intern(ld8_s,  strlen(ld8_s)));  store64(g_ld_len + 0*8, strlen(ld8_s));
+    store64(g_ld_off + 1*8, pool_intern(ld16_s, strlen(ld16_s))); store64(g_ld_len + 1*8, strlen(ld16_s));
+    store64(g_ld_off + 2*8, pool_intern(ld32_s, strlen(ld32_s))); store64(g_ld_len + 2*8, strlen(ld32_s));
+    store64(g_ld_off + 3*8, pool_intern(ld64_s, strlen(ld64_s))); store64(g_ld_len + 3*8, strlen(ld64_s));
+    store64(g_ld_off + 4*8, pool_intern(st8_s,  strlen(st8_s)));  store64(g_ld_len + 4*8, strlen(st8_s));
+    store64(g_ld_off + 5*8, pool_intern(st16_s, strlen(st16_s))); store64(g_ld_len + 5*8, strlen(st16_s));
+    store64(g_ld_off + 6*8, pool_intern(st32_s, strlen(st32_s))); store64(g_ld_len + 6*8, strlen(st32_s));
+    store64(g_ld_off + 7*8, pool_intern(st64_s, strlen(st64_s))); store64(g_ld_len + 7*8, strlen(st64_s));
+    store64(g_ld_done, 1);
+    return 0;
+}
+func ldst_idx(w: i64, isstore: i64) -> i64 {
+    k = 3;                 # default 8 -> load64
+    if w == 1 { k = 0; }
+    if w == 2 { k = 1; }
+    if w == 4 { k = 2; }
+    k = k + isstore * 4;
+    return k;
+}
+func nd_load(w: i64, addr: i64) -> i64 {        # load{w}(addr)
+    ldst_ensure();
+    idx = ldst_idx(w, 0);
+    return nd_call1(load64(g_ld_off + idx*8), load64(g_ld_len + idx*8), addr);
+}
+func nd_store(w: i64, addr: i64, val: i64) -> i64 {   # store{w}(addr, val)
+    ldst_ensure();
+    idx = ldst_idx(w, 1);
+    return nd_call2(load64(g_ld_off + idx*8), load64(g_ld_len + idx*8), addr, val);
+}
+func lt_add(noff: i64, nlen: i64, kind: i64, aux: i64) -> i64 {
+    i = load64(g_lt_count);
+    if i >= 63 { return 0; }
+    store64(g_lt_noff + i*8, noff);
+    store64(g_lt_nlen + i*8, nlen);
+    store64(g_lt_kind + i*8, kind);
+    store64(g_lt_aux  + i*8, aux);
+    store64(g_lt_sum  + i*8, load64(g_pt_sum));   # feature #5: sum index of a sum-typed local (else -1)
+    store64(g_lt_count, i + 1);
+    return 0;
+}
+func lt_find(noff: i64, nlen: i64) -> i64 {     # -> table index or -1
+    n = load64(g_lt_count);
+    i = 0;
+    r = 0 - 1;
+    while i < n {
+        if par_pool_eq(noff, nlen, load64(g_lt_noff + i*8), load64(g_lt_nlen + i*8)) == 1 { r = i; }
+        i = i + 1;
+    }
+    return r;
+}
+# seed a param's type: a struct-name type is dottable; a bare sum name is a sum scrutinee; else plain.
+func lt_seed_param(noff: i64, nlen: i64, tyoff: i64, tylen: i64) -> i64 {
+    si = par_struct_find(tyoff, tylen);
+    store64(g_pt_sum, par_sum_find(tyoff, tylen));   # feature #5: lt_add records g_lt_sum from this
+    if si != 0 - 1 { lt_add(noff, nlen, 1, si); }
+    if si == 0 - 1 { lt_add(noff, nlen, 0, 0); }
+    return 0;
+}
+
+# append a statement to the synthesized body (statements chain via g_nd_c)
+func prompt_append(s: i64) -> i64 {
+    if load64(g_pchain_first) == 0 { store64(g_pchain_first, s); }
+    last = load64(g_pchain_last);
+    if last != 0 { store64(g_nd_c + last * 8, s); }
+    store64(g_pchain_last, s);
+    store64(g_pchain_cnt, load64(g_pchain_cnt) + 1);
+    return 0;
+}
+# add the two shared @DATA buffers once
+func prompt_ensure_buffers() -> i64 {
+    n = load64(g_dv_count);
+    i = 0;
+    while i < n {
+        if par_name_is(load64(g_dv_name + i*8), load64(g_dv_namelen + i*8), pid_pbuild_s) == 1 { return 0; }
+        i = i + 1;
+    }
+    prompt_ensure_ids();
+    vi = load64(g_dv_count);
+    store64(g_dv_name    + vi*8, load64(g_pid_pbuild));
+    store64(g_dv_namelen + vi*8, strlen(pid_pbuild_s));
+    store64(g_dv_type    + vi*8, DV_BUF);
+    store64(g_dv_bufsize + vi*8, 16384);
+    store64(g_dv_count, vi + 1);
+    vi = vi + 1;
+    store64(g_dv_name    + vi*8, load64(g_pid_preply));
+    store64(g_dv_namelen + vi*8, strlen(pid_preply_s));
+    store64(g_dv_type    + vi*8, DV_BUF);
+    store64(g_dv_bufsize + vi*8, 65536);
+    store64(g_dv_count, vi + 1);
+    return 0;
+}
+
+func par_prompt() -> i64 {
+    par_advance();   # consume the contextual 'prompt' identifier
+
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+
+    # name
+    toff = par_cur_toff();
+    tlen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+    store64(g_fn_name    + fi * 8, toff);
+    store64(g_fn_namelen + fi * 8, tlen);
+
+    # params (record name + whether the hole substitutes as an integer)
+    par_expect(TOK_LPAREN);
+    np = 0;
+    if par_peek() != TOK_RPAREN {
+        going = 1;
+        while going == 1 {
+            if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (par_expect stops advancing -> would spin)
+            ptoff = par_cur_toff();
+            ptlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            par_expect(TOK_COLON);
+            tytoff = par_cur_toff();
+            tytlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            store64(g_fn_params + fi * 128 + np * 16 + 0, ptoff);
+            store64(g_fn_params + fi * 128 + np * 16 + 8, ptlen);
+            isint = 0;
+            if par_name_is(tytoff, tytlen, ty_i8)  == 1 { isint = 1; }
+            if par_name_is(tytoff, tytlen, ty_i16) == 1 { isint = 1; }
+            if par_name_is(tytoff, tytlen, ty_i32) == 1 { isint = 1; }
+            if par_name_is(tytoff, tytlen, ty_i64) == 1 { isint = 1; }
+            store64(g_prompt_pisint + np * 8, isint);
+            np = np + 1;
+            if par_peek() == TOK_COMMA { par_advance(); }
+            if par_peek() == TOK_RPAREN { going = 0; }
+            if par_peek() == TOK_ARROW  { going = 0; }   # F1/F2: '->' ends the param list, so a missing ')' heals AS ')' (not as a bogus IDENT)
+            if par_peek() == TOK_END    { going = 0; }
+        }
+    }
+    par_expect(TOK_RPAREN);
+    store64(g_fn_nparams + fi * 8, np);
+
+    # return type (str/ptr expected; recorded as metadata)
+    par_expect(TOK_ARROW);
+    rt = par_cur_toff();
+    par_expect(TOK_IDENT);
+    store64(g_fn_rettype + fi * 8, rt);
+
+    # body = one template string literal
+    par_expect(TOK_LBRACE);
+    tmpl_off = par_cur_toff();
+    tmpl_len = par_cur_tlen();
+    par_expect(TOK_STR);
+    par_expect(TOK_RBRACE);
+
+    # split the template into literal segments + {param} holes ({{ }} -> literal braces)
+    nseg = 0;
+    nhole = 0;
+    segoff = 0;
+    i = 0;
+    while i < tmpl_len {
+        c = load8(g_str_pool + tmpl_off + i);
+        nextc = 0;
+        if i + 1 < tmpl_len { nextc = load8(g_str_pool + tmpl_off + i + 1); }
+        if c == 123 {
+            if nextc == 123 {
+                store8(g_prompt_segbuf + segoff, 123);
+                segoff = segoff + 1;
+                i = i + 2;
+            }
+            if nextc != 123 {
+                store64(g_prompt_segids + nseg * 8, str_intern(g_prompt_segbuf, segoff));
+                nseg = nseg + 1;
+                segoff = 0;
+                j = i + 1;
+                hstart = j;
+                going2 = 1;
+                while going2 == 1 {
+                    if j >= tmpl_len { going2 = 0; }
+                    if going2 == 1 {
+                        if load8(g_str_pool + tmpl_off + j) == 125 { going2 = 0; }
+                        if load8(g_str_pool + tmpl_off + j) != 125 { j = j + 1; }
+                    }
+                }
+                holelen = j - hstart;
+                hidx = 0 - 1;
+                pp = 0;
+                while pp < np {
+                    if par_pool_eq(tmpl_off + hstart, holelen, load64(g_fn_params + fi*128 + pp*16 + 0), load64(g_fn_params + fi*128 + pp*16 + 8)) == 1 { hidx = pp; }
+                    pp = pp + 1;
+                }
+                if hidx == 0 - 1 { syscall 1, prompt_err_hole; }
+                store64(g_prompt_holes + nhole * 8, hidx);
+                nhole = nhole + 1;
+                i = j + 1;
+            }
+        }
+        if c == 125 {
+            store8(g_prompt_segbuf + segoff, 125);
+            segoff = segoff + 1;
+            if nextc == 125 { i = i + 2; }
+            if nextc != 125 { i = i + 1; }
+        }
+        if c != 123 {
+            if c != 125 {
+                store8(g_prompt_segbuf + segoff, c);
+                segoff = segoff + 1;
+                i = i + 1;
+            }
+        }
+    }
+    store64(g_prompt_segids + nseg * 8, str_intern(g_prompt_segbuf, segoff));
+    nseg = nseg + 1;
+
+    prompt_ensure_buffers();
+    prompt_ensure_ids();
+
+    # synthesize the desugared body
+    store64(g_pchain_first, 0);
+    store64(g_pchain_last, 0);
+    store64(g_pchain_cnt, 0);
+
+    e_off = load64(g_pid_e);      e_len = strlen(pid_e_s);
+    bld_off = load64(g_pid_pbuild); bld_len = strlen(pid_pbuild_s);
+    rpl_off = load64(g_pid_preply); rpl_len = strlen(pid_preply_s);
+    sc_off = load64(g_pid_strcpy);  sc_len = strlen(pid_strcpy_s);
+    it_off = load64(g_pid_itoa);    it_len = strlen(pid_itoa_s);
+    sl_off = load64(g_pid_strlen);  sl_len = strlen(pid_strlen_s);
+    aq_off = load64(g_pid_airq);    aq_len = strlen(pid_airq_s);
+
+    # e = str_copy(__prompt_build, seg0)
+    prompt_append(nd_assign(e_off, e_len,
+        nd_call2(sc_off, sc_len, nd_var(bld_off, bld_len), nd_strlit(load64(g_prompt_segids + 0)))));
+
+    h = 0;
+    while h < nhole {
+        hidx = load64(g_prompt_holes + h * 8);
+        pnoff = load64(g_fn_params + fi*128 + hidx*16 + 0);
+        pnlen = load64(g_fn_params + fi*128 + hidx*16 + 8);
+        if load64(g_prompt_pisint + hidx * 8) == 1 {
+            # int_to_str(e, param) ; e = e + strlen(e)
+            prompt_append(nd_exprstmt(nd_call2(it_off, it_len, nd_var(e_off,e_len), nd_var(pnoff,pnlen))));
+            prompt_append(nd_assign(e_off, e_len,
+                nd_binary(43, nd_var(e_off,e_len), nd_call1(sl_off, sl_len, nd_var(e_off,e_len)))));
+        }
+        if load64(g_prompt_pisint + hidx * 8) == 0 {
+            # e = str_copy(e, param)
+            prompt_append(nd_assign(e_off, e_len,
+                nd_call2(sc_off, sc_len, nd_var(e_off,e_len), nd_var(pnoff,pnlen))));
+        }
+        # e = str_copy(e, seg[h+1])
+        prompt_append(nd_assign(e_off, e_len,
+            nd_call2(sc_off, sc_len, nd_var(e_off,e_len), nd_strlit(load64(g_prompt_segids + (h+1)*8)))));
+        h = h + 1;
+    }
+    # ai_request(__prompt_build, __prompt_reply) ; return __prompt_reply
+    prompt_append(nd_exprstmt(nd_call2(aq_off, aq_len, nd_var(bld_off,bld_len), nd_var(rpl_off,rpl_len))));
+    prompt_append(nd_return(nd_var(rpl_off, rpl_len)));
+
+    store64(g_fn_body      + fi * 8, load64(g_pchain_first));
+    store64(g_fn_stmtcount + fi * 8, load64(g_pchain_cnt));
+    store64(g_fn_count, fi + 1);
+    return fi;
+}
+
+# ----------------------------------------------------------------
+#  par_func() -> function index
+# ----------------------------------------------------------------
+func par_func() -> i64 {
+    par_expect(TOK_KWFUNC);
+
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+
+    # function name
+    toff = par_cur_toff();
+    tlen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+    store64(g_fn_name    + fi * 8, toff);
+    store64(g_fn_namelen + fi * 8, tlen);
+
+    # parameter list
+    par_expect(TOK_LPAREN);
+    np = 0;
+    store64(g_lt_count, 0);                  # feature #4: reset the typed-local table for this body
+    if par_peek() != TOK_RPAREN {
+        going = 1;
+        while going == 1 {
+            if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (par_expect stops advancing -> would spin)
+            ptoff = par_cur_toff();
+            ptlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            par_expect(TOK_COLON);
+            ftyoff = par_cur_toff();
+            ftylen = par_cur_tlen();
+            par_expect(TOK_IDENT);           # param type
+            lt_seed_param(ptoff, ptlen, ftyoff, ftylen);   # feature #4: param dottable iff a struct name
+            store64(g_fn_params + fi * 128 + np * 16 + 0, ptoff);
+            store64(g_fn_params + fi * 128 + np * 16 + 8, ptlen);
+            # f64 param? (a bare f64/f32 ident -- *f64 would be a pointer, i.e. an int address)
+            pflt = 0;
+            if par_name_is(ftyoff, ftylen, "f64") == 1 { pflt = 1; }
+            if par_name_is(ftyoff, ftylen, "f32") == 1 { pflt = 1; }
+            if np < 8 { store64(g_fn_pfloat + fi * 64 + np * 8, pflt); }
+            np = np + 1;
+            if par_peek() == TOK_COMMA { par_advance(); }
+            if par_peek() == TOK_RPAREN { going = 0; }
+            if par_peek() == TOK_ARROW  { going = 0; }   # F1/F2: '->' ends the param list, so a missing ')' heals AS ')' (not as a bogus IDENT)
+            if par_peek() == TOK_END    { going = 0; }
+        }
+    }
+    par_expect(TOK_RPAREN);
+    store64(g_fn_nparams + fi * 8, np);
+
+    # return type
+    par_expect(TOK_ARROW);
+    rt    = par_cur_toff();
+    rtlen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+    store64(g_fn_rettype + fi * 8, rt);
+    rflt = 0;
+    if par_name_is(rt, rtlen, "f64") == 1 { rflt = 1; }
+    if par_name_is(rt, rtlen, "f32") == 1 { rflt = 1; }
+    store64(g_fn_retfloat + fi * 8, rflt);
+
+    # body
+    par_expect(TOK_LBRACE);
+    first_s = 0; last_s = 0; cnt_s = 0;
+    while par_peek() != TOK_RBRACE {
+        if par_peek() == TOK_END { par_expect(TOK_RBRACE); return 0 - 1; }
+        if load64(g_perr) != 0 { return 0 - 1; }   # F1/F2: bail on poison
+        s = par_stmt(fi);
+        if first_s == 0 { first_s = s; }
+        if last_s  != 0 { store64(g_nd_c + last_s * 8, s); }
+        last_s = s; cnt_s = cnt_s + 1;
+    }
+    par_expect(TOK_RBRACE);
+
+    store64(g_fn_body      + fi * 8, first_s);
+    store64(g_fn_stmtcount + fi * 8, cnt_s);
+    store64(g_fn_count, fi + 1);
+    return fi;
+}
+
+# ----------------------------------------------------------------
+#  par_const_expr() -> i64   --  @DATA compile-time const-expression
+#  Self-contained recursive-descent evaluator: parses AND directly
+#  evaluates an integer const-expr to i64 (no AST nodes). v1 supports
+#  int/hex/char literals (all lex to TOK_INT), unary minus, parens, and
+#  binary + - * / %  << >>  & ^ |  with C precedence. (const-NAME refs +
+#  f64 const-exprs are deferred to v1.1.) Called from par_data.
+#  Ladder (loose -> tight): | -> ^ -> & -> shift -> add -> mul -> unary.
+# ----------------------------------------------------------------
+func par_const_primary() -> i64 {
+    k = par_peek();
+    if k == TOK_LPAREN {
+        par_advance();
+        v = par_const_expr();
+        par_expect(TOK_RPAREN);
+        return v;
+    }
+    if k == TOK_INT {
+        v = par_cur_ival();
+        par_advance();
+        return v;
+    }
+    # unexpected token in a const-expr: poison under --fix recover, else hard error
+    if load64(g_recover) != 0 {
+        if load64(g_perr) == 0 { store64(g_perr, 1); }
+        return 0;
+    }
+    syscall 1, par_err_cexpr;
+    ExitProcess(1);
+    return 0;
+}
+
+func par_const_unary() -> i64 {
+    k = par_peek();
+    if k == TOK_MINUS { par_advance(); return 0 - par_const_unary(); }
+    if k == TOK_PLUS  { par_advance(); return par_const_unary(); }
+    return par_const_primary();
+}
+
+func par_const_mul() -> i64 {
+    v = par_const_unary();
+    going = 1;
+    while going == 1 {
+        k = par_peek();
+        if k == TOK_STAR    { par_advance(); v = v * par_const_unary(); }
+        if k == TOK_SLASH   { par_advance(); r = par_const_unary(); if r == 0 { v = 0; } if r != 0 { v = v / r; } }
+        if k == TOK_PERCENT { par_advance(); r = par_const_unary(); if r == 0 { v = 0; } if r != 0 { v = v % r; } }
+        if k != TOK_STAR { if k != TOK_SLASH { if k != TOK_PERCENT { going = 0; } } }
+    }
+    return v;
+}
+
+func par_const_add() -> i64 {
+    v = par_const_mul();
+    going = 1;
+    while going == 1 {
+        k = par_peek();
+        if k == TOK_PLUS  { par_advance(); v = v + par_const_mul(); }
+        if k == TOK_MINUS { par_advance(); v = v - par_const_mul(); }
+        if k != TOK_PLUS { if k != TOK_MINUS { going = 0; } }
+    }
+    return v;
+}
+
+func par_const_shift() -> i64 {
+    v = par_const_add();
+    going = 1;
+    while going == 1 {
+        k = par_peek();
+        if k == TOK_SHL { par_advance(); v = v << par_const_add(); }
+        if k == TOK_SHR { par_advance(); v = v >> par_const_add(); }
+        if k != TOK_SHL { if k != TOK_SHR { going = 0; } }
+    }
+    return v;
+}
+
+func par_const_bitand() -> i64 {
+    v = par_const_shift();
+    while par_peek() == TOK_AMP {
+        par_advance();
+        v = v & par_const_shift();
+    }
+    return v;
+}
+
+func par_const_bitxor() -> i64 {
+    v = par_const_bitand();
+    while par_peek() == TOK_CARET {
+        par_advance();
+        v = v ^ par_const_bitand();
+    }
+    return v;
+}
+
+func par_const_expr() -> i64 {
+    v = par_const_bitxor();
+    while par_peek() == TOK_PIPE {
+        par_advance();
+        v = v | par_const_bitxor();
+    }
+    return v;
+}
+
+# ----------------------------------------------------------------
+#  par_data() -> 0
+# ----------------------------------------------------------------
+func par_data() -> i64 {
+    while par_peek() == TOK_IDENT {
+        if load64(g_perr) != 0 { return 0; }   # F1/F2: bail on poison
+        vi = load64(g_dv_count);
+        if vi >= 511 { syscall 1, par_err_dv; return 0 - 1; }
+
+        ntoff = par_cur_toff();
+        ntlen = par_cur_tlen();
+        par_advance();
+
+        par_expect(TOK_COLON);
+
+        # type
+        tytoff = par_cur_toff();
+        tytlen = par_cur_tlen();
+        par_expect(TOK_IDENT);
+
+        # initialized integer array:  name: scalarType[N] = { cexpr, ... }
+        # -> a read-only byte blob in .rdata (interned via the string path); the
+        #    name evaluates to the blob's address (read with load*(name + i*w)).
+        is_arr = 0;
+        if par_peek() == TOK_LBRACKET {
+            is_arr = 1;
+            aw = 0;
+            if par_name_is(tytoff, tytlen, "i8")  { aw = 1; }
+            if par_name_is(tytoff, tytlen, "i16") { aw = 2; }
+            if par_name_is(tytoff, tytlen, "i32") { aw = 4; }
+            if par_name_is(tytoff, tytlen, "i64") { aw = 8; }
+            if par_name_is(tytoff, tytlen, "ptr") { aw = 8; }
+            if aw == 0 { syscall 1, par_err_arr; ExitProcess(1); }   # f64/struct arrays -> v1.1
+            par_advance();                  # consume '['
+            an = par_const_expr();          # element count N (const-expr)
+            par_expect(TOK_RBRACKET);
+            par_expect(TOK_ASSIGN);
+            par_expect(TOK_LBRACE);
+            if an * aw > 65500 { syscall 1, par_err_arr; ExitProcess(1); }   # blob must fit g_arr_scratch (64KB)
+            bz = 0;                          # zero the blob region (C-style zero-fill of remainder)
+            while bz < an * aw { store8(g_arr_scratch + bz, 0); bz = bz + 1; }
+            ei = 0;
+            while par_peek() != TOK_RBRACE {
+                ev = par_const_expr();
+                if ei >= an { syscall 1, par_err_arr; ExitProcess(1); }
+                bk = 0;
+                while bk < aw {
+                    store8(g_arr_scratch + ei * aw + bk, ev & 255);
+                    ev = ev >> 8;
+                    bk = bk + 1;
+                }
+                ei = ei + 1;
+                if par_peek() == TOK_COMMA { par_advance(); }
+                else { if par_peek() != TOK_RBRACE { syscall 1, par_err_arr; ExitProcess(1); } }   # ',' required between elements
+            }
+            par_expect(TOK_RBRACE);
+            sid = str_intern(g_arr_scratch, an * aw);
+            store64(g_dv_name    + vi * 8, ntoff);
+            store64(g_dv_namelen + vi * 8, ntlen);
+            store64(g_dv_type    + vi * 8, DV_STR);
+            store64(g_dv_strid   + vi * 8, sid);
+        }
+        if is_arr == 0 {
+        par_expect(TOK_ASSIGN);
+
+        # determine type code from pool text
+        tc = DV_I64;
+        c0 = load8(g_str_pool + tytoff);
+        # "str" s=115 t=116 r=114  len=3
+        if tytlen == 3 {
+            c1 = load8(g_str_pool + tytoff + 1);
+            c2 = load8(g_str_pool + tytoff + 2);
+            if c0 == 115 { if c1 == 116 { if c2 == 114 { tc = DV_STR; } } }
+            # "buf" b=98 u=117 f=102
+            if c0 == 98  { if c1 == 117 { if c2 == 102 { tc = DV_BUF; } } }
+            # "ptr" p=112 t=116 r=114
+            if c0 == 112 { if c1 == 116 { if c2 == 114 { tc = DV_PTR; } } }
+            # "i64" i=105 6=54 4=52
+            if c0 == 105 { if c1 == 54  { if c2 == 52  { tc = DV_I64; } } }
+            # "i32" i=105 3=51 2=50
+            if c0 == 105 { if c1 == 51  { if c2 == 50  { tc = DV_I32; } } }
+            # "i16" i=105 1=49 6=54
+            if c0 == 105 { if c1 == 49  { if c2 == 54  { tc = DV_I16; } } }
+            # "f64" f=102 6=54 4=52
+            if c0 == 102 { if c1 == 54  { if c2 == 52  { tc = DV_F64; } } }
+            # "f32" f=102 3=51 2=50
+            if c0 == 102 { if c1 == 51  { if c2 == 50  { tc = DV_F32; } } }
+            # "i8"  only len=2
+        }
+        if tytlen == 2 {
+            c1 = load8(g_str_pool + tytoff + 1);
+            if c0 == 105 { if c1 == 56 { tc = DV_I8; } }   # "i8"
+        }
+
+        store64(g_dv_name    + vi * 8, ntoff);
+        store64(g_dv_namelen + vi * 8, ntlen);
+        store64(g_dv_type    + vi * 8, tc);
+
+        if tc == DV_STR {
+            stoff = par_cur_toff();
+            stlen = par_cur_tlen();
+            par_expect(TOK_STR);
+            sid = str_intern(g_str_pool + stoff, stlen);
+            store64(g_dv_strid + vi * 8, sid);
+        }
+        if tc == DV_BUF {
+            # buf size is an integer literal OR sizeof(Typespec).
+            # (The bootstrap folds a const-expr here; network.ancl uses
+            #  buf = sizeof(Ring) to size its ring arenas. par_typesize
+            #  handles struct names, scalars, and T[N] arrays.)
+            if par_peek() == TOK_IDENT {
+                par_advance();              # consume 'sizeof'
+                par_expect(TOK_LPAREN);
+                bufsz = par_typesize();
+                par_expect(TOK_RPAREN);
+            } else {
+                bufsz = par_const_expr();
+            }
+            store64(g_dv_bufsize + vi * 8, bufsz);
+        }
+        if tc != DV_STR {
+            if tc != DV_BUF {
+                isfl = 0;
+                if tc == DV_F64 { isfl = 1; }
+                if tc == DV_F32 { isfl = 1; }
+                if isfl == 1 {
+                    # f64/f32 const: a float literal carries IEEE-754 bits; an int literal converts
+                    if par_peek() == TOK_FLOAT {
+                        store64(g_dv_ival + vi * 8, par_cur_ival());
+                        par_advance();
+                    } else {
+                        store64(g_dv_ival + vi * 8, lex_f64_bits(par_cur_ival(), 0));
+                        par_expect(TOK_INT);
+                    }
+                    store64(g_dv_isfloat + vi * 8, 1);
+                } else {
+                    # integer constant -- a compile-time const-expression now
+                    # (int/hex/char literals, unary minus, parens, and
+                    #  + - * / %  << >>  & ^ |  with C precedence)
+                    ival2 = par_const_expr();
+                    store64(g_dv_ival + vi * 8, ival2);
+                }
+            }
+        }
+        }
+
+        par_expect(TOK_SEMI);
+        store64(g_dv_count, vi + 1);
+    }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_extern_decl() -> 0
+# ----------------------------------------------------------------
+func par_extern_decl() -> i64 {
+    par_expect(TOK_KWEXTERN);
+    # dll name as string
+    dlltoff = par_cur_toff();
+    dlltlen = par_cur_tlen();
+    par_expect(TOK_STR);
+
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (par_expect stops advancing -> would spin)
+        ei = load64(g_ext_count);
+        if ei >= 255 { syscall 1, par_err_ext; return 0 - 1; }
+
+        fntoff = par_cur_toff();
+        fntlen = par_cur_tlen();
+        par_expect(TOK_IDENT);
+
+        is_ptr = 0;
+        ext_fl = 0;
+        if par_peek() == TOK_ARROW {
+            par_advance();
+            rtoff = par_cur_toff();
+            rtlen = par_cur_tlen();
+            par_expect(TOK_IDENT);   # return type
+            is_ptr = 1;              # -> ptr/i64/f64 all keep the full 64-bit return (no sign-extend)
+            if par_name_is(rtoff, rtlen, "f64") == 1 { ext_fl = 1; }
+            if par_name_is(rtoff, rtlen, "f32") == 1 { ext_fl = 1; }
+        }
+
+        store64(g_ext_fn     + ei * 8, fntoff);
+        store64(g_ext_fnlen  + ei * 8, fntlen);
+        store64(g_ext_dll    + ei * 8, dlltoff);
+        store64(g_ext_dlllen + ei * 8, dlltlen);
+        store64(g_ext_ptr    + ei * 8, is_ptr);
+        store64(g_ext_float  + ei * 8, ext_fl);
+        store64(g_ext_count, ei + 1);
+
+        if par_peek() == TOK_COMMA { par_advance(); }
+        if par_peek() != TOK_IDENT { going = 0; }
+    }
+    par_expect(TOK_SEMI);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_struct_decl() -> 0
+#  Parses  struct Name { field: type; ... }  recording the layout
+#  (field byte offsets + total size) into the g_struct_*/g_field_*
+#  tables.  Mirrors anclc.cpp parseStruct: per-field alignment, and
+#  total size rounded up to 8 (min 8).
+# ----------------------------------------------------------------
+func par_struct_decl() -> i64 {
+    par_expect(TOK_KWSTRUCT);
+
+    si = load64(g_struct_count);
+    if si >= 63 { syscall 1, par_err_struct; ExitProcess(1); }
+
+    ntoff = par_cur_toff();
+    ntlen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+
+    par_expect(TOK_LBRACE);
+
+    ffield = load64(g_field_count);
+    off    = 0;
+    nf     = 0;
+
+    # forward-register the struct NAME before parsing fields, so a self-referential
+    # `next: *Self` field resolves as a struct pointer (kind 1) for v1.1 chaining.
+    # Size/nfields are provisional (0) here and finalized after the loop; a *Self
+    # field is 8 bytes regardless, so the layout is unaffected (mirrors anclc.cpp).
+    store64(g_struct_name    + si * 8, ntoff);
+    store64(g_struct_namelen + si * 8, ntlen);
+    store64(g_struct_ffield  + si * 8, ffield);
+    store64(g_struct_size    + si * 8, 0);
+    store64(g_struct_nfields + si * 8, 0);
+    store64(g_struct_count, si + 1);
+
+    while par_peek() == TOK_IDENT {
+        if load64(g_perr) != 0 { return 0; }   # F1/F2: bail on poison
+        ftoff = par_cur_toff();
+        ftlen = par_cur_tlen();
+        par_advance();
+        par_expect(TOK_COLON);
+
+        sz = par_typesize();
+        al = load64(g_par_typealign);
+        off = par_align_up(off, al);
+
+        fi = load64(g_field_count);
+        if fi >= 511 { syscall 1, par_err_struct; ExitProcess(1); }
+        store64(g_field_name    + fi * 8, ftoff);
+        store64(g_field_namelen + fi * 8, ftlen);
+        store64(g_field_off     + fi * 8, off);
+        store64(g_field_width   + fi * 8, load64(g_pt_width));    # feature #4: p.field width / address
+        store64(g_field_isaddr  + fi * 8, load64(g_pt_isaddr));
+        store64(g_field_kind    + fi * 8, load64(g_pt_kind));     # feature #4 v1.1: result type for chaining
+        store64(g_field_aux     + fi * 8, load64(g_pt_aux));
+        store64(g_field_count, fi + 1);
+
+        off = off + sz;
+        nf  = nf + 1;
+
+        # field separator: ';' or ',' (either accepted, like the C++ reference)
+        if par_peek() == TOK_SEMI  { par_advance(); }
+        else { if par_peek() == TOK_COMMA { par_advance(); } }
+    }
+
+    par_expect(TOK_RBRACE);
+
+    total = par_align_up(off, 8);
+    if total == 0 { total = 8; }
+
+    # finalize the forward-registered struct (name/ffield/count set before the loop)
+    store64(g_struct_size    + si * 8, total);
+    store64(g_struct_nfields + si * 8, nf);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  feature #5: par_sum() -> 0   (sum Name { Variant(f: T,...), Empty, ... })
+#  records the layout (tag@0, payload@8) + synthesizes a maker fn per variant.
+# ----------------------------------------------------------------
+func sum_emit_maker(vi: i64, block: i64) -> i64 {
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+    store64(g_fn_name    + fi*8, load64(g_var_makeroff + vi*8));
+    store64(g_fn_namelen + fi*8, load64(g_var_makerlen + vi*8));
+    ffield = load64(g_var_ffield  + vi*8);
+    nf     = load64(g_var_nfields + vi*8);
+    np = 0;
+    while np < nf {
+        store64(g_fn_params + fi*128 + np*16 + 0, load64(g_vf_name    + (ffield+np)*8));
+        store64(g_fn_params + fi*128 + np*16 + 8, load64(g_vf_namelen + (ffield+np)*8));
+        np = np + 1;
+    }
+    store64(g_fn_nparams + fi*8, nf);
+    store64(g_fn_rettype + fi*8, 0);                 # write-only metadata (codegen ignores it)
+    # body:  __p = alloc(block); store64(__p, tag); store{w}(__p+off, field)...; return __p;
+    store64(g_pchain_first, 0); store64(g_pchain_last, 0); store64(g_pchain_cnt, 0);
+    poff = load64(g_id_p_off); plen = load64(g_id_p_len);
+    prompt_append(nd_assign(poff, plen, nd_call1(load64(g_id_alloc_off), load64(g_id_alloc_len), nd_int(block))));
+    prompt_append(nd_exprstmt(nd_store(8, nd_var(poff, plen), nd_int(load64(g_var_tag + vi*8)))));
+    np = 0;
+    while np < nf {
+        prompt_append(nd_exprstmt(nd_store(load64(g_vf_width + (ffield+np)*8),
+            nd_binary(43, nd_var(poff, plen), nd_int(load64(g_vf_off + (ffield+np)*8))),
+            nd_var(load64(g_vf_name + (ffield+np)*8), load64(g_vf_namelen + (ffield+np)*8)))));
+        np = np + 1;
+    }
+    prompt_append(nd_return(nd_var(poff, plen)));
+    store64(g_fn_body      + fi*8, load64(g_pchain_first));
+    store64(g_fn_stmtcount + fi*8, load64(g_pchain_cnt));
+    store64(g_fn_count, fi + 1);
+    return 0;
+}
+func par_sum() -> i64 {
+    par_advance();                                   # consume 'sum' (contextual ident)
+    sum_ensure_ids();
+    ldst_ensure();                                   # makers use store{w} nodes
+
+    si = load64(g_sum_count);
+    soff = par_cur_toff(); slen = par_cur_tlen();
+    par_expect(TOK_IDENT);
+    par_expect(TOK_LBRACE);
+
+    fvar = load64(g_var_count);
+    # forward-register the sum name (self-referential payloads resolve)
+    store64(g_sum_name    + si*8, soff);
+    store64(g_sum_namelen + si*8, slen);
+    store64(g_sum_fvar    + si*8, fvar);
+    store64(g_sum_block   + si*8, 8);
+    store64(g_sum_nvar    + si*8, 0);
+    store64(g_sum_count, si + 1);
+
+    maxend = 8; tag = 0;
+    while par_peek() == TOK_IDENT {
+        if load64(g_perr) != 0 { return 0; }   # F1/F2: bail on poison
+        vi = load64(g_var_count);
+        voff = par_cur_toff(); vlen = par_cur_tlen();
+        par_advance();
+        ffield = load64(g_vf_count);
+        off = 8; nf = 0;
+        if par_peek() == TOK_LPAREN {
+            par_advance();
+            if par_peek() != TOK_RPAREN {
+                going = 1;
+                while going == 1 {
+                    if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (uniformity w/ the other going-loops)
+                    fnoff = par_cur_toff(); fnlen = par_cur_tlen();
+                    par_expect(TOK_IDENT);
+                    par_expect(TOK_COLON);
+                    sz = par_typesize();
+                    off = par_align_up(off, load64(g_par_typealign));
+                    vf = load64(g_vf_count);
+                    store64(g_vf_name    + vf*8, fnoff);
+                    store64(g_vf_namelen + vf*8, fnlen);
+                    store64(g_vf_off     + vf*8, off);
+                    store64(g_vf_width   + vf*8, load64(g_pt_width));
+                    store64(g_vf_count, vf + 1);
+                    off = off + sz; nf = nf + 1;
+                    if par_peek() == TOK_COMMA { par_advance(); }
+                    else { going = 0; }
+                    if par_peek() == TOK_RPAREN { going = 0; }
+                }
+            }
+            par_expect(TOK_RPAREN);
+        }
+        if off > maxend { maxend = off; }
+        store64(g_var_name    + vi*8, voff);
+        store64(g_var_namelen + vi*8, vlen);
+        store64(g_var_tag     + vi*8, tag);
+        store64(g_var_ffield  + vi*8, ffield);
+        store64(g_var_nfields + vi*8, nf);
+        sum_build_maker_name(vi, soff, slen, voff, vlen);
+        store64(g_var_count, vi + 1);
+        tag = tag + 1;
+        if par_peek() == TOK_COMMA { par_advance(); }    # optional variant separator
+    }
+    par_expect(TOK_RBRACE);
+
+    block = par_align_up(maxend, 8);
+    if block < 8 { block = 8; }
+    store64(g_sum_block + si*8, block);
+    store64(g_sum_nvar  + si*8, tag);
+
+    v = 0;                                           # synthesize a maker per variant (block size now known)
+    while v < tag {
+        sum_emit_maker(fvar + v, block);
+        v = v + 1;
+    }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  feature #5: `match` desugar -> nested if/else-if chain in `if 1 { ... }`.
+#  Recursive over arms (each level owns its locals -> nesting-safe), building
+#  `if (disc==cmp) { body } else { rest }` from the front; the `_` arm's body
+#  becomes the terminal else. sum-mode dispatches on load64(scrut) (the tag) and
+#  binds variant fields; int-mode dispatches on the scrutinee variable's value.
+# ----------------------------------------------------------------
+func par_match_arm(fn_idx: i64, soff: i64, slen: i64, summode: i64, smidx: i64) -> i64 {
+    if par_peek() == TOK_RBRACE { return 0; }
+    if par_peek() == TOK_END    { return 0; }
+
+    isdef = 0; cmpval = 0; var_idx = 0 - 1;
+    bind_head = 0; bind_last = 0;
+
+    if par_peek() == TOK_IDENT {
+        if par_name_is(par_cur_toff(), par_cur_tlen(), "_") == 1 { isdef = 1; par_advance(); }
+    }
+    if isdef == 0 {
+        if summode == 1 {
+            vnoff = par_cur_toff(); vnlen = par_cur_tlen();
+            par_expect(TOK_IDENT);
+            var_idx = par_variant_find(smidx, vnoff, vnlen);
+            if var_idx == 0 - 1 { syscall 1, sum_err_var; ExitProcess(1); }
+            cmpval = load64(g_var_tag + var_idx * 8);
+            nbind = 0;
+            if par_peek() == TOK_LPAREN {
+                par_advance();
+                if par_peek() != TOK_RPAREN {
+                    going = 1;
+                    while going == 1 {
+                        if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison (uniformity w/ the other going-loops)
+                        boff = par_cur_toff(); blen = par_cur_tlen();
+                        par_expect(TOK_IDENT);
+                        vfi = load64(g_var_ffield + var_idx * 8) + nbind;
+                        bstmt = nd_assign(boff, blen, nd_load(load64(g_vf_width + vfi*8), nd_binary(43, nd_var(soff, slen), nd_int(load64(g_vf_off + vfi*8)))));
+                        if bind_head == 0 { bind_head = bstmt; }
+                        if bind_last != 0 { store64(g_nd_c + bind_last * 8, bstmt); }
+                        bind_last = bstmt;
+                        nbind = nbind + 1;
+                        if par_peek() == TOK_COMMA { par_advance(); }
+                        else { going = 0; }
+                        if par_peek() == TOK_RPAREN { going = 0; }
+                    }
+                }
+                par_expect(TOK_RPAREN);
+            }
+        }
+        if summode == 0 {
+            cmpval = par_cur_ival();          # int-match: integer-literal pattern
+            par_expect(TOK_INT);
+        }
+    }
+
+    par_expect(TOK_FATARROW);
+    par_expect(TOK_LBRACE);
+    head = bind_head; last = bind_last;       # body = bindings ++ block statements
+    while par_peek() != TOK_RBRACE {
+        if par_peek() == TOK_END { return head; }
+        if load64(g_perr) != 0 { return head; }   # F1/F2: bail on poison
+        bs = par_stmt(fn_idx);
+        if head == 0 { head = bs; }
+        if last != 0 { store64(g_nd_c + last * 8, bs); }
+        last = bs;
+    }
+    par_expect(TOK_RBRACE);
+    if last != 0 { store64(g_nd_c + last * 8, 0); }     # terminate the body chain
+    if par_peek() == TOK_COMMA { par_advance(); }       # optional arm separator
+
+    if isdef == 1 { return head; }                      # default body = the terminal else
+
+    rest = par_match_arm(fn_idx, soff, slen, summode, smidx);
+    ifnd = nd_alloc(ST_IF);
+    disc = nd_var(soff, slen);
+    if summode == 1 { disc = nd_load(8, nd_var(soff, slen)); }   # load64(scrut) = tag
+    store64(g_nd_a    + ifnd * 8, nd_binary(101, disc, nd_int(cmpval)));   # 101 = 'e' (==)
+    store64(g_nd_b    + ifnd * 8, head);
+    store64(g_nd_ival + ifnd * 8, 0);
+    store64(g_nd_name + ifnd * 8, rest);                # else-branch head
+    return ifnd;
+}
+func par_match(fn_idx: i64) -> i64 {
+    ldst_ensure();
+    soff = par_cur_toff(); slen = par_cur_tlen();       # scrutinee identifier
+    par_advance();
+    par_expect(TOK_LBRACE);
+    summode = 0; smidx = 0 - 1;
+    li = lt_find(soff, slen);
+    if li != 0 - 1 {
+        if load64(g_lt_sum + li * 8) != 0 - 1 { summode = 1; smidx = load64(g_lt_sum + li * 8); }
+    }
+    head = par_match_arm(fn_idx, soff, slen, summode, smidx);
+    par_expect(TOK_RBRACE);
+    wrap = nd_alloc(ST_IF);                              # `if 1 { …desugar… }` (one Stmt carries it all)
+    store64(g_nd_a    + wrap * 8, nd_int(1));
+    store64(g_nd_b    + wrap * 8, head);
+    store64(g_nd_ival + wrap * 8, 0);
+    store64(g_nd_name + wrap * 8, 0);
+    return wrap;
+}
+
+# ----------------------------------------------------------------
+#  SC4: the `intent` oracle (L3). Contextual top-level keyword.
+#    intent NAME { goal: "..."; case fn(args) => expected; ... }
+#  Desugars (ZERO codegen change) into a synthetic checker __intent_NAME()
+#  that returns the 1-based index of the first failing case (0 = all pass),
+#  printing "intent NAME case K: expected E got A" on the first failure.
+#  Mirrors compiler/anclc.cpp parseIntent(); the goal string is parsed but
+#  not emitted (compile-time metadata for the AI repair driver).
+# ----------------------------------------------------------------
+func par_intent() -> i64 {
+    par_advance();                            # consume 'intent'
+    inoff = par_cur_toff(); inlen = par_cur_tlen();
+    par_expect(TOK_IDENT);                    # intent name
+    par_expect(TOK_LBRACE);
+    par_expect(TOK_IDENT);                    # 'goal' (contextual; not strictly verified)
+    par_expect(TOK_COLON);
+    par_expect(TOK_STR);                      # goal string literal (metadata; discarded)
+    par_expect(TOK_SEMI);
+
+    # build "__intent_<name>" into scratch, intern as the checker function name
+    o = 0;
+    pl = strlen(int_pre_s);
+    i = 0; while i < pl    { store8(g_int_scratch + o, load8(int_pre_s + i));        o = o + 1; i = i + 1; }
+    i = 0; while i < inlen { store8(g_int_scratch + o, load8(g_str_pool + inoff + i)); o = o + 1; i = i + 1; }
+    fnoff = pool_intern(g_int_scratch, o);
+    fnlen = o;
+
+    # interned-once temp-local names + the counterexample string-literal pieces
+    aoff = pool_intern(int_a_s, strlen(int_a_s)); alen = strlen(int_a_s);
+    eoff = pool_intern(int_e_s, strlen(int_e_s)); elen = strlen(int_e_s);
+    nsid = str_intern(g_str_pool + inoff, inlen);   # the bare intent name
+    sid0 = str_intern(ce_s0, strlen(ce_s0));        # "intent "
+    sid1 = str_intern(ce_s1, strlen(ce_s1));        # " case "
+    sid2 = str_intern(ce_s2, strlen(ce_s2));        # ": expected "
+    sid3 = str_intern(ce_s3, strlen(ce_s3));        # " got "
+    sidn = str_intern(ce_nl, strlen(ce_nl));        # "\n"
+
+    # synthesize the checker function shell
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+    store64(g_fn_name     + fi * 8, fnoff);
+    store64(g_fn_namelen  + fi * 8, fnlen);
+    store64(g_fn_nparams  + fi * 8, 0);
+    store64(g_fn_rettype  + fi * 8, pool_intern(int_rt_s, strlen(int_rt_s)));
+    store64(g_fn_retfloat + fi * 8, 0);
+
+    first_s = 0; last_s = 0; cnt_s = 0; caseno = 0;
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { going = 0; }   # F1/F2: bail on poison
+        if par_peek() == TOK_RBRACE { going = 0; }
+        if par_peek() == TOK_END    { going = 0; }
+        if going == 1 {
+            par_expect(TOK_IDENT);                # 'case'
+            cfoff = par_cur_toff(); cflen = par_cur_tlen();
+            par_expect(TOK_IDENT);                # function name
+            par_expect(TOK_LPAREN);
+            # call node: fn(args)
+            callnd = nd_alloc(ND_CALL);
+            store64(g_nd_name    + callnd * 8, cfoff);
+            store64(g_nd_namelen + callnd * 8, cflen);
+            first_arg = 0; last_arg = 0;
+            if par_peek() != TOK_RPAREN {
+                ag = 1;
+                while ag == 1 {
+                    if load64(g_perr) != 0 { ag = 0; }   # F1/F2: bail on poison (uniformity w/ the other going-loops)
+                    arg = par_expr();
+                    if first_arg == 0 { first_arg = arg; }
+                    if last_arg  != 0 { store64(g_nd_c + last_arg * 8, arg); }
+                    last_arg = arg;
+                    if par_peek() == TOK_COMMA { par_advance(); } else { ag = 0; }
+                    if par_peek() == TOK_RPAREN { ag = 0; }
+                }
+            }
+            if last_arg != 0 { store64(g_nd_c + last_arg * 8, 0); }
+            store64(g_nd_a + callnd * 8, first_arg);
+            par_expect(TOK_RPAREN);
+            par_expect(TOK_FATARROW);
+            expnode = par_expr();                 # expected value expression
+            par_expect(TOK_SEMI);
+            caseno = caseno + 1;
+
+            # __a = fn(args);  __e = expected;  if __a != __e { print counterexample; return K }
+            s1 = nd_assign(aoff, alen, callnd);
+            s2 = nd_assign(eoff, elen, expnode);
+            ifnd = nd_alloc(ST_IF);
+            store64(g_nd_a    + ifnd * 8, nd_binary(110, nd_var(aoff, alen), nd_var(eoff, elen)));  # __a != __e
+            store64(g_nd_name + ifnd * 8, 0);     # no else
+            store64(g_nd_ival + ifnd * 8, 0);
+            p0 = nd_syscall1(nd_strlit(sid0));    # "intent "
+            p1 = nd_syscall1(nd_strlit(nsid));    # NAME
+            p2 = nd_syscall1(nd_strlit(sid1));    # " case "
+            p3 = nd_syscall1(nd_int(caseno));     # K
+            p4 = nd_syscall1(nd_strlit(sid2));    # ": expected "
+            p5 = nd_syscall1(nd_var(eoff, elen)); # E (= __e)
+            p6 = nd_syscall1(nd_strlit(sid3));    # " got "
+            p7 = nd_syscall1(nd_var(aoff, alen)); # A (= __a)
+            p8 = nd_syscall1(nd_strlit(sidn));    # "\n"
+            pr = nd_return(nd_int(caseno));
+            store64(g_nd_c + p0 * 8, p1);  store64(g_nd_c + p1 * 8, p2);
+            store64(g_nd_c + p2 * 8, p3);  store64(g_nd_c + p3 * 8, p4);
+            store64(g_nd_c + p4 * 8, p5);  store64(g_nd_c + p5 * 8, p6);
+            store64(g_nd_c + p6 * 8, p7);  store64(g_nd_c + p7 * 8, p8);
+            store64(g_nd_c + p8 * 8, pr);  store64(g_nd_c + pr * 8, 0);
+            store64(g_nd_b + ifnd * 8, p0);       # then-head
+
+            # append s1 -> s2 -> ifnd to the checker body
+            if first_s == 0 { first_s = s1; }
+            if last_s  != 0 { store64(g_nd_c + last_s * 8, s1); }
+            store64(g_nd_c + s1 * 8, s2);
+            store64(g_nd_c + s2 * 8, ifnd);
+            last_s = ifnd; cnt_s = cnt_s + 3;
+        }
+    }
+    par_expect(TOK_RBRACE);
+
+    # final `return 0` (all cases passed)
+    rfin = nd_return(nd_int(0));
+    if first_s == 0 { first_s = rfin; }
+    if last_s  != 0 { store64(g_nd_c + last_s * 8, rfin); }
+    store64(g_nd_c + rfin * 8, 0);
+    cnt_s = cnt_s + 1;
+
+    store64(g_fn_body      + fi * 8, first_s);
+    store64(g_fn_stmtcount + fi * 8, cnt_s);
+    store64(g_fn_count, fi + 1);
+
+    # record the checker for --check
+    ii = load64(g_intent_count);
+    store64(g_intent_off + ii * 8, fnoff);
+    store64(g_intent_len + ii * 8, fnlen);
+    store64(g_intent_count, ii + 1);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  SC4 --check: synthesize a fresh `main` that runs every intent checker and
+#  returns the first non-zero failing-case ordinal (0 = all pass). Appended
+#  last, so cg_emit_start (which picks the LAST `main`) makes it the entry,
+#  shadowing any user main -- matching the bootstrap's "replaces any main".
+# ----------------------------------------------------------------
+func par_check_runner() -> i64 {
+    roff = pool_intern(int_r_s, strlen(int_r_s)); rlen = strlen(int_r_s);
+    sidok = str_intern(ce_ok, strlen(ce_ok));      # "all intents OK\n"
+
+    fi = load64(g_fn_count);
+    if fi >= 511 { syscall 1, par_err_fn; return 0 - 1; }
+    store64(g_fn_name     + fi * 8, pool_intern(int_main_s, strlen(int_main_s)));
+    store64(g_fn_namelen  + fi * 8, strlen(int_main_s));
+    store64(g_fn_nparams  + fi * 8, 0);
+    store64(g_fn_rettype  + fi * 8, pool_intern(int_rt_s, strlen(int_rt_s)));
+    store64(g_fn_retfloat + fi * 8, 0);
+
+    first_s = 0; last_s = 0; cnt_s = 0;
+    n = load64(g_intent_count); i = 0;
+    while i < n {
+        # r = __intent_X()
+        callnd = nd_alloc(ND_CALL);
+        store64(g_nd_name    + callnd * 8, load64(g_intent_off + i * 8));
+        store64(g_nd_namelen + callnd * 8, load64(g_intent_len + i * 8));
+        store64(g_nd_a       + callnd * 8, 0);     # zero args
+        s1 = nd_assign(roff, rlen, callnd);
+        # if r != 0 { return r }
+        ifnd = nd_alloc(ST_IF);
+        store64(g_nd_a    + ifnd * 8, nd_binary(110, nd_var(roff, rlen), nd_int(0)));
+        store64(g_nd_name + ifnd * 8, 0);
+        store64(g_nd_ival + ifnd * 8, 0);
+        rr = nd_return(nd_var(roff, rlen));
+        store64(g_nd_c + rr * 8, 0);
+        store64(g_nd_b + ifnd * 8, rr);
+        if first_s == 0 { first_s = s1; }
+        if last_s  != 0 { store64(g_nd_c + last_s * 8, s1); }
+        store64(g_nd_c + s1 * 8, ifnd);
+        last_s = ifnd; cnt_s = cnt_s + 2;
+        i = i + 1;
+    }
+    # syscall 1, "all intents OK\n";  return 0
+    sok  = nd_syscall1(nd_strlit(sidok));
+    rfin = nd_return(nd_int(0));
+    store64(g_nd_c + sok * 8, rfin);
+    store64(g_nd_c + rfin * 8, 0);
+    if first_s == 0 { first_s = sok; }
+    if last_s  != 0 { store64(g_nd_c + last_s * 8, sok); }
+    cnt_s = cnt_s + 2;
+
+    store64(g_fn_body      + fi * 8, first_s);
+    store64(g_fn_stmtcount + fi * 8, cnt_s);
+    store64(g_fn_count, fi + 1);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  par_program() -> 0
+#  Top-level: parses @DATA, @CODE, func, extern, import sections.
+# ----------------------------------------------------------------
+func par_program() -> i64 {
+    going = 1;
+    while going == 1 {
+        if load64(g_perr) != 0 { going = 0; }   # F1/F2: detection point -- stop, the --fix driver handles it
+        k = par_peek();
+        if k == TOK_END { going = 0; }
+        if k == TOK_KWDATA {
+            par_advance();
+            par_data();
+        }
+        if k == TOK_KWCODE {
+            par_advance();
+            going2 = 1;
+            while going2 == 1 {
+                if load64(g_perr) != 0 { going2 = 0; }   # F1/F2: bail on poison
+                pk = par_peek();
+                if pk == TOK_KWFUNC { par_func(); }
+                if pk == TOK_KWTOOL { par_tool(); }
+                if pk != TOK_KWFUNC { if pk != TOK_KWTOOL { going2 = 0; } }
+            }
+        }
+        if k == TOK_KWFUNC { par_func(); }
+        if k == TOK_KWTOOL { par_tool(); }
+        # 'prompt' is a CONTEXTUAL keyword: a bare top-level identifier is only valid if it is
+        # 'prompt' (a prompt declaration); anything else ends the program. Capture the verdict
+        # BEFORE par_prompt advances the cursor.
+        if k == TOK_IDENT {
+            is_prompt = par_name_is(par_cur_toff(), par_cur_tlen(), prompt_kw);
+            is_sum    = par_name_is(par_cur_toff(), par_cur_tlen(), sum_kw);   # feature #5 (contextual)
+            is_intent = par_name_is(par_cur_toff(), par_cur_tlen(), intent_kw); # SC4 (contextual)
+            if is_prompt == 1 { par_prompt(); }
+            if is_sum == 1 { par_sum(); }
+            if is_intent == 1 { par_intent(); }
+            if is_prompt == 0 { if is_sum == 0 { if is_intent == 0 { going = 0; } } }
+        }
+        if k == TOK_KWEXTERN { par_extern_decl(); }
+        if k == TOK_KWIMPORT {
+            par_advance();
+            par_advance();   # skip the string path
+            par_accept(TOK_SEMI);
+        }
+        if k == TOK_KWSTRUCT {
+            par_struct_decl();
+        }
+        if k == TOK_END    { going = 0; }
+        if k != TOK_KWDATA  {
+            if k != TOK_KWCODE  {
+                if k != TOK_KWFUNC  {
+                    if k != TOK_KWTOOL {
+                        if k != TOK_IDENT {      # TOK_IDENT already handled above (prompt or stop)
+                            if k != TOK_KWEXTERN {
+                                if k != TOK_KWIMPORT {
+                                    if k != TOK_KWSTRUCT {
+                                        if k != TOK_END { going = 0; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}

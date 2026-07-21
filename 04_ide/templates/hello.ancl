@@ -1,0 +1,27 @@
+# =====================================================================
+#  Welcome to Aether Studio  -  a native ANCL IDE, written in ANCL.
+#
+#  AI features (all LOCAL, all verified by the compiler):
+#    Ctrl+B          build the current file
+#    Ctrl+Space      AI autocomplete  - the op-brain predicts the next
+#                    code STRUCTURE (local, instant; suggestions in Output)
+#    Ctrl+Shift+I    Plan from Intent - put your goal in an # @INTENT block
+#                    (below); the router classifies it + pre-loads the Aether
+#                    Agent to implement it, then the compiler checks each step
+#
+#  Try it now:  New Project  ->  fill in the "# goal:" line  ->  Ctrl+Shift+I
+#  -> press Send in the Aether Agent panel (set a backend in LLM Settings first).
+# =====================================================================
+
+# @INTENT
+# goal: (describe what you want to build, then press Ctrl+Shift+I)
+# skills:
+
+@DATA
+hi: str = "Hello from ANCL - native x86-64, no VM, no interpreter, no CRT.\n";
+
+@CODE
+func main() -> i32 {
+    syscall 1, hi;
+    return 0;
+}

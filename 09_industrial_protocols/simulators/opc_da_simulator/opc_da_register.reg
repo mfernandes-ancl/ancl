@@ -1,0 +1,33 @@
+Windows Registry Editor Version 5.00
+
+; =====================================================================
+;  ANCL OPC DA Simulator - registration
+;  RUN AS ADMINISTRATOR (writes HKEY_CLASSES_ROOT = HKLM\Software\Classes).
+;  After importing: the server appears in OPC client "Available servers"
+;  lists (via OpcEnum, through the OPC DA 2.0 component category below),
+;  and clients can bind by ProgID "ANCL.OPCDASim.1" or the CLSID.
+;  To remove later, import opc_da_unregister.reg.
+; =====================================================================
+
+; ---- ProgID -> CLSID ----
+[HKEY_CLASSES_ROOT\ANCL.OPCDASim.1]
+@="ANCL OPC DA Simulator"
+
+[HKEY_CLASSES_ROOT\ANCL.OPCDASim.1\CLSID]
+@="{00112233-4455-6677-8899-AABBCCDDEEFF}"
+
+; ---- CLSID -> friendly name, ProgID, exe, and OPC DA category ----
+[HKEY_CLASSES_ROOT\CLSID\{00112233-4455-6677-8899-AABBCCDDEEFF}]
+@="ANCL OPC DA Simulator"
+
+[HKEY_CLASSES_ROOT\CLSID\{00112233-4455-6677-8899-AABBCCDDEEFF}\ProgID]
+@="ANCL.OPCDASim.1"
+
+; out-of-proc local server: EDIT the path below to the full path where you placed
+; opc_da_server.exe on your machine (COM LocalServer32 requires an absolute path), then import.
+[HKEY_CLASSES_ROOT\CLSID\{00112233-4455-6677-8899-AABBCCDDEEFF}\LocalServer32]
+@="C:\\PATH\\TO\\opc_da_simulator\\opc_da_server.exe"
+
+; THIS is what makes OpcEnum list it: the OPC DA 2.0 server component category
+;   CATID_OPCDAServer20 = {63D5F432-CFE4-11D1-B2C8-0060083BA1FB}
+[HKEY_CLASSES_ROOT\CLSID\{00112233-4455-6677-8899-AABBCCDDEEFF}\Implemented Categories\{63D5F432-CFE4-11D1-B2C8-0060083BA1FB}]

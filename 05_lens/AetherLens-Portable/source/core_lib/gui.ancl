@@ -1,0 +1,160 @@
+# =====================================================================
+#  gui.ancl - small Win32 GUI helpers for native ANCL applications.
+# =====================================================================
+import "gdi.ancl";
+
+extern "comctl32.dll" InitCommonControlsEx;
+
+@DATA
+gui_empty:  str = "";
+gui_static: str = "STATIC";
+gui_edit:   str = "EDIT";
+gui_button: str = "BUTTON";
+gui_list:   str = "SysListView32";
+
+gui_wndclass_scratch: buf = 80;
+gui_msg_scratch:      buf = 64;
+gui_icc_scratch:      buf = 8;
+gui_lvcol_scratch:    buf = 64;
+gui_lvitem_scratch:   buf = 96;
+
+@CODE
+
+func gui_loword(v: i64) -> i64 { return band(v, 65535); }
+func gui_hiword(v: i64) -> i64 { return band(shr(v, 16), 65535); }
+
+func gui_fill_wndclass(wndclass: ptr, clsname: str, wndproc: ptr, hinst: i64, cursor: i64, brush: i64) -> ptr {
+    memset(wndclass, 0, 80);
+    store32(wndclass + 0, 80);        # cbSize
+    store32(wndclass + 4, 3);         # CS_HREDRAW | CS_VREDRAW
+    store64(wndclass + 8, wndproc);
+    store64(wndclass + 24, hinst);
+    store64(wndclass + 40, cursor);
+    store64(wndclass + 48, brush);
+    store64(wndclass + 64, clsname);
+    return wndclass;
+}
+
+func gui_register_class(wndclass: ptr, clsname: str, wndproc: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    gui_fill_wndclass(wndclass, clsname, wndproc, hinst, cursor, brush);
+    return RegisterClassExA(wndclass);
+}
+
+func gui_register_class_auto(clsname: str, wndproc: ptr, brush: i64) -> i64 {
+    hinst = GetModuleHandleA(0);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    return gui_register_class(gui_wndclass_scratch, clsname, wndproc, hinst, cursor, brush);
+}
+
+func gui_init_common_controls(flags: i64) -> i64 {
+    store32(gui_icc_scratch + 0, 8);
+    store32(gui_icc_scratch + 4, flags);
+    return InitCommonControlsEx(gui_icc_scratch);
+}
+
+func gui_message_loop(msgbuf: ptr) -> i32 {
+    while GetMessageA(msgbuf, 0, 0, 0) != 0 {
+        TranslateMessage(msgbuf);
+        DispatchMessageA(msgbuf);
+    }
+    return 0;
+}
+
+func gui_show(hwnd: i64, cmd: i64) -> i64 {
+    ShowWindow(hwnd, cmd);
+    UpdateWindow(hwnd);
+    return hwnd;
+}
+
+func gui_child(cls: str, text: str, style: i64, x: i64, y: i64, w: i64, h: i64, parent: i64, id: i64, hinst: i64) -> ptr {
+    return CreateWindowExA(0, cls, text, style, x, y, w, h, parent, id, hinst, 0);
+}
+
+func gui_child_ex(exstyle: i64, cls: str, text: str, style: i64, x: i64, y: i64, w: i64, h: i64, parent: i64, id: i64, hinst: i64) -> ptr {
+    return CreateWindowExA(exstyle, cls, text, style, x, y, w, h, parent, id, hinst, 0);
+}
+
+func gui_static_text(parent: i64, hinst: i64, text: str, x: i64, y: i64, w: i64, h: i64) -> ptr {
+    return gui_child(gui_static, text, 0x50000000, x, y, w, h, parent, 0, hinst);
+}
+
+func gui_edit_text(parent: i64, hinst: i64, id: i64, text: str, x: i64, y: i64, w: i64, h: i64) -> ptr {
+    return gui_child_ex(512, gui_edit, text, 0x50010080, x, y, w, h, parent, id, hinst);
+}
+
+func gui_button_ctl(parent: i64, hinst: i64, id: i64, text: str, x: i64, y: i64, w: i64, h: i64) -> ptr {
+    return gui_child(gui_button, text, 0x50000000, x, y, w, h, parent, id, hinst);
+}
+
+func gui_listview_report(parent: i64, hinst: i64, id: i64, x: i64, y: i64, w: i64, h: i64) -> ptr {
+    return gui_child_ex(512, gui_list, gui_empty, 0x50000001, x, y, w, h, parent, id, hinst);
+}
+
+func gui_set_font(hwnd: i64, font: i64) -> i64 {
+    if hwnd != 0 { SendMessageA(hwnd, 48, font, 1); } # WM_SETFONT
+    return hwnd;
+}
+
+func gui_set_text(hwnd: i64, text: str) -> i64 {
+    SetWindowTextA(hwnd, text);
+    return hwnd;
+}
+
+func gui_get_text(hwnd: i64, dst: ptr, cap: i64) -> i64 {
+    return GetWindowTextA(hwnd, dst, cap);
+}
+
+func gui_prepare_lv_column(dst: ptr, idx: i64, width: i64, text: str) -> ptr {
+    memset(dst, 0, 64);
+    store32(dst + 0, 15);       # LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM
+    store32(dst + 4, 0);        # LVCFMT_LEFT
+    store32(dst + 8, width);
+    store64(dst + 16, text);
+    store32(dst + 28, idx);
+    return dst;
+}
+
+func gui_lv_add_col(hlv: i64, idx: i64, width: i64, text: str) -> i64 {
+    gui_prepare_lv_column(gui_lvcol_scratch, idx, width, text);
+    return SendMessageA(hlv, 4123, idx, gui_lvcol_scratch); # LVM_INSERTCOLUMNA
+}
+
+func gui_prepare_lv_item(dst: ptr, row: i64, col: i64, text: str) -> ptr {
+    memset(dst, 0, 96);
+    store32(dst + 0, 1);        # LVIF_TEXT
+    store32(dst + 4, row);
+    store32(dst + 8, col);
+    store64(dst + 24, text);
+    store32(dst + 32, 256);
+    return dst;
+}
+
+func gui_lv_insert_row(hlv: i64, row: i64, text: str) -> i64 {
+    gui_prepare_lv_item(gui_lvitem_scratch, row, 0, text);
+    return SendMessageA(hlv, 4103, 0, gui_lvitem_scratch); # LVM_INSERTITEMA
+}
+
+func gui_lv_set_cell(hlv: i64, row: i64, col: i64, text: str) -> i64 {
+    gui_prepare_lv_item(gui_lvitem_scratch, row, col, text);
+    if col == 0 { return SendMessageA(hlv, 4103, 0, gui_lvitem_scratch); }
+    return SendMessageA(hlv, 4142, row, gui_lvitem_scratch); # LVM_SETITEMTEXTA
+}
+
+func gui_lv_get_cell(hlv: i64, row: i64, col: i64, dst: ptr, cap: i64) -> i64 {
+    gui_prepare_lv_item(gui_lvitem_scratch, row, col, dst);
+    store32(gui_lvitem_scratch + 32, cap);
+    return SendMessageA(hlv, 4141, row, gui_lvitem_scratch); # LVM_GETITEMTEXTA
+}
+
+func gui_lv_clear(hlv: i64) -> i64 {
+    return SendMessageA(hlv, 4105, 0, 0); # LVM_DELETEALLITEMS
+}
+
+func gui_lv_count(hlv: i64) -> i64 {
+    return SendMessageA(hlv, 4100, 0, 0); # LVM_GETITEMCOUNT
+}
+
+func gui_lv_style_grid(hlv: i64) -> i64 {
+    SendMessageA(hlv, 4150, 0, 33);      # LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES
+    return hlv;
+}

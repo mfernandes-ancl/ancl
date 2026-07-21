@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+; Unregister the ANCL OPC DA Simulator (run as Administrator).
+[-HKEY_CLASSES_ROOT\ANCL.OPCDASim.1]
+[-HKEY_CLASSES_ROOT\CLSID\{00112233-4455-6677-8899-AABBCCDDEEFF}]

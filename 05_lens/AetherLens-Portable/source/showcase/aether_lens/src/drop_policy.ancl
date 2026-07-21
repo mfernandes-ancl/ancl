@@ -1,0 +1,28 @@
+# Pure Windows Explorer drop validation used before Lens reads a queued image.
+
+@CODE
+func ldp_lower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func ldp_ends_ci(src: i64, suffix: i64) -> i64 {
+    ns = strlen(src);
+    nx = strlen(suffix);
+    if nx > ns { return 0; }
+    i = 0;
+    while i < nx {
+        if ldp_lower(load8(src + ns - nx + i)) != ldp_lower(load8(suffix + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+func ldp_image_path_supported(path: i64) -> i64 {
+    if ldp_ends_ci(path, ".png") == 1 { return 1; }
+    if ldp_ends_ci(path, ".jpg") == 1 { return 1; }
+    if ldp_ends_ci(path, ".jpeg") == 1 { return 1; }
+    if ldp_ends_ci(path, ".gif") == 1 { return 1; }
+    if ldp_ends_ci(path, ".webp") == 1 { return 1; }
+    return 0;
+}

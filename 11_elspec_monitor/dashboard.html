@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Elspec G4430 Grid Monitor</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',sans-serif; background:#0a0e14; color:#c5cdd8; min-height:100vh; }
+.header { background:#111820; padding:12px 24px; border-bottom:2px solid #29ffff; display:flex; align-items:center; gap:16px; }
+.header h1 { font-size:18px; color:#29ffff; font-weight:600; letter-spacing:1px; }
+.header .status { font-size:12px; color:#39d353; margin-left:auto; }
+.tabs { display:flex; gap:0; background:#111820; border-bottom:1px solid #2a3545; }
+.tab { padding:10px 24px; cursor:pointer; font-size:13px; color:#888; border-bottom:2px solid transparent; transition:all .2s; }
+.tab:hover { color:#c5cdd8; }
+.tab.active { color:#29ffff; border-bottom-color:#29ffff; }
+.page { display:none; padding:20px; }
+.page.active { display:block; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; }
+.card { background:#111820; border:1px solid #2a3545; border-radius:8px; padding:16px; position:relative; }
+.card.offline { opacity:0.5; border-color:#555; }
+.card.disabled { opacity:0.35; border-color:#333; }
+.card-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding-right:90px; }
+.card-header h2 { font-size:14px; color:#fff; }
+.card-header .farm { font-size:11px; color:#888; }
+.card-header .ip { font-size:11px; color:#29ffff; font-family:monospace; }
+.badge { font-size:10px; padding:2px 8px; border-radius:4px; font-weight:600; }
+.badge.online { background:#1a3d1a; color:#39d353; }
+.badge.offline { background:#3d1a1a; color:#f53a70; }
+.badge.disabled { background:#2a2a1a; color:#888; }
+.values { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+.val-item { background:#0a0e14; border:1px solid #1e2a36; border-radius:4px; padding:8px; text-align:center; }
+.val-item .label { font-size:10px; color:#888; text-transform:uppercase; margin-bottom:2px; }
+.val-item .num { font-size:15px; font-weight:600; color:#e0e6ed; font-family:'Consolas',monospace; }
+.val-item .unit { font-size:10px; color:#666; margin-left:2px; }
+.val-item.highlight .num { color:#29ffff; }
+.toggle-btn { position:absolute; top:12px; right:12px; padding:6px 14px; font-size:11px; border:1px solid #2a3545;
+  border-radius:4px; cursor:pointer; background:#0a0e14; color:#c5cdd8; min-width:80px; text-align:center; }
+.toggle-btn:hover { border-color:#29ffff; color:#29ffff; }
+.toggle-btn.enabled { border-color:#39d353; color:#39d353; }
+.toggle-btn.disabled { border-color:#f53a70; color:#f53a70; }
+.reg-table { width:100%; border-collapse:collapse; max-width:700px; }
+.reg-table th { text-align:left; padding:8px 12px; font-size:11px; color:#888; border-bottom:1px solid #2a3545; }
+.reg-table td { padding:6px 12px; border-bottom:1px solid #1e2a36; }
+.reg-table input { background:#0a0e14; border:1px solid #2a3545; color:#fff; padding:5px 8px; border-radius:4px; font-size:12px; width:80px; }
+.reg-table input.unit-input { width:50px; text-align:center; }
+.reg-table .tag-name { color:#29ffff; font-family:monospace; font-size:12px; }
+.reg-table .addr { color:#888; font-family:monospace; font-size:11px; }
+.btn-save-regs { padding:8px 24px; background:#1a3d1a; color:#39d353; border:1px solid #39d353; border-radius:4px; cursor:pointer; font-size:13px; margin-top:16px; }
+</style>
+</head>
+<body>
+<div class="header">
+<h1>ELSPEC G4430 GRID MONITOR</h1>
+<button id="poll-btn" onclick="togglePolling()" style="padding:6px 16px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;border:1px solid #39d353;background:#0a0e14;color:#39d353;margin-left:16px;">Start Polling</button>
+<button onclick="shutdownApp()" title="Stop the monitor service" style="padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;border:1px solid #f53a70;background:#0a0e14;color:#f53a70;margin-left:10px;">&#9211; Shutdown</button>
+<span class="status" id="status">Connecting...</span>
+</div>
+<div class="tabs">
+<div class="tab active" onclick="switchTab(0)">Monitor</div>
+<div class="tab" onclick="switchTab(1)">Configuration</div>
+<div class="tab" onclick="switchTab(2)">Registers</div>
+</div>
+<div class="page active" id="page-monitor">
+<div class="grid" id="grid"></div>
+</div>
+
+<div class="page" id="page-config">
+<div style="max-width:900px;">
+<h2 style="color:#29ffff;margin-bottom:16px;font-size:16px;">Device Configuration</h2>
+<p style="color:#888;font-size:12px;margin-bottom:20px;">Add, remove and edit Elspec analyzers. Click <b style="color:#c5cdd8;">Save Configuration</b> to apply &amp; persist (written to elspec_config.ini).</p>
+<div id="config-cards"></div>
+<div style="margin-top:16px;">
+<button onclick="addDevice()" style="padding:8px 20px;background:#10202e;color:#29ffff;border:1px solid #29ffff;border-radius:4px;cursor:pointer;font-size:13px;">+ Add Elspec</button>
+</div>
+<div style="margin-top:16px;display:flex;gap:12px;">
+<button onclick="saveConfig()" style="padding:8px 24px;background:#1a3d1a;color:#39d353;border:1px solid #39d353;border-radius:4px;cursor:pointer;font-size:13px;">Save Configuration</button>
+<span id="save-status" style="font-size:12px;color:#888;line-height:36px;"></span>
+</div>
+</div>
+</div>
+
+<div class="page" id="page-registers">
+<div style="max-width:760px;">
+<h2 style="color:#29ffff;margin-bottom:8px;font-size:16px;">Register Scale &amp; Units</h2>
+<p style="color:#888;font-size:12px;margin-bottom:12px;">Raw Modbus float &times; scale = displayed value. <b style="color:#c5cdd8;">Scale is per device</b> (meters can report in different units, e.g. W vs MW); Unit &amp; Highlight are shared across all devices.</p>
+<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+  <label style="font-size:12px;color:#888;">Editing device:</label>
+  <select id="reg-dev-sel" onchange="onRegDevChange()" style="background:#0a0e14;border:1px solid #2a3545;color:#29ffff;padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;"></select>
+</div>
+<table class="reg-table">
+<thead><tr><th>Tag</th><th>Elspec Addr</th><th>Scale (this device)</th><th>Unit (all)</th><th>Highlight (all)</th></tr></thead>
+<tbody id="reg-table-body"></tbody>
+</table>
+<button class="btn-save-regs" onclick="saveRegs()">Apply Changes</button>
+<button class="btn-save-regs" style="background:#10202e;color:#29ffff;border-color:#29ffff;margin-left:8px;" onclick="copyScalesToAll()">Copy this device's scales to all</button>
+<span id="reg-save-status" style="font-size:12px;color:#888;margin-left:12px;"></span>
+</div>
+</div>
+
+<div id="logpanel" style="margin:0 20px 18px;border:1px solid #2a3545;border-radius:8px;background:#0a0e14;">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 14px;border-bottom:1px solid #2a3545;">
+    <span style="font-size:11px;color:#888;letter-spacing:1px;font-weight:600;">SERVICE LOG</span>
+    <span>
+      <button onclick="saveLog()" title="Download the log to a file" style="padding:3px 12px;font-size:11px;background:#0a0e14;color:#29ffff;border:1px solid #2a3545;border-radius:4px;cursor:pointer;">Save</button>
+      <button onclick="clearLog()" title="Clear the log" style="padding:3px 12px;font-size:11px;background:#0a0e14;color:#888;border:1px solid #2a3545;border-radius:4px;cursor:pointer;margin-left:6px;">Clear</button>
+    </span>
+  </div>
+  <pre id="logtext" style="margin:0;padding:10px 14px;max-height:170px;overflow:auto;font-family:'Consolas',monospace;font-size:11px;line-height:1.5;color:#9fb3c8;white-space:pre-wrap;word-break:break-word;"></pre>
+</div>
+
+<script>
+// Register META: unit label + highlight are cosmetic (browser localStorage,
+// by index). Elspec ADDRESSES and per-device SCALES are SERVER-side (the backend
+// stores them in elspec_config.ini and serves them via /api/config & /api/data).
+const REGS_DEFAULT = [
+  { tag:'MW', unit:'MW', highlight:true }, { tag:'MVAr', unit:'MVAr', highlight:true },
+  { tag:'Hz', unit:'Hz', highlight:true }, { tag:'V12_RMS', unit:'V', highlight:false },
+  { tag:'V23_RMS', unit:'V', highlight:false }, { tag:'V31_RMS', unit:'V', highlight:false },
+  { tag:'I1_RMS', unit:'A', highlight:false }, { tag:'I2_RMS', unit:'A', highlight:false },
+  { tag:'I3_RMS', unit:'A', highlight:false }, { tag:'V_AVG', unit:'V', highlight:false },
+  { tag:'I_AVG', unit:'A', highlight:false }, { tag:'PF', unit:'', highlight:true }
+];
+let REGS = JSON.parse(localStorage.getItem('elspec_regs_meta')) || JSON.parse(JSON.stringify(REGS_DEFAULT));
+REGS_DEFAULT.forEach((d,i) => { if (!REGS[i] || REGS[i].tag !== d.tag) REGS[i] = Object.assign({}, d); });
+
+let regEditDev = 0;   // device the Registers tab is editing
+
+function deviceNames() {
+  if (currentData && currentData.devices && currentData.devices.length) return currentData.devices.map(d => d.name);
+  return ['Device 0'];
+}
+// Per-device scale for register index r, from the live /api/data snapshot.
+function getScaleIdx(devIdx, r) {
+  const dev = currentData && currentData.devices && currentData.devices[devIdx];
+  if (dev && dev.scales && dev.scales[r] != null) { const v = parseFloat(dev.scales[r]); if (!isNaN(v)) return v; }
+  return 1;
+}
+
+function buildRegTable() {
+  fetch('/api/config').then(r=>r.json()).then(cfg => {
+    const names = cfg.devices.map(d => d.name);
+    if (regEditDev >= names.length) regEditDev = 0;
+    document.getElementById('reg-dev-sel').innerHTML = names.map((n,i) => `<option value="${i}" ${i===regEditDev?'selected':''}>${n}</option>`).join('');
+    const scales = (cfg.devices[regEditDev] && cfg.devices[regEditDev].scales) || [];
+    const addrs = cfg.registers || [];
+    const tbody = document.getElementById('reg-table-body');
+    tbody.innerHTML = '';
+    REGS.forEach((reg, i) => {
+      const addr = addrs[i] ? addrs[i].addr : '';
+      const sc = scales[i] != null ? scales[i] : '1';
+      tbody.innerHTML += `<tr>
+        <td class="tag-name">${reg.tag}</td>
+        <td><input id="reg-addr-${i}" type="text" value="${addr}" style="width:80px;"></td>
+        <td><input id="reg-scale-${i}" type="text" value="${sc}"></td>
+        <td><input id="reg-unit-${i}" class="unit-input" type="text" value="${reg.unit}"></td>
+        <td><input id="reg-hl-${i}" type="checkbox" ${reg.highlight?'checked':''} style="width:16px;height:16px;cursor:pointer;"></td>
+      </tr>`;
+    });
+  });
+}
+
+// Read table inputs -> {addrs[], scales[]}; persist unit/highlight locally.
+function collectRegInputs() {
+  const addrs = [], scales = [];
+  REGS.forEach((reg, i) => {
+    addrs.push(parseInt(document.getElementById('reg-addr-'+i).value) || 0);
+    scales.push((document.getElementById('reg-scale-'+i).value || '1').trim() || '1');
+    reg.unit = document.getElementById('reg-unit-'+i).value;
+    reg.highlight = document.getElementById('reg-hl-'+i).checked;
+  });
+  localStorage.setItem('elspec_regs_meta', JSON.stringify(REGS));
+  return { addrs, scales };
+}
+function postRegisters(dev, addrs, scales) {
+  return fetch('/api/registers', {method:'POST', body: JSON.stringify({dev, addrs, scales})});
+}
+
+// Switching device auto-saves the current device's edits, then reloads.
+function onRegDevChange() {
+  const r = collectRegInputs();
+  postRegisters(regEditDev, r.addrs, r.scales).then(() => {
+    regEditDev = parseInt(document.getElementById('reg-dev-sel').value) || 0;
+    buildRegTable();
+  });
+}
+
+function saveRegs() {
+  const r = collectRegInputs();
+  postRegisters(regEditDev, r.addrs, r.scales)
+    .then(() => { setStatus('reg-save-status', 'Applied to ' + deviceNames()[regEditDev] + ' at ' + new Date().toLocaleTimeString(), '#39d353'); buildRegTable(); poll(); })
+    .catch(() => setStatus('reg-save-status', 'Save failed!', '#f53a70'));
+}
+
+// Copy current addresses + scales to EVERY device (one POST per device).
+function copyScalesToAll() {
+  const r = collectRegInputs();
+  const cnt = (currentData && currentData.devices) ? currentData.devices.length : 1;
+  let chain = Promise.resolve();
+  for (let d = 0; d < cnt; d++) { const dd = d; chain = chain.then(() => postRegisters(dd, r.addrs, r.scales)); }
+  chain.then(() => { setStatus('reg-save-status', 'Copied to all ' + cnt + ' devices at ' + new Date().toLocaleTimeString(), '#39d353'); buildRegTable(); poll(); })
+       .catch(() => setStatus('reg-save-status', 'Copy failed!', '#f53a70'));
+}
+
+let currentData = null;
+
+function switchTab(n) {
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', i===n));
+  document.querySelectorAll('.page').forEach((p,i) => p.classList.toggle('active', i===n));
+  if (n===1) loadConfig();
+  if (n===2) buildRegTable();
+}
+
+function toggleDevice(idx) {
+  fetch('/api/enable', {method:'POST', body: JSON.stringify({device:idx})})
+    .then(r => r.json()).then(() => { setTimeout(poll, 300); });
+}
+
+function togglePolling() {
+  fetch('/api/data').then(r=>r.json()).then(data => {
+    const endpoint = data.polling ? '/api/stop' : '/api/start';
+    fetch(endpoint, {method:'POST', body:'{}'}).then(() => setTimeout(poll, 300));
+  });
+}
+
+function updatePollButton(isPolling) {
+  const btn = document.getElementById('poll-btn');
+  if (isPolling) {
+    btn.textContent = 'Stop Polling';
+    btn.style.borderColor = '#f53a70';
+    btn.style.color = '#f53a70';
+  } else {
+    btn.textContent = 'Start Polling';
+    btn.style.borderColor = '#39d353';
+    btn.style.color = '#39d353';
+  }
+}
+
+function formatValue(raw, scale) {
+  const v = parseFloat(raw) * scale;
+  if (Math.abs(v) >= 10000) return v.toFixed(0);
+  if (Math.abs(v) >= 1000) return v.toFixed(1);
+  if (Math.abs(v) >= 100) return v.toFixed(2);
+  return v.toFixed(2);
+}
+
+function render(data) {
+  currentData = data;
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  data.devices.forEach((dev, idx) => {
+    const card = document.createElement('div');
+    let cls = 'card';
+    if (!dev.enabled) cls += ' disabled';
+    else if (!dev.connected) cls += ' offline';
+    card.className = cls;
+
+    const btnLabel = dev.enabled ? 'Enabled' : 'Disabled';
+    const btnCls = dev.enabled ? 'toggle-btn enabled' : 'toggle-btn disabled';
+
+    let badge = '';
+    if (!dev.enabled) badge = '<span class="badge disabled">DISABLED</span>';
+    else if (dev.connected) badge = '<span class="badge online">ONLINE</span>';
+    else badge = '<span class="badge offline">OFFLINE</span>';
+
+    let vals = '';
+    REGS.forEach((reg, r) => {
+      const raw = dev.values[reg.tag] || '0.00';
+      const displayed = formatValue(raw, getScaleIdx(idx, r));
+      const hl = reg.highlight ? ' highlight' : '';
+      const unitHtml = reg.unit ? `<span class="unit">${reg.unit}</span>` : '';
+      vals += `<div class="val-item${hl}"><div class="label">${reg.tag}</div><div class="num">${displayed} ${unitHtml}</div></div>`;
+    });
+
+    card.innerHTML = `
+      <button class="${btnCls}" onclick="toggleDevice(${idx})">${btnLabel}</button>
+      <div class="card-header">
+        <div><h2>${dev.name}</h2><span class="farm">${dev.farm}</span> &middot; <span class="ip">${dev.ip}</span></div>
+        ${badge}
+      </div>
+      <div class="values">${vals}</div>`;
+    grid.appendChild(card);
+  });
+}
+
+const MAX_DEVICES = 32;
+function setStatus(id, text, color) { const el = document.getElementById(id); el.textContent = text; el.style.color = color; }
+
+function deviceCardHTML(dev) {
+  const d = dev || {name:'Device', farm:'', ip:'127.0.0.1', unit_id:1, poll_ms:1000, enabled:false};
+  const inp = 'width:100%;background:#0a0e14;border:1px solid #2a3545;color:#fff;padding:6px;border-radius:4px;font-size:12px;';
+  return `
+  <div class="cfg-card" style="background:#111820;border:1px solid #2a3545;border-radius:8px;padding:16px;margin-bottom:12px;position:relative;">
+    <button onclick="removeDevice(this)" title="Remove this device" style="position:absolute;top:10px;right:10px;padding:4px 10px;font-size:11px;background:#0a0e14;color:#f53a70;border:1px solid #3d1a1a;border-radius:4px;cursor:pointer;">Remove</button>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 90px 90px 70px;gap:12px;align-items:end;padding-right:80px;">
+      <div><label style="font-size:11px;color:#888;">Name</label><input class="cfg-name" value="${d.name||''}" style="${inp}"></div>
+      <div><label style="font-size:11px;color:#888;">Site / Farm</label><input class="cfg-farm" value="${d.farm||''}" style="${inp}"></div>
+      <div><label style="font-size:11px;color:#888;">IP Address</label><input class="cfg-ip" value="${d.ip||''}" style="${inp}color:#29ffff;font-family:monospace;"></div>
+      <div><label style="font-size:11px;color:#888;">Unit ID</label><input class="cfg-uid" type="number" value="${d.unit_id}" style="${inp}"></div>
+      <div><label style="font-size:11px;color:#888;">Poll (ms)</label><input class="cfg-poll" type="number" value="${d.poll_ms}" style="${inp}"></div>
+      <div style="text-align:center;"><label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">Enabled</label><input class="cfg-en" type="checkbox" ${d.enabled?'checked':''} style="width:20px;height:20px;cursor:pointer;"></div>
+    </div>
+  </div>`;
+}
+
+function loadConfig() {
+  fetch('/api/config').then(r=>r.json()).then(cfg => {
+    const cont = document.getElementById('config-cards');
+    cont.innerHTML = '';
+    cfg.devices.forEach(dev => cont.insertAdjacentHTML('beforeend', deviceCardHTML(dev)));
+  });
+}
+
+function addDevice() {
+  const cont = document.getElementById('config-cards');
+  if (cont.querySelectorAll('.cfg-card').length >= MAX_DEVICES) { setStatus('save-status', 'Max ' + MAX_DEVICES + ' devices reached', '#f53a70'); return; }
+  cont.insertAdjacentHTML('beforeend', deviceCardHTML(null));
+}
+
+function removeDevice(btn) { const card = btn.closest('.cfg-card'); if (card) card.remove(); }
+
+function saveConfig() {
+  const cards = [...document.querySelectorAll('#config-cards .cfg-card')];
+  if (cards.length === 0) { setStatus('save-status', 'Add at least one device first', '#f53a70'); return; }
+  const devices = cards.map(c => ({
+    name: c.querySelector('.cfg-name').value || 'Elspec',
+    farm: c.querySelector('.cfg-farm').value,
+    ip: c.querySelector('.cfg-ip').value,
+    unit_id: parseInt(c.querySelector('.cfg-uid').value) || 159,
+    poll_ms: parseInt(c.querySelector('.cfg-poll').value) || 1000,
+    enabled: c.querySelector('.cfg-en').checked
+  }));
+  // POST the FULL config: backend applies name/farm/ip/unit/poll/enabled for
+  // every device, writes elspec_config.ini, and reconnects with the new values.
+  fetch('/api/config', {method:'POST', body: JSON.stringify({devices})})
+    .then(r => r.json())
+    .then(() => { setStatus('save-status', 'Saved ' + devices.length + ' device(s) at ' + new Date().toLocaleTimeString(), '#39d353'); setTimeout(poll, 500); })
+    .catch(() => { setStatus('save-status', 'Save failed!', '#f53a70'); });
+}
+
+function poll() {
+  fetch('/api/data')
+    .then(r => r.json())
+    .then(data => {
+      render(data);
+      updatePollButton(data.polling);
+      document.getElementById('status').textContent = 'Live (' + new Date().toLocaleTimeString() + ')';
+      document.getElementById('status').style.color = '#39d353';
+    })
+    .catch(() => {
+      document.getElementById('status').textContent = 'Connection lost';
+      document.getElementById('status').style.color = '#f53a70';
+    });
+}
+
+function pollLog() {
+  fetch('/api/log').then(r => r.text()).then(t => {
+    const el = document.getElementById('logtext');
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+    if (el.textContent !== t) { el.textContent = t; if (atBottom) el.scrollTop = el.scrollHeight; }
+  }).catch(() => {});
+}
+
+function saveLog() {
+  const txt = document.getElementById('logtext').textContent || '';
+  const blob = new Blob([txt], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+  a.href = url; a.download = 'elspec_log_' + ts + '.txt';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function clearLog() {
+  fetch('/api/logclear', {method:'POST', body:'{}'}).catch(() => {});
+  document.getElementById('logtext').textContent = '';
+}
+
+function shutdownApp() {
+  if (!confirm('Shut down the Elspec monitor service? The dashboard will stop responding.')) return;
+  fetch('/api/shutdown', {method:'POST', body:'{}'}).catch(() => {});
+  setStatus('status', 'Service stopped', '#f53a70');
+}
+
+poll();
+pollLog();
+setInterval(poll, 2000);
+setInterval(pollLog, 2000);
+</script>
+</body>
+</html>

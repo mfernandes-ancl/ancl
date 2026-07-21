@@ -1,0 +1,62 @@
+# =====================================================================
+#  minimal_window.ancl  -  Aether Studio "New > Win32 Window" boilerplate.
+#
+#  The smallest native dark Win32 window: RegisterClassExA + CreateWindowExA
+#  + a message loop, painting a greeting. Self-contained (a few inline
+#  externs; the rest of the Win32 calls are anclc built-ins). CRT-free.
+#  Build it from the IDE with Ctrl+B (it auto-selects the GUI subsystem
+#  because it calls CreateWindowExA).
+# =====================================================================
+extern "gdi32.dll"  CreateSolidBrush -> ptr;   # HBRUSH CreateSolidBrush(COLORREF)
+extern "gdi32.dll"  SetTextColor;              # COLORREF SetTextColor(hdc, COLORREF)
+extern "gdi32.dll"  SetBkMode;                 # int SetBkMode(hdc, mode)
+extern "gdi32.dll"  TextOutA;                  # BOOL TextOutA(hdc, x, y, str, cch)
+extern "user32.dll" BeginPaint -> ptr;         # HDC BeginPaint(hwnd, &PAINTSTRUCT)
+extern "user32.dll" EndPaint;                  # BOOL EndPaint(hwnd, &PAINTSTRUCT)
+
+@DATA
+wc:     buf = 80;       # WNDCLASSEXA
+msg:    buf = 48;       # MSG
+ps:     buf = 72;       # PAINTSTRUCT
+cls:    str = "MinimalAnclWnd";
+title:  str = "Minimal ANCL Window";
+hello:  str = "Hello from a native ANCL window!";
+brush:  buf = 8;
+
+@CODE
+func WndProc(h: i64, m: i64, w: i64, l: i64) -> i64 {
+    if m == 15 {                                # WM_PAINT
+        hdc = BeginPaint(h, ps);
+        SetBkMode(hdc, 1);                      # TRANSPARENT
+        SetTextColor(hdc, 0x00DCDCDC);
+        TextOutA(hdc, 24, 24, hello, strlen(hello));
+        EndPaint(h, ps);
+        return 0;
+    }
+    if m == 2 { PostQuitMessage(0); return 0; } # WM_DESTROY
+    return DefWindowProcA(h, m, w, l);
+}
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(brush, CreateSolidBrush(0x00000000));      # pure black
+    store32(wc + 0,  80);                              # cbSize
+    store32(wc + 4,  3);                               # CS_HREDRAW|CS_VREDRAW
+    store64(wc + 8,  &WndProc);
+    store64(wc + 24, hinst);
+    store64(wc + 40, LoadCursorA(0, 32512));           # IDC_ARROW
+    store64(wc + 48, load64(brush));                   # hbrBackground
+    store64(wc + 64, cls);
+    RegisterClassExA(wc);
+
+    h = CreateWindowExA(0, cls, title, 0x12CF0000, 80, 60, 640, 420, 0, 0, hinst, 0);
+    ShowWindow(h, 1);
+    UpdateWindow(h);
+    while 1 {
+        r = GetMessageA(msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(msg);
+        DispatchMessageA(msg);
+    }
+    return 0;
+}

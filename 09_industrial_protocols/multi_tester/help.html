@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AetherEdge Ultimate Multi-Tester - Help Guide</title>
+    <style>
+        :root {
+            --bg-color: #0b0908;
+            --panel-color: #120e0d;
+            --border-color: #241d1a;
+            --text-color: #e5dfda;
+            --text-muted: #968c85;
+            --accent-red: #ff3c3c;
+            --accent-green: #3cd070;
+            --accent-orange: #f28c28;
+            --accent-blue: #3c92fb;
+            --accent-cyan: #3cd0c0;
+            --accent-purple: #a855f7;
+            --accent-teal: #40d080;
+            --accent-bacnet: #cc7a00;
+            --accent-iccp: #ffa500;
+            --accent-wind: #ffe500;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Outfit', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            line-height: 1.6;
+            padding: 40px 20px;
+        }
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+        header {
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 20px;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            letter-spacing: -0.05em;
+            color: #ffffff;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        h1 span {
+            color: var(--accent-red);
+        }
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 24px;
+        }
+        .card {
+            background-color: var(--panel-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }
+        .card:hover {
+            transform: translateY(-2px);
+        }
+        .card.modbus { border-top: 4px solid var(--accent-cyan); }
+        .card.fins { border-top: 4px solid var(--accent-orange); }
+        .card.s7 { border-top: 4px solid var(--accent-green); }
+        .card.iec104 { border-top: 4px solid var(--accent-blue); }
+        .card.iec61850 { border-top: 4px solid var(--accent-purple); }
+        .card.ab { border-top: 4px solid var(--accent-red); }
+        .card.dnp3 { border-top: 4px solid var(--accent-teal); }
+        .card.bacnet { border-top: 4px solid var(--accent-bacnet); }
+        .card.iccp { border-top: 4px solid var(--accent-iccp); }
+        .card.wind { border-top: 4px solid var(--accent-wind); }
+
+        .card h2 {
+            font-size: 1.4rem;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .port-badge {
+            font-size: 0.8rem;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background-color: rgba(255,255,255,0.05);
+            color: var(--text-muted);
+            font-family: monospace;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .card.modbus .port-badge { color: var(--accent-cyan); border-color: rgba(60,208,192,0.2); }
+        .card.fins .port-badge { color: var(--accent-orange); border-color: rgba(242,140,40,0.2); }
+        .card.s7 .port-badge { color: var(--accent-green); border-color: rgba(60,208,112,0.2); }
+        .card.iec104 .port-badge { color: var(--accent-blue); border-color: rgba(60,146,251,0.2); }
+        .card.iec61850 .port-badge { color: var(--accent-purple); border-color: rgba(168,85,247,0.2); }
+        .card.ab .port-badge { color: var(--accent-red); border-color: rgba(255,60,60,0.2); }
+        .card.dnp3 .port-badge { color: var(--accent-teal); border-color: rgba(64,208,128,0.2); }
+        .card.bacnet .port-badge { color: var(--accent-bacnet); border-color: rgba(204,122,0,0.2); }
+        .card.iccp .port-badge { color: var(--accent-iccp); border-color: rgba(255,165,0,0.2); }
+        .card.wind .port-badge { color: var(--accent-wind); border-color: rgba(255,229,0,0.2); }
+
+        ul {
+            list-style: none;
+            margin-bottom: 16px;
+        }
+        li {
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+            color: var(--text-color);
+        }
+        strong {
+            color: #ffffff;
+        }
+        .code-block {
+            background-color: rgba(0,0,0,0.3);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+            overflow-x: auto;
+            margin-top: 4px;
+        }
+        .footer {
+            margin-top: 50px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border-color);
+            padding-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>AetherEdge <span>Multi-Tester</span></h1>
+            <p class="subtitle">Quick-Start Field Guide for Supported Substation & Automation Protocols</p>
+        </header>
+
+        <div class="grid">
+            <!-- Modbus/TCP -->
+            <div class="card modbus">
+                <h2>Modbus/TCP <span class="port-badge">Port 502</span></h2>
+                <ul>
+                    <li><strong>Coils (0x)</strong>: Read/Write single bits. Code: <code>01</code> (Read), <code>05</code> (Write).</li>
+                    <li><strong>Discrete Inputs (1x)</strong>: Read-only bits. Code: <code>02</code>.</li>
+                    <li><strong>Input Registers (3x)</strong>: Read-only 16-bit. Code: <code>04</code>.</li>
+                    <li><strong>Holding Registers (4x)</strong>: Read/Write 16-bit. Code: <code>03</code> (Read), <code>06</code>/<code>16</code> (Write).</li>
+                </ul>
+                <p>Address Syntax:</p>
+                <div class="code-block">00001 (Coil 1), 40002 (Holding Register 2)</div>
+            </div>
+
+            <!-- Omron FINS -->
+            <div class="card fins">
+                <h2>Omron FINS <span class="port-badge">Port 9600</span></h2>
+                <ul>
+                    <li><strong>DM (Data Memory)</strong>: Hex code <code>0x82</code>. Primary memory area.</li>
+                    <li><strong>HR (Holding Area)</strong>: Hex code <code>0xB2</code>. Retentive memory.</li>
+                    <li><strong>CIO (Core I/O)</strong>: Hex code <code>0xB0</code>. Direct physical I/O mapping.</li>
+                    <li><strong>AR / EM Areas</strong>: Hex codes <code>0xB3</code> / <code>0x90</code> (EM Bank 0).</li>
+                </ul>
+                <p>Address Format:</p>
+                <div class="code-block">DM100 (Offset 100 in DM), HR20 (Offset 20 in HR)</div>
+            </div>
+
+            <!-- Siemens S7comm -->
+            <div class="card s7">
+                <h2>Siemens S7comm <span class="port-badge">Port 102 / 10200</span></h2>
+                <ul>
+                    <li><strong>DB (Data Block)</strong>: User-defined memory blocks.</li>
+                    <li><strong>M (Markers)</strong>: Internal relays/flags.</li>
+                    <li><strong>I (Inputs) / Q (Outputs)</strong>: Physical I/O states.</li>
+                    <li><strong>Sizes</strong>: Bit (X), Byte (B), Word (W), Double-Word (D).</li>
+                </ul>
+                <p>Address Format:</p>
+                <div class="code-block">DB1.DBW2 (Word at DB1 offset 2), MW4 (Word at M offset 4)</div>
+            </div>
+
+            <!-- IEC 60870-5-104 -->
+            <div class="card iec104">
+                <h2>IEC 104 <span class="port-badge">Port 2404</span></h2>
+                <ul>
+                    <li><strong>CA (Common Address)</strong>: Sector/Station Address (usually 1).</li>
+                    <li><strong>IOA (Info Object Address)</strong>: Specific point index.</li>
+                    <li><strong>Commands</strong>:
+                        <br>• Type 45: Single Command (SC)
+                        <br>• Type 46: Double Command (DC)
+                    </li>
+                </ul>
+                <p>Connection Handshake:</p>
+                <div class="code-block">Sends STARTDT act. Waits for STARTDT con before ASDU transmission.</div>
+            </div>
+
+            <!-- IEC 61850 MMS -->
+            <div class="card iec61850">
+                <h2>IEC 61850 MMS <span class="port-badge">Port 102</span></h2>
+                <ul>
+                    <li><strong>Object Reference</strong>: Structured hierarchy.</li>
+                    <li><strong>Syntax</strong>: <code>Device/Node.Data.Attribute</code></li>
+                    <li><strong>FC (Functional Constraint)</strong>: Grouping filter (ST=Status, MX=Measurands, CO=Control, SP=Setpoints).</li>
+                </ul>
+                <p>Example Point:</p>
+                <div class="code-block">WTG_Status/MMXU1.TotW.mag.f[MX] (Total Watts float value)</div>
+            </div>
+
+            <!-- IEC 61400-25 Wind -->
+            <div class="card wind">
+                <h2>IEC 61400-25 (WIND) <span class="port-badge">Port 10104</span></h2>
+                <ul>
+                    <li><strong>Object Hierarchy</strong>: Tailored wind turbine model (e.g. Wnac1, WROT1, Wmet1).</li>
+                    <li><strong>Syntax</strong>: <code>LogicalDevice/Node.Data.Attribute</code></li>
+                    <li><strong>FC (Functional Constraint)</strong>: Filter groups (MX=Measurements, ST=Status, CO=Controls).</li>
+                </ul>
+                <p>Example Point:</p>
+                <div class="code-block">WTG1Sim/Wnac1.TurSt.stVal[ST] (Turbine State status value)</div>
+            </div>
+
+            <!-- Allen-Bradley CIP -->
+            <div class="card ab">
+                <h2>Allen-Bradley <span class="port-badge">Port 44818</span></h2>
+                <ul>
+                    <li><strong>Symbolic Tags</strong>: Tags are referenced directly by name.</li>
+                    <li><strong>ANSI Segment</strong>: Encodes tag names into binary segments.</li>
+                    <li><strong>Data Types</strong>:
+                        <br>• BOOL (1-bit), INT (16-bit), DINT (32-bit), REAL (32-bit Float)
+                    </li>
+                </ul>
+                <p>Example Point:</p>
+                <div class="code-block">WTG_Running (BOOL), WTG_WindSpeed (REAL)</div>
+            </div>
+
+            <!-- DNP3 Outstation -->
+            <div class="card dnp3">
+                <h2>DNP3 <span class="port-badge">Port 20000</span></h2>
+                <ul>
+                    <li><strong>Binary Inputs / Outputs</strong>: Group 1 / 10 (Variation 2 for status/value).</li>
+                    <li><strong>Analog Inputs / Outputs</strong>: Group 30 / 40 (Variation 1 for 32-bit signed with flags).</li>
+                    <li><strong>Counters</strong>: Group 20 (Variation 1 for 32-bit with flags).</li>
+                    <li><strong>Commands</strong>:
+                        <br>• Group 12 (CROB): Binary control (Index/Control).
+                        <br>• Group 41: Analog Setpoint command (Index/Setpoint).
+                    </li>
+                </ul>
+                <p>Address Syntax:</p>
+                <div class="code-block">Grp 41 Var 2 Index 0 Ctrl 999 (Analog setpoint 999 to AO 0)</div>
+            </div>
+
+            <!-- BACnet/IP -->
+            <div class="card bacnet">
+                <h2>BACnet/IP <span class="port-badge">Port 47808</span></h2>
+                <ul>
+                    <li><strong>Analog Input (AI) / Output (AO)</strong>: Read/Write float values. Type 0 (AI), Type 1 (AO).</li>
+                    <li><strong>Analog Value (AV)</strong>: Read/Write float values. Type 2.</li>
+                    <li><strong>Binary Input (BI) / Output (BO) / Value (BV)</strong>: Read/Write boolean states (0/1). Type 3 (BI), Type 4 (BO), Type 5 (BV).</li>
+                    <li><strong>Who-Is Discovery</strong>: Unconfirmed service to discover active BACnet devices on the network.</li>
+                </ul>
+                <p>Address Syntax:</p>
+                <div class="code-block">AI:0 (Analog Input 0), AV:4 (Analog Value 4), BV:5 (Binary Value 5)</div>
+            </div>
+
+            <!-- ICCP (TASE.2) -->
+            <div class="card iccp">
+                <h2>ICCP (TASE.2) <span class="port-badge">Port 10103</span></h2>
+                <ul>
+                    <li><strong>MMS Association</strong>: Standard connection for TASE.2 client/server association.</li>
+                    <li><strong>Data Point Mapping</strong>: Standardized mapping of telemetry data.</li>
+                    <li><strong>Control Operations</strong>: Direct control operations on remote points.</li>
+                </ul>
+                <p>Address Format:</p>
+                <div class="code-block">/Device/Data.Attribute (MMS hierarchy reference)</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>AetherEdge Industrial Protocol Multi-Tester &bull; Zero-CRT High-Performance Win32 &bull; Version 1.0</p>
+        </div>
+    </div>
+</body>
+</html>

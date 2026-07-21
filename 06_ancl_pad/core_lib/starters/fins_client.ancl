@@ -1,0 +1,139 @@
+# fins_client.ancl - Omron FINS/TCP DM read/write/poll STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client: edit the CONFIG block, COMPILE, RUN. Then extend it -
+# Ctrl+Space (the op-brain) knows the ANCL idioms. Defaults to READ (CFG_OP=0);
+# set CFG_OP=1 to write g_wq[0] into DMx. Loaded by Aether Studio for FINS intent.
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" setsockopt;
+extern "kernel32.dll" Sleep;
+
+@DATA
+mInfo: str = "[fins] Omron FINS client (ANCL starter)";
+mErr:  str = "[fins] connect failed - check IP / port / cable.";
+mNo:   str = "[fins] no / short reply.";
+mHok:  str = "[fins] FINS/TCP handshake OK - client node ";
+mHok2: str = ", server node ";
+mHf:   str = "[fins] handshake refused - error ";
+mDm:   str = "[fins] DM";
+mEq:   str = " = ";
+mWr:   str = "[fins] write confirmed at DM";
+mEc:   str = "[fins] device end code = ";
+nl:    str = "\r\n";
+# ==== CONFIG - edit these ====
+CFG_IP0:  i64 = 127;    # target IP, octet 1
+CFG_IP1:  i64 = 0;      #   octet 2
+CFG_IP2:  i64 = 0;      #   octet 3
+CFG_IP3:  i64 = 1;      #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 9600;   # Omron FINS/TCP port (standard 9600)
+CFG_ADDR: i64 = 100;    # first DM word
+CFG_COUNT: i64 = 1;     # how many DM words to read
+CFG_OP:   i64 = 0;      # 0 = read, 1 = write g_wq[0]
+CFG_NV:   i64 = 1;      # number of words to write (when CFG_OP=1)
+CFG_MS:   i64 = 0;      # poll interval ms (0 = one-shot)
+# =============================
+g_wsa: buf = 512;
+g_addr: buf = 16;
+g_tmo: buf = 8;
+g_req: buf = 300;
+g_buf: buf = 600;
+g_wq: buf = 128;
+g_cn: buf = 8;
+g_sn: buf = 8;
+
+@CODE
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+func recv_fins(s: i64) -> i64 {
+    if recv_n(s, g_buf, 8) < 0 { return 0 - 1; }
+    ln = load8(g_buf+4)*16777216 + load8(g_buf+5)*65536 + load8(g_buf+6)*256 + load8(g_buf+7);
+    if ln < 8 { return 0 - 1; }
+    if ln > 580 { ln = 580; }
+    if recv_n(s, g_buf + 8, ln) < 0 { return 0 - 1; }
+    return 8 + ln;
+}
+func fins_hello(s: i64) -> i64 {
+    memset(g_req, 0, 20);
+    store8(g_req+0,70); store8(g_req+1,73); store8(g_req+2,78); store8(g_req+3,83);
+    store8(g_req+7,12);
+    if send(s, g_req, 20, 0) <= 0 { return 0; }
+    if recv_fins(s) < 24 { return 0; }
+    ec = load8(g_buf+12)*16777216 + load8(g_buf+13)*65536 + load8(g_buf+14)*256 + load8(g_buf+15);
+    if ec != 0 { syscall 1, mHf, ec, nl; return 0; }
+    store64(g_cn, load8(g_buf + 19));
+    store64(g_sn, load8(g_buf + 23));
+    cn = load64(g_cn); sn = load64(g_sn);
+    syscall 1, mHok, cn, mHok2, sn, nl;
+    return 1;
+}
+func txn(s: i64) -> i64 {
+    fl = 18;
+    if CFG_OP == 1 { fl = 18 + CFG_NV * 2; }
+    tn = 8 + fl;
+    memset(g_req, 0, 40);
+    store8(g_req+0,70); store8(g_req+1,73); store8(g_req+2,78); store8(g_req+3,83);
+    store8(g_req+4, band(shr(tn,24),255)); store8(g_req+5, band(shr(tn,16),255)); store8(g_req+6, band(shr(tn,8),255)); store8(g_req+7, band(tn,255));
+    store8(g_req+11, 2);
+    store8(g_req+16, 0x80); store8(g_req+18, 0x02);
+    store8(g_req+20, load64(g_sn));
+    store8(g_req+23, load64(g_cn));
+    store8(g_req+26, 0x01);
+    sub = 0x01;
+    if CFG_OP == 1 { sub = 0x02; }
+    store8(g_req+27, sub);
+    store8(g_req+28, 0x82);
+    store8(g_req+29, band(shr(CFG_ADDR,8),255)); store8(g_req+30, band(CFG_ADDR,255));
+    store8(g_req+31, 0);
+    store8(g_req+32, band(shr(CFG_COUNT,8),255)); store8(g_req+33, band(CFG_COUNT,255));
+    if CFG_OP == 1 {
+        store8(g_req+32, band(shr(CFG_NV,8),255)); store8(g_req+33, band(CFG_NV,255));
+        i = 0;
+        while i < CFG_NV {
+            v = load64(g_wq + i*8);
+            store8(g_req+34+i*2, band(shr(v,8),255)); store8(g_req+35+i*2, band(v,255));
+            i = i + 1;
+        }
+    }
+    if send(s, g_req, 16 + fl, 0) <= 0 { return 0 - 1; }
+    if recv_fins(s) < 30 { syscall 1, mNo, nl; return 0 - 1; }
+    ecv = load8(g_buf+28) * 256 + load8(g_buf+29);
+    if ecv != 0 { syscall 1, mEc, ecv, nl; return 0; }
+    if CFG_OP == 0 {
+        i = 0;
+        while i < CFG_COUNT {
+            v = load8(g_buf + 30 + i*2) * 256 + load8(g_buf + 31 + i*2);
+            dd = CFG_ADDR + i;
+            syscall 1, mDm, dd, mEq, v, nl;
+            i = i + 1;
+        }
+    } else {
+        syscall 1, mWr, CFG_ADDR, nl;
+    }
+    return 0;
+}
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, htons(CFG_PORT));
+    store32(g_addr + 4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24));
+    store64(g_addr + 8, 0);
+    if connect(s, g_addr, 16) != 0 { syscall 1, mErr, nl; closesocket(s); return 1; }
+    store32(g_tmo, 3000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);
+    if fins_hello(s) == 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    store64(g_wq + 0, 555);
+    while 1 {
+        if txn(s) < 0 { break; }
+        if CFG_MS == 0 { break; }
+        Sleep(CFG_MS);
+    }
+    closesocket(s);
+    return 0;
+}

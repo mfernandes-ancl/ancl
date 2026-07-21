@@ -1,0 +1,503 @@
+# Neon Breakout - A Native Win32 Game in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+extern "gdi32.dll"  DeleteDC;
+extern "gdi32.dll"  SetTextAlign;
+
+extern "user32.dll" PeekMessageA -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+class_name: str = "NeonBreakout";
+window_title: str = "Neon Breakout - ANCL Native Showcase";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+
+# Brushes and Fonts
+bg_brush: buf = 8;
+hud_brush: buf = 8;
+board_brush: buf = 8;
+border_brush: buf = 8;
+paddle_brush: buf = 8;
+ball_brush: buf = 8;
+
+# Brick brushes (by row)
+brick_brush0: buf = 8; # Row 0: Red
+brick_brush1: buf = 8; # Row 1: Pink
+brick_brush2: buf = 8; # Row 2: Yellow
+brick_brush3: buf = 8; # Row 3: Green
+
+title_font: buf = 8;
+hud_font: buf = 8;
+small_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+cell_rect: buf = 16;
+hud_str: buf = 64;
+
+# Game state
+game_state: buf = 8;  # 0 = Start, 1 = Playing, 2 = Game Over, 3 = Win
+score: buf = 8;
+high_score: buf = 8;
+lives: buf = 8;
+last_tick: buf = 8;
+rand_seed: buf = 8;
+
+# Paddle & Ball coordinates (stored as 64-bit integers)
+paddle_x: buf = 8;
+ball_x: buf = 8;
+ball_y: buf = 8;
+ball_dx: buf = 8;
+ball_dy: buf = 8;
+
+# Input state (holds)
+key_left: buf = 8;
+key_right: buf = 8;
+
+# Brick state (8 columns x 4 rows)
+bricks_active: buf = 32;
+
+@CODE
+
+# --- Helper Functions ---
+func draw_rect(hdc: ptr, x1: i32, y1: i32, x2: i32, y2: i32, brush: ptr) -> i64 {
+    store32(cell_rect + 0, x1);
+    store32(cell_rect + 4, y1);
+    store32(cell_rect + 8, x2);
+    store32(cell_rect + 12, y2);
+    FillRect(hdc, cell_rect, brush);
+    return 0;
+}
+
+func draw_text_num(hdc: ptr, x: i32, y: i32, prefix: ptr, val: i64) -> i64 {
+    str_len = strlen(prefix);
+    memset(hud_str, 0, 64);
+    memcpy(hud_str, prefix, str_len);
+    nf_u64dec(val, hud_str + str_len);
+    TextOutA(hdc, x, y, hud_str, strlen(hud_str));
+    return 0;
+}
+
+func reset_ball() -> i64 {
+    store64(paddle_x, 210); # Centered
+    store64(ball_x, 250);   # Centered on paddle
+    store64(ball_y, 450);   # Just above paddle
+    store64(ball_dx, 3);    # Move right
+    store64(ball_dy, 0 - 5); # Move up
+    return 0;
+}
+
+func game_start() -> i64 {
+    store64(score, 0);
+    store64(lives, 3);
+    store64(game_state, 1);
+    
+    # Reset bricks to active
+    memset(bricks_active, 1, 32);
+    
+    reset_ball();
+    store64(last_tick, GetTickCount());
+    return 0;
+}
+
+func check_win() -> i64 {
+    i = 0;
+    while i < 32 {
+        if load8(bricks_active + i) == 1 { return 0; }
+        i = i + 1;
+    }
+    store64(game_state, 3); # Win state
+    return 0;
+}
+
+func game_update() -> i64 {
+    if load64(game_state) != 1 { return 0; }
+    
+    bx = load64(ball_x);
+    by = load64(ball_y);
+    bdx = load64(ball_dx);
+    bdy = load64(ball_dy);
+    
+    nbx = bx + bdx;
+    nby = by + bdy;
+    
+    # 1. Wall Collisions
+    if nbx <= 4 { nbx = 4; bdx = 0 - bdx; }
+    if nbx >= 496 { nbx = 496; bdx = 0 - bdx; }
+    if nby <= 4 { nby = 4; bdy = 0 - bdy; }
+    
+    # 2. Paddle Collision (width 80, height 12, Y starts at 470)
+    px = load64(paddle_x);
+    if nby >= 470 {
+        if nby <= 482 {
+            if nbx >= px {
+                if nbx <= px + 80 {
+                    nby = 469;
+                    bdy = 0 - bdy;
+                    
+                    # Bounce angle calculation (hit location offset)
+                    hit_offset = nbx - (px + 40);
+                    bdx = hit_offset / 7;
+                }
+            }
+        }
+    }
+    
+    # 3. Brick Collision (Y boundaries 20 to 80)
+    if nby >= 20 {
+        if nby <= 80 {
+            col = nbx / 62;
+            row = (nby - 20) / 15;
+            if col >= 0 {
+                if col < 8 {
+                    if row >= 0 {
+                        if row < 4 {
+                            idx = row * 8 + col;
+                            if load8(bricks_active + idx) == 1 {
+                                store8(bricks_active + idx, 0); # deactivate
+                                bdy = 0 - bdy;
+                                
+                                s = load64(score) + 10;
+                                store64(score, s);
+                                if s > load64(high_score) { store64(high_score, s); }
+                                
+                                check_win();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    # 4. Out of bounds (Death)
+    if nby >= 500 {
+        l = load64(lives) - 1;
+        store64(lives, l);
+        if l == 0 {
+            store64(game_state, 2); # Game Over
+        } else {
+            reset_ball();
+        }
+        return 0;
+    }
+    
+    store64(ball_x, nbx);
+    store64(ball_y, nby);
+    store64(ball_dx, bdx);
+    store64(ball_dy, bdy);
+    
+    return 0;
+}
+
+func game_render(hdc: ptr) -> i64 {
+    GetClientRect(load64(hwnd), client_rect);
+    width = load32(client_rect + 8);
+    height = load32(client_rect + 12);
+    
+    draw_rect(hdc, 0, 0, width, height, load64(bg_brush));
+    draw_rect(hdc, 0, 0, width, 90, load64(hud_brush));
+    
+    SetBkMode(hdc, 1);
+    old_font = SelectObject(hdc, load64(hud_font));
+    
+    # Render HUD Information
+    SetTextColor(hdc, 0x00FF00); # Neon Green
+    draw_text_num(hdc, 30, 20, "SCORE: ", load64(score));
+    
+    SetTextColor(hdc, 0x0000FF); # Red Lives
+    draw_text_num(hdc, 30, 50, "LIVES: ", load64(lives));
+    
+    SetTextColor(hdc, 0x00D898); # Gold High Score
+    SetTextAlign(hdc, 2);                            # TA_RIGHT
+    draw_text_num(hdc, width - 30, 30, "HIGH SCORE: ", load64(high_score));
+    SetTextAlign(hdc, 0);                            # restore TA_LEFT
+
+    # Centered grid alignment
+    start_x = (width - 500) / 2;
+    start_y = 120;
+    
+    draw_rect(hdc, start_x - 4, start_y - 4, start_x + 504, start_y + 504, load64(border_brush));
+    draw_rect(hdc, start_x, start_y, start_x + 500, start_y + 500, load64(board_brush));
+    
+    state = load64(game_state);
+    
+    if state == 0 {
+        # Start menu â€” centered neon layout
+        cx = start_x + 250;                              # board centre x
+        SetTextAlign(hdc, 6);                            # TA_CENTER
+
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x00FFFF);                     # cyan
+        TextOutA(hdc, cx, start_y + 120, "NEON BREAKOUT", 13);
+        draw_rect(hdc, cx - 108, start_y + 170, cx + 108, start_y + 173, load64(paddle_brush));
+
+        SelectObject(hdc, load64(small_font));
+        SetTextColor(hdc, 0x8A8A8A);
+        TextOutA(hdc, cx, start_y + 184, "A NATIVE ANCL GAME", 18);
+
+        SetTextColor(hdc, 0x00A5FF);                     # orange
+        TextOutA(hdc, cx, start_y + 300, "ARROWS   MOVE THE PADDLE", 24);
+
+        SelectObject(hdc, load64(hud_font));
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0xFFFFFF);
+            TextOutA(hdc, cx, start_y + 380, "PRESS SPACE TO PLAY", 19);
+        }
+
+        SetTextAlign(hdc, 0);                            # restore TA_LEFT
+    }
+    
+    if state == 1 {
+        # Render Paddle (80x12)
+        px = load64(paddle_x);
+        draw_rect(hdc, start_x + px, start_y + 470, start_x + px + 80, start_y + 482, load64(paddle_brush));
+        
+        # Render Ball (radius 4)
+        bx = load64(ball_x);
+        by = load64(ball_y);
+        draw_rect(hdc, start_x + bx - 4, start_y + by - 4, start_x + bx + 4, start_y + by + 4, load64(ball_brush));
+        
+        # Render Bricks (8x4 grid)
+        r = 0;
+        while r < 4 {
+            c = 0;
+            while c < 8 {
+                idx = r * 8 + c;
+                if load8(bricks_active + idx) == 1 {
+                    bx1 = start_x + c * 62 + 2;
+                    by1 = start_y + 20 + r * 15;
+                    
+                    brush = load64(brick_brush0);
+                    if r == 1 { brush = load64(brick_brush1); }
+                    if r == 2 { brush = load64(brick_brush2); }
+                    if r == 3 { brush = load64(brick_brush3); }
+                    
+                    draw_rect(hdc, bx1, by1, bx1 + 60, by1 + 13, brush);
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+    }
+    
+    if state == 2 {
+        # Game Over Screen
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x0000FF);
+        TextOutA(hdc, start_x + 140, start_y + 150, "GAME OVER", 9);
+        
+        SelectObject(hdc, load64(hud_font));
+        SetTextColor(hdc, 0xCCCCCC);
+        draw_text_num(hdc, start_x + 180, start_y + 230, "FINAL SCORE: ", load64(score));
+        
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0x00FFFF);
+            TextOutA(hdc, start_x + 130, start_y + 310, "PRESS SPACE TO RESTART", 22);
+        }
+    }
+    
+    if state == 3 {
+        # Victory Screen
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x00FF00);
+        TextOutA(hdc, start_x + 150, start_y + 150, "YOU WIN!", 8);
+        
+        SelectObject(hdc, load64(hud_font));
+        SetTextColor(hdc, 0x00FFFF);
+        draw_text_num(hdc, start_x + 180, start_y + 230, "FINAL SCORE: ", load64(score));
+        
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0xFFFFFF);
+            TextOutA(hdc, start_x + 130, start_y + 310, "PRESS SPACE TO PLAY AGAIN", 25);
+        }
+    }
+    
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { # WM_PAINT (double-buffered: render off-screen, blit once â€” no flicker)
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        GetClientRect(hwnd_val, client_rect);
+        db_w = load32(client_rect + 8);
+        db_h = load32(client_rect + 12);
+        db_dc = CreateCompatibleDC(hdc);
+        db_bmp = CreateCompatibleBitmap(hdc, db_w, db_h);
+        db_old = SelectObject(db_dc, db_bmp);
+        game_render(db_dc);
+        BitBlt(hdc, 0, 0, db_w, db_h, db_dc, 0, 0, 0x00CC0020);
+        SelectObject(db_dc, db_old);
+        DeleteObject(db_bmp);
+        DeleteDC(db_dc);
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1; # Suppress background erasure to eliminate flickers
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    if msg == 256 { # WM_KEYDOWN
+        state = load64(game_state);
+        if state == 0 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        if state == 2 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        if state == 3 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        
+        if state == 1 {
+            if wParam == 37 { store64(key_left, 1); return 0; } # Arrow Left
+            if wParam == 65 { store64(key_left, 1); return 0; } # A
+            if wParam == 39 { store64(key_right, 1); return 0; } # Arrow Right
+            if wParam == 68 { store64(key_right, 1); return 0; } # D
+        }
+        return 0;
+    }
+    
+    if msg == 257 { # WM_KEYUP
+        if wParam == 37 { store64(key_left, 0); return 0; }
+        if wParam == 65 { store64(key_left, 0); return 0; }
+        if wParam == 39 { store64(key_right, 0); return 0; }
+        if wParam == 68 { store64(key_right, 0); return 0; }
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize GDI Brushes
+    store64(bg_brush, CreateSolidBrush(0x1E1E1E));      # Canvas Background
+    store64(hud_brush, CreateSolidBrush(0x252525));     # HUD Panel Background
+    store64(board_brush, CreateSolidBrush(0x121212));   # Play Area Background
+    store64(border_brush, CreateSolidBrush(0x444444));  # Play Area Border
+    store64(paddle_brush, CreateSolidBrush(0x00FFFF));  # Paddle
+    store64(ball_brush, CreateSolidBrush(0xFFFFFF));    # White Ball
+    
+    # Brick row colors (0: Red, 1: Pink, 2: Yellow, 3: Green)
+    store64(brick_brush0, CreateSolidBrush(0x0000FF));
+    store64(brick_brush1, CreateSolidBrush(0xFF00FF));
+    store64(brick_brush2, CreateSolidBrush(0x00FFFF));
+    store64(brick_brush3, CreateSolidBrush(0x00FF00));
+    
+    # Create Custom Bold Fonts
+    store64(title_font, CreateFontA(36, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(hud_font, CreateFontA(20, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(small_font, CreateFontA(15, 0, 0, 0, 500, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    
+    # Setup initial states
+    store64(game_state, 0);
+    store64(score, 0);
+    store64(high_score, 0);
+    store64(rand_seed, GetTickCount());
+    
+    # Initialize WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3);
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+    
+    # CreateWindowExA
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 200, 100, 600, 700, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    
+    if hwnd_val == 0 {
+        return 1;
+    }
+    
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    
+    store64(last_tick, GetTickCount());
+    
+    while 1 {
+        # Update randomness seed continuously
+        store64(rand_seed, load64(rand_seed) * 2862933555777941757 + GetTickCount() + 13);
+        
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; }
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            Sleep(1);
+        }
+        
+        # Game loop speed limit (60 FPS physics updates)
+        current_tick = GetTickCount();
+        if current_tick - load64(last_tick) >= 16 {
+            store64(last_tick, current_tick);
+            
+            if load64(game_state) == 1 {
+                # Update smooth paddle updates (8px displacement)
+                px = load64(paddle_x);
+                if load64(key_left) == 1 {
+                    if px > 0 { store64(paddle_x, px - 8); }
+                }
+                if load64(key_right) == 1 {
+                    if px < 420 { store64(paddle_x, px + 8); }
+                }
+                
+                game_update();
+            }
+            
+            InvalidateRect(hwnd_val, 0, 0);
+        }
+    }
+    
+    # Release Handles on Exit
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(hud_brush));
+    DeleteObject(load64(board_brush));
+    DeleteObject(load64(border_brush));
+    DeleteObject(load64(paddle_brush));
+    DeleteObject(load64(ball_brush));
+    DeleteObject(load64(brick_brush0));
+    DeleteObject(load64(brick_brush1));
+    DeleteObject(load64(brick_brush2));
+    DeleteObject(load64(brick_brush3));
+    DeleteObject(load64(title_font));
+    DeleteObject(load64(hud_font));
+    DeleteObject(load64(small_font));
+    
+    return 0;
+}

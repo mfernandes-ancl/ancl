@@ -1,0 +1,28 @@
+# ANCL Pad V1 sample
+
+import "core_lib/cstring.ancl";
+
+@DATA
+title: str = "ANCL Pad";
+msg:   str = "Syntax coloring, line numbers, menus, and shortcuts from native ANCL.\n";
+num:   buf = 32;
+
+@CODE
+
+func main() -> i32 {
+    syscall 1, title, "\n";
+    syscall 1, msg;
+
+    total = 32;
+    int_to_str(num, total);
+    syscall 1, "modbus_registers: ";
+    puts_cstr(num);
+    syscall 1, "\n";
+    if total > 16 {
+        syscall 1, "ready for protocol-aware editor helpers\n";
+    } else {
+        syscall 1, "small sample\n";
+    }
+
+    return 0;
+}

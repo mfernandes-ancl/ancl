@@ -1,0 +1,1718 @@
+# ============================================================================
+#  s7_tester.ancl  -  ANCL Native Siemens S7comm Client Tester GUI
+#
+#  A native Win32 dark-themed Siemens S7comm client, written in ANCL.
+#  NexusEdge themed with GlowButtons, live polling ListView grid, read/write.
+#  100% CRT-free PE32+, GUI subsystem.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "gdi32.dll" RoundRect;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "dwmapi.dll" DwmSetWindowAttribute -> i32;
+extern "user32.dll" TrackMouseEvent;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetClassInfoExA -> i32;
+extern "user32.dll" MessageBoxA -> i32;
+extern "user32.dll" GetWindowRect;
+
+
+# ---- Winsock imports ----
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+extern "ws2_32.dll" socket -> i64;
+extern "ws2_32.dll" bind -> i32;
+extern "ws2_32.dll" listen -> i32;
+extern "ws2_32.dll" accept -> i64;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" ioctlsocket -> i32;
+extern "ws2_32.dll" WSAGetLastError -> i32;
+extern "ws2_32.dll" connect -> i32;
+extern "ws2_32.dll" setsockopt -> i32;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "ANCLS7TESTER";
+title:      str = "ANCL Siemens S7comm Client Tester";
+title_draw: str = "ANCL SIEMENS S7COMM TESTER";
+st_conn_ind: str = "* CONNECTED";
+st_disc_ind: str = "* DISCONNECTED";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom window classes ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+
+# ---- Labels ----
+lbl_host:   str = "Host:";
+lbl_port:   str = "Port:";
+lbl_log:    str = "Traffic Log:";
+lbl_status: str = "Status: Disconnected";
+lbl_reg:    str = "Reg:";
+lbl_val:    str = "Value:";
+
+# ---- ListView columns ----
+cls_lv:     str = "SysListView32";
+col_addr:   str = "Address";
+col_area:   str = "Area";
+col_type:   str = "Type";
+col_val_hex:str = "Value (Hex)";
+col_val_dec:str = "Value (Dec)";
+col_status: str = "Status";
+
+# ---- Buttons ----
+btn_conn:   str = "Connect";
+btn_disc:   str = "Disconnect";
+btn_read:   str = "Read";
+btn_write:  str = "Write";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_min:    str = "-";
+btn_close:  str = "X";
+
+# ---- Defaults ----
+def_host:   str = "127.0.0.1";
+def_port:   str = "10200"; # Default to simulator high port to avoid permissions issues
+
+# ---- Log Messages ----
+crlf:       str = "\r\n";
+g_logpath:  str = "s7_tester_log.txt";
+m_save_ok:  str = "[S7 Client] Log saved to s7_tester_log.txt\r\n";
+m_save_err: str = "[S7 Client] Log save failed.\r\n";
+
+# ---- Register Lists ----
+reg_db1_x00: str = "DB1.DBX0.0";
+reg_db1_x01: str = "DB1.DBX0.1";
+reg_db1_b1:  str = "DB1.DBB1";
+reg_db1_w2:  str = "DB1.DBW2";
+reg_db1_d4:  str = "DB1.DBD4";
+reg_m0_0:    str = "M0.0";
+reg_mb1:     str = "MB1";
+reg_mw2:     str = "MW2";
+reg_md4:     str = "MD4";
+reg_i0_0:    str = "I0.0";
+reg_ib1:     str = "IB1";
+reg_q0_0:    str = "Q0.0";
+reg_qb1:     str = "QB1";
+
+# ---- Global handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_host_ed:  buf = 8;
+g_port_ed:  buf = 8;
+g_btn_conn: buf = 8;
+g_btn_disc: buf = 8;
+g_log:      buf = 8;
+g_status:   buf = 8;
+g_font:     buf = 8;
+g_listview: buf = 8;
+g_reg_ed:   buf = 8;
+g_val_ed:   buf = 8;
+
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+
+g_wsa:      buf = 512;
+g_sock:     buf = 8;
+g_nonblock: buf = 8;
+g_addr:     buf = 16;
+g_tmo:      buf = 8;
+
+# ---- Protocol Buffers ----
+g_recv_buf: buf = 2048;
+g_send_buf: buf = 2048;
+g_temp_addr:buf = 256;
+g_temp_fc:  buf = 256;
+g_valbuf_hex:buf = 64;
+g_valbuf_dec:buf = 64;
+g_numbuf:   buf = 32;
+g_hostbuf:  buf = 256;
+g_portbuf:  buf = 32;
+g_logbuf:   buf = 1024;
+g_savebuf:  buf = 4096;
+g_idx_buf:  buf = 8;        # helper pointer for parse index
+g_parse_area: buf = 8;
+g_parse_db: buf = 8;
+g_parse_offset: buf = 8;
+g_parse_type: buf = 8;
+g_parse_bit: buf = 8;
+
+# ---- GDI setup ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+g_lv_brush:  buf = 8;
+
+COL_BG:      i64 = 0x150E0C;
+COL_PANEL:   i64 = 0x050403;
+COL_TEXT:    i64 = 0xAB9687;
+COL_ACCENT:  i64 = 0x4CE75C; # Siemens Green BGR (0x4CE75C)
+
+# Dark theme overrides (Siemens Green accents)
+COLOR_BG_DEEP:     i64 = 0x0C0908; # deep space void
+COLOR_BG_PANEL:    i64 = 0x120E0D; # side panel container
+COLOR_BG_CARD:     i64 = 0x1A1412; # list item cards
+COLOR_BG_INPUT:    i64 = 0x080606; # text area bg
+COLOR_BG_HOVER:    i64 = 0x241C19; # glow selection hover
+COLOR_BORDER:      i64 = 0x2C2220; # border lines
+COLOR_TEXT_PRIMARY:i64 = 0xDFD5CF; # bone white headings
+COLOR_TEXT_MUTED:  i64 = 0x7A6A66; # warm gray logs
+
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_temp_text:    buf = 256;
+w_empty:        buf = 8;
+
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40; # "DarkMode_Explorer" wide string
+thm_dm_cfd_w:   buf = 40; # "CFD" wide string
+g_allowdark:    buf = 8;
+
+g_lvcol:       buf = 64;
+g_lvitem:      buf = 96;
+
+# Width & Height
+WIN_W: i64 = 1100;
+WIN_H: i64 = 600;
+
+# Subclass original wndproc pointers
+g_orig_btn_proc: buf = 8;
+
+@CODE
+
+# ============================================================================
+# HELPER UTILITIES
+# ============================================================================
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0); # WM_GETTEXTLENGTH
+    SendMessageA(hwnd_log, 177, len, len);  # EM_SETSEL
+    SendMessageA(hwnd_log, 194, 0, text);   # EM_REPLACESEL
+    return 0;
+}
+
+func str_equal(s1: i64, s2: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c1 = load8(s1 + i);
+        c2 = load8(s2 + i);
+        if c1 != c2 { return 0; }
+        if c1 == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func starts_with(s: i64, prefix: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c2 = load8(prefix + i);
+        if c2 == 0 { return 1; }
+        c1 = load8(s + i);
+        if c1 != c2 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func parse_int_at(s: i64, offset_ptr: i64) -> i64 {
+    val = 0;
+    i = load64(offset_ptr);
+    while 1 {
+        c = load8(s + i);
+        if c >= 48 {
+            if c <= 57 {
+                val = val * 10 + (c - 48);
+                i = i + 1;
+                continue;
+            }
+        }
+        break;
+    }
+    store64(offset_ptr, i);
+    return val;
+}
+
+# Parsers big-endian values
+func load16_be(ptr: i64) -> i64 {
+    return bor(shl(load8(ptr), 8), load8(ptr + 1));
+}
+
+func load32_be(ptr: i64) -> i64 {
+    return bor(bor(shl(load8(ptr), 24), shl(load8(ptr + 1), 16)), bor(shl(load8(ptr + 2), 8), load8(ptr + 3)));
+}
+
+func store16_be(ptr: i64, val: i64) -> i64 {
+    store8(ptr, band(shr(val, 8), 0xFF));
+    store8(ptr + 1, band(val, 0xFF));
+    return 0;
+}
+
+func store32_be(ptr: i64, val: i64) -> i64 {
+    store8(ptr, band(shr(val, 24), 0xFF));
+    store8(ptr + 1, band(shr(val, 16), 0xFF));
+    store8(ptr + 2, band(shr(val, 8), 0xFF));
+    store8(ptr + 3, band(val, 0xFF));
+    return 0;
+}
+
+func load24_be(ptr: i64) -> i64 {
+    return bor(bor(shl(load8(ptr), 16), shl(load8(ptr + 1), 8)), load8(ptr + 2));
+}
+
+func store24_be(ptr: i64, val: i64) -> i64 {
+    store8(ptr, band(shr(val, 16), 0xFF));
+    store8(ptr + 1, band(shr(val, 8), 0xFF));
+    store8(ptr + 2, band(val, 0xFF));
+    return 0;
+}
+
+func format_nibble(n: i64) -> i64 {
+    if n >= 10 { return 55 + n; }
+    return 48 + n;
+}
+
+func byte_to_hex(v: i64, dst: i64) -> i64 {
+    store8(dst, format_nibble(band(shr(v, 4), 15)));
+    store8(dst + 1, format_nibble(band(v, 15)));
+    store8(dst + 2, 0);
+    return 0;
+}
+
+func word_to_hex(v: i64, dst: i64) -> i64 {
+    store8(dst, format_nibble(band(shr(v, 12), 15)));
+    store8(dst + 1, format_nibble(band(shr(v, 8), 15)));
+    store8(dst + 2, format_nibble(band(shr(v, 4), 15)));
+    store8(dst + 3, format_nibble(band(v, 15)));
+    store8(dst + 4, 0);
+    return 0;
+}
+
+func dword_to_hex(v: i64, dst: i64) -> i64 {
+    store8(dst, format_nibble(band(shr(v, 28), 15)));
+    store8(dst + 1, format_nibble(band(shr(v, 24), 15)));
+    store8(dst + 2, format_nibble(band(shr(v, 20), 15)));
+    store8(dst + 3, format_nibble(band(shr(v, 16), 15)));
+    store8(dst + 4, format_nibble(band(shr(v, 12), 15)));
+    store8(dst + 5, format_nibble(band(shr(v, 8), 15)));
+    store8(dst + 6, format_nibble(band(shr(v, 4), 15)));
+    store8(dst + 7, format_nibble(band(v, 15)));
+    store8(dst + 8, 0);
+    return 0;
+}
+
+# ============================================================================
+# S7 ADDRESS PARSING
+# ============================================================================
+
+# Area constants: 0x81 = I, 0x82 = Q, 0x83 = M, 0x84 = DB
+# Type constants: 1 = Bit, 2 = Byte, 3 = Word, 4 = DWord
+func parse_s7_address(s: i64, out_area: i64, out_db: i64, out_offset: i64, out_type: i64, out_bit: i64) -> i64 {
+    store64(out_area, 0);
+    store64(out_db, 0);
+    store64(out_offset, 0);
+    store64(out_type, 2); # default Byte
+    store64(out_bit, 0);
+    
+    # ---- DB area ----
+    if starts_with(s, "DB1.DB") != 0 {
+        store64(out_area, 0x84);
+        store64(out_db, 1);
+        
+        c = load8(s + 6);
+        if c == 88 { # 'X' - Bit
+            store64(out_type, 1);
+            store64(g_idx_buf, 7);
+            byte_off = parse_int_at(s, g_idx_buf);
+            store64(out_offset, byte_off);
+            if load8(s + load64(g_idx_buf)) == 46 { # '.'
+                store64(g_idx_buf, load64(g_idx_buf) + 1);
+                bit_off = parse_int_at(s, g_idx_buf);
+                store64(out_bit, bit_off);
+            }
+            return 1;
+        }
+        if c == 66 { # 'B' - Byte
+            store64(out_type, 2);
+            store64(g_idx_buf, 7);
+            store64(out_offset, parse_int_at(s, g_idx_buf));
+            return 1;
+        }
+        if c == 87 { # 'W' - Word
+            store64(out_type, 3);
+            store64(g_idx_buf, 7);
+            store64(out_offset, parse_int_at(s, g_idx_buf));
+            return 1;
+        }
+        if c == 68 { # 'D' - DWord
+            store64(out_type, 4);
+            store64(g_idx_buf, 7);
+            store64(out_offset, parse_int_at(s, g_idx_buf));
+            return 1;
+        }
+    }
+    
+    # ---- Markers area ----
+    if starts_with(s, "MB") != 0 {
+        store64(out_area, 0x83);
+        store64(out_type, 2);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "MW") != 0 {
+        store64(out_area, 0x83);
+        store64(out_type, 3);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "MD") != 0 {
+        store64(out_area, 0x83);
+        store64(out_type, 4);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if load8(s) == 77 { # 'M' - Bit
+        store64(out_area, 0x83);
+        store64(out_type, 1);
+        store64(g_idx_buf, 1);
+        byte_off = parse_int_at(s, g_idx_buf);
+        store64(out_offset, byte_off);
+        if load8(s + load64(g_idx_buf)) == 46 { # '.'
+            store64(g_idx_buf, load64(g_idx_buf) + 1);
+            store64(out_bit, parse_int_at(s, g_idx_buf));
+        }
+        return 1;
+    }
+    
+    # ---- Inputs area ----
+    if starts_with(s, "IB") != 0 {
+        store64(out_area, 0x81);
+        store64(out_type, 2);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "IW") != 0 {
+        store64(out_area, 0x81);
+        store64(out_type, 3);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "ID") != 0 {
+        store64(out_area, 0x81);
+        store64(out_type, 4);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if load8(s) == 73 { # 'I' - Bit
+        store64(out_area, 0x81);
+        store64(out_type, 1);
+        store64(g_idx_buf, 1);
+        byte_off = parse_int_at(s, g_idx_buf);
+        store64(out_offset, byte_off);
+        if load8(s + load64(g_idx_buf)) == 46 { # '.'
+            store64(g_idx_buf, load64(g_idx_buf) + 1);
+            store64(out_bit, parse_int_at(s, g_idx_buf));
+        }
+        return 1;
+    }
+    
+    # ---- Outputs area ----
+    if starts_with(s, "QB") != 0 {
+        store64(out_area, 0x82);
+        store64(out_type, 2);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "QW") != 0 {
+        store64(out_area, 0x82);
+        store64(out_type, 3);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if starts_with(s, "QD") != 0 {
+        store64(out_area, 0x82);
+        store64(out_type, 4);
+        store64(g_idx_buf, 2);
+        store64(out_offset, parse_int_at(s, g_idx_buf));
+        return 1;
+    }
+    if load8(s) == 81 { # 'Q' - Bit
+        store64(out_area, 0x82);
+        store64(out_type, 1);
+        store64(g_idx_buf, 1);
+        byte_off = parse_int_at(s, g_idx_buf);
+        store64(out_offset, byte_off);
+        if load8(s + load64(g_idx_buf)) == 46 { # '.'
+            store64(g_idx_buf, load64(g_idx_buf) + 1);
+            store64(out_bit, parse_int_at(s, g_idx_buf));
+        }
+        return 1;
+    }
+    
+    return 0;
+}
+
+# ============================================================================
+# S7 PROTOCOL ENGINE (CLIENT)
+# ============================================================================
+
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+
+func recv_tpkt(s: i64, dst_buf: i64) -> i64 {
+    if recv_n(s, dst_buf, 4) < 0 { return 0 - 1; }
+    tl = load8(dst_buf + 2) * 256 + load8(dst_buf + 3);
+    if tl < 4 { return 0 - 1; }
+    if tl > 2048 { tl = 2048; }
+    if recv_n(s, dst_buf + 4, tl - 4) < 0 { return 0 - 1; }
+    return tl;
+}
+
+func drain_socket(s: i64) -> i64 {
+    store64(g_nonblock, 1);
+    ioctlsocket(s, 0x8004667E, g_nonblock);
+    while recv(s, g_recv_buf, 2048, 0) > 0 {}
+    return 0;
+}
+
+func send_read_job(s: i64, area: i64, db_num: i64, byte_offset: i64, byte_count: i64) -> i64 {
+    ba = byte_offset * 8;
+    
+    # TPKT Header
+    store8(g_send_buf+0, 0x03);
+    store8(g_send_buf+1, 0x00);
+    store8(g_send_buf+2, 0x00);
+    store8(g_send_buf+3, 31);
+    
+    # COTP DT
+    store8(g_send_buf+4, 0x02);
+    store8(g_send_buf+5, 0xF0);
+    store8(g_send_buf+6, 0x80);
+    
+    # S7comm Header
+    store8(g_send_buf+7, 0x32);
+    store8(g_send_buf+8, 0x01); # Job
+    store16_be(g_send_buf+9, 0x0000);
+    store16_be(g_send_buf+11, 0x1234);
+    store16_be(g_send_buf+13, 14); # Param Len
+    store16_be(g_send_buf+15, 0);  # Data Len
+    
+    # S7comm Parameter
+    store8(g_send_buf+17, 0x04); # Read Variable
+    store8(g_send_buf+18, 0x01); # Item count
+    
+    # Item Espec
+    store8(g_send_buf+19, 0x12);
+    store8(g_send_buf+20, 10);
+    store8(g_send_buf+21, 0x10); # Syntax ID
+    store8(g_send_buf+22, 0x02); # Transport Size = BYTE
+    store16_be(g_send_buf+23, byte_count);
+    store16_be(g_send_buf+25, db_num);
+    store8(g_send_buf+27, area);
+    store24_be(g_send_buf+28, ba);
+    
+    send(s, g_send_buf, 31, 0);
+    return 0;
+}
+
+func parse_read_response(dst_val_dec: i64, dst_val_hex: i64, type: i64, bit_offset: i64) -> i64 {
+    if load8(g_recv_buf + 8) != 0x03 { # Ack Data
+        return 0 - 1;
+    }
+    err_class = load8(g_recv_buf + 17);
+    err_code = load8(g_recv_buf + 18);
+    if bor(err_class != 0, err_code != 0) != 0 {
+        return 0 - 2;
+    }
+    
+    param_len = load16_be(g_recv_buf + 13);
+    data_ptr = 19 + param_len;
+    
+    ret_code = load8(g_recv_buf + data_ptr);
+    if ret_code != 0xFF {
+        return 0 - 3;
+    }
+    
+    val_ptr = data_ptr + 4;
+    val = 0;
+    
+    if type == 1 { # Bit
+        b = load8(g_recv_buf + val_ptr);
+        val = band(shr(b, bit_offset), 1);
+        int_to_str(dst_val_dec, val);
+        str_copy(dst_val_hex, dst_val_dec);
+    } else if type == 2 { # Byte
+        val = load8(g_recv_buf + val_ptr);
+        int_to_str(dst_val_dec, val);
+        str_copy(dst_val_hex, "0x");
+        byte_to_hex(val, dst_val_hex + 2);
+    } else if type == 3 { # Word
+        val = load16_be(g_recv_buf + val_ptr);
+        int_to_str(dst_val_dec, val);
+        str_copy(dst_val_hex, "0x");
+        word_to_hex(val, dst_val_hex + 2);
+    } else if type == 4 { # DWord
+        val = load32_be(g_recv_buf + val_ptr);
+        int_to_str(dst_val_dec, val);
+        str_copy(dst_val_hex, "0x");
+        dword_to_hex(val, dst_val_hex + 2);
+    }
+    
+    return 1;
+}
+
+func send_write_job(s: i64, area: i64, db_num: i64, byte_offset: i64, type: i64, bit_offset: i64, val: i64) -> i64 {
+    if type == 1 { # Bit Write
+        # TPKT Header
+        store8(g_send_buf+0, 0x03);
+        store8(g_send_buf+1, 0x00);
+        store8(g_send_buf+2, 0x00);
+        store8(g_send_buf+3, 36);
+        
+        # COTP DT
+        store8(g_send_buf+4, 0x02);
+        store8(g_send_buf+5, 0xF0);
+        store8(g_send_buf+6, 0x80);
+        
+        # S7comm Header
+        store8(g_send_buf+7, 0x32);
+        store8(g_send_buf+8, 0x01); # Job
+        store16_be(g_send_buf+9, 0x0000);
+        store16_be(g_send_buf+11, 0x1234);
+        store16_be(g_send_buf+13, 14); # Param Len
+        store16_be(g_send_buf+15, 5);  # Data Len
+        
+        # Parameter
+        store8(g_send_buf+17, 0x05); # Write Variable
+        store8(g_send_buf+18, 0x01);
+        
+        # Item Espec
+        store8(g_send_buf+19, 0x12);
+        store8(g_send_buf+20, 10);
+        store8(g_send_buf+21, 0x10);
+        store8(g_send_buf+22, 0x01); # Transport Size = BIT
+        store16_be(g_send_buf+23, 1);
+        store16_be(g_send_buf+25, db_num);
+        store8(g_send_buf+27, area);
+        store24_be(g_send_buf+28, byte_offset * 8 + bit_offset);
+        
+        # Data block
+        store8(g_send_buf+31, 0x00);
+        store8(g_send_buf+32, 0x03); # Transport size = BIT
+        store16_be(g_send_buf+33, 1);
+        v = 0;
+        if val != 0 { v = 1; }
+        store8(g_send_buf+35, v);
+        
+        send(s, g_send_buf, 36, 0);
+    } else {
+        # Byte/Word/DWord Write
+        byte_count = 1;
+        if type == 3 { byte_count = 2; }
+        if type == 4 { byte_count = 4; }
+        
+        tl = 35 + byte_count;
+        
+        # TPKT Header
+        store8(g_send_buf+0, 0x03);
+        store8(g_send_buf+1, 0x00);
+        store8(g_send_buf+2, band(shr(tl, 8), 0xFF));
+        store8(g_send_buf+3, band(tl, 0xFF));
+        
+        # COTP DT
+        store8(g_send_buf+4, 0x02);
+        store8(g_send_buf+5, 0xF0);
+        store8(g_send_buf+6, 0x80);
+        
+        # S7comm Header
+        store8(g_send_buf+7, 0x32);
+        store8(g_send_buf+8, 0x01); # Job
+        store16_be(g_send_buf+9, 0x0000);
+        store16_be(g_send_buf+11, 0x1234);
+        store16_be(g_send_buf+13, 14); # Param Len
+        store16_be(g_send_buf+15, 4 + byte_count); # Data Len
+        
+        # Parameter
+        store8(g_send_buf+17, 0x05);
+        store8(g_send_buf+18, 0x01);
+        
+        # Item Espec
+        store8(g_send_buf+19, 0x12);
+        store8(g_send_buf+20, 10);
+        store8(g_send_buf+21, 0x10);
+        store8(g_send_buf+22, 0x02); # Transport Size = BYTE
+        store16_be(g_send_buf+23, byte_count);
+        store16_be(g_send_buf+25, db_num);
+        store8(g_send_buf+27, area);
+        store24_be(g_send_buf+28, byte_offset * 8);
+        
+        # Data block
+        store8(g_send_buf+31, 0x00);
+        store8(g_send_buf+32, 0x04); # Transport size = BYTE
+        store16_be(g_send_buf+33, byte_count * 8);
+        
+        if type == 2 { # Byte
+            store8(g_send_buf+35, band(val, 0xFF));
+        } else if type == 3 { # Word
+            store16_be(g_send_buf+35, band(val, 0xFFFF));
+        } else if type == 4 { # DWord
+            store32_be(g_send_buf+35, band(val, 0xFFFFFFFF));
+        }
+        
+        send(s, g_send_buf, tl, 0);
+    }
+    return 0;
+}
+
+func parse_write_response() -> i64 {
+    if load8(g_recv_buf + 8) != 0x03 {
+        return 0 - 1;
+    }
+    err_class = load8(g_recv_buf + 17);
+    err_code = load8(g_recv_buf + 18);
+    if bor(err_class != 0, err_code != 0) != 0 {
+        return 0 - 2;
+    }
+    ret_code = load8(g_recv_buf + 21);
+    if ret_code != 0xFF {
+        return 0 - 3;
+    }
+    return 1;
+}
+
+# ============================================================================
+# GUI LOGIC & OPERATIONS
+# ============================================================================
+
+func do_disconnect() -> i64 {
+    sock = load64(g_sock);
+    if sock != 0 {
+        closesocket(sock);
+        store64(g_sock, 0);
+        WSACleanup();
+        
+        log_append("[S7 Client] Disconnected.\r\n");
+        SetWindowTextA(load64(g_status), "Status: Disconnected");
+        SetWindowTextA(load64(g_btn_conn), "Connect");
+        
+        # Kill polling timer
+        KillTimer(load64(g_hwnd), 1);
+        
+        # Set point statuses to Disconnected
+        hlv = load64(g_listview);
+        if hlv != 0 {
+            count = SendMessageA(hlv, 4100, 0, 0);
+            i = 0;
+            while i < count {
+                update_grid_value(i, "", "", "Offline");
+                i = i + 1;
+            }
+        }
+        InvalidateRect(load64(g_hwnd), 0, 1);
+    }
+    return 0;
+}
+
+func do_connect() -> i64 {
+    sock = load64(g_sock);
+    if sock != 0 { return 0; }
+    
+    GetWindowTextA(load64(g_host_ed), g_hostbuf, 256);
+    GetWindowTextA(load64(g_port_ed), g_portbuf, 32);
+    port = str_to_int(g_portbuf);
+    if port < 1 { port = 10200; }
+    
+    log_append("[S7 Client] Connecting to ");
+    log_append(g_hostbuf);
+    log_append(":");
+    log_append(g_portbuf);
+    log_append("...\r\n");
+    
+    WSAStartup(0x0202, g_wsa);
+    
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2); # AF_INET
+    store16_be(g_addr + 2, port);
+    
+    # Parse Host IP
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = g_hostbuf;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 { # '.'
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10;
+            octet = octet + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+    
+    s = socket(2, 1, 6);
+    if s == 0 - 1 {
+        log_append("[S7 Client] Failed to create socket.\r\n");
+        WSACleanup();
+        return 0;
+    }
+    
+    # Set 3-second receive timeout for handshake
+    store32(g_tmo, 3000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);
+    
+    rc = connect(s, g_addr, 16);
+    if rc != 0 {
+        closesocket(s);
+        WSACleanup();
+        log_append("[S7 Client] Connection failed (unreachable or rejected).\r\n");
+        return 0;
+    }
+    
+    # Send COTP CR
+    log_append("[S7 Client] Sending COTP Connection Request (CR)...\r\n");
+    store8(g_send_buf+0,0x03); store8(g_send_buf+1,0x00); store8(g_send_buf+2,0x00); store8(g_send_buf+3,0x16);
+    store8(g_send_buf+4,0x11); store8(g_send_buf+5,0xE0); store8(g_send_buf+6,0x00); store8(g_send_buf+7,0x00);
+    store8(g_send_buf+8,0x00); store8(g_send_buf+9,0x01); store8(g_send_buf+10,0x00); store8(g_send_buf+11,0xC0);
+    store8(g_send_buf+12,0x01); store8(g_send_buf+13,0x0A); store8(g_send_buf+14,0xC1); store8(g_send_buf+15,0x02);
+    store8(g_send_buf+16,0x01); store8(g_send_buf+17,0x00); store8(g_send_buf+18,0xC2); store8(g_send_buf+19,0x02);
+    store8(g_send_buf+20,0x01); store8(g_send_buf+21,0x02);
+    
+    send(s, g_send_buf, 22, 0);
+    
+    # Read COTP CC
+    n = recv_n(s, g_recv_buf, 22);
+    if n <= 0 {
+        closesocket(s);
+        WSACleanup();
+        log_append("[S7 Client] Failed to receive COTP Connection Confirm (CC).\r\n");
+        return 0;
+    }
+    
+    if load8(g_recv_buf + 5) != 0xD0 {
+        closesocket(s);
+        WSACleanup();
+        log_append("[S7 Client] Invalid COTP CC response.\r\n");
+        return 0;
+    }
+    log_append("[S7 Client] COTP Connection Confirmed.\r\n");
+    
+    # Send S7 Setup Communication
+    log_append("[S7 Client] Sending S7 Setup Communication...\r\n");
+    store8(g_send_buf+0,0x03); store8(g_send_buf+1,0x00); store8(g_send_buf+2,0x00); store8(g_send_buf+3,0x19);
+    store8(g_send_buf+4,0x02); store8(g_send_buf+5,0xF0); store8(g_send_buf+6,0x80); store8(g_send_buf+7,0x32);
+    store8(g_send_buf+8,0x01); store8(g_send_buf+9,0x00); store8(g_send_buf+10,0x00); store8(g_send_buf+11,0x04);
+    store8(g_send_buf+12,0x00); store8(g_send_buf+13,0x00); store8(g_send_buf+14,0x08); store8(g_send_buf+15,0x00);
+    store8(g_send_buf+16,0x00); store8(g_send_buf+17,0xF0); store8(g_send_buf+18,0x00); store8(g_send_buf+19,0x00);
+    store8(g_send_buf+20,0x01); store8(g_send_buf+21,0x00); store8(g_send_buf+22,0x01); store8(g_send_buf+23,0x03);
+    store8(g_send_buf+24,0xC0);
+    
+    send(s, g_send_buf, 25, 0);
+    
+    # Read Setup Ack
+    n = recv_n(s, g_recv_buf, 27);
+    if n <= 0 {
+        closesocket(s);
+        WSACleanup();
+        log_append("[S7 Client] Failed to receive S7 Setup Ack.\r\n");
+        return 0;
+    }
+    
+    if load8(g_recv_buf + 8) != 0x03 {
+        closesocket(s);
+        WSACleanup();
+        log_append("[S7 Client] S7 Setup Communication failed (non-Ack ROSCTR).\r\n");
+        return 0;
+    }
+    
+    log_append("[S7 Client] S7 Setup Communication successful.\r\n");
+    store64(g_sock, s);
+    
+    # Set socket to non-blocking for polling
+    store64(g_nonblock, 1);
+    ioctlsocket(s, 0x8004667E, g_nonblock);
+    
+    SetWindowTextA(load64(g_status), "Status: Connected");
+    SetWindowTextA(load64(g_btn_conn), "Connected");
+    
+    # Start polling timer (every 1 second)
+    SetTimer(load64(g_hwnd), 1, 1000, 0);
+    
+    # Trigger first grid read immediately
+    handle_poll_timer();
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 1;
+}
+
+func log_recv_buf(len: i64) -> i64 {
+    log_append("[S7 Client] Recv PDU: ");
+    i = 0;
+    while i < len {
+        val = load8(g_recv_buf + i);
+        byte_to_hex(val, g_numbuf);
+        log_append(g_numbuf);
+        log_append(" ");
+        i = i + 1;
+    }
+    log_append("\r\n");
+    return 0;
+}
+
+func do_read_register(addr_str: i64, row_idx: i64, log_success: i64) -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+    
+    res = parse_s7_address(addr_str, g_parse_area, g_parse_db, g_parse_offset, g_parse_type, g_parse_bit);
+    if res == 0 { return 0; }
+    
+    area = load64(g_parse_area);
+    db = load64(g_parse_db);
+    offset = load64(g_parse_offset);
+    type = load64(g_parse_type);
+    bit = load64(g_parse_bit);
+    
+    byte_count = 1;
+    if type == 3 { byte_count = 2; }
+    if type == 4 { byte_count = 4; }
+    
+    # Clean socket buffer
+    drain_socket(sock);
+    
+    # Send Read job
+    send_read_job(sock, area, db, offset, byte_count);
+    
+    # Set to blocking temporarily
+    store64(g_nonblock, 0);
+    ioctlsocket(sock, 0x8004667E, g_nonblock);
+    
+    # Read response
+    tl = recv_tpkt(sock, g_recv_buf);
+    
+    # Restore to non-blocking
+    store64(g_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, g_nonblock);
+    
+    if tl <= 0 {
+        do_disconnect();
+        log_append("[S7 Client] Error: Read response timeout or disconnected.\r\n");
+        return 0;
+    }
+    
+    parsed = parse_read_response(g_valbuf_dec, g_valbuf_hex, type, bit);
+    if parsed < 0 {
+        log_append("[S7 Client] parse_read_response failed: ");
+        int_to_str(g_numbuf, parsed);
+        log_append(g_numbuf);
+        log_append("\r\n");
+        log_recv_buf(32);
+        update_grid_value(row_idx, "Err", "Err", "S7 Error");
+        return 0;
+    }
+    
+    update_grid_value(row_idx, g_valbuf_hex, g_valbuf_dec, "Success");
+    if log_success != 0 {
+        log_append("[S7 Client] Read successful: ");
+        log_append(addr_str);
+        log_append(" = ");
+        log_append(g_valbuf_dec);
+        log_append(" (");
+        log_append(g_valbuf_hex);
+        log_append(")\r\n");
+    }
+    return 1;
+}
+
+func do_write_register(addr_str: i64, val_str: i64, row_idx: i64) -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 {
+        log_append("[S7 Client] Error: Not connected.\r\n");
+        return 0;
+    }
+    
+    res = parse_s7_address(addr_str, g_parse_area, g_parse_db, g_parse_offset, g_parse_type, g_parse_bit);
+    if res == 0 {
+        log_append("[S7 Client] Error: Invalid register address format.\r\n");
+        return 0;
+    }
+    
+    area = load64(g_parse_area);
+    db = load64(g_parse_db);
+    offset = load64(g_parse_offset);
+    type = load64(g_parse_type);
+    bit = load64(g_parse_bit);
+    
+    val = str_to_int(val_str);
+    
+    drain_socket(sock);
+    
+    send_write_job(sock, area, db, offset, type, bit, val);
+    
+    store64(g_nonblock, 0);
+    ioctlsocket(sock, 0x8004667E, g_nonblock);
+    
+    tl = recv_tpkt(sock, g_recv_buf);
+    
+    store64(g_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, g_nonblock);
+    
+    if tl <= 0 {
+        do_disconnect();
+        log_append("[S7 Client] Error: Write response timeout or disconnected.\r\n");
+        return 0;
+    }
+    
+    parsed = parse_write_response();
+    if parsed < 0 {
+        log_append("[S7 Client] S7 Write failed.\r\n");
+        if row_idx >= 0 {
+            update_grid_value(row_idx, "", "", "Write Err");
+        }
+        return 0;
+    }
+    
+    log_append("[S7 Client] Write successful: ");
+    log_append(addr_str);
+    log_append(" = ");
+    log_append(val_str);
+    log_append("\r\n");
+    
+    # Immediate read back
+    if row_idx >= 0 {
+        do_read_register(addr_str, row_idx, 1);
+    }
+    return 1;
+}
+
+func handle_poll_timer() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+    
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    
+    count = SendMessageA(hlv, 4100, 0, 0);
+    i = 0;
+    while i < count {
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, g_temp_addr);
+        store32(g_lvitem + 32, 256);
+        SendMessageA(hlv, 4141, i, g_lvitem);
+        
+        do_read_register(g_temp_addr, i, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    
+    len = GetWindowTextA(hwnd_log, g_savebuf, 4096);
+    if len <= 0 { return 0; }
+    
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0); # GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2, NORMAL=128
+    if hf == 0 - 1 {
+        log_append(m_save_err);
+        return 0;
+    }
+    
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+func handle_manual_read() -> i64 {
+    GetWindowTextA(load64(g_reg_ed), g_temp_addr, 256);
+    if load8(g_temp_addr) == 0 {
+        log_append("[S7 Client] Error: Register address edit field is empty.\r\n");
+        return 0;
+    }
+    
+    # Find matching row in grid to update
+    hlv = load64(g_listview);
+    count = SendMessageA(hlv, 4100, 0, 0);
+    row_idx = 0 - 1;
+    i = 0;
+    while i < count {
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, g_temp_fc);
+        store32(g_lvitem + 32, 256);
+        SendMessageA(hlv, 4141, i, g_lvitem);
+        
+        if str_equal(g_temp_fc, g_temp_addr) != 0 {
+            row_idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    
+    do_read_register(g_temp_addr, row_idx, 1);
+    SetWindowTextA(load64(g_val_ed), g_valbuf_dec);
+    return 0;
+}
+
+func handle_manual_write() -> i64 {
+    GetWindowTextA(load64(g_reg_ed), g_temp_addr, 256);
+    GetWindowTextA(load64(g_val_ed), g_numbuf, 32);
+    
+    if load8(g_temp_addr) == 0 {
+        log_append("[S7 Client] Error: Register address edit field is empty.\r\n");
+        return 0;
+    }
+    
+    hlv = load64(g_listview);
+    count = SendMessageA(hlv, 4100, 0, 0);
+    row_idx = 0 - 1;
+    
+    i = 0;
+    while i < count {
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, g_temp_fc);
+        store32(g_lvitem + 32, 256);
+        SendMessageA(hlv, 4141, i, g_lvitem);
+        
+        if str_equal(g_temp_fc, g_temp_addr) != 0 {
+            row_idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    
+    do_write_register(g_temp_addr, g_numbuf, row_idx);
+    return 0;
+}
+
+func handle_listview_click() -> i64 {
+    hlv = load64(g_listview);
+    sel_row = SendMessageA(hlv, 4108, 0 - 1, 2); # LVM_GETNEXTITEM, LVNI_SELECTED
+    if sel_row < 0 { return 0; }
+    
+    # Get Address (Col 0)
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, sel_row);
+    store32(g_lvitem + 8, 0);
+    store64(g_lvitem + 24, g_temp_addr);
+    store32(g_lvitem + 32, 256);
+    SendMessageA(hlv, 4141, sel_row, g_lvitem);
+    SetWindowTextA(load64(g_reg_ed), g_temp_addr);
+    
+    # Get Value (Col 4 - Dec)
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, sel_row);
+    store32(g_lvitem + 8, 4);
+    store64(g_lvitem + 24, g_numbuf);
+    store32(g_lvitem + 32, 32);
+    SendMessageA(hlv, 4141, sel_row, g_lvitem);
+    SetWindowTextA(load64(g_val_ed), g_numbuf);
+    
+    return 0;
+}
+
+func handle_listview_double_click() -> i64 {
+    hlv = load64(g_listview);
+    sel_row = SendMessageA(hlv, 4108, 0 - 1, 2);
+    if sel_row < 0 { return 0; }
+    
+    # Get Address
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, sel_row);
+    store32(g_lvitem + 8, 0);
+    store64(g_lvitem + 24, g_temp_addr);
+    store32(g_lvitem + 32, 256);
+    SendMessageA(hlv, 4141, sel_row, g_lvitem);
+    
+    do_read_register(g_temp_addr, sel_row, 1);
+    return 0;
+}
+
+# ============================================================================
+# LISTVIEW GRID HELPERS
+# ============================================================================
+
+func insert_point_row(addr_str: i64, area_str: i64, type_str: i64) -> i64 {
+    hlv = load64(g_listview);
+    count = SendMessageA(hlv, 4100, 0, 0);
+    
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1); # LVIF_TEXT
+    store32(g_lvitem + 4, count);
+    store32(g_lvitem + 8, 0);
+    store64(g_lvitem + 24, addr_str);
+    SendMessageA(hlv, 4103, 0, g_lvitem); # LVM_INSERTITEMA
+    
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 8, 1);
+    store64(g_lvitem + 24, area_str);
+    SendMessageA(hlv, 4142, count, g_lvitem); # LVM_SETITEMA
+    
+    store32(g_lvitem + 8, 2);
+    store64(g_lvitem + 24, type_str);
+    SendMessageA(hlv, 4142, count, g_lvitem);
+    
+    store32(g_lvitem + 8, 5);
+    store64(g_lvitem + 24, "Offline");
+    SendMessageA(hlv, 4142, count, g_lvitem);
+    
+    return 0;
+}
+
+func update_grid_value(row_idx: i64, hex_str: i64, dec_str: i64, status_str: i64) -> i64 {
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, row_idx);
+    
+    if load8(hex_str) != 0 {
+        store32(g_lvitem + 8, 3); # Col 3
+        store64(g_lvitem + 24, hex_str);
+        SendMessageA(hlv, 4142, row_idx, g_lvitem);
+    }
+    
+    if load8(dec_str) != 0 {
+        store32(g_lvitem + 8, 4); # Col 4
+        store64(g_lvitem + 24, dec_str);
+        SendMessageA(hlv, 4142, row_idx, g_lvitem);
+    }
+    
+    if load8(status_str) != 0 {
+        store32(g_lvitem + 8, 5); # Col 5
+        store64(g_lvitem + 24, status_str);
+        SendMessageA(hlv, 4142, row_idx, g_lvitem);
+    }
+    return 0;
+}
+
+func populate_default_registers() -> i64 {
+    insert_point_row(reg_db1_x00, "DB1", "Bit");
+    insert_point_row(reg_db1_x01, "DB1", "Bit");
+    insert_point_row(reg_db1_b1,  "DB1", "Byte");
+    insert_point_row(reg_db1_w2,  "DB1", "Word");
+    insert_point_row(reg_db1_d4,  "DB1", "DWord");
+    insert_point_row(reg_m0_0,    "M",   "Bit");
+    insert_point_row(reg_mb1,     "M",   "Byte");
+    insert_point_row(reg_mw2,     "M",   "Word");
+    insert_point_row(reg_md4,     "M",   "DWord");
+    insert_point_row(reg_i0_0,    "I",   "Bit");
+    insert_point_row(reg_ib1,     "I",   "Byte");
+    insert_point_row(reg_q0_0,    "Q",   "Bit");
+    insert_point_row(reg_qb1,     "Q",   "Byte");
+    return 0;
+}
+
+func refresh_point_grid() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+    
+    handle_poll_timer();
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE OVERRIDES & GDI SUBCLASSING
+# ============================================================================
+
+func register_wide_string(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while load8(src + i) != 0 {
+        store16(dst + i * 2, load8(src + i));
+        i = i + 1;
+    }
+    store16(dst + i * 2, 0);
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    register_wide_string(thm_dm_exp_w, "DarkMode_Explorer");
+    register_wide_string(thm_dm_cfd_w, "CFD");
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+# Custom GlowButton procedure (state-based)
+func GlowButtonWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+    if msg == 512 { # WM_MOUSEMOVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            SetWindowLongA(hwnd, 0 - 21, bor(pressed, 1));
+            InvalidateRect(hwnd, 0, 1);
+            
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 { # WM_MOUSELEAVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 { # WM_LBUTTONDOWN
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        SetWindowLongA(hwnd, 0 - 21, bor(hover, 2));
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 { # WM_LBUTTONUP
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+        
+        brush = load64(g_brush_card);
+        if pressed == 2 { brush = load64(g_brush_deep); }
+        else if hover == 1 { brush = load64(g_brush_hover); }
+        
+        old_brush = SelectObject(hdc, brush);
+        
+        pen = load64(g_pen_border);
+        if pressed == 2 { pen = load64(g_pen_neon); }
+        else if hover == 1 { pen = load64(g_pen_neon); }
+        
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, 0, 0, w, h, 6, 6);
+        
+        if hover == 1 {
+            SelectObject(hdc, load64(g_pen_neon));
+            RoundRect(hdc, 1, 1, w - 1, h - 1, 6, 6);
+        }
+        
+        SetBkMode(hdc, 1);
+        tc = COLOR_TEXT_PRIMARY;
+        if hover == 1 { tc = COL_ACCENT; }
+        else if pressed == 2 { tc = COL_ACCENT; }
+        SetTextColor(hdc, tc);
+        
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 256);
+        
+        # Reset g_rect before DrawText
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, w);
+        store32(g_rect + 12, h);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+        
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func register_class(wndcls_ptr: i64, name: i64, wndproc_addr: i64, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    memset(wndcls_ptr, 0, 80);
+    store32(wndcls_ptr + 0, 80);
+    store32(wndcls_ptr + 4, 3);
+    store64(wndcls_ptr + 8, wndproc_addr);
+    store64(wndcls_ptr + 24, hinst);
+    store64(wndcls_ptr + 40, cursor);
+    store64(wndcls_ptr + 48, brush);
+    store64(wndcls_ptr + 64, name);
+    return RegisterClassExA(wndcls_ptr);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        
+        gfont = CreateFontA(14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face_mono);
+        store64(g_font, gfont);
+        
+        # No superclassing button proc retrieval needed since it is a pure custom class.
+        
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 1040, 6, 24, 24, hwnd, 108, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1068, 6, 24, 24, hwnd, 109, hinst, 0);
+        
+        # ---- Row 1: Connection setup ----
+        CreateWindowExA(0, cls_stat, lbl_host, 0x50000000, 12, 54, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_host, 0x50000080, 50, 52, 95, 24, hwnd, 0, hinst, 0);
+        store64(g_host_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+        
+        CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 155, 54, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50000080, 195, 52, 55, 24, hwnd, 0, hinst, 0);
+        store64(g_port_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+        
+        h = CreateWindowExA(0, cls_glow_btn, btn_conn, 0x50000000, 260, 50, 85, 28, hwnd, 101, hinst, 0);
+        store64(g_btn_conn, h);
+        
+        h = CreateWindowExA(0, cls_glow_btn, btn_disc, 0x50000000, 355, 50, 85, 28, hwnd, 102, hinst, 0);
+        store64(g_btn_disc, h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 460, 54, 180, 20, hwnd, 0, hinst, 0);
+        store64(g_status, h); SendMessageA(h, 48, gfont, 1);
+        
+        # ---- Log View (Y=100) ----
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 12, 82, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50200044, 12, 100, 480, 440, hwnd, 103, hinst, 0);
+        store64(g_log, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+        
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 360, 550, 55, 26, hwnd, 106, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 425, 550, 55, 26, hwnd, 107, hinst, 0);
+        
+        # ---- ListView Grid (right side, Y=100) ----
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 510, 100, 560, 440, hwnd, 105, hinst, 0);
+        store64(g_listview, h); SendMessageA(h, 48, gfont, 1);
+        SendMessageA(h, 4150, 0x20, 0x20); # LVS_EX_FULLROWSELECT
+        
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);
+        dark_scroll(h);
+        
+        # Columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+        
+        store32(g_lvcol + 8, 100); store64(g_lvcol + 16, col_addr);
+        SendMessageA(h, 4123, 0, g_lvcol);
+        
+        store32(g_lvcol + 8, 60); store64(g_lvcol + 16, col_area); store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+        
+        store32(g_lvcol + 8, 60); store64(g_lvcol + 16, col_type); store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+        
+        store32(g_lvcol + 8, 100); store64(g_lvcol + 16, col_val_hex); store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+        
+        store32(g_lvcol + 8, 100); store64(g_lvcol + 16, col_val_dec); store32(g_lvcol + 24, 4);
+        SendMessageA(h, 4123, 4, g_lvcol);
+        
+        store32(g_lvcol + 8, 120); store64(g_lvcol + 16, col_status); store32(g_lvcol + 24, 5);
+        SendMessageA(h, 4123, 5, g_lvcol);
+        
+        # ---- Edit Panel (Y=550) ----
+        CreateWindowExA(0, cls_stat, lbl_reg, 0x50000000, 510, 554, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50000080, 550, 552, 100, 24, hwnd, 110, hinst, 0);
+        store64(g_reg_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+        
+        CreateWindowExA(0, cls_stat, lbl_val, 0x50000000, 665, 554, 50, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50000080, 715, 552, 100, 24, hwnd, 111, hinst, 0);
+        store64(g_val_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+        
+        CreateWindowExA(0, cls_glow_btn, btn_read, 0x50000000, 825, 550, 85, 28, hwnd, 112, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_write, 0x50000000, 920, 550, 85, 28, hwnd, 113, hinst, 0);
+        
+        populate_default_registers();
+        return 0;
+    }
+    
+    if msg == 2 {
+        do_disconnect();
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    if msg == 15 {
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+        
+        GetClientRect(hwnd, g_rect);
+        FillRect(hdc, g_rect, load64(g_bg_brush));
+        
+        # Title bar background
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, WIN_W);
+        store32(g_rect + 12, 36);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+        
+        SelectObject(hdc, load64(g_font_header));
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        
+        store32(g_rect + 0, 12);
+        store32(g_rect + 4, 12);
+        store32(g_rect + 8, 500);
+        store32(g_rect + 12, 35);
+        DrawTextA(hdc, title_draw, 0 - 1, g_rect, 0);
+        
+        sock = load64(g_sock);
+        indicator = st_disc_ind;
+        if sock != 0 {
+            indicator = st_conn_ind;
+            SetTextColor(hdc, COL_ACCENT);
+        } else {
+            SetTextColor(hdc, 0x555555);
+        }
+        
+        store32(g_rect + 0, 290);
+        store32(g_rect + 8, 480);
+        DrawTextA(hdc, indicator, 0 - 1, g_rect, 0);
+        
+        SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 12, 36, 0);
+        LineTo(hdc, WIN_W - 12, 36);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 307 { # WM_CTLCOLOREDIT
+        hdc = wp;
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkColor(hdc, COLOR_BG_INPUT);
+        return load64(g_brush_input);
+    }
+    
+    if msg == 312 {
+        hdc = wp;
+        SetTextColor(hdc, COL_TEXT);
+        SetBkColor(hdc, COL_BG);
+        return load64(g_bg_brush);
+    }
+    
+    if msg == 311 {
+        hdc = wp;
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkColor(hdc, COLOR_BG_INPUT);
+        return load64(g_brush_input);
+    }
+    
+    if msg == 273 {
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == 101 { do_connect(); }
+        if cmd_id == 102 { do_disconnect(); }
+        if cmd_id == 106 { do_clear_log(); }
+        if cmd_id == 107 { do_save_log(); }
+        if cmd_id == 108 { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == 109 { DestroyWindow(hwnd); return 0; }
+        if cmd_id == 112 { handle_manual_read(); }
+        if cmd_id == 113 { handle_manual_write(); }
+        return 0;
+    }
+    
+    if msg == 275 {
+        if wp == 1 {
+            handle_poll_timer();
+        }
+        return 0;
+    }
+    
+    if msg == 132 { # WM_NCHITTEST
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        if mx >= 32768 { mx = mx - 65536; }
+        my = band(shr(lp, 16), 65535);
+        if my >= 32768 { my = my - 65536; }
+        cx = mx - wl;
+        cy = my - wt;
+        
+        if cy < 36 {
+            if cx >= 1040 {
+                if cx < 1064 {
+                    if cy >= 6 {
+                        if cy < 30 { return 1; }
+                    }
+                }
+            }
+            if cx >= 1068 {
+                if cx < 1092 {
+                    if cy >= 6 {
+                        if cy < 30 { return 1; }
+                    }
+                }
+            }
+            return 2; # HTCAPTION
+        }
+    }
+    
+    if msg == 78 {
+        hdr_ptr = lp;
+        code = load32(hdr_ptr + 16);
+        
+        if code == 4294967294 {
+            handle_listview_click();
+        }
+        if code == 4294967293 {
+            handle_listview_double_click();
+        }
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    store64(g_sock, 0);
+    
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    
+    enable_dark_mode();
+    
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COL_ACCENT));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COL_ACCENT));
+    
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+    
+    res = register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+    if res == 0 {
+        MessageBoxA(0, "RegisterClassExA failed for Button!", "Error", 16);
+    }
+    
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+    
+    hwnd = CreateWindowExA(0, clsname, title, 0x92000000, 100, 100, WIN_W, WIN_H, 0, 0, hinst, 0);
+    if hwnd == 0 {
+        MessageBoxA(0, "CreateWindowExA failed for main window!", "Error", 16);
+    }
+    store64(g_hwnd, hwnd);
+    
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

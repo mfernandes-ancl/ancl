@@ -1,0 +1,198 @@
+# dnp3_client.ancl - DNP3 master Integrity-Poll (Class-0 read) STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client: link reset -> Integrity Poll -> prints every static point
+# (group/var/index/value/flags). Edit the CONFIG block, COMPILE, RUN, then extend it
+# (Direct Operate fn 0x05 to write a CROB/AO) - Ctrl+Space knows the idioms.
+# Loaded by Aether Studio for DNP3 intent.
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" setsockopt;
+
+@DATA
+mInfo: str = "[dnp3] native DNP3 master - Integrity Poll (ANCL starter).";
+mConn: str = "[dnp3] connecting on port ";
+mErr:  str = "[dnp3] connect failed - check IP / port / cable.";
+mRst:  str = "[dnp3] link reset sent; ACK bytes = ";
+mPoll: str = "[dnp3] sent Integrity Poll (Class 0, read G60V1).";
+mNo:   str = "[dnp3] no/short response (timeout).";
+mFc:   str = "[dnp3] response FC=";
+mIin:  str = "  IIN=0x";
+mPt:   str = "  point G";
+mV:    str = "V";
+mIdx:  str = " idx ";
+mEq:   str = " = ";
+mFl:   str = "  (flags 0x";
+mCp:   str = ")";
+mDone: str = "[dnp3] integrity poll complete; points read = ";
+nl:    str = "\n";
+hexd:  str = "0123456789ABCDEF";
+# ==== CONFIG - edit these ====
+CFG_IP0:  i64 = 127;     # target IP, octet 1
+CFG_IP1:  i64 = 0;       #   octet 2
+CFG_IP2:  i64 = 0;       #   octet 3
+CFG_IP3:  i64 = 1;       #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 20000;   # DNP3-over-TCP port (standard 20000)
+CFG_DST:  i64 = 1;       # outstation link address
+CFG_SRC:  i64 = 3;       # master link address
+# =============================
+g_wsa:    buf = 512;
+g_addr:   buf = 16;
+g_tx:     buf = 292;      # outgoing link frame
+g_rx:     buf = 2048;     # raw response
+g_re:     buf = 2048;     # reassembled application data (link CRCs stripped)
+g_io:     buf = 8;
+g_tmo:    buf = 8;
+g_seq:    buf = 8;
+g_hx:     buf = 8;
+
+@CODE
+# DNP3 link CRC-16 (poly 0x3D65 bit-reversed -> 0xA6BC), per-bit, final XOR 0xFFFF.
+func dnp3_crc(d: i64, n: i64) -> i64 {
+    crc = 0; i = 0;
+    while i < n {
+        crc = bxor(crc, load8(d + i));
+        j = 0;
+        while j < 8 {
+            if band(crc, 1) != 0 { crc = bxor(shr(crc, 1), 0xA6BC); } else { crc = shr(crc, 1); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return band(bxor(crc, 0xFFFF), 0xFFFF);
+}
+
+# build a 10-byte link frame (start, len=5, ctrl, dst, src, CRC) into g_tx; returns 10.
+func build_link(ctrl: i64) -> i64 {
+    store8(g_tx+0,0x05); store8(g_tx+1,0x64); store8(g_tx+2,5); store8(g_tx+3,ctrl);
+    store8(g_tx+4, band(CFG_DST,0xFF)); store8(g_tx+5, band(shr(CFG_DST,8),0xFF));
+    store8(g_tx+6, band(CFG_SRC,0xFF)); store8(g_tx+7, band(shr(CFG_SRC,8),0xFF));
+    c = dnp3_crc(g_tx, 8);
+    store8(g_tx+8, band(c,0xFF)); store8(g_tx+9, band(shr(c,8),0xFF));
+    return 10;
+}
+
+# wrap a `len`-byte application payload (at `app`) in a DNP3 frame (link hdr + transport
+# + per-16-byte-block CRCs) into g_tx. Returns the total frame length.
+func build_frame(app: i64, len: i64) -> i64 {
+    store8(g_tx+0,0x05); store8(g_tx+1,0x64);
+    store8(g_tx+2, 5 + 1 + len);
+    store8(g_tx+3, 0x44);                                  # UNCONFIRMED USER DATA (DIR=0,PRM=1,FC=4)
+    store8(g_tx+4, band(CFG_DST,0xFF)); store8(g_tx+5, band(shr(CFG_DST,8),0xFF));
+    store8(g_tx+6, band(CFG_SRC,0xFF)); store8(g_tx+7, band(shr(CFG_SRC,8),0xFF));
+    hc = dnp3_crc(g_tx, 8);
+    store8(g_tx+8, band(hc,0xFF)); store8(g_tx+9, band(shr(hc,8),0xFF));
+    # user data = transport(0xC0) + app, laid contiguously at +10 first, then CRC-blocked
+    store8(g_tx+10, 0xC0);
+    i = 0;
+    while i < len { store8(g_tx+11+i, load8(app+i)); i = i + 1; }
+    total_user = 1 + len;
+    src_pos = 0; out_pos = 10;
+    while src_pos < total_user {
+        rem = total_user - src_pos;
+        blk = 16; if rem < 16 { blk = rem; }
+        j = 0; while j < blk { store8(g_tx+out_pos+j, load8(g_tx+10+src_pos+j)); j = j + 1; }
+        bc = dnp3_crc(g_tx+out_pos, blk);
+        store8(g_tx+out_pos+blk, band(bc,0xFF)); store8(g_tx+out_pos+blk+1, band(shr(bc,8),0xFF));
+        out_pos = out_pos + blk + 2; src_pos = src_pos + blk;
+    }
+    return out_pos;
+}
+
+# strip the link-layer CRCs from the response in g_rx (length n) into g_re; drop the
+# transport byte. Returns the application-data length (appctrl, FC, IIN, objects...).
+func extract_app(n: i64) -> i64 {
+    if n < 12 { return 0; }
+    flen = load8(g_rx+2);
+    udl = flen - 5;                                        # user-data length (transport + app)
+    if udl <= 0 { return 0; }
+    # Detect link-layer CRCs: a CRC-blocked frame is longer than the no-CRC length.
+    # Some outstations (and our simulator) send NO link CRCs -> app data sits at +9.
+    if n <= flen + 3 {
+        app_bytes = udl - 1;
+        if app_bytes <= 0 { return 0; }
+        j = 0; while j < app_bytes { store8(g_re+j, load8(g_rx+9+j)); j = j + 1; }
+        return app_bytes;
+    }
+    src_pos = 10; dst = 0;
+    first = 16; if udl < 16 { first = udl; }
+    j = 1;                                                 # j=1 skips the transport byte
+    while j < first { if src_pos+j < n { store8(g_re+dst, load8(g_rx+src_pos+j)); dst = dst + 1; } j = j + 1; }
+    src_pos = src_pos + first + 2;
+    rem = udl - first;
+    while rem > 0 {
+        blk = 16; if rem < 16 { blk = rem; }
+        j = 0; while j < blk { if src_pos+j < n { store8(g_re+dst, load8(g_rx+src_pos+j)); dst = dst + 1; } j = j + 1; }
+        src_pos = src_pos + blk + 2; rem = rem - blk;
+    }
+    return dst;
+}
+
+func ph(v: i64) -> i64 {                                  # print one byte as 2 hex chars
+    store8(g_hx+0, load8(hexd + band(shr(v,4),0xF)));
+    store8(g_hx+1, load8(hexd + band(v,0xF)));
+    store8(g_hx+2, 0);
+    puts_cstr(g_hx);
+    return 0;
+}
+
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    syscall 1, mConn, CFG_PORT, nl;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);
+    store16(g_addr+0, 2); store16(g_addr+2, htons(CFG_PORT));
+    store32(g_addr+4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24)); store64(g_addr+8, 0);
+    if connect(s, g_addr, 16) != 0 { syscall 1, mErr, nl; closesocket(s); return 1; }
+    store32(g_tmo, 2000); setsockopt(s, 65535, 4102, g_tmo, 4);   # SO_RCVTIMEO 2s
+    store64(g_seq, 0);
+
+    # 1) link reset + ACK
+    build_link(0xC0);
+    send(s, g_tx, 10, 0);
+    a = recv(s, g_rx, 2048, 0);
+    syscall 1, mRst, a, nl;
+
+    # 2) Integrity Poll: app = [appctrl C0][FC READ 01][grp 60][var 1][qual 0x06]
+    store8(g_re+0, 0xC0); store8(g_re+1, 0x01); store8(g_re+2, 60); store8(g_re+3, 1); store8(g_re+4, 0x06);
+    flen = build_frame(g_re, 5);
+    send(s, g_tx, flen, 0);
+    syscall 1, mPoll, nl;
+
+    # 3) response -> strip CRCs -> parse objects
+    n = recv(s, g_rx, 2048, 0);
+    if n < 12 { syscall 1, mNo, nl; closesocket(s); return 0; }
+    al = extract_app(n);                                  # g_re = [appctrl][FC][IIN_lo][IIN_hi][objects...]
+    fc = load8(g_re+1);
+    syscall 1, mFc, fc;
+    iin = load8(g_re+2) + shl(load8(g_re+3), 8);
+    syscall 1, mIin; ph(band(shr(iin,8),0xFF)); ph(band(iin,0xFF)); syscall 1, nl;
+
+    off = 4; pts = 0;
+    while off + 3 <= al {
+        grp = load8(g_re+off); var = load8(g_re+off+1); qual = load8(g_re+off+2);
+        if grp == 12 { break; }
+        if grp == 41 { break; }
+        qc = band(qual, 0x0F);
+        count = 0; start = 0;
+        if qc == 0x07 { count = load8(g_re+off+3); off = off + 4; }
+        else if qc == 0x08 { count = load16(g_re+off+3); off = off + 5; }
+        else if qc == 0x00 { start = load8(g_re+off+3); count = load8(g_re+off+4) - start + 1; off = off + 5; }
+        else if qc == 0x01 { start = load16(g_re+off+3); count = load16(g_re+off+5) - start + 1; off = off + 7; }
+        else if qc == 0x06 { count = 0; off = off + 3; }
+        else { break; }
+        item = 0;
+        while item < count {
+            if off >= al { break; }
+            vsize = 1; val = 0; flags = 0;
+            if grp == 1 { if var == 2 { b = load8(g_re+off); val = shr(band(b,0x80),7); flags = band(b,0x7F); vsize = 1; } }
+            else if grp == 10 { if var == 2 { b = load8(g_re+off); val = shr(band(b,0x80),7); flags = band(b,0x7F); vsize = 1; } }
+            else if grp == 20 { if var == 1 { flags = load8(g_re+off); val = load32(g_re+off+1); vsize = 5; } }
+            else if grp == 30 { if var == 1 { flags = load8(g_re+off); val = load32(g_re+off+1); vsize = 5; } }
+            else if grp == 40 { if var == 1 { flags = load8(g_re+off); val = load32(g_re+off+1); vsize = 5; } }
+            syscall 1, mPt, grp, mV, var, mIdx, (start + item), mEq, val;
+            syscall 1, mFl; ph(flags); syscall 1, mCp, nl;
+            off = off + vsize; item = item + 1; pts = pts + 1;
+        }
+    }
+    syscall 1, mDone, pts, nl;
+    closesocket(s);
+    return 0;
+}

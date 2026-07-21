@@ -1,0 +1,38 @@
+# Aether Lens R9 first-run guidance policy.
+# Pure decision helpers stay separate from Win32 presentation so the model
+# recommendation can be regression-tested without opening a window.
+
+@DATA
+fr_tag_small: str = "qwen2.5:0.5b";
+fr_tag_default: str = "qwen3:0.6b";
+fr_tag_medium: str = "qwen3:1.7b";
+fr_tag_large: str = "qwen3:4b";
+
+fr_size_small: str = "397 MB";
+fr_size_default: str = "523 MB";
+fr_size_medium: str = "1.4 GB";
+fr_size_large: str = "2.5 GB";
+
+@CODE
+func fr_model_tier(ram_gib: i64) -> i64 {
+    if ram_gib < 8 { return 0; }
+    if ram_gib < 16 { return 1; }
+    if ram_gib < 32 { return 2; }
+    return 3;
+}
+
+func fr_model_tag(ram_gib: i64) -> i64 {
+    tier = fr_model_tier(ram_gib);
+    if tier == 0 { return fr_tag_small; }
+    if tier == 1 { return fr_tag_default; }
+    if tier == 2 { return fr_tag_medium; }
+    return fr_tag_large;
+}
+
+func fr_model_download(ram_gib: i64) -> i64 {
+    tier = fr_model_tier(ram_gib);
+    if tier == 0 { return fr_size_small; }
+    if tier == 1 { return fr_size_default; }
+    if tier == 2 { return fr_size_medium; }
+    return fr_size_large;
+}

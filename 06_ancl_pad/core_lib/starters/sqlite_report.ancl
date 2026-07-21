@@ -1,0 +1,29 @@
+# sqlite_report.ancl - SQLite first-row query STARTER for ANCL Pad bundles.
+# Save this starter in the ancl_pad folder so import "core_lib/sqlite.ancl" resolves.
+# Requires sqlite3.dll beside the program or available in PATH.
+
+import "core_lib/sqlite.ancl";
+
+@DATA
+CFG_DB:  str = "sample.db";
+CFG_SQL: str = "select sqlite_version();";
+
+mInfo: str = "[sqlite] running query\n";
+mRow:  str = "[sqlite] first column = ";
+mNone: str = "[sqlite] no row or query failed, rc=";
+nl:    str = "\n";
+row:   buf = 256;
+
+@CODE
+func main() -> i32 {
+    syscall 1, mInfo;
+    rc = sqlite_query_first_text(CFG_DB, CFG_SQL, row, 256);
+    if rc == 1 {
+        syscall 1, mRow;
+        puts_cstr(row);
+        syscall 1, nl;
+        return 0;
+    }
+    syscall 1, mNone, rc, nl;
+    return 1;
+}

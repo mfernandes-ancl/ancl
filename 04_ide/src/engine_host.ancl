@@ -1,0 +1,460 @@
+# =====================================================================
+#  engine_host.ancl  -  Aether Engine (local) lifecycle for the IDE.
+#
+#  The pure-ANCL LLM engine (aether_engine.exe) is Ollama-compatible on
+#  /api/chat + /api/tags + /api/version, so transport.ancl does all the
+#  talking; this module makes the engine BE THERE:
+#    - eng_probe()           GET /api/version at the current transport target
+#    - eng_loaded_model(d)   GET /api/tags -> the served model name
+#    - eng_fill_combo(h)     list pulled models from the engine's exe-relative
+#                            store (models\manifests\registry.ollama.ai\
+#                            library\<name>\<tag>.json) -- offline, no server
+#    - eng_ensure(model,c)   spawn `aether_engine.exe serve <model> <port> gpu`
+#                            beside the IDE when the target is down, poll
+#                            ready (watching the process for early death),
+#                            restart when OUR server runs a different model
+#    - eng_stop()            kill the engine WE spawned (IDE exit / restart)
+#
+#  Layering: settings.ancl and agent.ancl import this module; this module
+#  never imports them. The transport target (ol_cur_*) already points at
+#  the engine when backend 5 is active (settings_apply_target), so every
+#  probe/tag/chat call here and in the agent rides the same target.
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+import "UI_controls.ancl";
+import "transport.ancl";
+
+extern "kernel32.dll" TerminateProcess;         # BOOL (HANDLE, exitCode)
+extern "kernel32.dll" Sleep;                    # void (ms)
+extern "kernel32.dll" SetEnvironmentVariableA;  # BOOL (name, value) - hand flags to the child engine
+
+@DATA
+eng_exe_sfx:   str = "\\aether_engine.exe";
+eng_man_sfx:   str = "\\models\\manifests\\registry.ollama.ai\\library";
+eng_bslash:    str = "\\";
+eng_star:      str = "\\*";
+eng_starjson:  str = "\\*.json";
+eng_colon:     str = ":";
+eng_sp:        str = " ";
+eng_arg_serve: str = "\" serve ";
+eng_arg_pull:  str = "\" models pull ";
+eng_arg_gpu:   str = " gpu";
+eng_arg_gpu_bare: str = "gpu";
+eng_q:         str = "\"";
+eng_path_ver:  str = "/api/version";
+eng_path_tags: str = "/api/tags";
+eng_get:       str = "GET";
+eng_nm_ndl:    str = "\"name\":\"";
+# store roots to enumerate for the picker (same order the engine resolves):
+# exe-relative, shared user store, Ollama's own store.
+eng_man_sfx_ol: str = "\\.ollama\\models\\manifests\\registry.ollama.ai\\library";
+eng_aether_sfx: str = "\\.aether\\models\\manifests\\registry.ollama.ai\\library";
+eng_env_models: str = "AETHER_MODELS";
+eng_env_home:   str = "USERPROFILE";
+eng_env_flags:  str = "AETHER_FLAGS";       # engine flags override (settings sets this per-process)
+eng_man_tail:   str = "\\manifests\\registry.ollama.ai\\library";
+eng_st_down:    str = "Server: not running (starts on first Send).";
+eng_st_up:      str = "Server: running - ";
+eng_st_flags:   str = "  flags: ";
+eng_st_foreign: str = "  (external server)";
+eng_st_unknown: str = "(model unknown)";
+
+eng_dir:      buf = 600;      # IDE exe dir
+eng_exe:      buf = 700;      # <exedir>\aether_engine.exe
+eng_manroot:  buf = 700;      # <exedir>\models\...\library
+eng_manshared: buf = 700;     # <profile-or-AETHER_MODELS>\...\library
+eng_manollama: buf = 700;     # <profile>\.ollama\...\library
+eng_home:     buf = 600;      # %USERPROFILE%
+eng_pat1:     buf = 800;      # library\* glob
+eng_pat2:     buf = 800;      # library\<name>\*.json glob
+eng_fd1:      buf = 320;      # WIN32_FIND_DATAA
+eng_fd2:      buf = 320;
+eng_entry:    buf = 256;      # "name:tag" scratch
+eng_seen:     buf = 16384;    # dedupe list of names already added (NUL-joined)
+eng_seen_n:   buf = 8;
+eng_cmd:      buf = 1024;     # serve command line (CreateProcessA may edit it in place)
+eng_flags:    buf = 256;      # serve flags (from settings; default "gpu")
+eng_si:       buf = 104;      # STARTUPINFOA
+eng_pi:       buf = 24;       # PROCESS_INFORMATION
+eng_owned:    buf = 8;        # 1 = we spawned the current engine process
+eng_hproc:    buf = 8;
+eng_curmodel: buf = 256;      # model the owned process was started with
+eng_resp:     buf = 8192;     # version/tags response sink
+eng_ldname:   buf = 256;      # model name reported by /api/tags
+eng_exitcode: buf = 8;        # GetExitCodeProcess sink (DWORD)
+eng_pullcmd:  buf = 1024;     # models-pull command line
+eng_pullmodel: buf = 256;     # last model requested for pull
+# serve stdout/stderr capture -> report WHY a model failed to load (e.g. an
+# unsupported architecture) instead of a generic "is it pulled?"
+eng_log_sfx:  str = "\\_engine_serve.log";
+eng_logpath:  buf = 700;
+eng_logh:     buf = 8;
+eng_sa:       buf = 24;       # SECURITY_ATTRIBUTES (inheritable log handle)
+eng_logbuf:   buf = 8192;     # read-back of the serve log
+eng_lognrd:   buf = 8;
+eng_reason:   buf = 512;      # the extracted "[serve] FAILED: ..." line
+eng_ndl_fail: str = "FAILED";
+eng_portbuf:  buf = 16;
+
+@CODE
+func eng_paths_init() -> i64 {
+    if load8(eng_exe) != 0 { return 0; }
+    ui_exedir(eng_dir);
+    ui_join(eng_exe, eng_dir, eng_exe_sfx);
+    ui_join(eng_manroot, eng_dir, eng_man_sfx);
+    ui_join(eng_logpath, eng_dir, eng_log_sfx);
+    # shared store: AETHER_MODELS (its own manifests tail) else %USERPROFILE%\.aether
+    store8(eng_home, 0);
+    GetEnvironmentVariableA(eng_env_home, eng_home, 590);
+    store8(eng_manshared, 0);
+    am = GetEnvironmentVariableA(eng_env_models, eng_manshared, 590);
+    if am > 0 {
+        e = eng_manshared + strlen(eng_manshared);
+        str_copy(e, eng_man_tail);
+    } else {
+        if load8(eng_home) != 0 { ui_join(eng_manshared, eng_home, eng_aether_sfx); }
+    }
+    store8(eng_manollama, 0);
+    if load8(eng_home) != 0 { ui_join(eng_manollama, eng_home, eng_man_sfx_ol); }
+    return 0;
+}
+
+# 1 if `name` is already in the dedupe list (first store wins, engine-order).
+func eng_seen_has(name: i64) -> i64 {
+    p = 0;
+    n = load64(eng_seen_n);
+    i = 0;
+    while i < n {
+        if strcmp(eng_seen + p, name) == 0 { return 1; }
+        p = p + strlen(eng_seen + p) + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+func eng_seen_add(name: i64) -> i64 {
+    p = 0;
+    n = load64(eng_seen_n);
+    i = 0;
+    while i < n { p = p + strlen(eng_seen + p) + 1; i = i + 1; }
+    if p + strlen(name) + 2 >= 16384 { return 0; }
+    str_copy(eng_seen + p, name);
+    store64(eng_seen_n, n + 1);
+    return 0;
+}
+
+# 1 = aether_engine.exe is bundled beside the IDE.
+func eng_exe_present() -> i64 {
+    eng_paths_init();
+    h = CreateFileA(eng_exe, 0x80000000, 1, 0, 3, 0x80, 0);   # GENERIC_READ, share-read, OPEN_EXISTING
+    if h == 0 - 1 { return 0; }
+    CloseHandle(h);
+    return 1;
+}
+
+# index in hay right AFTER the first occurrence of ndl, or -1 (local copy;
+# agent/ai_bridge have their own -- modules stay import-independent).
+func eng_find_after(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0 - 1; }
+        j = 0;
+        going = 1;
+        while going == 1 {
+            nc = load8(ndl + j);
+            if nc == 0 { return i + j; }
+            if load8(hay + i + j) != nc { going = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# GET /api/version at the current transport target -> 1 if an engine answers.
+func eng_probe() -> i64 {
+    st = ol_http2(ol_cur_host, load64(ol_cur_port), load64(ol_cur_sec), eng_get, eng_path_ver, 0, 0, 0, eng_resp);
+    if st == 200 { return 1; }
+    return 0;
+}
+
+# GET /api/tags -> the served model name into dst. 1 = got one.
+func eng_loaded_model(dst: i64) -> i64 {
+    store8(dst, 0);
+    st = ol_http2(ol_cur_host, load64(ol_cur_port), load64(ol_cur_sec), eng_get, eng_path_tags, 0, 0, 0, eng_resp);
+    if st != 200 { return 0; }
+    s = eng_find_after(eng_resp, eng_nm_ndl);
+    if s < 0 { return 0; }
+    k = 0;
+    while k < 255 {
+        c = load8(eng_resp + s + k);
+        if c == 0 { break; }
+        if c == 34 { break; }
+        store8(dst + k, c);
+        k = k + 1;
+    }
+    store8(dst + k, 0);
+    return 1;
+}
+
+# Walk ONE store root (a ...\library dir) and CB_ADDSTRING each "name:tag"
+# into hcombo (0 = count only), deduping by name. jext=1 strips ".json"
+# (engine + shared stores); jext=0 = Ollama's extensionless tag files.
+# Returns the entries added.
+func eng_walk_root(root: i64, jext: i64, hcombo: i64) -> i64 {
+    if load8(root) == 0 { return 0; }
+    n = 0;
+    e = str_copy(eng_pat1, root);
+    str_copy(e, eng_star);
+    h1 = FindFirstFileA(eng_pat1, eng_fd1);
+    if h1 == 0 - 1 { return 0; }
+    while 1 {
+        if band(load32(eng_fd1), 16) != 0 {                    # directories = model names
+            nm = eng_fd1 + 44;
+            if load8(nm) != 46 {                               # skip . and ..
+                e2 = str_copy(eng_pat2, root);
+                e2 = str_copy(e2, eng_bslash);
+                e2 = str_copy(e2, nm);
+                if jext == 1 { str_copy(e2, eng_starjson); } else { str_copy(e2, eng_star); }
+                h2 = FindFirstFileA(eng_pat2, eng_fd2);
+                if h2 != 0 - 1 {
+                    while 1 {
+                        istag = 0;
+                        if band(load32(eng_fd2), 16) == 0 { istag = 1; }
+                        else { if load8(eng_fd2 + 44) == 46 { istag = 0; } }   # skip . / .. (dirs)
+                        if istag == 1 {
+                            e3 = str_copy(eng_entry, nm);
+                            e3 = str_copy(e3, eng_colon);
+                            str_copy(e3, eng_fd2 + 44);
+                            el = strlen(eng_entry);
+                            if jext == 1 { if el > 5 { store8(eng_entry + el - 5, 0); } }   # strip ".json"
+                            if eng_seen_has(eng_entry) == 0 {
+                                eng_seen_add(eng_entry);
+                                if hcombo != 0 { SendMessageA(hcombo, 323, 0, eng_entry); }  # CB_ADDSTRING
+                                n = n + 1;
+                            }
+                        }
+                        if FindNextFileA(h2, eng_fd2) == 0 { break; }
+                    }
+                    FindClose(h2);
+                }
+            }
+        }
+        if FindNextFileA(h1, eng_fd1) == 0 { break; }
+    }
+    FindClose(h1);
+    return n;
+}
+
+# Fill hcombo (0 = count only) from ALL engine store roots in resolve order:
+# exe-relative -> shared user store -> Ollama's own store. Deduped by name so
+# a model in two stores shows once. Returns the total distinct entries.
+func eng_fill_combo(hcombo: i64) -> i64 {
+    eng_paths_init();
+    store64(eng_seen_n, 0);
+    if hcombo != 0 { SendMessageA(hcombo, 331, 0, 0); }        # CB_RESETCONTENT
+    n = eng_walk_root(eng_manroot, 1, hcombo);
+    n = n + eng_walk_root(eng_manshared, 1, hcombo);
+    n = n + eng_walk_root(eng_manollama, 0, hcombo);
+    return n;
+}
+
+# the serve flags: settings' eng_flags if set, else "gpu" (safe everywhere -
+# no Vulkan silently runs the CPU path). Never empty.
+func eng_flags_eff() -> i64 {
+    i = 0;
+    while is_ws_e(load8(eng_flags + i)) == 1 { i = i + 1; }
+    if load8(eng_flags + i) == 0 { return eng_arg_gpu_bare; }
+    return eng_flags + i;
+}
+func is_ws_e(c: i64) -> i64 {
+    if c == 32 { return 1; }
+    if c == 9  { return 1; }
+    if c == 13 { return 1; }
+    if c == 10 { return 1; }
+    return 0;
+}
+
+# spawn `"<exe>" serve <model> <port> <flags>` with no console window.
+# 1 = spawned. AETHER_FLAGS is also set so the child's own defaults match.
+func eng_start(model: i64) -> i64 {
+    eng_paths_init();
+    e = str_copy(eng_cmd, eng_q);
+    e = str_copy(e, eng_exe);
+    e = str_copy(e, eng_arg_serve);
+    e = str_copy(e, model);
+    e = str_copy(e, eng_sp);
+    int_to_str(eng_portbuf, load64(ol_cur_port));
+    e = str_copy(e, eng_portbuf);
+    e = str_copy(e, eng_sp);
+    str_copy(e, eng_flags_eff());
+    SetEnvironmentVariableA(eng_env_flags, eng_flags_eff());
+    # capture the serve's stdout+stderr to a log (inheritable handle) so a
+    # failed load reports the real reason ("[serve] FAILED: unsupported ...")
+    memset(eng_sa, 0, 24);
+    store64(eng_sa, 24); store64(eng_sa + 16, 1);             # nLength=24, bInheritHandle=1
+    lh = CreateFileA(eng_logpath, 0x40000000, 3, eng_sa, 2, 0x80, 0);   # GENERIC_WRITE, share RW, CREATE_ALWAYS
+    store64(eng_logh, lh);
+    memset(eng_si, 0, 104);
+    store32(eng_si, 104);
+    inh = 0;
+    if lh != 0 - 1 {
+        store32(eng_si + 60, 0x100);                          # STARTF_USESTDHANDLES
+        store64(eng_si + 88, lh);                             # hStdOutput
+        store64(eng_si + 96, lh);                             # hStdError
+        inh = 1;
+    }
+    memset(eng_pi, 0, 24);
+    ok = CreateProcessA(0, eng_cmd, 0, 0, inh, 0x08000000, 0, 0, eng_si, eng_pi);   # CREATE_NO_WINDOW
+    if lh != 0 - 1 { CloseHandle(lh); }                       # the child holds its own copy
+    if ok == 0 { return 0; }
+    CloseHandle(load64(eng_pi + 8));                           # thread handle
+    store64(eng_hproc, load64(eng_pi + 0));
+    store64(eng_owned, 1);
+    str_copy(eng_curmodel, model);
+    return 1;
+}
+
+# after the owned serve exits during startup, read its log and extract the
+# "[serve] FAILED: ..." reason into dst. 1 = got a reason, 0 = none.
+func eng_fail_reason(dst: i64) -> i64 {
+    store8(dst, 0);
+    fh = CreateFileA(eng_logpath, 0x80000000, 3, 0, 3, 0x80, 0);   # GENERIC_READ, share RW, OPEN_EXISTING
+    if fh == 0 - 1 { return 0; }
+    ReadFile(fh, eng_logbuf, 8191, eng_lognrd, 0);
+    CloseHandle(fh);
+    n = load32(eng_lognrd);
+    if n < 1 { return 0; }
+    store8(eng_logbuf + n, 0);
+    i = 0;
+    found = 0 - 1;
+    while i < n {
+        j = 0; hit = 1;
+        while hit == 1 {
+            fc = load8(eng_ndl_fail + j);
+            if fc == 0 { break; }
+            if load8(eng_logbuf + i + j) != fc { hit = 0; }
+            j = j + 1;
+        }
+        if hit == 1 {
+            ls = i;
+            while ls > 0 { if load8(eng_logbuf + ls - 1) == 10 { break; } ls = ls - 1; }
+            found = ls;
+            i = n;
+        }
+        i = i + 1;
+    }
+    if found < 0 { return 0; }
+    k = 0;
+    while 1 {
+        c = load8(eng_logbuf + found + k);
+        if c == 0 { break; }
+        if c == 10 { break; }
+        if c == 13 { break; }
+        if k >= 500 { break; }
+        store8(dst + k, c); k = k + 1;
+    }
+    store8(dst + k, 0);
+    if k > 0 { return 1; }
+    return 0;
+}
+
+# spawn `"<exe>" models pull <model>` in a VISIBLE console so the user watches
+# the multi-GB download progress. Returns the process handle (0 = failed) so
+# the caller can wait/poll; the download lands in the shared store.
+func eng_pull_start(model: i64) -> i64 {
+    eng_paths_init();
+    str_copy(eng_pullmodel, model);
+    e = str_copy(eng_pullcmd, eng_q);
+    e = str_copy(e, eng_exe);
+    e = str_copy(e, eng_arg_pull);
+    str_copy(e, model);
+    memset(eng_si, 0, 104);
+    store32(eng_si, 104);
+    memset(eng_pi, 0, 24);
+    ok = CreateProcessA(0, eng_pullcmd, 0, 0, 0, 0x00000010, 0, 0, eng_si, eng_pi);   # CREATE_NEW_CONSOLE
+    if ok == 0 { return 0; }
+    CloseHandle(load64(eng_pi + 8));
+    return load64(eng_pi + 0);
+}
+
+# 1 = the owned engine process has exited (exit code lands in eng_exitcode).
+func eng_proc_exited() -> i64 {
+    h = load64(eng_hproc);
+    if h == 0 { return 0; }
+    GetExitCodeProcess(h, eng_exitcode);
+    if load32(eng_exitcode) == 259 { return 0; }               # STILL_ACTIVE
+    return 1;
+}
+
+# poll /api/version until the engine answers. cancel = ptr to an abort flag
+# (the chat Stop button) or 0. 1 ready / 0 timeout / -1 process died / -2 cancelled.
+func eng_wait_ready(tries: i64, cancel: i64) -> i64 {
+    i = 0;
+    while i < tries {
+        if eng_probe() == 1 { return 1; }
+        if cancel != 0 { if load64(cancel) == 1 { return 0 - 2; } }
+        if load64(eng_owned) == 1 { if eng_proc_exited() == 1 { return 0 - 1; } }
+        Sleep(500);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# stop the engine WE own (IDE exit / model switch). Foreign servers untouched.
+func eng_stop() -> i64 {
+    if load64(eng_owned) == 0 { return 0; }
+    h = load64(eng_hproc);
+    if h != 0 { TerminateProcess(h, 0); CloseHandle(h); }
+    store64(eng_hproc, 0);
+    store64(eng_owned, 0);
+    store8(eng_curmodel, 0);
+    return 0;
+}
+
+# Make sure an engine serves `model` at the current target.
+#   1 = already serving (same model, or a server we don't own -> use as-is;
+#       eng_ldname then holds what it actually serves)
+#   2 = spawned + ready
+#  -1 = aether_engine.exe missing beside the IDE
+#  -2 = spawn failed
+#  -3 = engine exited during startup (exit code in eng_exitcode: bad model?)
+#  -4 = timeout waiting for ready
+#  -5 = cancelled via the Stop flag
+func eng_ensure(model: i64, cancel: i64) -> i64 {
+    eng_paths_init();
+    if eng_probe() == 1 {
+        eng_loaded_model(eng_ldname);
+        if load64(eng_owned) == 0 { return 1; }                # not ours -> use what it serves
+        # ours: compare against what WE started it with (the /api/tags echo of
+        # a path-served model is a default name -> comparing it would restart
+        # the server on every turn)
+        if strcmp(eng_curmodel, model) == 0 { return 1; }
+        eng_stop();                                            # ours + model changed -> restart
+        Sleep(300);                                            # let the port free up
+    }
+    if eng_exe_present() == 0 { return 0 - 1; }
+    if eng_start(model) == 0 { return 0 - 2; }
+    r = eng_wait_ready(240, cancel);                           # up to ~2 min (big-model load)
+    if r == 1 { return 2; }
+    if r == 0 - 1 { return 0 - 3; }
+    if r == 0 - 2 { eng_stop(); return 0 - 5; }
+    eng_stop();
+    return 0 - 4;
+}
+
+# Build a one-line live status into dst: running model + flags if a server is
+# up, else "not running". Used by the Settings note so the user sees what is
+# actually active. Returns 1 if a server answered, 0 otherwise.
+func eng_status_line(dst: i64) -> i64 {
+    if eng_probe() == 0 { str_copy(dst, eng_st_down); return 0; }
+    eng_loaded_model(eng_ldname);
+    e = str_copy(dst, eng_st_up);
+    if load8(eng_ldname) != 0 { e = str_copy(e, eng_ldname); } else { e = str_copy(e, eng_st_unknown); }
+    if load64(eng_owned) == 1 {
+        e = str_copy(e, eng_st_flags);
+        str_copy(e, eng_flags_eff());
+    } else {
+        str_copy(e, eng_st_foreign);
+    }
+    return 1;
+}

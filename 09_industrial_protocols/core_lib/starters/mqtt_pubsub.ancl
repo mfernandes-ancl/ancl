@@ -1,0 +1,27 @@
+# mqtt_pubsub.ancl - MQTT QoS0 publish STARTER for ANCL Pad bundles.
+# Save this starter in the ancl_pad folder so import "core_lib/mqtt.ancl" resolves.
+
+import "core_lib/mqtt.ancl";
+
+@DATA
+CFG_HOST: str = "127.0.0.1";
+CFG_PORT: i64 = 1883;
+CFG_TOPIC: str = "ancl/pad/demo";
+CFG_PAYLOAD: str = "hello from ANCL Pad";
+
+mInfo: str = "[mqtt] publishing QoS0 message\n";
+mOk:   str = "[mqtt] publish OK\n";
+mFail: str = "[mqtt] publish failed, rc=";
+nl:    str = "\n";
+
+@CODE
+func main() -> i32 {
+    syscall 1, mInfo;
+    rc = mqtt_publish_qos0(CFG_HOST, CFG_PORT, CFG_TOPIC, CFG_PAYLOAD);
+    if rc == 1 {
+        syscall 1, mOk;
+        return 0;
+    }
+    syscall 1, mFail, rc, nl;
+    return 1;
+}

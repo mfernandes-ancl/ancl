@@ -1,0 +1,36 @@
+# Aether Lens R6 voice primitives: dependency-free PCM/WAV bookkeeping.
+
+@CODE
+func lvc_wav_header(dst: i64, data_bytes: i64, sample_rate: i64) -> i64 {
+    if dst == 0 { return 0; }
+    if data_bytes < 0 { return 0; }
+    if sample_rate <= 0 { return 0; }
+    memset(dst, 0, 44);
+    store32(dst + 0, 0x46464952);  # RIFF
+    store32(dst + 4, data_bytes + 36);
+    store32(dst + 8, 0x45564157);  # WAVE
+    store32(dst + 12, 0x20746D66); # fmt 
+    store32(dst + 16, 16);
+    store16(dst + 20, 1);          # PCM
+    store16(dst + 22, 1);          # mono
+    store32(dst + 24, sample_rate);
+    store32(dst + 28, sample_rate * 2);
+    store16(dst + 32, 2);
+    store16(dst + 34, 16);
+    store32(dst + 36, 0x61746164); # data
+    store32(dst + 40, data_bytes);
+    return 44;
+}
+
+func lvc_seconds_from_bytes(data_bytes: i64, bytes_per_second: i64) -> i64 {
+    if data_bytes <= 0 { return 0; }
+    if bytes_per_second <= 0 { return 0; }
+    return data_bytes / bytes_per_second;
+}
+
+func lvc_capture_usable(data_bytes: i64, bytes_per_second: i64) -> i64 {
+    if bytes_per_second <= 0 { return 0; }
+    # Reject captures shorter than 100 ms.
+    if data_bytes < bytes_per_second / 10 { return 0; }
+    return 1;
+}

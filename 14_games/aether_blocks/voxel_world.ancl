@@ -1,0 +1,299 @@
+# =====================================================================
+#  voxel_world.ancl  -  Voxel Grid Database, Procedural Gen & Physics
+#  Format: Bare-Metal ANCL V6, Zero-CRT
+# =====================================================================
+import "win32_api.ancl";
+
+@DATA
+# World Dimensions
+WORLD_W: i64 = 32; # Width (X)
+WORLD_L: i64 = 32; # Length (Y)
+WORLD_H: i64 = 16; # Height (Z)
+
+# Block Type Constants
+BLOCK_AIR:    i64 = 0;
+BLOCK_GRASS:  i64 = 1;
+BLOCK_DIRT:   i64 = 2;
+BLOCK_STONE:  i64 = 3;
+BLOCK_WOOD:   i64 = 4;
+BLOCK_LEAVES: i64 = 5;
+BLOCK_WATER:  i64 = 6;
+
+# Voxel array: 32 * 32 * 16 = 16384 bytes
+g_world_grid:     buf = 16384;
+
+# Physics velocity
+g_player_vz:      buf = 8;
+g_on_ground:      buf = 8;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Get block at coordinates (x, y, z) with bounds checking
+# ---------------------------------------------------------------------
+func get_block(x: i64, y: i64, z: i64) -> i64 {
+    if x < 0 { return BLOCK_AIR; }
+    if x >= WORLD_W { return BLOCK_AIR; }
+    if y < 0 { return BLOCK_AIR; }
+    if y >= WORLD_L { return BLOCK_AIR; }
+    if z < 0 { return BLOCK_AIR; }
+    if z >= WORLD_H { return BLOCK_AIR; }
+    
+    idx = (x * WORLD_L + y) * WORLD_H + z;
+    return load8(g_world_grid + idx);
+}
+
+# ---------------------------------------------------------------------
+# Set block at coordinates (x, y, z) with bounds checking
+# ---------------------------------------------------------------------
+func set_block(x: i64, y: i64, z: i64, type: i64) -> i64 {
+    if x < 0 { return 0; }
+    if x >= WORLD_W { return 0; }
+    if y < 0 { return 0; }
+    if y >= WORLD_L { return 0; }
+    if z < 0 { return 0; }
+    if z >= WORLD_H { return 0; }
+    
+    idx = (x * WORLD_L + y) * WORLD_H + z;
+    store8(g_world_grid + idx, type);
+    return 1;
+}
+
+# ---------------------------------------------------------------------
+# Get default block color (0x00BBGGRR format)
+# ---------------------------------------------------------------------
+func get_block_color(type: i64) -> i64 {
+    if type == BLOCK_GRASS { return 0x002FA45E; }  # Grass Green
+    if type == BLOCK_DIRT  { return 0x003A5F8B; }  # Dirt Brown
+    if type == BLOCK_STONE { return 0x00808080; }  # Stone Gray
+    if type == BLOCK_WOOD  { return 0x002B4B70; }  # Trunk Wood
+    if type == BLOCK_LEAVES{ return 0x00155C15; }  # Leaf Green
+    if type == BLOCK_WATER { return 0x00D47C35; }  # Water Blue
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Procedurally generate terrain with grass, dirt, stone, lakes, and trees
+# ---------------------------------------------------------------------
+func generate_terrain() -> i64 {
+    # Initialize voxel grid to Air
+    memset(g_world_grid, BLOCK_AIR, 16384);
+    
+    # Generate land structure
+    x = 0;
+    while x < WORLD_W {
+        y = 0;
+        while y < WORLD_L {
+            # Use LUT-based sine waves for organic hills
+            angle_x = band(x * 32, 1023);
+            angle_y = band(y * 32, 1023);
+            
+            # Combine waves (scaled down to fit 16 height blocks)
+            # base height is 5, plus sine wave offsets
+            h = 5 + (load64(g_sin + angle_x * 8) + load64(g_sin + angle_y * 8)) / 26214;
+            if h < 1 { h = 1; }
+            if h >= WORLD_H - 4 { h = WORLD_H - 5; }
+            
+            # Fill block layers
+            z = 0;
+            while z < WORLD_H {
+                if z < h - 2 {
+                    set_block(x, y, z, BLOCK_STONE);
+                } else {
+                    if z < h - 1 {
+                        set_block(x, y, z, BLOCK_DIRT);
+                    } else {
+                        if z == h - 1 {
+                            set_block(x, y, z, BLOCK_GRASS);
+                        } else {
+                            # Add water below sea level (z = 4)
+                            if z <= 4 {
+                                set_block(x, y, z, BLOCK_WATER);
+                            }
+                        }
+                    }
+                }
+                z = z + 1;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    
+    # Spawn a few simple trees procedurally (spaced 8 blocks apart)
+    x = 4;
+    while x < WORLD_W - 4 {
+        y = 4;
+        while y < WORLD_L - 4 {
+            # Find grass height at this position
+            th = 0;
+            while th < WORLD_H {
+                if get_block(x, y, th) == BLOCK_GRASS {
+                    # Make sure it is not under water
+                    if th > 4 {
+                        # Place Wood Trunk (4 blocks high)
+                        set_block(x, y, th + 1, BLOCK_WOOD);
+                        set_block(x, y, th + 2, BLOCK_WOOD);
+                        set_block(x, y, th + 3, BLOCK_WOOD);
+                        set_block(x, y, th + 4, BLOCK_WOOD);
+                        
+                        # Place simple Leaf Canopy around trunk top
+                        set_block(x - 1, y, th + 4, BLOCK_LEAVES);
+                        set_block(x + 1, y, th + 4, BLOCK_LEAVES);
+                        set_block(x, y - 1, th + 4, BLOCK_LEAVES);
+                        set_block(x, y + 1, th + 4, BLOCK_LEAVES);
+                        set_block(x, y, th + 5, BLOCK_LEAVES);
+                    }
+                    th = WORLD_H; # Break
+                }
+                th = th + 1;
+            }
+            y = y + 8;
+        }
+        x = x + 8;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Physics Update: Gravity & simple collision detection
+# ---------------------------------------------------------------------
+func update_player_physics() -> i64 {
+    px = load64(g_player_x);
+    py = load64(g_player_y);
+    pz = load64(g_player_z);
+    vz = load64(g_player_vz);
+    
+    # Apply gravity acceleration
+    vz = vz - 15; # Scale: units * 100/sec2
+    if vz < 0 - 200 { vz = 0 - 200; } # Terminal velocity
+    
+    # Integrate velocity
+    new_z = pz + vz;
+    
+    # Convert scaled coordinates to voxel indexes
+    vx = px / 100;
+    vy = py / 100;
+    
+    # Ground Collision check at feet (new_z)
+    # Scaled block height is 100.
+    foot_z = new_z / 100;
+    block_at_feet = get_block(vx, vy, foot_z);
+    
+    # Solid block collision check
+    is_solid = 0;
+    if block_at_feet != BLOCK_AIR {
+        if block_at_feet != BLOCK_WATER {
+            is_solid = 1;
+        }
+    }
+    
+    if is_solid == 1 {
+        # Snap to top of the solid block
+        snap_z = (foot_z + 1) * 100;
+        store64(g_player_z, snap_z);
+        store64(g_player_vz, 0);
+        store64(g_on_ground, 1);
+    } else {
+        # Fall freely
+        store64(g_player_z, new_z);
+        store64(g_player_vz, vz);
+        store64(g_on_ground, 0);
+    }
+    
+    # Prevent falling out of the world bottom
+    if load64(g_player_z) < 0 {
+        store64(g_player_z, 1200); # Respawn at top
+        store64(g_player_vz, 0);
+    }
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Perform simple player jump
+# ---------------------------------------------------------------------
+func perform_jump() -> i64 {
+    if load64(g_on_ground) == 1 {
+        store64(g_player_vz, 130); # Vertical thrust
+        store64(g_on_ground, 0);
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Raycast block interaction (Mine or Build)
+# ---------------------------------------------------------------------
+func interact_block(action: i64, block_type: i64) -> i64 {
+    # Get directional vector from yaw/pitch
+    yaw = load64(g_player_yaw);
+    pitch = load64(g_player_pitch);
+    
+    cosY = load64(g_cos + yaw * 8);
+    sinY = load64(g_sin + yaw * 8);
+    pitch_idx = band(pitch, 1023);
+    cosP = load64(g_cos + pitch_idx * 8);
+    sinP = load64(g_sin + pitch_idx * 8);
+    
+    # Scale components to [-65536, 65536]
+    dx = (sinY * cosP) / 65536;
+    dy = (cosY * cosP) / 65536;
+    dz = sinP;
+    
+    # Start ray at player eyes (eye level is Z + 80)
+    rx = load64(g_player_x);
+    ry = load64(g_player_y);
+    rz = load64(g_player_z) + 80;
+    
+    prev_vx = rx / 100;
+    prev_vy = ry / 100;
+    prev_vz = rz / 100;
+    
+    step = 0;
+    while step < 250 {
+        # Step forward (each step is 6 units = 0.06 blocks)
+        rx = rx + (dx * 6) / 65536;
+        ry = ry + (dy * 6) / 65536;
+        rz = rz + (dz * 6) / 65536;
+        
+        vx = rx / 100;
+        vy = ry / 100;
+        vz = rz / 100;
+        
+        block = get_block(vx, vy, vz);
+        if block != BLOCK_AIR {
+            if block != BLOCK_WATER {
+                # Found solid block intersection!
+                if action == 1 {
+                    # Mine: set targeted block to Air
+                    set_block(vx, vy, vz, BLOCK_AIR);
+                    return 1;
+                }
+                if action == 2 {
+                    # Place: set block in previous step coordinates if not overlapping player
+                    px = load64(g_player_x) / 100;
+                    py = load64(g_player_y) / 100;
+                    pz = load64(g_player_z) / 100;
+                    
+                    # Prevent placing inside the player
+                    if prev_vx == px {
+                        if prev_vy == py {
+                            if prev_vz == pz { return 0; }
+                            if prev_vz == pz + 1 { return 0; }
+                        }
+                    }
+                    
+                    set_block(prev_vx, prev_vy, prev_vz, block_type);
+                    return 1;
+                }
+                return 0;
+            }
+        }
+        
+        prev_vx = vx;
+        prev_vy = vy;
+        prev_vz = vz;
+        step = step + 1;
+    }
+    return 0;
+}

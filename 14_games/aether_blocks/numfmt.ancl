@@ -1,0 +1,159 @@
+# =====================================================================
+#  numfmt.ancl  -  integer-only numeric formatting for ANCL (core_lib)
+#  Phase 6.11. ANCL emits integer x86-64 only (no FPU/SSE codegen), so
+#  floating-point and OLE-DATE values are decoded + formatted to strings
+#  purely with integer/bitwise ops. Used by the OPC DA explorer to show
+#  VT_R4/VT_R8/VT_DATE tag values, and signed VT_I1/I2/I4.
+# =====================================================================
+
+@DATA
+nf_tmp:  buf = 32;   # scratch for decimal reversal
+d_inf:   str = "inf";
+d_nan:   str = "nan";
+d_big:   str = "(big)";
+
+@CODE
+# ---- signed-extend the zero-extended results of load8/16/32 ----------------
+func nf_sext8(v: i64) -> i64  { if v >= 128 { return v - 256; } return v; }
+func nf_sext16(v: i64) -> i64 { if v >= 32768 { return v - 65536; } return v; }
+func nf_sext32(v: i64) -> i64 { if v >= 2147483648 { return v - 4294967296; } return v; }
+
+# ---- unsigned 64-bit integer -> decimal at dst; returns end pointer --------
+func nf_u64dec(val: i64, dst: ptr) -> ptr {
+    if val == 0 { store8(dst, 48); return dst + 1; }
+    n = 0;
+    v = val;
+    while v > 0 {
+        store8(nf_tmp + n, 48 + v % 10);
+        v = v / 10;
+        n = n + 1;
+    }
+    i = 0;
+    while i < n {
+        store8(dst + i, load8(nf_tmp + n - 1 - i));
+        i = i + 1;
+    }
+    return dst + n;
+}
+
+# fixed-width zero-padded helpers (return end pointer)
+func nf_2d(v: i64, dst: ptr) -> ptr {
+    store8(dst + 0, 48 + (v / 10) % 10);
+    store8(dst + 1, 48 + v % 10);
+    return dst + 2;
+}
+func nf_4d(v: i64, dst: ptr) -> ptr {
+    store8(dst + 0, 48 + (v / 1000) % 10);
+    store8(dst + 1, 48 + (v / 100) % 10);
+    store8(dst + 2, 48 + (v / 10) % 10);
+    store8(dst + 3, 48 + v % 10);
+    return dst + 4;
+}
+
+# ---- IEEE-754 double (raw 64-bit `bits`) -> string (6 fractional digits) ----
+func nf_dtoa(bits: i64, dst: ptr) -> i64 {
+    sgn  = band(shr(bits, 63), 1);
+    exp  = band(shr(bits, 52), 2047);
+    mant = band(bits, 4503599627370495);          # 2^52 - 1
+    if exp == 2047 {
+        if mant == 0 { str_copy(dst, d_inf); } else { str_copy(dst, d_nan); }
+        return 0;
+    }
+    p = dst;
+    if sgn == 1 { store8(p, 45); p = p + 1; }      # '-'
+    if exp == 0 {                                   # zero / subnormal -> ~0
+        store8(p, 48); store8(p + 1, 0);
+        return 0;
+    }
+    m = mant + 4503599627370496;                    # add implicit leading 1 (2^52)
+    k = exp - 1075;                                 # value = m * 2^k
+    if k >= 0 {
+        if k >= 10 { str_copy(p, d_big); return 0; }   # > ~2^62, not real data
+        e = nf_u64dec(shl(m, k), p);
+        store8(e, 0);
+        return 0;
+    }
+    kk = 0 - k;
+    if kk >= 63 {                                   # |value| < ~1e-3 -> 0.000000
+        store8(p + 0, 48); store8(p + 1, 46);
+        i = 0; while i < 6 { store8(p + 2 + i, 48); i = i + 1; }
+        store8(p + 8, 0);
+        return 0;
+    }
+    mask = shl(1, kk) - 1;
+    e = nf_u64dec(shr(m, kk), p);                   # integer part
+    store8(e, 46); e = e + 1;                       # '.'
+    frac = band(m, mask);
+    d = 0;
+    while d < 6 {
+        frac = frac * 10;
+        store8(e, 48 + shr(frac, kk));
+        frac = band(frac, mask);
+        e = e + 1;
+        d = d + 1;
+    }
+    store8(e, 0);
+    return 0;
+}
+
+# ---- IEEE-754 single (raw 32-bit `b`) -> string ----------------------------
+func nf_ftoa(b: i64, dst: ptr) -> i64 {
+    sgn  = band(shr(b, 31), 1);
+    exp  = band(shr(b, 23), 255);
+    mant = band(b, 8388607);                        # 2^23 - 1
+    if exp == 0 {
+        if mant == 0 { store8(dst, 48); store8(dst + 1, 0); return 0; }   # 0
+        store8(dst, 48); store8(dst + 1, 0); return 0;                    # subnormal ~ 0
+    }
+    de = exp - 127 + 1023;
+    if exp == 255 { de = 2047; }
+    dbits = shl(sgn, 63) + shl(de, 52) + shl(mant, 29);   # widen fields to double layout
+    return nf_dtoa(dbits, dst);
+}
+
+# ---- OLE Automation DATE (double `bits`) -> "YYYY-MM-DD HH:MM:SS" -----------
+func nf_oadate(bits: i64, dst: ptr) -> i64 {
+    exp  = band(shr(bits, 52), 2047);
+    mant = band(bits, 4503599627370495);
+    if exp == 2047 { str_copy(dst, d_nan); return 0; }
+    days = 0;
+    secs = 0;
+    if exp != 0 {
+        m = mant + 4503599627370496;
+        k = exp - 1075;
+        if k < 0 {
+            kk = 0 - k;
+            if kk < 63 {
+                days = shr(m, kk);
+                mask = shl(1, kk) - 1;
+                frac = band(m, mask);
+                if kk <= 46 { secs = shr(frac * 86400, kk); }
+                else { secs = shr(shr(frac, kk - 46) * 86400, 46); }
+            }
+        }
+    }
+    # civil-from-days (Hinnant): days since 1899-12-30 -> Gregorian Y-M-D
+    z = days - 25569 + 719468;                      # -> days since 0000-03-01 era base
+    era = z / 146097;
+    doe = z - era * 146097;
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y = yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    mon = mp + 3;
+    if mp >= 10 { mon = mp - 9; }
+    if mon <= 2 { y = y + 1; }
+    hh = secs / 3600;
+    mm = (secs % 3600) / 60;
+    ss = secs % 60;
+    p = dst;
+    p = nf_4d(y, p);   store8(p, 45); p = p + 1;    # 'YYYY-'
+    p = nf_2d(mon, p); store8(p, 45); p = p + 1;    # 'MM-'
+    p = nf_2d(d, p);   store8(p, 32); p = p + 1;    # 'DD '
+    p = nf_2d(hh, p);  store8(p, 58); p = p + 1;    # 'HH:'
+    p = nf_2d(mm, p);  store8(p, 58); p = p + 1;    # 'MM:'
+    p = nf_2d(ss, p);
+    store8(p, 0);
+    return 0;
+}

@@ -1,0 +1,109 @@
+# bacnet_client.ancl - BACnet/IP ReadProperty (Present_Value) STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client over UDP: builds a confirmed ReadProperty request, sends it,
+# parses the Complex-ACK value. Edit the CONFIG block, COMPILE, RUN, then extend it
+# (WriteProperty service 15, Who-Is discovery) - Ctrl+Space knows the idioms.
+# Loaded by Aether Studio for BACnet intent.
+extern "ws2_32.dll" bind;
+extern "ws2_32.dll" sendto;
+extern "ws2_32.dll" recvfrom -> i32;
+extern "ws2_32.dll" setsockopt;
+
+@DATA
+mInfo: str = "[bacnet] BACnet/IP ReadProperty client (ANCL starter)";
+mErr:  str = "[bacnet] socket/bind failed.";
+mTx:   str = "[bacnet] sent ReadProperty (Present_Value) to object ";
+mDot:  str = ":";
+mNo:   str = "[bacnet] no / short reply (timeout - is the device listening?).";
+mBad:  str = "[bacnet] reply was not a BACnet/IP ReadProperty Complex-ACK.";
+mReal: str = "[bacnet] Present_Value (REAL, raw f32 bits) = ";
+mUint: str = "[bacnet] Present_Value (unsigned) = ";
+mEnum: str = "[bacnet] Present_Value (enumerated) = ";
+mBool: str = "[bacnet] Present_Value (boolean) = ";
+mErrR: str = "[bacnet] device returned an Error APDU - class/code = ";
+mSl:   str = " / ";
+nl:    str = "\r\n";
+# ==== CONFIG - edit these ====
+CFG_IP0:  i64 = 127;    # target IP, octet 1
+CFG_IP1:  i64 = 0;      #   octet 2
+CFG_IP2:  i64 = 0;      #   octet 3
+CFG_IP3:  i64 = 1;      #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 47808;  # BACnet/IP UDP port (standard 47808 / 0xBAC0)
+CFG_OBJ_TYPE: i64 = 0;  # object type: 0=AnalogInput 1=AnalogOutput 2=AnalogValue 3=BinaryInput 4=BinaryOutput 5=BinaryValue
+CFG_OBJ_INST: i64 = 0;  # object instance number
+# =============================
+g_wsa:    buf = 512;
+g_addr:   buf = 16;     # local bind addr
+g_remote: buf = 16;     # destination addr
+g_from:   buf = 32;     # recvfrom source addr
+g_fromlen: buf = 8;
+g_tmo:    buf = 8;
+g_tx:     buf = 64;
+g_rx:     buf = 1500;
+
+@CODE
+func store16_be(p: i64, v: i64) -> i64 { store8(p, band(shr(v,8),0xFF)); store8(p+1, band(v,0xFF)); return 0; }
+func store32_be(p: i64, v: i64) -> i64 {
+    store8(p, band(shr(v,24),0xFF)); store8(p+1, band(shr(v,16),0xFF));
+    store8(p+2, band(shr(v,8),0xFF)); store8(p+3, band(v,0xFF)); return 0;
+}
+func load32_be(p: i64) -> i64 {
+    return shl(load8(p),24) + shl(load8(p+1),16) + shl(load8(p+2),8) + load8(p+3);
+}
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 2, 17);                          # AF_INET, SOCK_DGRAM, UDP
+    if s == 0 - 1 { syscall 1, mErr, nl; return 1; }
+    # bind locally to any port
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, 0);
+    store32(g_addr + 4, 0);
+    if bind(s, g_addr, 16) != 0 { syscall 1, mErr, nl; closesocket(s); return 1; }
+    store32(g_tmo, 3000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);          # SO_RCVTIMEO 3s
+    # destination
+    memset(g_remote, 0, 16);
+    store16(g_remote + 0, 2);
+    store8(g_remote + 2, band(shr(CFG_PORT,8),0xFF)); store8(g_remote + 3, band(CFG_PORT,0xFF));
+    store32(g_remote + 4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24));
+
+    # ReadProperty request: BVLC + NPDU + APDU (Confirmed Request, ReadProperty=12)
+    store8(g_tx+0, 0x81); store8(g_tx+1, 0x0A); store16_be(g_tx+2, 17);   # BVLC unicast, len 17
+    store8(g_tx+4, 0x01); store8(g_tx+5, 0x04);                          # NPDU, expecting reply
+    store8(g_tx+6, 0x00); store8(g_tx+7, 0x02); store8(g_tx+8, 1); store8(g_tx+9, 12);  # APDU + invoke id 1 + ReadProperty
+    store8(g_tx+10, 0x0C); store32_be(g_tx+11, shl(CFG_OBJ_TYPE,22) + CFG_OBJ_INST);    # ctx tag 0: object id
+    store8(g_tx+15, 0x19); store8(g_tx+16, 0x55);                        # ctx tag 1: property 85 (Present_Value)
+    sendto(s, g_tx, 17, 0, g_remote, 16);
+    syscall 1, mTx, CFG_OBJ_TYPE, mDot, CFG_OBJ_INST, nl;
+
+    store64(g_fromlen, 16);
+    n = recvfrom(s, g_rx, 1500, 0, g_from, g_fromlen);
+    if n < 6 { syscall 1, mNo, nl; closesocket(s); return 0; }
+    if load8(g_rx+0) != 0x81 { syscall 1, mBad, nl; closesocket(s); return 0; }
+
+    # skip NPDU routing fields if present
+    ctrl = load8(g_rx+5);
+    ao = 6;
+    if band(ctrl, 0x20) != 0 { dlen = load8(g_rx+ao+2); ao = ao + 2 + 1 + dlen + 1; }
+    if band(ctrl, 0x08) != 0 { slen = load8(g_rx+ao+2); ao = ao + 2 + 1 + slen; }
+    if ao >= n { syscall 1, mBad, nl; closesocket(s); return 0; }
+
+    atype = shr(load8(g_rx+ao), 4);
+    if atype == 5 {                                                     # Error APDU
+        syscall 1, mErrR, load8(g_rx+ao+3), mSl, load8(g_rx+ao+4), nl; closesocket(s); return 0;
+    }
+    if atype != 3 { syscall 1, mBad, nl; closesocket(s); return 0; }    # want Complex-ACK
+    if load8(g_rx+ao+2) != 12 { syscall 1, mBad, nl; closesocket(s); return 0; }  # ReadProperty
+    if load8(g_rx+ao+10) != 0x3E { syscall 1, mBad, nl; closesocket(s); return 0; } # opening tag 3
+
+    vt = load8(g_rx+ao+11);                                             # application value tag
+    if vt == 0x44 { syscall 1, mReal, load32_be(g_rx+ao+12), nl; }       # REAL (f32)
+    else if vt == 0x21 { syscall 1, mUint, load8(g_rx+ao+12), nl; }      # unsigned, 1 byte
+    else if vt == 0x91 { syscall 1, mEnum, load8(g_rx+ao+12), nl; }      # enumerated, 1 byte
+    else if vt == 0x10 { syscall 1, mBool, 0, nl; }
+    else if vt == 0x11 { syscall 1, mBool, 1, nl; }
+    else { syscall 1, mBad, nl; }
+    closesocket(s);
+    return 0;
+}

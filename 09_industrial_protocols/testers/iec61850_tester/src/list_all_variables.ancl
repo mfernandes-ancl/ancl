@@ -1,0 +1,248 @@
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+import "../../../core_lib/iec61850_compat.ancl";
+
+
+@DATA
+g_align_offset: buf = 8;
+g_val_str:      buf = 256;
+g_type_str:     buf = 64;
+g_err:          buf = 8;
+g_decbuf:       buf = 32;
+g_ref_parsed:   buf = 256;
+g_temp_fc:      buf = 32;
+
+@CODE
+
+func strlen(s: i64) -> i64 {
+    p = s;
+    while load8(p) != 0 { p = p + 1; }
+    return p - s;
+}
+
+func str_equal(s1: i64, s2: i64) -> i64 {
+    p1 = s1; p2 = s2;
+    while load8(p1) != 0 {
+        if load8(p1) != load8(p2) { return 0; }
+        p1 = p1 + 1; p2 = p2 + 1;
+    }
+    if load8(p2) != 0 { return 0; }
+    return 1;
+}
+
+func str_copy(dst: i64, src: i64) -> i64 {
+    d = dst; s = src;
+    while load8(s) != 0 {
+        store8(d, load8(s));
+        d = d + 1; s = s + 1;
+    }
+    store8(d, 0);
+    return d;
+}
+
+func str_find(s: i64, sub: i64) -> i64 {
+    p = s;
+    while load8(p) != 0 {
+        p1 = p;
+        p2 = sub;
+        match = 1;
+        while load8(p2) != 0 {
+            if load8(p1) != load8(p2) { match = 0; break; }
+            p1 = p1 + 1;
+            p2 = p2 + 1;
+        }
+        if match == 1 { return p; }
+        p = p + 1;
+    }
+    return 0;
+}
+
+func int_to_dec_str(val: i64, dst: i64) -> i64 {
+    nf_u64dec(val, dst);
+    return 0;
+}
+
+func detect_mms_alignment() -> i64 {
+    val1 = MmsValue_newBoolean(1);
+    val0 = MmsValue_newBoolean(0);
+    offset = 8;
+    if load8(val1 + 5) == 1 {
+        if load8(val0 + 5) == 0 {
+            offset = 5;
+        }
+    }
+    MmsValue_delete(val1);
+    MmsValue_delete(val0);
+    store64(g_align_offset, offset);
+    return offset;
+}
+
+func decode_mms_value(val_ptr: i64) -> i64 {
+    type = MmsValue_getType(val_ptr);
+    offset = load64(g_align_offset);
+    store8(g_val_str, 0);
+    store8(g_type_str, 0);
+    
+    if type == 2 {
+        str_copy(g_type_str, "Boolean");
+        b = load8(val_ptr + offset);
+        if b != 0 { str_copy(g_val_str, "True"); }
+        else { str_copy(g_val_str, "False"); }
+        return 0;
+    }
+    if type == 4 {
+        str_copy(g_type_str, "Integer");
+        int_to_dec_str(MmsValue_toInt64(val_ptr), g_val_str);
+        return 0;
+    }
+    if type == 5 {
+        str_copy(g_type_str, "Unsigned");
+        int_to_dec_str(MmsValue_toInt64(val_ptr), g_val_str);
+        return 0;
+    }
+    if type == 6 {
+        format_width = load8(val_ptr + offset + 1);
+        if format_width == 32 {
+            str_copy(g_type_str, "Float32");
+            nf_ftoa(load32(val_ptr + offset + 2), g_val_str);
+        } else {
+            str_copy(g_type_str, "Float64");
+            nf_dtoa(load64(val_ptr + offset + 2), g_val_str);
+        }
+        return 0;
+    }
+    if type == 8 {
+        str_copy(g_type_str, "VisibleString");
+        str_copy(g_val_str, MmsValue_toString(val_ptr));
+        return 0;
+    }
+    if type == 14 {
+        str_copy(g_type_str, "UtcTime");
+        int_to_dec_str(MmsValue_getUtcTimeInMs(val_ptr), g_val_str);
+        return 0;
+    }
+    if type == 15 {
+        str_copy(g_type_str, "DataAccessError");
+        int_to_dec_str(load32(val_ptr + offset), g_val_str);
+        return 0;
+    }
+    str_copy(g_type_str, "Structure");
+    int_to_dec_str(type, g_val_str);
+    return 0;
+}
+
+func parse_mms_var(ld_name: i64, mms_var: i64) -> i64 {
+    e = str_copy(g_ref_parsed, ld_name);
+    store8(e, 47);
+    e = e + 1;
+    
+    i = 0;
+    dollar_count = 0;
+    fc_ptr = g_temp_fc;
+    store8(fc_ptr, 0);
+    
+    while 1 {
+        c = load8(mms_var + i);
+        if c == 0 {
+            store8(e, 0);
+            break;
+        }
+        if c == 36 {
+            dollar_count = dollar_count + 1;
+            if dollar_count >= 2 {
+                store8(e, 46);
+                e = e + 1;
+            }
+        } else {
+            if dollar_count == 0 {
+                store8(e, c);
+                e = e + 1;
+            } else if dollar_count == 1 {
+                store8(fc_ptr, c);
+                fc_ptr = fc_ptr + 1;
+                store8(fc_ptr, 0);
+            } else {
+                store8(e, c);
+                e = e + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func main() -> i32 {
+    detect_mms_alignment();
+    
+    puts_cstr("Connecting to 127.0.0.1:10102...\n");
+    conn = IedConnection_create();
+    store32(g_err, 0);
+    IedConnection_connect(conn, g_err, "127.0.0.1", 10102);
+    if load32(g_err) != 0 {
+        puts_cstr("FAILED to connect!\n");
+        return 1;
+    }
+    puts_cstr("Connected successfully!\n");
+    
+    ld_list = IedConnection_getLogicalDeviceList(conn, g_err);
+    if ld_list != 0 {
+        ld_el = LinkedList_getNext(ld_list);
+        while ld_el != 0 {
+            ld_name = LinkedList_getData(ld_el);
+            if ld_name != 0 {
+                puts_cstr("Device: "); puts_cstr(ld_name); puts_cstr("\n");
+                
+                var_list = IedConnection_getLogicalDeviceVariables(conn, g_err, ld_name);
+                if var_list != 0 {
+                    var_el = LinkedList_getNext(var_list);
+                    while var_el != 0 {
+                        mms_var = LinkedList_getData(var_el);
+                        if mms_var != 0 {
+                            parse_mms_var(ld_name, mms_var);
+                            
+                            fc = 1;
+                            if str_equal(g_temp_fc, "ST") != 0 { fc = 0; }
+                            else if str_equal(g_temp_fc, "MX") != 0 { fc = 1; }
+                            else if str_equal(g_temp_fc, "CO") != 0 { fc = 12; }
+                            else if str_equal(g_temp_fc, "CF") != 0 { fc = 4; }
+                            
+                            # Only query variables containing 'DISJ'
+                            if str_find(g_ref_parsed, "DISJ") != 0 {
+                                store32(g_err, 0);
+                                val = IedConnection_readObject(conn, g_err, g_ref_parsed, fc);
+                                if load32(g_err) == 0 {
+                                    decode_mms_value(val);
+                                    puts_cstr("  ");
+                                    puts_cstr(g_ref_parsed);
+                                    puts_cstr(" [");
+                                    puts_cstr(g_temp_fc);
+                                    puts_cstr("] = ");
+                                    puts_cstr(g_val_str);
+                                    puts_cstr(" (");
+                                    puts_cstr(g_type_str);
+                                    puts_cstr(")\n");
+                                    MmsValue_delete(val);
+                                } else {
+                                    puts_cstr("  ");
+                                    puts_cstr(g_ref_parsed);
+                                    puts_cstr(" [");
+                                    puts_cstr(g_temp_fc);
+                                    puts_cstr("] = READ_ERROR\n");
+                                }
+                            }
+                        }
+                        var_el = LinkedList_getNext(var_el);
+                    }
+                    LinkedList_destroy(var_list);
+                }
+            }
+            ld_el = LinkedList_getNext(ld_el);
+        }
+        LinkedList_destroy(ld_list);
+    }
+    
+    IedConnection_close(conn);
+    IedConnection_destroy(conn);
+    return 0;
+}

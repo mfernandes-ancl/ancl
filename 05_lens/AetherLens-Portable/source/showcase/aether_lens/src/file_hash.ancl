@@ -1,0 +1,104 @@
+# =====================================================================
+# file_hash.ancl - dependency-free Windows SHA-256 helpers for Lens.
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+
+extern "advapi32.dll" CryptAcquireContextA;
+extern "advapi32.dll" CryptCreateHash;
+extern "advapi32.dll" CryptHashData;
+extern "advapi32.dll" CryptGetHashParam;
+extern "advapi32.dll" CryptDestroyHash;
+extern "advapi32.dll" CryptReleaseContext;
+
+@DATA
+lfh_provider: buf = 8;
+lfh_hash: buf = 8;
+lfh_digest: buf = 32;
+lfh_len: buf = 8;
+lfh_read: buf = 8;
+lfh_hex: str = "0123456789abcdef";
+
+@CODE
+func lfh_digest_hex(out: i64) -> i64 {
+    i = 0;
+    while i < 32 {
+        b = load8(lfh_digest + i);
+        store8(out + i * 2, load8(lfh_hex + b / 16));
+        store8(out + i * 2 + 1, load8(lfh_hex + b % 16));
+        i = i + 1;
+    }
+    store8(out + 64, 0);
+    return 0;
+}
+
+func lfh_begin() -> i64 {
+    store64(lfh_provider, 0);
+    store64(lfh_hash, 0);
+    if CryptAcquireContextA(lfh_provider, 0, 0, 24, 0xF0000000) == 0 { return 0; }
+    if CryptCreateHash(load64(lfh_provider), 0x800C, 0, 0, lfh_hash) == 0 {
+        CryptReleaseContext(load64(lfh_provider), 0);
+        store64(lfh_provider, 0);
+        return 0;
+    }
+    return 1;
+}
+
+func lfh_finish(out: i64) -> i64 {
+    store64(lfh_len, 32);
+    ok = CryptGetHashParam(load64(lfh_hash), 2, lfh_digest, lfh_len, 0);
+    if ok != 0 { lfh_digest_hex(out); }
+    CryptDestroyHash(load64(lfh_hash));
+    CryptReleaseContext(load64(lfh_provider), 0);
+    store64(lfh_hash, 0);
+    store64(lfh_provider, 0);
+    if ok == 0 { return 0; }
+    return 1;
+}
+
+func lfh_sha256_bytes(data: i64, n: i64, out: i64) -> i64 {
+    store8(out, 0);
+    if lfh_begin() == 0 { return 0; }
+    off = 0;
+    while off < n {
+        chunk = n - off;
+        if chunk > 65536 { chunk = 65536; }
+        if CryptHashData(load64(lfh_hash), data + off, chunk, 0) == 0 {
+            CryptDestroyHash(load64(lfh_hash));
+            CryptReleaseContext(load64(lfh_provider), 0);
+            return 0;
+        }
+        off = off + chunk;
+    }
+    return lfh_finish(out);
+}
+
+func lfh_sha256_file(path: i64, out: i64) -> i64 {
+    store8(out, 0);
+    fh = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if fh == 0 - 1 { return 0; }
+    if lfh_begin() == 0 { CloseHandle(fh); return 0; }
+    block = alloc(65536);
+    if block == 0 {
+        CryptDestroyHash(load64(lfh_hash));
+        CryptReleaseContext(load64(lfh_provider), 0);
+        CloseHandle(fh);
+        return 0;
+    }
+    ok = 1;
+    while ok == 1 {
+        if ReadFile(fh, block, 65536, lfh_read, 0) == 0 { ok = 0; }
+        else {
+            n = load32(lfh_read);
+            if n == 0 { break; }
+            if CryptHashData(load64(lfh_hash), block, n, 0) == 0 { ok = 0; }
+        }
+    }
+    free(block);
+    CloseHandle(fh);
+    if ok == 0 {
+        CryptDestroyHash(load64(lfh_hash));
+        CryptReleaseContext(load64(lfh_provider), 0);
+        return 0;
+    }
+    return lfh_finish(out);
+}

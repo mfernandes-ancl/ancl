@@ -1,0 +1,363 @@
+# =====================================================================
+#  transport.ancl  -  HTTP transports for the Aether Studio AI layer.
+#
+#  Every backend's wire transport behind winhttp.dll:
+#    - ol_http2(...)     the generic request primitive (host/port/TLS/header)
+#    - ollama_tags/chat  local Ollama (target set via ol_set_target)
+#    - oai_chat(...)     OpenAI-compatible (TLS + Authorization: Bearer)
+#    - url_split(...)    parse http(s)://host[:port][/path]
+#
+#  Copied + generalized from showcase/ancl_agent/ollama.ancl so the IDE
+#  dist stays self-contained. Shares the winhttp externs with ai_bridge.ancl
+#  (duplicate extern decls merge benignly - verified).
+# =====================================================================
+extern "winhttp.dll" WinHttpOpen -> ptr;
+extern "winhttp.dll" WinHttpSetTimeouts;          # BOOL (h, resolve, connect, send, receive) ms
+extern "winhttp.dll" WinHttpConnect -> ptr;
+extern "winhttp.dll" WinHttpOpenRequest -> ptr;
+extern "winhttp.dll" WinHttpAddRequestHeaders;
+extern "winhttp.dll" WinHttpSendRequest;
+extern "winhttp.dll" WinHttpReceiveResponse;
+extern "winhttp.dll" WinHttpQueryHeaders;
+extern "winhttp.dll" WinHttpReadData;
+extern "winhttp.dll" WinHttpCloseHandle;
+
+@DATA
+tr_ua_a:      str = "AetherStudio/1.0";
+tr_hdr_a:     str = "content-type: application/json";
+tr_get_a:     str = "GET";
+tr_post_a:    str = "POST";
+tr_chat_path: str = "/api/chat";
+tr_tags_path: str = "/api/tags";
+tr_auth_pfx:  str = "Authorization: Bearer ";
+s_http:       str = "http://";
+s_https:      str = "https://";
+
+# wide-string scratch (one request in flight at a time)
+tr_host_w: buf = 256;
+tr_ua_w:   buf = 64;
+tr_hdr_w:  buf = 128;
+tr_verb_w: buf = 16;
+tr_path_w: buf = 512;
+tr_xhdr_w: buf = 2048;       # extra header (auth) widened
+tr_auth_a: buf = 1024;       # "Authorization: Bearer <key>" ANSI
+
+# current Ollama target (settings populates via ol_set_target; defaults = localhost)
+ol_cur_host: buf = 256;
+ol_cur_port: buf = 8;
+ol_cur_sec:  buf = 8;
+ol_def_host: str = "127.0.0.1";
+
+tr_status: buf = 8;
+tr_slen:   buf = 8;
+tr_nread:  buf = 8;
+g_cur_req: buf = 8;          # in-flight request handle (so Stop can abort a blocked call)
+
+# ---- streaming (NDJSON, stream:true) -------------------------------------------
+# The engine streams one JSON line per token: {"...","message":{"content":"<piece>"},
+# "done":false}. ol_http2_stream reads chunks, splits on '\n', extracts each piece
+# (message.content, or response for /api/generate), unescapes it, and hands it to a
+# function-pointer sink via callp -- so the transcript fills token-by-token (Lens feel).
+tr_stream_cb:  buf = 8;      # fn(piece_ptr) sink; 0 = plain buffered read
+tr_rchunk:     buf = 65536;  # raw read chunk
+tr_line:       buf = 262144; # rolling line accumulator (one NDJSON line, incl. a long piece)
+tr_line_n:     buf = 8;
+tr_piece:      buf = 262144; # unescaped piece handed to the sink
+tr_ndl_content: str = "\"content\":\"";
+tr_ndl_response: str = "\"response\":\"";
+tr_ndl_done_true: str = "\"done\":true";
+
+@CODE
+# ANSI -> UTF-16LE into dst (wide NUL-terminated). WinHttp wants wide strings.
+func tr_a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i * 2, c);
+        store8(dst + i * 2 + 1, 0);
+        if c == 0 { return i * 2; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# prefix test: does pat occur at s+pos? (local to transport; agent has its own match_at)
+func tr_match(s: i64, pos: i64, pat: i64) -> i64 {
+    j = 0;
+    while 1 {
+        pc = load8(pat + j);
+        if pc == 0 { return 1; }
+        if load8(s + pos + j) != pc { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# Close the tracked request handle exactly once (clears first to avoid a double close).
+# Called from the worker (normal close) AND from the UI thread (Stop -> aborts the blocked call).
+func ol_close_req() -> i64 {
+    h = load64(g_cur_req);
+    if h != 0 { store64(g_cur_req, 0); WinHttpCloseHandle(h); }
+    return 0;
+}
+func ol_abort() -> i64 { ol_close_req(); return 0; }
+
+# core request. host_a/verb_a/path_a ANSI; secure=1 -> TLS; xhdr_a=0 or one extra ANSI header line.
+# body/blen = request body (0/0 for GET); resp = sink (NUL-term). Returns HTTP status (0 = transport fail).
+func ol_http2(host_a: i64, port: i64, secure: i64, verb_a: i64, path_a: i64, xhdr_a: i64, body: i64, blen: i64, resp: i64) -> i64 {
+    tr_a2w(tr_host_w, host_a);
+    tr_a2w(tr_ua_w,   tr_ua_a);
+    tr_a2w(tr_hdr_w,  tr_hdr_a);
+    tr_a2w(tr_verb_w, verb_a);
+    tr_a2w(tr_path_w, path_a);
+
+    hs = WinHttpOpen(tr_ua_w, 0, 0, 0, 0);
+    if hs == 0 { store8(resp, 0); return 0; }
+    # generous timeouts (ms): a slow LOCAL model can take minutes -> 10-min receive
+    WinHttpSetTimeouts(hs, 0, 30000, 60000, 600000);
+    hc = WinHttpConnect(hs, tr_host_w, port, 0);
+    if hc == 0 { WinHttpCloseHandle(hs); store8(resp, 0); return 0; }
+    fl = 0;
+    if secure == 1 { fl = 0x00800000; }                 # WINHTTP_FLAG_SECURE
+    hr = WinHttpOpenRequest(hc, tr_verb_w, tr_path_w, 0, 0, 0, fl);
+    if hr == 0 { WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); store8(resp, 0); return 0; }
+    store64(g_cur_req, hr);                              # track for Stop/abort
+
+    WinHttpAddRequestHeaders(hr, tr_hdr_w, 0 - 1, 0x20000000);
+    if xhdr_a != 0 {
+        tr_a2w(tr_xhdr_w, xhdr_a);
+        WinHttpAddRequestHeaders(hr, tr_xhdr_w, 0 - 1, 0x20000000);
+    }
+    sok = WinHttpSendRequest(hr, 0, 0, body, blen, blen, 0);
+    if sok == 0 { ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); store8(resp, 0); return 0; }
+    rok = WinHttpReceiveResponse(hr, 0);
+    if rok == 0 { ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); store8(resp, 0); return 0; }
+
+    store32(tr_slen, 4);
+    WinHttpQueryHeaders(hr, 0x20000013, 0, tr_status, tr_slen, 0);   # STATUS_CODE | FLAG_NUMBER
+
+    total = 0;
+    while 1 {
+        rd = WinHttpReadData(hr, resp + total, 65536, tr_nread);
+        if rd == 0 { break; }
+        n = load32(tr_nread);
+        if n == 0 { break; }
+        total = total + n;
+        if total > 983040 { break; }     # cap (caller buffer should be >= 1 MB)
+    }
+    store8(resp + total, 0);
+    ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs);
+    return load32(tr_status);
+}
+
+# find needle in NUL-term hay from `from`; returns index after the needle, or -1.
+func tr_after(hay: i64, from: i64, ndl: i64) -> i64 {
+    i = from;
+    while 1 {
+        if load8(hay + i) == 0 { return 0 - 1; }
+        j = 0;
+        ok = 1;
+        while ok == 1 {
+            c = load8(ndl + j);
+            if c == 0 { return i + j; }
+            if load8(hay + i + j) != c { ok = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# extract one NDJSON line's piece (message.content, else response) into tr_piece,
+# unescaping \n \t \r \" \\ \uXXXX. Returns the piece length, or -1 if no piece.
+func tr_extract_piece(line: i64) -> i64 {
+    s = tr_after(line, 0, tr_ndl_content);
+    if s < 0 { s = tr_after(line, 0, tr_ndl_response); }
+    if s < 0 { return 0 - 1; }
+    i = s;
+    j = 0;
+    while 1 {
+        c = load8(line + i);
+        if c == 0 { break; }
+        if c == 34 { break; }                                   # closing quote
+        if c == 92 {                                            # escape
+            d = load8(line + i + 1);
+            if d == 110 { store8(tr_piece + j, 10); j = j + 1; i = i + 2; }
+            else { if d == 116 { store8(tr_piece + j, 9); j = j + 1; i = i + 2; }
+            else { if d == 114 { store8(tr_piece + j, 13); j = j + 1; i = i + 2; }
+            else { if d == 117 {                                # \uXXXX -> UTF-8
+                cp = shl(tr_hex(load8(line+i+2)), 12) + shl(tr_hex(load8(line+i+3)), 8) + shl(tr_hex(load8(line+i+4)), 4) + tr_hex(load8(line+i+5));
+                j = tr_emitu(tr_piece, j, cp); i = i + 6;
+            } else { store8(tr_piece + j, d); j = j + 1; i = i + 2; } } } }
+        } else {
+            store8(tr_piece + j, c); j = j + 1; i = i + 1;
+        }
+    }
+    store8(tr_piece + j, 0);
+    return j;
+}
+func tr_hex(c: i64) -> i64 {
+    if c >= 48 { if c <= 57  { return c - 48; } }
+    if c >= 65 { if c <= 70  { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0;
+}
+func tr_emitu(dst: i64, j: i64, cp: i64) -> i64 {
+    if cp < 128 { store8(dst + j, cp); return j + 1; }
+    if cp < 2048 {
+        store8(dst + j,     bor(192, shr(cp, 6)));
+        store8(dst + j + 1, bor(128, band(cp, 63)));
+        return j + 2;
+    }
+    store8(dst + j,     bor(224, shr(cp, 12)));
+    store8(dst + j + 1, bor(128, band(shr(cp, 6), 63)));
+    store8(dst + j + 2, bor(128, band(cp, 63)));
+    return j + 3;
+}
+# process a completed NDJSON line: hand its piece to the sink.
+func tr_stream_line(line: i64) -> i64 {
+    if tr_extract_piece(line) >= 0 {
+        cb = load64(tr_stream_cb);
+        if cb != 0 { callp(cb, tr_piece); }
+    }
+    return 0;
+}
+
+# streaming request: like ol_http2 but drives tr_stream_cb per NDJSON line as
+# tokens arrive. `full` (>= 512KB) accumulates the concatenated pieces (the whole
+# reply, for tool-call parsing). Returns the HTTP status.
+func ol_http2_stream(host_a: i64, port: i64, secure: i64, path_a: i64, body: i64, blen: i64, full: i64) -> i64 {
+    store8(full, 0);
+    tr_a2w(tr_host_w, host_a);
+    tr_a2w(tr_ua_w,   tr_ua_a);
+    tr_a2w(tr_hdr_w,  tr_hdr_a);
+    tr_a2w(tr_verb_w, tr_post_a);
+    tr_a2w(tr_path_w, path_a);
+
+    hs = WinHttpOpen(tr_ua_w, 0, 0, 0, 0);
+    if hs == 0 { return 0; }
+    WinHttpSetTimeouts(hs, 0, 30000, 60000, 600000);
+    hc = WinHttpConnect(hs, tr_host_w, port, 0);
+    if hc == 0 { WinHttpCloseHandle(hs); return 0; }
+    fl = 0;
+    if secure == 1 { fl = 0x00800000; }
+    hr = WinHttpOpenRequest(hc, tr_verb_w, tr_path_w, 0, 0, 0, fl);
+    if hr == 0 { WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); return 0; }
+    store64(g_cur_req, hr);
+    WinHttpAddRequestHeaders(hr, tr_hdr_w, 0 - 1, 0x20000000);
+    sok = WinHttpSendRequest(hr, 0, 0, body, blen, blen, 0);
+    if sok == 0 { ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); return 0; }
+    rok = WinHttpReceiveResponse(hr, 0);
+    if rok == 0 { ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs); return 0; }
+    store32(tr_slen, 4);
+    WinHttpQueryHeaders(hr, 0x20000013, 0, tr_status, tr_slen, 0);
+
+    store64(tr_line_n, 0);
+    ftot = 0;
+    while 1 {
+        rd = WinHttpReadData(hr, tr_rchunk, 65536, tr_nread);
+        if rd == 0 { break; }
+        n = load32(tr_nread);
+        if n == 0 { break; }
+        bi = 0;
+        while bi < n {
+            c = load8(tr_rchunk + bi);
+            if c == 10 {                                        # line complete
+                ln = load64(tr_line_n);
+                store8(tr_line + ln, 0);
+                # accumulate this line's piece into `full` before the sink call
+                pl = tr_extract_piece(tr_line);
+                if pl > 0 {
+                    k = 0;
+                    while k < pl { if ftot < 522240 { store8(full + ftot, load8(tr_piece + k)); ftot = ftot + 1; } k = k + 1; }
+                    store8(full + ftot, 0);
+                    cb = load64(tr_stream_cb);
+                    if cb != 0 { callp(cb, tr_piece); }
+                }
+                store64(tr_line_n, 0);
+            } else {
+                ln = load64(tr_line_n);
+                if ln < 262140 { store8(tr_line + ln, c); store64(tr_line_n, ln + 1); }
+            }
+            bi = bi + 1;
+        }
+    }
+    store8(full + ftot, 0);
+    ol_close_req(); WinHttpCloseHandle(hc); WinHttpCloseHandle(hs);
+    return load32(tr_status);
+}
+
+# ---- Ollama target (the model picker + agent loop talk to this) -----
+func ol_set_target(host_a: i64, port: i64, secure: i64) -> i64 {
+    str_copy(ol_cur_host, host_a);
+    store64(ol_cur_port, port);
+    store64(ol_cur_sec, secure);
+    return 0;
+}
+func ol_target_init() -> i64 {
+    str_copy(ol_cur_host, ol_def_host);
+    store64(ol_cur_port, 11434);
+    store64(ol_cur_sec, 0);
+    return 0;
+}
+func ollama_tags(resp: i64) -> i64 {
+    return ol_http2(ol_cur_host, load64(ol_cur_port), load64(ol_cur_sec), tr_get_a, tr_tags_path, 0, 0, 0, resp);
+}
+func ollama_chat(body: i64, resp: i64) -> i64 {
+    return ol_http2(ol_cur_host, load64(ol_cur_port), load64(ol_cur_sec), tr_post_a, tr_chat_path, 0, body, strlen(body), resp);
+}
+# streaming /api/chat: drives tr_stream_cb per token; `full` gets the whole reply.
+func ollama_chat_stream(body: i64, full: i64) -> i64 {
+    return ol_http2_stream(ol_cur_host, load64(ol_cur_port), load64(ol_cur_sec), tr_chat_path, body, strlen(body), full);
+}
+
+# OpenAI-compatible chat: TLS + Authorization: Bearer <key>. path_a = full request path.
+func oai_chat(host_a: i64, port: i64, secure: i64, path_a: i64, key_a: i64, body: i64, resp: i64) -> i64 {
+    e = str_copy(tr_auth_a, tr_auth_pfx);
+    str_copy(e, key_a);
+    return ol_http2(host_a, port, secure, tr_post_a, path_a, tr_auth_a, body, strlen(body), resp);
+}
+
+# Parse "http(s)://host[:port][/path...]". host_out <- ANSI host; store64 port_out / sec_out;
+# path_out <- the path prefix (everything from the first '/', or "" if none). Returns 0.
+func url_split(url: i64, host_out: i64, port_out: i64, sec_out: i64, path_out: i64) -> i64 {
+    i = 0;
+    sec = 0;
+    if tr_match(url, 0, s_https) == 1 { sec = 1; i = 8; }
+    else { if tr_match(url, 0, s_http) == 1 { sec = 0; i = 7; } }
+    store64(sec_out, sec);
+
+    h = 0;
+    while 1 {
+        c = load8(url + i);
+        if c == 0 { break; }
+        if c == 58 { break; }                 # ':'
+        if c == 47 { break; }                 # '/'
+        store8(host_out + h, c); h = h + 1; i = i + 1;
+    }
+    store8(host_out + h, 0);
+
+    p = 80;
+    if sec == 1 { p = 443; }
+    if load8(url + i) == 58 {
+        i = i + 1;
+        p = 0;
+        while 1 {
+            c = load8(url + i);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            p = p * 10 + (c - 48);
+            i = i + 1;
+        }
+    }
+    store64(port_out, p);
+
+    k = 0;
+    while 1 {
+        c = load8(url + i);
+        if c == 0 { break; }
+        store8(path_out + k, c); k = k + 1; i = i + 1;
+    }
+    store8(path_out + k, 0);
+    return 0;
+}

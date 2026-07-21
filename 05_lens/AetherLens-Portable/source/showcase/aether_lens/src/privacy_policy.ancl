@@ -1,0 +1,35 @@
+# Pure endpoint classification used by the R7 Privacy Proof panel.
+
+@CODE
+func lpp_lower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func lpp_starts_ci(src: i64, prefix: i64) -> i64 {
+    i = 0;
+    while load8(prefix + i) != 0 {
+        if lpp_lower(load8(src + i)) != lpp_lower(load8(prefix + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+func lpp_host_prefix(url: i64, prefix: i64) -> i64 {
+    if lpp_starts_ci(url, prefix) == 0 { return 0; }
+    c = load8(url + strlen(prefix));
+    if c == 0 { return 1; }
+    if c == 47 { return 1; }
+    if c == 58 { return 1; }
+    return 0;
+}
+
+func lpp_loopback_url(url: i64) -> i64 {
+    if lpp_host_prefix(url, "http://127.0.0.1") == 1 { return 1; }
+    if lpp_host_prefix(url, "https://127.0.0.1") == 1 { return 1; }
+    if lpp_host_prefix(url, "http://localhost") == 1 { return 1; }
+    if lpp_host_prefix(url, "https://localhost") == 1 { return 1; }
+    if lpp_host_prefix(url, "http://[::1]") == 1 { return 1; }
+    if lpp_host_prefix(url, "https://[::1]") == 1 { return 1; }
+    return 0;
+}

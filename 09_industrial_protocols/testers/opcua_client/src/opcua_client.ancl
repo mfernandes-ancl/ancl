@@ -1,0 +1,2683 @@
+# ============================================================================
+#  opcua_client.ancl  -  ANCL Native OPC UA Client  (Phase 1-3)
+#
+#  A native Win32 dark-mode GUI OPC UA Binary client, written in ANCL.
+#  Phase 1: TCP connect + HELLO/ACK handshake.
+#  Phase 2: OpenSecureChannel (SecurityMode=None)
+#  Phase 3: CreateSession + ActivateSession (Anonymous)
+#
+#  OPC UA Connection Protocol (Part 6, Section 7.1):
+#    HEL message: 'H','E','L','F' + MessageSize(u32) + fields
+#    ACK message: 'A','C','K','F' + MessageSize(u32) + fields
+#    OPN message: 'O','P','N','F' + SecureChannel framing + service body
+#    MSG message: 'M','S','G','F' + SecureChannel framing + service body
+#
+#  100% CRT-free PE32+, GUI subsystem. Imports kernel32 + user32 + ws2_32.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+
+extern "ws2_32.dll" connect;
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "user32.dll" PostMessageA;
+extern "user32.dll" PeekMessageA -> i32;
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+extern "comctl32.dll" InitCommonControlsEx;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll" RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "ANCLOPCUACLIENT";
+title:      str = "ANCL OPC UA Client";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+cls_list:   str = "LISTBOX";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom window classes ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+cls_panel:    str = "ANCL_PANEL";
+
+# ---- Labels ----
+lbl_ep:     str = "Endpoint URL:";
+lbl_log:    str = "Log:";
+lbl_status: str = "Status: Disconnected";
+
+# ---- Buttons ----
+btn_conn:   str = "Connect";
+btn_disc:   str = "Disconnect";
+btn_browse: str = "Browse Root";
+btn_read:   str = "Read";
+btn_poll:   str = "Start Poll";
+btn_stop:   str = "Stop Poll";
+btn_back:   str = "Back";
+btn_write:  str = "Write";
+lbl_wrval:  str = "Write Value:";
+
+# ---- Labels ----
+lbl_nodeid: str = "Node (numeric ns;id):";
+cls_lv:     str = "SysListView32";
+col_node:   str = "Node ID";
+col_name:   str = "Display Name";
+col_val:    str = "Value";
+col_type:   str = "Type";
+
+# ---- Default endpoint ----
+def_ep:     str = "opc.tcp://127.0.0.1:4840";
+
+# ---- Log messages ----
+crlf:       str = "\r\n";
+m_hello:    str = "[ua] sending HELLO...\r\n";
+m_ack:      str = "[ua] received ACK - connection established!\r\n";
+m_ack_ver:  str = "[ua] protocol version = ";
+m_ack_rcv:  str = "[ua] server recv buffer = ";
+m_ack_snd:  str = "[ua] server send buffer = ";
+m_ack_msg:  str = "[ua] server max msg size = ";
+m_ack_chk:  str = "[ua] server max chunk count = ";
+m_err_wsa:  str = "[ua] WSAStartup failed.\r\n";
+m_err_parse:str = "[ua] cannot parse endpoint URL.\r\n";
+m_err_conn: str = "[ua] connect() failed - server unreachable.\r\n";
+m_err_hel:  str = "[ua] send HELLO failed.\r\n";
+m_err_recv: str = "[ua] recv failed or server closed connection.\r\n";
+m_err_type: str = "[ua] unexpected response (not ACK).\r\n";
+m_err_errmsg:str = "[ua] server returned ERR: status = 0x";
+m_disc:     str = "[ua] disconnected.\r\n";
+m_conn_to:  str = "[ua] connecting to ";
+m_dots:     str = "...\r\n";
+m_port_is:  str = "[ua] parsed port = ";
+m_st_conn:  str = "Status: Connected to ";
+m_st_disc:  str = "Status: Disconnected";
+m_bytes:    str = " bytes\r\n";
+
+# ---- GUI handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_eped:     buf = 8;      # endpoint URL edit control
+g_log:      buf = 8;      # log multiline edit
+g_status:   buf = 8;      # status label
+g_font:     buf = 8;      # Consolas font
+
+# ---- Win32 structs ----
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+
+# ---- Winsock ----
+g_wsa:      buf = 512;
+g_addr:     buf = 16;
+g_sock:     buf = 8;      # active TCP socket (0 = disconnected)
+
+# ---- HEL/ACK buffers ----
+g_hel:      buf = 256;    # outgoing HELLO message
+g_rxbuf:    buf = 8192;   # incoming ACK/ERR
+
+# ---- Endpoint URL parsing scratch ----
+g_host:     buf = 256;    # parsed host
+g_port:     buf = 8;      # parsed port (integer)
+g_urlbuf:   buf = 512;    # copy of endpoint URL from edit control
+
+# ---- GUI colour brushes ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+g_lv_brush:  buf = 8;     # dark ListView background
+g_dwm_val:  buf = 8;      # DWM attribute value (BOOL TRUE)
+
+# NexusEdge color palette (BGR format for Win32)
+COL_BG:      i64 = 0x1C1008;    # COLOR_BG_DEEP
+COL_PANEL:   i64 = 0x060402;    # COLOR_BG_PANEL
+COL_TEXT:    i64 = 0xAB9687;    # COLOR_TEXT_PRIMARY
+COL_ACCENT:  i64 = 0xFFFF29;    # COLOR_NEON_BLUE (cyan)
+COL_DIM:     i64 = 0x808080;    # dim text
+COL_GREEN:   i64 = 0x5EC45E;    # status connected
+
+# NexusEdge extended palette
+COLOR_BG_DEEP:     i64 = 0x1C1008;
+COLOR_BG_PANEL:    i64 = 0x060402;
+COLOR_BG_CARD:     i64 = 0x180D05;
+COLOR_BG_INPUT:    i64 = 0x080604;
+COLOR_BG_HOVER:    i64 = 0x301F0D;
+COLOR_TEXT_PRIMARY:i64 = 0xAB9687;
+COLOR_TEXT_BRIGHT: i64 = 0xFFFFFF;
+COLOR_NEON_BLUE:   i64 = 0xFFFF29;
+COLOR_BORDER:      i64 = 0x7C6543;
+
+# GDI objects for NexusEdge UI
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_wndclass_pnl: buf = 80;
+g_temp_text:    buf = 256;
+g_ps:           buf = 72;
+w_empty:        buf = 8;    # UTF-16 empty string for SetWindowTheme
+
+# ---- Scratch ----
+g_numbuf:   buf = 32;
+g_logbuf:   buf = 512;
+g_statbuf:  buf = 256;
+g_hexbuf:   buf = 32;
+
+# ---- GUI geometry constants ----
+WIN_W:      i64 = 900;
+WIN_H:      i64 = 650;
+
+# ---- Control IDs ----
+ID_EP_EDIT: i64 = 100;
+ID_BTN_CONN: i64 = 101;
+ID_BTN_DISC: i64 = 102;
+ID_LOG:     i64 = 103;
+ID_STATUS:  i64 = 104;
+ID_BTN_BROWSE: i64 = 105;
+ID_NODEID_EDIT: i64 = 106;
+ID_BTN_READ: i64 = 107;
+ID_LISTVIEW: i64 = 108;
+ID_BTN_POLL: i64 = 109;
+ID_BTN_STOP: i64 = 110;
+ID_INTERVAL_EDIT: i64 = 111;
+ID_TIMER_POLL: i64 = 1;
+ID_BTN_BACK:  i64 = 112;
+ID_BTN_WRITE: i64 = 113;
+ID_WRITE_EDIT: i64 = 114;
+
+# ---- ListView + Polling state ----
+g_listview:   buf = 8;      # ListView HWND
+g_polling:    buf = 8;      # 1 = polling active
+g_icc:        buf = 8;      # INITCOMMONCONTROLSEX
+g_lvcol:      buf = 64;     # LVCOLUMNA struct
+g_lvitem:     buf = 96;     # LVITEMA struct
+g_lv_txtbuf:  buf = 256;    # text buffer for ListView items
+g_interval_ed: buf = 8;   # interval edit HWND
+g_interval_buf: buf = 16; # interval text buffer
+
+# ---- Stored node info from Browse (max 32 tags) ----
+# Each tag: namespace(i64) + is_string(i64) + numeric_id(i64) + name_offset(i64) + name_len(i64) + vtype(i64)
+# = 6 * 8 = 48 bytes per tag, 32 tags = 1536 bytes
+g_tag_data:   buf = 1536;
+g_tag_names:  buf = 2048;   # pooled tag name strings (NUL-separated)
+g_tag_names_off: buf = 8;   # current offset in g_tag_names
+g_tag_count:  buf = 8;      # number of tags stored
+
+# Browse history (stack of parent NodeIds for Back navigation, max 8 levels)
+# Each level stores: encoding(1) + ns(2) + id(4) = 7 bytes, but we simplify:
+# Store the numeric ID of the node browsed at each level (ns=0 assumed for standard nodes)
+g_browse_stack: buf = 64;   # i64[8] = NodeId stack
+g_browse_depth: buf = 8;    # current depth (0 = root = i=85)
+g_browse_cur_id: buf = 8;   # current browse node numeric ID (85 = Objects)
+
+# Write support
+g_write_ed:  buf = 8;       # write value edit HWND
+g_write_buf: buf = 128;     # write value text
+
+# Write log messages
+m_wr_send:   str = "[ua] writing value...\r\n";
+m_wr_ok:     str = "[ua] Write OK.\r\n";
+m_wr_fail:   str = "[ua] Write FAILED.\r\n";
+m_wr_nosel:  str = "[ua] select a tag in the grid first.\r\n";
+m_brw_into:  str = "[ua] browsing into node...\r\n";
+
+# Poll log messages
+m_poll_on:    str = "[ua] polling started (interval = ";
+m_poll_on2:   str = "ms).\r\n";
+m_poll_off:   str = "[ua] polling stopped.\r\n";
+m_poll_err:   str = "[ua] connection lost - poll stopped.\r\n";
+m_poll_nobrw: str = "[ua] press Browse Root first to populate tags.\r\n";
+lbl_interval: str = "Interval ms:";
+def_interval: str = "1000";
+
+# Type name strings for the grid
+tn_bool:  str = "Boolean";
+tn_sbyte: str = "SByte";
+tn_byte:  str = "Byte";
+tn_i16:   str = "Int16";
+tn_u16:   str = "UInt16";
+tn_i32:   str = "Int32";
+tn_u32:   str = "UInt32";
+tn_i64:   str = "Int64";
+tn_u64:   str = "UInt64";
+tn_float: str = "Float";
+tn_dbl:   str = "Double";
+tn_str:   str = "String";
+tn_dt:    str = "DateTime";
+tn_unk:   str = "Unknown";
+lv_prefix:str = "1;s=";
+
+# ---- Phase 2/3: Secure Channel + Session state ----
+g_sc_id:    buf = 8;      # SecureChannelId (from OPN response)
+g_sc_token: buf = 8;      # TokenId (from OPN response)
+g_seq_num:  buf = 8;      # sequence number (incremented per message)
+g_req_id:   buf = 8;      # request id (incremented per request)
+g_auth_token: buf = 8;    # AuthenticationToken (from CreateSession response)
+g_auth_raw: buf = 64;     # raw AuthenticationToken NodeId bytes (echoed verbatim in ActivateSession)
+g_auth_raw_len: buf = 8;  # length of g_auth_raw (0 = no session yet)
+g_session_id: buf = 8;    # SessionId (from CreateSession, numeric node-id value)
+g_txbuf:    buf = 4096;   # outgoing message assembly buffer
+g_nonce:    buf = 64;     # server nonce from CreateSession (up to 32 bytes)
+g_nonce_len: buf = 8;
+g_filetime: buf = 8;    # GetSystemTimeAsFileTime output
+
+# Security policy URI for None (OPC UA spec)
+sec_none:   str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+
+# Phase 2/3 log messages
+m_opn_send: str = "[ua] sending OpenSecureChannel (None)...\r\n";
+m_opn_ok:   str = "[ua] SecureChannel opened. ID=";
+m_opn_tok:  str = "  TokenId=";
+m_opn_fail: str = "[ua] OpenSecureChannel FAILED.\r\n";
+m_cs_send:  str = "[ua] sending CreateSession...\r\n";
+m_cs_ok:    str = "[ua] session created. SessionId=";
+m_cs_fail:  str = "[ua] CreateSession FAILED.\r\n";
+m_as_send:  str = "[ua] sending ActivateSession (Anonymous)...\r\n";
+m_as_ok:    str = "[ua] session ACTIVE - ready for operations.\r\n";
+m_as_fail:  str = "[ua] ActivateSession FAILED.\r\n";
+m_recv_n:   str = "[ua] recv bytes = ";
+m_svc_err:  str = "[ua] service error, status = 0x";
+m_gep_send: str = "[ua] sending GetEndpoints...\r\n";
+m_gep_ok:   str = "[ua] GetEndpoints OK, endpoints found = ";
+m_gep_fail: str = "[ua] GetEndpoints FAILED.\r\n";
+m_dump:     str = "";
+m_sp:       str = " ";
+m_brw_send: str = "[ua] sending Browse (Objects folder)...\r\n";
+m_brw_ok:   str = "[ua] Browse OK, references found = ";
+m_brw_fail: str = "[ua] Browse FAILED.\r\n";
+m_brw_node: str = "  -> ";
+m_brw_nocon:str = "[ua] not connected - press Connect first.\r\n";
+m_rd_send:  str = "[ua] reading node value...\r\n";
+m_rd_ok:    str = "[ua] Read OK: value = ";
+m_rd_fail:  str = "[ua] Read FAILED.\r\n";
+m_rd_type:  str = "  (variant type = ";
+m_rd_close: str = ")\r\n";
+m_rd_nocon: str = "[ua] not connected.\r\n";
+m_rd_bool_t:str = "TRUE";
+m_rd_bool_f:str = "FALSE";
+
+# ---- GUI handles for Read ----
+g_nodeid_ed: buf = 8;     # NodeId edit control handle
+g_nodeid_buf: buf = 64;   # typed NodeId text "ns;id"
+g_rd_ns_buf:  buf = 8;    # parsed namespace
+g_rd_id_buf:  buf = 8;    # parsed numeric id
+g_rd_is_string: buf = 8;  # 1 if string NodeId
+g_rd_str_ptr: buf = 8;    # pointer to string identifier
+g_rd_str_len: buf = 8;    # length of string identifier
+def_nodeid: str = "0;2258";  # default: Server.CurrentTime
+m_dbg_roff: str = "[ua] DEBUG body start offset (roff) = ";
+m_dbg_enc:  str = "[ua] DEBUG SessionId enc byte = ";
+m_dbg_aenc: str = "[ua] DEBUG AuthToken enc byte = ";
+
+# Strings used in CreateSession body
+cs_app_uri:   str = "urn:ancl:opcua:client";
+cs_app_name:  str = "ANCL OPC UA Client";
+cs_sess_name: str = "ANCL_Session";
+
+@CODE
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+# Append text to the log multiline edit control
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    # move caret to end
+    len = SendMessageA(hwnd_log, 14, 0, 0);   # WM_GETTEXTLENGTH
+    SendMessageA(hwnd_log, 177, len, len);     # EM_SETSEL(end,end)
+    SendMessageA(hwnd_log, 194, 0, text);      # EM_REPLACESEL(0, text)
+    return 0;
+}
+
+# Convert a 32-bit value to hex string (8 hex digits) at g_hexbuf
+func to_hex8(val: i64) -> i64 {
+    i = 7;
+    while i >= 0 {
+        nib = band(val, 15);
+        ch = 48 + nib;
+        if nib >= 10 { ch = 55 + nib; }
+        store8(g_hexbuf + i, ch);
+        val = shr(val, 4);
+        i = i - 1;
+    }
+    store8(g_hexbuf + 8, 0);
+    return g_hexbuf;
+}
+
+# Log a number on one line: prefix + number + crlf
+func log_num(prefix: i64, val: i64) -> i64 {
+    log_append(prefix);
+    int_to_str(g_numbuf, val);
+    log_append(g_numbuf);
+    log_append(crlf);
+    return 0;
+}
+
+# ============================================================================
+# OPC UA TRANSPORT: PARSE ENDPOINT URL
+# ============================================================================
+
+# Parse "opc.tcp://host:port" -> g_host + g_port
+# Returns 1 on success, 0 on error
+func parse_endpoint(url: i64) -> i64 {
+    # skip "opc.tcp://" (10 chars)
+    p = url;
+    # find "://"
+    while load8(p) != 0 {
+        if load8(p) == 58 {      # ':'
+            if load8(p + 1) == 47 {  # '/'
+                if load8(p + 2) == 47 {
+                    p = p + 3;
+                    break;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    if load8(p) == 0 { return 0; }
+
+    # copy host until ':' or '/' or NUL
+    hi = 0;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 58 { break; }    # ':'
+        if c == 47 { break; }    # '/'
+        store8(g_host + hi, c);
+        hi = hi + 1;
+        p = p + 1;
+    }
+    store8(g_host + hi, 0);
+
+    # parse port
+    port = 4840;    # default OPC UA port
+    if load8(p) == 58 {
+        p = p + 1;
+        port = 0;
+        while load8(p) != 0 {
+            c = load8(p);
+            if c == 47 { break; }
+            if c < 48 { break; }
+            if c > 57 { break; }
+            port = port * 10 + (c - 48);
+            p = p + 1;
+        }
+    }
+    store64(g_port, port);
+    return 1;
+}
+
+# Resolve hostname to IPv4 (simple dotted-quad parser: a.b.c.d)
+# Returns the network-order IP as a 32-bit int, or 0 on failure
+func resolve_ipv4(host: i64) -> i64 {
+    a = 0; b = 0; c2 = 0; d = 0;
+    octet = 0;
+    oidx = 0;
+    p = host;
+    while load8(p) != 0 {
+        ch = load8(p);
+        if ch >= 48 {
+            if ch <= 57 {
+                octet = octet * 10 + (ch - 48);
+            }
+        }
+        if ch == 46 {
+            if oidx == 0 { a = octet; }
+            if oidx == 1 { b = octet; }
+            if oidx == 2 { c2 = octet; }
+            octet = 0;
+            oidx = oidx + 1;
+        }
+        p = p + 1;
+    }
+    # last octet
+    if oidx == 3 { d = octet; }
+    if oidx != 3 { return 0; }
+    # network byte order: first octet at lowest address byte
+    ip = a + shl(b, 8) + shl(c2, 16) + shl(d, 24);
+    return ip;
+}
+
+# ============================================================================
+# OPC UA TRANSPORT: BUILD & SEND HELLO MESSAGE
+# ============================================================================
+
+# Build a HELLO message into g_hel, returns total message size
+# HEL format:
+#   [0..3]   'H','E','L','F'           (message type + reserved)
+#   [4..7]   MessageSize (UInt32 LE)    (total bytes including header)
+#   [8..11]  ProtocolVersion (UInt32)   = 0
+#   [12..15] ReceiveBufferSize (UInt32) = 65535
+#   [16..19] SendBufferSize (UInt32)    = 65535
+#   [20..23] MaxMessageSize (UInt32)    = 0 (no limit)
+#   [24..27] MaxChunkCount (UInt32)     = 0 (no limit)
+#   [28..31] EndpointUrl length (Int32) = strlen(url)
+#   [32..]   EndpointUrl bytes (no NUL)
+func build_hello(url: i64) -> i64 {
+    memset(g_hel, 0, 256);
+    # Message type: "HELF"
+    store8(g_hel + 0, 72);    # 'H'
+    store8(g_hel + 1, 69);    # 'E'
+    store8(g_hel + 2, 76);    # 'L'
+    store8(g_hel + 3, 70);    # 'F'
+    # ProtocolVersion = 0
+    store32(g_hel + 8, 0);
+    # ReceiveBufferSize = 65535
+    store32(g_hel + 12, 65535);
+    # SendBufferSize = 65535
+    store32(g_hel + 16, 65535);
+    # MaxMessageSize = 0 (no limit)
+    store32(g_hel + 20, 0);
+    # MaxChunkCount = 0 (no limit)
+    store32(g_hel + 24, 0);
+    # EndpointUrl (UA String: Int32 length + bytes)
+    url_len = strlen(url);
+    store32(g_hel + 28, url_len);
+    memcpy(g_hel + 32, url, url_len);
+    # Total message size
+    msg_size = 32 + url_len;
+    store32(g_hel + 4, msg_size);
+    return msg_size;
+}
+
+# ============================================================================
+# OPC UA TRANSPORT: PARSE ACK RESPONSE
+# ============================================================================
+
+# Parse an ACK response from g_rxbuf.
+# ACK format:
+#   [0..3]   'A','C','K','F'
+#   [4..7]   MessageSize (UInt32)
+#   [8..11]  ProtocolVersion (UInt32)
+#   [12..15] ReceiveBufferSize (UInt32)
+#   [16..19] SendBufferSize (UInt32)
+#   [20..23] MaxMessageSize (UInt32)
+#   [24..27] MaxChunkCount (UInt32)
+# Returns 1 if valid ACK, 0 otherwise
+func parse_ack() -> i64 {
+    if load8(g_rxbuf + 0) != 65 { return 0; }   # 'A'
+    if load8(g_rxbuf + 1) != 67 { return 0; }   # 'C'
+    if load8(g_rxbuf + 2) != 75 { return 0; }   # 'K'
+    # Log the ACK fields
+    log_append(m_ack);
+    log_num(m_ack_ver, load32(g_rxbuf + 8));
+    log_num(m_ack_rcv, load32(g_rxbuf + 12));
+    log_num(m_ack_snd, load32(g_rxbuf + 16));
+    log_num(m_ack_msg, load32(g_rxbuf + 20));
+    log_num(m_ack_chk, load32(g_rxbuf + 24));
+    return 1;
+}
+
+# Check if response is an ERR message
+func check_err_response() -> i64 {
+    if load8(g_rxbuf + 0) != 69 { return 0; }   # 'E'
+    if load8(g_rxbuf + 1) != 82 { return 0; }   # 'R'
+    if load8(g_rxbuf + 2) != 82 { return 0; }   # 'R'
+    # ERR: [8..11] = StatusCode
+    log_append(m_err_errmsg);
+    to_hex8(load32(g_rxbuf + 8));
+    log_append(g_hexbuf);
+    log_append(crlf);
+    return 1;
+}
+
+# ============================================================================
+# OPC UA PHASE 2: OpenSecureChannel (SecurityMode=None)
+# ============================================================================
+
+# Write a UA String (Int32 length + bytes) at buf+off, return new offset
+func ua_write_string(buf: i64, off: i64, s: i64, slen: i64) -> i64 {
+    store32(buf + off, slen);
+    memcpy(buf + off + 4, s, slen);
+    return off + 4 + slen;
+}
+
+# Write an empty UA ByteString (length = -1) at buf+off, return new offset
+func ua_write_empty_bytestring(buf: i64, off: i64) -> i64 {
+    store8(buf + off + 0, 0xFF);
+    store8(buf + off + 1, 0xFF);
+    store8(buf + off + 2, 0xFF);
+    store8(buf + off + 3, 0xFF);
+    return off + 4;
+}
+
+# Write a null UA String (length = -1) at buf+off, return new offset
+func ua_write_null_string(buf: i64, off: i64) -> i64 {
+    store8(buf + off + 0, 0xFF);
+    store8(buf + off + 1, 0xFF);
+    store8(buf + off + 2, 0xFF);
+    store8(buf + off + 3, 0xFF);
+    return off + 4;
+}
+
+# Get next sequence number
+func next_seq() -> i64 {
+    v = load64(g_seq_num) + 1;
+    store64(g_seq_num, v);
+    return v;
+}
+
+# Get next request ID
+func next_req_id() -> i64 {
+    v = load64(g_req_id) + 1;
+    store64(g_req_id, v);
+    return v;
+}
+
+# Send an OPN message (OpenSecureChannel request, SecurityMode=None)
+# OPN layout for None security:
+#   [0..3]   'O','P','N','F'
+#   [4..7]   MessageSize
+#   [8..11]  SecureChannelId = 0 (requesting new)
+#   --- Asymmetric Security Header (for None) ---
+#   [12..15] SecurityPolicyUri length
+#   [16..]   SecurityPolicyUri bytes ("http://opcfoundation.org/UA/SecurityPolicy#None")
+#   [+0]     SenderCertificate = -1 (empty ByteString)
+#   [+4]     ReceiverCertificateThumbprint = -1 (empty ByteString)
+#   --- Sequence Header ---
+#   [+0]     SequenceNumber (UInt32)
+#   [+4]     RequestId (UInt32)
+#   --- Body: OpenSecureChannelRequest (NodeId = FourByte ns=0 id=446) ---
+#   [+0]     NodeId encoding: 0x01 (FourByte), ns=0, id=446 (0x01BE)
+#   [+4]     RequestHeader (simplified for None: all zeros + timestamp)
+#   [+N]     ClientProtocolVersion = 0
+#   [+N+4]   RequestType = 0 (Issue)
+#   [+N+8]   SecurityMode = 1 (None)
+#   [+N+12]  ClientNonce = -1 (empty ByteString)
+#   [+N+16]  RequestedLifetime = 3600000 (ms)
+func do_open_secure_channel() -> i64 {
+    log_append(m_opn_send);
+    memset(g_txbuf, 0, 4096);
+
+    # Message type: "OPNF"
+    store8(g_txbuf + 0, 79);   # 'O'
+    store8(g_txbuf + 1, 80);   # 'P'
+    store8(g_txbuf + 2, 78);   # 'N'
+    store8(g_txbuf + 3, 70);   # 'F'
+    # [4..7] MessageSize - fill at end
+    # [8..11] SecureChannelId = 0
+    store32(g_txbuf + 8, 0);
+
+    # Asymmetric Security Header
+    off = 12;
+    sec_len = strlen(sec_none);
+    off = ua_write_string(g_txbuf, off, sec_none, sec_len);
+    off = ua_write_empty_bytestring(g_txbuf, off);   # SenderCertificate
+    off = ua_write_empty_bytestring(g_txbuf, off);   # ReceiverCertThumbprint
+
+    # Sequence Header
+    store32(g_txbuf + off, next_seq());   # SequenceNumber
+    store32(g_txbuf + off + 4, next_req_id());  # RequestId
+    off = off + 8;
+
+    # Body: NodeId for OpenSecureChannelRequest = ns=0, id=446
+    # FourByte encoding: byte 0x01, namespace byte, id UInt16
+    store8(g_txbuf + off, 1);      # encoding = FourByte
+    store8(g_txbuf + off + 1, 0);  # namespace = 0
+    store16(g_txbuf + off + 2, 446); # id = 446
+    off = off + 4;
+
+    # RequestHeader (minimal for None security):
+    #   AuthenticationToken: NodeId encoding=0 (TwoByte, id=0 = null)
+    #   Timestamp: Int64 = 0 (server ignores for OPN)
+    #   RequestHandle: UInt32 = 1
+    #   ReturnDiagnostics: UInt32 = 0
+    #   AuditEntryId: String = -1 (null)
+    #   TimeoutHint: UInt32 = 10000
+    #   AdditionalHeader: ExtensionObject = 0x00,0x00,0x00 (null)
+    store8(g_txbuf + off, 0);   store8(g_txbuf + off + 1, 0);  # AuthToken = null NodeId (TwoByte, id=0)
+    off = off + 2;
+    store64(g_txbuf + off, 0);   # Timestamp
+    off = off + 8;
+    store32(g_txbuf + off, 1);   # RequestHandle
+    off = off + 4;
+    store32(g_txbuf + off, 0);   # ReturnDiagnostics
+    off = off + 4;
+    store32(g_txbuf + off, 0 - 1);  # AuditEntryId = null string
+    off = off + 4;
+    store32(g_txbuf + off, 10000);  # TimeoutHint
+    off = off + 4;
+    # AdditionalHeader (null ExtensionObject): TypeId=TwoByte(0) + encoding=0
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); store8(g_txbuf + off + 2, 0);
+    off = off + 3;
+
+    # OpenSecureChannelRequest body:
+    store32(g_txbuf + off, 0);          # ClientProtocolVersion = 0
+    off = off + 4;
+    store32(g_txbuf + off, 0);          # RequestType = 0 (Issue)
+    off = off + 4;
+    store32(g_txbuf + off, 1);          # SecurityMode = 1 (MessageSecurityMode_None)
+    off = off + 4;
+    store32(g_txbuf + off, 0 - 1);      # ClientNonce = null ByteString (-1)
+    off = off + 4;
+    store32(g_txbuf + off, 3600000);    # RequestedLifetime = 1 hour
+    off = off + 4;
+
+    # Fill MessageSize
+    store32(g_txbuf + 4, off);
+
+    # Send
+    s = load64(g_sock);
+    sent = send(s, g_txbuf, off, 0);
+    if sent <= 0 { log_append(m_opn_fail); return 0; }
+
+    # Receive response
+    n = recv(s, g_rxbuf, 8192, 0);
+    if n <= 0 { log_append(m_opn_fail); return 0; }
+    log_num(m_recv_n, n);
+
+    # Verify it's an OPN response: 'O','P','N','F'
+    if load8(g_rxbuf + 0) != 79 { log_append(m_opn_fail); return 0; }
+    if load8(g_rxbuf + 1) != 80 { log_append(m_opn_fail); return 0; }
+    if load8(g_rxbuf + 2) != 78 { log_append(m_opn_fail); return 0; }
+
+    # Extract SecureChannelId from response at offset 8
+    sc_id = load32(g_rxbuf + 8);
+    store64(g_sc_id, sc_id);
+
+    # To find the TokenId, we need to skip the asymmetric security header.
+    # Skip: SecurityPolicyUri (Int32 len + bytes) + SenderCert(-1) + RecvThumb(-1)
+    roff = 12;
+    sp_len = load32(g_rxbuf + roff);
+    log_num(m_recv_n, sp_len);   # DEBUG: log the security policy URI length
+    roff = roff + 4 + sp_len;          # skip policy URI
+    sc_len = load32(g_rxbuf + roff);    # sender cert length (-1 = empty)
+    if sc_len > 1000000 { roff = roff + 4; }        # -1 interpreted as large unsigned = skip
+    if sc_len <= 1000000 { roff = roff + 4 + sc_len; }
+    rc_len = load32(g_rxbuf + roff);    # receiver thumbprint (-1 = empty)
+    if rc_len > 1000000 { roff = roff + 4; }
+    if rc_len <= 1000000 { roff = roff + 4 + rc_len; }
+
+    # Sequence header (skip)
+    roff = roff + 8;   # SeqNum + RequestId
+
+    # Body starts with NodeId for OpenSecureChannelResponse (id=449)
+    # Skip the NodeId (FourByte = 4 bytes)
+    roff = roff + 4;
+
+    # ResponseHeader: skip it to get to the body
+    #   ServiceResult(StatusCode=4 bytes) is at a known offset in ResponseHeader
+    #   ResponseHeader: Timestamp(8) + RequestHandle(4) + ServiceResult(4) + ServiceDiag(1min) + StringTable(4min) + AdditionalHeader(3min)
+    # Simpler approach: just read the StatusCode after the timestamp
+    # ResponseHeader layout: Timestamp(8) + RequestHandle(4) + ServiceResult(4) + ...
+    resp_timestamp = roff;
+    roff = roff + 8;    # Timestamp
+    roff = roff + 4;    # RequestHandle
+    svc_status = load32(g_rxbuf + roff);
+    roff = roff + 4;    # ServiceResult
+
+    if svc_status != 0 {
+        log_append(m_svc_err);
+        to_hex8(svc_status);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        log_append(m_opn_fail);
+        return 0;
+    }
+
+    # Skip DiagnosticInfo (encoding byte; if 0 = empty)
+    roff = roff + 1;
+    # Skip StringTable (array: Int32 count; if 0 = empty array)
+    roff = roff + 4;
+    # Skip AdditionalHeader (null ExtensionObject = 3 bytes)
+    roff = roff + 3;
+
+    # OpenSecureChannelResponse body:
+    #   ServerProtocolVersion (UInt32)
+    #   SecurityToken: ChannelId(4) + TokenId(4) + CreatedAt(8) + RevisedLifetime(4)
+    #   ServerNonce (ByteString)
+    roff = roff + 4;    # ServerProtocolVersion
+
+    # SecurityToken
+    roff = roff + 4;    # ChannelId (same as sc_id)
+    token_id = load32(g_rxbuf + roff);
+    store64(g_sc_token, token_id);
+    roff = roff + 4;    # TokenId
+    roff = roff + 8;    # CreatedAt
+    roff = roff + 4;    # RevisedLifetime
+
+    log_num(m_opn_ok, sc_id);
+    log_num(m_opn_tok, token_id);
+    return 1;
+}
+
+# ============================================================================
+# OPC UA PHASE 2.5: GetEndpoints (required by many servers before CreateSession)
+# ============================================================================
+
+func do_get_endpoints() -> i64 {
+    log_append(m_gep_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for GetEndpointsRequest Binary Encoding = ns=0, id=428
+    store8(g_txbuf + off, 1);       # FourByte
+    store8(g_txbuf + off + 1, 0);   # ns=0
+    store16(g_txbuf + off + 2, 428);
+    off = off + 4;
+
+    # RequestHeader (auth token = null since no session yet)
+    off = write_request_header(g_txbuf, off);
+
+    # GetEndpointsRequest body:
+    #   EndpointUrl: String (the URL we connected to)
+    url_len = strlen(g_urlbuf);
+    off = ua_write_string(g_txbuf, off, g_urlbuf, url_len);
+    #   LocaleIds: array of String = null (-1)
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #   ProfileUris: array of String = null (-1)
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_gep_fail); return 0; }
+
+    # GetEndpointsResponse body:
+    #   Endpoints: array of EndpointDescription
+    #   We just need to read the array count to confirm it worked
+    ep_count = load32(g_rxbuf + roff);
+    log_num(m_gep_ok, ep_count);
+
+    return 1;
+}
+
+# ============================================================================
+# OPC UA PHASE 3: CreateSession + ActivateSession
+# ============================================================================
+
+# Build the MSG message header + symmetric security header
+# Returns offset after the headers (where body starts)
+func msg_header_start(sc_id: i64, token_id: i64) -> i64 {
+    memset(g_txbuf, 0, 4096);
+    # "MSGF"
+    store8(g_txbuf + 0, 77);   # 'M'
+    store8(g_txbuf + 1, 83);   # 'S'
+    store8(g_txbuf + 2, 71);   # 'G'
+    store8(g_txbuf + 3, 70);   # 'F'
+    # [4..7] MessageSize - fill later
+    # [8..11] SecureChannelId
+    store32(g_txbuf + 8, sc_id);
+    # Symmetric Security Header: TokenId
+    store32(g_txbuf + 12, token_id);
+    # Sequence Header
+    store32(g_txbuf + 16, next_seq());
+    store32(g_txbuf + 20, next_req_id());
+    return 24;
+}
+
+# Write a minimal RequestHeader at buf+off using the session's AuthenticationToken
+# Returns new offset
+func write_request_header(buf: i64, off: i64) -> i64 {
+    # AuthenticationToken: echo the NodeId captured from CreateSessionResponse
+    # VERBATIM (handles numeric/GUID/opaque alike). Null (TwoByte id=0) until a
+    # session exists (OPN / GetEndpoints / CreateSession itself).
+    alen = load64(g_auth_raw_len);
+    if alen > 0 {
+        memcpy(buf + off, g_auth_raw, alen);
+        off = off + alen;
+    } else {
+        store8(buf + off, 0); store8(buf + off + 1, 0);
+        off = off + 2;
+    }
+    # Timestamp = current FILETIME (100ns intervals since 1601-01-01)
+    GetSystemTimeAsFileTime(g_filetime);
+    store32(buf + off, load32(g_filetime));
+    store32(buf + off + 4, load32(g_filetime + 4));
+    off = off + 8;
+    # RequestHandle
+    store32(buf + off, load64(g_req_id));
+    off = off + 4;
+    # ReturnDiagnostics = 0
+    store32(buf + off, 0);
+    off = off + 4;
+    # AuditEntryId = null string
+    store32(buf + off, 0 - 1);
+    off = off + 4;
+    # TimeoutHint = 10000
+    store32(buf + off, 10000);
+    off = off + 4;
+    # AdditionalHeader = null ExtensionObject
+    store8(buf + off, 0); store8(buf + off + 1, 0); store8(buf + off + 2, 0);
+    off = off + 3;
+    return off;
+}
+
+# Send a MSG, receive response, check service status.
+# Returns offset to the start of the response body (after ResponseHeader) or 0 on failure.
+func msg_send_recv(msg_size: i64) -> i64 {
+    store32(g_txbuf + 4, msg_size);
+    s = load64(g_sock);
+    sent = send(s, g_txbuf, msg_size, 0);
+    if sent <= 0 { return 0; }
+
+    n = recv(s, g_rxbuf, 8192, 0);
+    if n <= 0 { return 0; }
+
+    # Verify MSG response
+    if load8(g_rxbuf + 0) != 77 { return 0; }  # 'M'
+    if load8(g_rxbuf + 1) != 83 { return 0; }  # 'S'
+    if load8(g_rxbuf + 2) != 71 { return 0; }  # 'G'
+
+    # Skip to body: after header(8) + SecureChannelId(4) + TokenId(4) + SeqNum(4) + ReqId(4) = 24
+    roff = 24;
+
+    # Skip response NodeId (FourByte = 4 bytes)
+    roff = roff + 4;
+
+    # ResponseHeader: Timestamp(8) + RequestHandle(4) + ServiceResult(4)
+    roff = roff + 8;   # Timestamp
+    roff = roff + 4;   # RequestHandle
+    svc_status = load32(g_rxbuf + roff);
+    roff = roff + 4;
+
+    if svc_status != 0 {
+        log_append(m_svc_err);
+        to_hex8(svc_status);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        return 0;
+    }
+
+    # Skip rest of ResponseHeader: DiagnosticInfo(1) + StringTable(4) + AdditionalHeader(3)
+    roff = roff + 1 + 4 + 3;
+
+    return roff;
+}
+
+func do_create_session() -> i64 {
+    log_append(m_cs_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for CreateSessionRequest Binary Encoding = ns=0, id=461
+    # (461 = CreateSessionRequest_Encoding_DefaultBinary; 463 is the RESPONSE's
+    #  XML encoding -> server rejects it with BadServiceUnsupported 0x800B0000)
+    store8(g_txbuf + off, 1);       # FourByte
+    store8(g_txbuf + off + 1, 0);   # ns=0
+    store16(g_txbuf + off + 2, 461);
+    off = off + 4;
+
+    # RequestHeader (auth token = null since no session yet)
+    off = write_request_header(g_txbuf, off);
+
+    # CreateSessionRequest body:
+    #   ClientDescription (ApplicationDescription):
+    #     ApplicationUri: String
+    off = ua_write_string(g_txbuf, off, cs_app_uri, strlen(cs_app_uri));
+    #     ProductUri: String = null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #     ApplicationName (LocalizedText): encoding=0x03 (has locale + text)
+    store8(g_txbuf + off, 3); off = off + 1;
+    # locale = "en" (2 bytes)
+    store32(g_txbuf + off, 2); off = off + 4;
+    store8(g_txbuf + off, 101); store8(g_txbuf + off + 1, 110); off = off + 2;
+    # text
+    off = ua_write_string(g_txbuf, off, cs_app_name, strlen(cs_app_name));
+    #     ApplicationType: UInt32 = 1 (Client)
+    store32(g_txbuf + off, 1); off = off + 4;
+    #     GatewayServerUri: String = null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #     DiscoveryProfileUri: String = null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #     DiscoveryUrls: array of String (count=0)
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+
+    #   ServerUri: String = null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #   EndpointUrl: String (the endpoint we connected to)
+    url_len = strlen(g_urlbuf);
+    off = ua_write_string(g_txbuf, off, g_urlbuf, url_len);
+    #   SessionName: String
+    off = ua_write_string(g_txbuf, off, cs_sess_name, strlen(cs_sess_name));
+    #   ClientNonce: ByteString = 32 bytes of pseudo-random data
+    #   (Some servers require a non-empty nonce even for None security)
+    store32(g_txbuf + off, 32); off = off + 4;
+    # Fill with GetTickCount-derived pseudo-random bytes
+    tick = GetTickCount();
+    i = 0;
+    while i < 32 {
+        tick = tick * 1103515245 + 12345;
+        store8(g_txbuf + off + i, band(shr(tick, 16), 255));
+        i = i + 1;
+    }
+    off = off + 32;
+    #   ClientCertificate: ByteString = -1
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #   RequestedSessionTimeout: Double = 0.0 (let server decide)
+    store32(g_txbuf + off, 0);
+    store32(g_txbuf + off + 4, 0);
+    off = off + 8;
+    #   MaxResponseMessageSize: UInt32 = 0 (no limit)
+    store32(g_txbuf + off, 0); off = off + 4;
+
+    # Send + receive
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_cs_fail); return 0; }
+
+    # CreateSessionResponse body:
+    #   SessionId: NodeId
+    #   AuthenticationToken: NodeId
+    #   RevisedSessionTimeout: Double
+    #   ServerNonce: ByteString
+    #   ServerCertificate: ByteString
+    #   ServerEndpoints: array (skip)
+    #   ...
+
+    # DEBUG: show where the body parse begins and the first encoding bytes
+    log_num(m_dbg_roff, roff);
+    log_num(m_dbg_enc, load8(g_rxbuf + roff));
+
+    # Parse SessionId (NodeId) - read encoding byte
+    enc = load8(g_rxbuf + roff);
+    sid_val = 0;
+    if enc == 0 { sid_val = load8(g_rxbuf + roff + 1); roff = roff + 2; }          # TwoByte
+    if enc == 1 { sid_val = load16(g_rxbuf + roff + 2); roff = roff + 4; }         # FourByte
+    if enc == 2 { sid_val = load32(g_rxbuf + roff + 3); roff = roff + 7; }         # Numeric (ns=u16@+1, id=u32@+3)
+    if enc == 3 { roff = roff + 2; sid_val = 0; }                                   # String (skip namespace+skip)
+    if enc == 4 { roff = roff + 19; sid_val = 0; }                                  # GUID (1+2+16)
+    store64(g_session_id, sid_val);
+
+    # Parse AuthenticationToken (NodeId) - CAPTURE RAW BYTES to echo verbatim.
+    # Token length by encoding: TwoByte=2, FourByte=4, Numeric=7, GUID=19,
+    # String/ByteString=7+len. This server uses a GUID (enc=4); the old code
+    # zeroed it -> null token -> BadSessionIdInvalid 0x80250000.
+    log_num(m_dbg_aenc, load8(g_rxbuf + roff));
+    enc2 = load8(g_rxbuf + roff);
+    tlen = 2;
+    if enc2 == 1 { tlen = 4; }
+    if enc2 == 2 { tlen = 7; }
+    if enc2 == 4 { tlen = 19; }
+    if enc2 == 3 { tlen = 7 + load32(g_rxbuf + roff + 3); }
+    if enc2 == 5 { tlen = 7 + load32(g_rxbuf + roff + 3); }
+    if tlen > 64 { tlen = 64; }                  # clamp to g_auth_raw size
+    memcpy(g_auth_raw, g_rxbuf + roff, tlen);
+    store64(g_auth_raw_len, tlen);
+    roff = roff + tlen;
+
+    log_num(m_cs_ok, sid_val);
+    return 1;
+}
+
+func do_activate_session() -> i64 {
+    log_append(m_as_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for ActivateSessionRequest Binary Encoding = ns=0, id=467
+    # (467 = ActivateSessionRequest_Encoding_DefaultBinary; 469 is the RESPONSE's
+    #  XML encoding -> same BadServiceUnsupported class of bug as CreateSession)
+    store8(g_txbuf + off, 1);       # FourByte
+    store8(g_txbuf + off + 1, 0);
+    store16(g_txbuf + off + 2, 467);
+    off = off + 4;
+
+    # RequestHeader (now with the auth token from CreateSession)
+    off = write_request_header(g_txbuf, off);
+
+    # ActivateSessionRequest body:
+    #   ClientSignature (SignatureData): Algorithm=null(-1) + Signature=null(-1)
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # Algorithm
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # Signature
+    #   ClientSoftwareCertificates: array count=0
+    store32(g_txbuf + off, 0); off = off + 4;
+    #   LocaleIds: array of String, count=1 ["en"]
+    store32(g_txbuf + off, 1); off = off + 4;       # array count
+    store32(g_txbuf + off, 2); off = off + 4;       # "en" length
+    store8(g_txbuf + off, 101); store8(g_txbuf + off + 1, 110); off = off + 2;  # "en"
+    #   UserIdentityToken: ExtensionObject with AnonymousIdentityToken (id=321)
+    #     TypeId: FourByte NodeId ns=0 id=321
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0);
+    store16(g_txbuf + off + 2, 321);
+    off = off + 4;
+    #     Encoding: 0x01 (has binary body)
+    store8(g_txbuf + off, 1); off = off + 1;
+    #     Body length: 4+N (AnonymousIdentityToken just has PolicyId string)
+    #     AnonymousIdentityToken: PolicyId = null string (-1) -> body = 4 bytes
+    store32(g_txbuf + off, 4); off = off + 4;    # body length
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # PolicyId = null
+    #   UserTokenSignature (SignatureData): Algorithm=null + Signature=null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_as_fail); return 0; }
+
+    # ActivateSessionResponse: we just need to confirm status=Good (already checked)
+    log_append(m_as_ok);
+    return 1;
+}
+
+# ============================================================================
+# CONNECTION LOGIC
+# ============================================================================
+
+func do_connect() -> i64 {
+    # Already connected?
+    if load64(g_sock) != 0 { return 0; }
+
+    # Get endpoint URL from the edit control
+    hwnd_ep = load64(g_eped);
+    SendMessageA(hwnd_ep, 13, 511, g_urlbuf);   # WM_GETTEXT
+
+    log_append(m_conn_to);
+    log_append(g_urlbuf);
+    log_append(m_dots);
+
+    # Parse the URL
+    if parse_endpoint(g_urlbuf) == 0 {
+        log_append(m_err_parse);
+        return 0;
+    }
+
+    # Resolve IP
+    ip = resolve_ipv4(g_host);
+    if ip == 0 {
+        log_append(m_err_parse);
+        return 0;
+    }
+
+    port = load64(g_port);
+    log_num(m_port_is, port);
+
+    # Create socket + connect
+    s = socket(2, 1, 6);   # AF_INET, SOCK_STREAM, IPPROTO_TCP
+    if s == 0 - 1 {
+        log_append(m_err_wsa);
+        return 0;
+    }
+
+    store16(g_addr + 0, 2);              # AF_INET
+    store16(g_addr + 2, htons(port));    # port (network byte order)
+    store32(g_addr + 4, ip);             # IP (already network order from resolve)
+    store64(g_addr + 8, 0);
+
+    rc = connect(s, g_addr, 16);
+    if rc != 0 {
+        log_append(m_err_conn);
+        closesocket(s);
+        return 0;
+    }
+
+    # Build & send HELLO
+    log_append(m_hello);
+    hel_size = build_hello(g_urlbuf);
+    sent = send(s, g_hel, hel_size, 0);
+    if sent <= 0 {
+        log_append(m_err_hel);
+        closesocket(s);
+        return 0;
+    }
+
+    # Receive response
+    n = recv(s, g_rxbuf, 8192, 0);
+    if n <= 0 {
+        log_append(m_err_recv);
+        closesocket(s);
+        return 0;
+    }
+
+    # Check if it's an ERR response
+    if check_err_response() == 1 {
+        closesocket(s);
+        return 0;
+    }
+
+    # Check if it's a valid ACK
+    if parse_ack() == 0 {
+        log_append(m_err_type);
+        closesocket(s);
+        return 0;
+    }
+
+    # Success - save socket
+    store64(g_sock, s);
+
+    # Initialize sequence/request counters
+    store64(g_seq_num, 0);
+    store64(g_req_id, 0);
+    store64(g_auth_token, 0);
+    store64(g_auth_raw_len, 0);
+
+    # Phase 2: OpenSecureChannel
+    if do_open_secure_channel() == 0 {
+        closesocket(s);
+        store64(g_sock, 0);
+        return 0;
+    }
+
+    # Phase 2.5: GetEndpoints (required by many servers)
+    if do_get_endpoints() == 0 {
+        closesocket(s);
+        store64(g_sock, 0);
+        return 0;
+    }
+
+    # Phase 3: CreateSession + ActivateSession
+    if do_create_session() == 0 {
+        closesocket(s);
+        store64(g_sock, 0);
+        return 0;
+    }
+    if do_activate_session() == 0 {
+        closesocket(s);
+        store64(g_sock, 0);
+        return 0;
+    }
+
+    # Update status bar
+    w = str_copy(g_statbuf, m_st_conn);
+    str_copy(w, g_urlbuf);
+    SendMessageA(load64(g_status), 12, 0, g_statbuf);   # WM_SETTEXT
+
+    return 1;
+}
+
+func do_disconnect() -> i64 {
+    s = load64(g_sock);
+    if s == 0 { return 0; }
+    closesocket(s);
+    store64(g_sock, 0);
+    log_append(m_disc);
+    SendMessageA(load64(g_status), 12, 0, m_st_disc);
+    return 0;
+}
+
+# ============================================================================
+# OPC UA PHASE 4: Browse
+# ============================================================================
+
+# Helper: get variant type name string pointer
+func get_type_name(vtype: i64) -> i64 {
+    if vtype == 1 { return tn_bool; }
+    if vtype == 2 { return tn_sbyte; }
+    if vtype == 3 { return tn_byte; }
+    if vtype == 4 { return tn_i16; }
+    if vtype == 5 { return tn_u16; }
+    if vtype == 6 { return tn_i32; }
+    if vtype == 7 { return tn_u32; }
+    if vtype == 8 { return tn_i64; }
+    if vtype == 9 { return tn_u64; }
+    if vtype == 10 { return tn_float; }
+    if vtype == 11 { return tn_dbl; }
+    if vtype == 12 { return tn_str; }
+    if vtype == 13 { return tn_dt; }
+    return tn_unk;
+}
+
+# ---- IEEE-754 Float decoder (32-bit -> string with 2 decimal places) ----
+func decode_float32(buf: i64, raw: i64) -> i64 {
+    sign = band(shr(raw, 31), 1);
+    exp = band(shr(raw, 23), 0xFF);
+    mant = band(raw, 0x7FFFFF);
+
+    w = buf;
+    # Zero
+    if exp == 0 {
+        if mant == 0 {
+            if sign == 1 { store8(w, 45); w = w + 1; }
+            store8(w, 48); store8(w+1, 46); store8(w+2, 48); store8(w+3, 48); store8(w+4, 0);
+            return 0;
+        }
+    }
+    # Inf/NaN
+    if exp == 255 {
+        store8(w, 73); store8(w+1, 110); store8(w+2, 102); store8(w+3, 0);
+        return 0;
+    }
+
+    # value = (8388608 + mant) * 2^(exp - 150)
+    # We want integer_part and 2 decimal digits.
+    # Strategy: compute value * 100 as integer.
+    # val100 = (8388608 + mant) * 100 * 2^(exp-150)
+    #        = (8388608 + mant) * 100 >> (150 - exp)   [if exp < 150]
+    #        = (8388608 + mant) * 100 << (exp - 150)   [if exp >= 150]
+    full_mant = 8388608 + mant;
+    val100 = full_mant * 100;
+
+    if exp >= 150 {
+        sh = exp - 150;
+        if sh < 30 { val100 = shl(val100, sh); }
+        if sh >= 30 { val100 = 999999999; }
+    }
+    if exp < 150 {
+        sh = 150 - exp;
+        if sh < 60 { val100 = shr(val100, sh); }
+        if sh >= 60 { val100 = 0; }
+    }
+
+    if sign == 1 { store8(w, 45); w = w + 1; }
+    int_part = val100 / 100;
+    dec_part = val100 % 100;
+    int_to_str(w, int_part);
+    w = w + strlen(w);
+    store8(w, 46); w = w + 1;
+    store8(w, 48 + dec_part / 10); w = w + 1;
+    store8(w, 48 + dec_part % 10); w = w + 1;
+    store8(w, 0);
+    return 0;
+}
+
+# ---- IEEE-754 Double decoder (64-bit -> string with 2 decimal places) ----
+func decode_float64(buf: i64, raw_lo: i64, raw_hi: i64) -> i64 {
+    sign = band(shr(raw_hi, 31), 1);
+    exp = band(shr(raw_hi, 20), 0x7FF);
+    mant_hi = band(raw_hi, 0xFFFFF);
+
+    w = buf;
+    if exp == 0 {
+        if mant_hi == 0 {
+            if raw_lo == 0 {
+                if sign == 1 { store8(w, 45); w = w + 1; }
+                store8(w, 48); store8(w+1, 46); store8(w+2, 48); store8(w+3, 48); store8(w+4, 0);
+                return 0;
+            }
+        }
+    }
+    if exp == 2047 {
+        store8(w, 73); store8(w+1, 110); store8(w+2, 102); store8(w+3, 0);
+        return 0;
+    }
+
+    # Double mantissa is 52 bits. We use the top 30 bits for precision.
+    # full_mant_30 = (2^20 + mant_hi) << 10 + top 10 bits of raw_lo
+    # This gives us ~30 bits of mantissa precision.
+    top_lo = shr(raw_lo, 22);   # top 10 bits of raw_lo
+    full_mant = shl(1048576 + mant_hi, 10) + top_lo;   # 30-bit mantissa
+    # effective exponent: exp - 1023 - 30 (since we took 30 mantissa bits)
+    # val100 = full_mant * 100 * 2^(exp - 1053)
+
+    val100 = full_mant * 100;
+
+    if exp >= 1053 {
+        sh = exp - 1053;
+        if sh < 30 { val100 = shl(val100, sh); }
+        if sh >= 30 { val100 = 999999999999; }
+    }
+    if exp < 1053 {
+        sh = 1053 - exp;
+        if sh < 60 { val100 = shr(val100, sh); }
+        if sh >= 60 { val100 = 0; }
+    }
+
+    if sign == 1 { store8(w, 45); w = w + 1; }
+    int_part = val100 / 100;
+    dec_part = val100 % 100;
+    int_to_str(w, int_part);
+    w = w + strlen(w);
+    store8(w, 46); w = w + 1;
+    store8(w, 48 + dec_part / 10); w = w + 1;
+    store8(w, 48 + dec_part % 10); w = w + 1;
+    store8(w, 0);
+    return 0;
+}
+
+# ---- DateTime decoder (FILETIME -> "YYYY-MM-DD HH:MM:SS") ----
+# FILETIME = 100-nanosecond intervals since 1601-01-01
+# We split the 64-bit value carefully to avoid overflow.
+func decode_datetime(buf: i64, ft_lo: i64, ft_hi: i64) -> i64 {
+    # Total seconds = (ft_hi * 2^32 + ft_lo) / 10_000_000
+    # = ft_hi * 429.4967296 + ft_lo / 10000000
+    # More precisely: ft_hi * 429 + (ft_hi * 4967296 + ft_lo) / 10000000
+    # But ft_hi * 4967296 can overflow. Use: ft_hi * 429 + ft_hi/10*4967296/1000000 + ft_lo/10000000
+    # Simpler correct approach:
+    #   seconds_from_hi = ft_hi * 429 + (ft_hi * 4967296) / 10000000
+    #   seconds_from_lo = ft_lo / 10000000
+    #   total = seconds_from_hi + seconds_from_lo
+
+    # ft_hi * 4967296 might overflow for large ft_hi, so split:
+    # ft_hi * 4967296 = ft_hi * 4967296
+    # For typical 2020s dates, ft_hi ≈ 0x01D6xxxx ≈ 30000000, * 4967296 ≈ 1.5e14 which fits i64
+    remainder_contribution = (ft_hi * 4967296 + ft_lo) / 10000000;
+    ft_sec = ft_hi * 429 + remainder_contribution;
+
+    # Subtract 1601->1970 offset (11644473600 seconds)
+    unix_sec = ft_sec - 11644473600;
+
+    # Handle time-only values (very small FILETIME = just time of day, date is 1601-01-01)
+    # If the total is negative or the year would be before 1970, just show time portion
+    show_date = 1;
+    if unix_sec < 0 {
+        # Time-only: ft_sec is seconds since midnight 1601-01-01
+        # For OPC UA Time type, the value is just time-of-day
+        day_sec = ft_sec % 86400;
+        if day_sec < 0 { day_sec = 0; }
+        hours = day_sec / 3600;
+        mins = (day_sec % 3600) / 60;
+        secs = day_sec % 60;
+        w = buf;
+        if hours < 10 { store8(w, 48); w = w + 1; }
+        int_to_str(g_numbuf, hours); w = str_copy(w, g_numbuf);
+        store8(w, 58); w = w + 1;
+        if mins < 10 { store8(w, 48); w = w + 1; }
+        int_to_str(g_numbuf, mins); w = str_copy(w, g_numbuf);
+        store8(w, 58); w = w + 1;
+        if secs < 10 { store8(w, 48); w = w + 1; }
+        int_to_str(g_numbuf, secs); w = str_copy(w, g_numbuf);
+        store8(w, 0);
+        return 0;
+    }
+
+    # Full date+time
+    days = unix_sec / 86400;
+    rem = unix_sec % 86400;
+    hours = rem / 3600;
+    rem = rem % 3600;
+    mins = rem / 60;
+    secs = rem % 60;
+
+    year = 1970;
+    going = 1;
+    while going == 1 {
+        ydays = 365;
+        if year % 4 == 0 {
+            if year % 100 != 0 { ydays = 366; }
+            if year % 400 == 0 { ydays = 366; }
+        }
+        if days >= ydays { days = days - ydays; year = year + 1; }
+        if days < ydays { going = 0; }
+    }
+
+    # Month
+    mdays = alloc(12 * 8);
+    store64(mdays + 0, 31); store64(mdays + 8, 28); store64(mdays + 16, 31);
+    store64(mdays + 24, 30); store64(mdays + 32, 31); store64(mdays + 40, 30);
+    store64(mdays + 48, 31); store64(mdays + 56, 31); store64(mdays + 64, 30);
+    store64(mdays + 72, 31); store64(mdays + 80, 30); store64(mdays + 88, 31);
+    if year % 4 == 0 {
+        if year % 100 != 0 { store64(mdays + 8, 29); }
+        if year % 400 == 0 { store64(mdays + 8, 29); }
+    }
+
+    month = 1;
+    mi = 0;
+    while mi < 12 {
+        md = load64(mdays + mi * 8);
+        if days >= md { days = days - md; month = month + 1; mi = mi + 1; }
+        if days < md { mi = 12; }
+    }
+    day = days + 1;
+    free(mdays);
+
+    # Format: "YYYY-MM-DD HH:MM:SS"
+    w = buf;
+    int_to_str(g_numbuf, year);
+    w = str_copy(w, g_numbuf);
+    store8(w, 45); w = w + 1;
+    if month < 10 { store8(w, 48); w = w + 1; }
+    int_to_str(g_numbuf, month); w = str_copy(w, g_numbuf);
+    store8(w, 45); w = w + 1;
+    if day < 10 { store8(w, 48); w = w + 1; }
+    int_to_str(g_numbuf, day); w = str_copy(w, g_numbuf);
+    store8(w, 32); w = w + 1;
+    if hours < 10 { store8(w, 48); w = w + 1; }
+    int_to_str(g_numbuf, hours); w = str_copy(w, g_numbuf);
+    store8(w, 58); w = w + 1;
+    if mins < 10 { store8(w, 48); w = w + 1; }
+    int_to_str(g_numbuf, mins); w = str_copy(w, g_numbuf);
+    store8(w, 58); w = w + 1;
+    if secs < 10 { store8(w, 48); w = w + 1; }
+    int_to_str(g_numbuf, secs); w = str_copy(w, g_numbuf);
+    store8(w, 0);
+    return 0;
+}
+
+# Store a tag from Browse into g_tag_data for later polling
+# tag_idx = index, ns = namespace, name_ptr = display name, name_len = length
+func store_tag(tag_idx: i64, ns: i64, is_str: i64, str_id_ptr: i64, str_id_len: i64, num_id: i64, name_ptr: i64, name_len: i64) -> i64 {
+    if tag_idx >= 32 { return 0; }
+    base = tag_idx * 48;
+    store64(g_tag_data + base + 0, ns);
+    store64(g_tag_data + base + 8, is_str);
+    store64(g_tag_data + base + 16, num_id);
+    # store name in pool
+    pool_off = load64(g_tag_names_off);
+    if name_len > 0 {
+        if name_len < 128 {
+            memcpy(g_tag_names + pool_off, name_ptr, name_len);
+            store8(g_tag_names + pool_off + name_len, 0);
+        }
+    }
+    if name_len == 0 { store8(g_tag_names + pool_off, 0); }
+    store64(g_tag_data + base + 24, pool_off);
+    store64(g_tag_data + base + 32, name_len);
+    store64(g_tag_data + base + 40, 0);   # vtype = unknown until first poll
+    store64(g_tag_names_off, pool_off + name_len + 1);
+
+    # Also store the string ID for string NodeIds
+    # We reuse the name as the identifier for string nodes
+    # (since Browse gives us DisplayName which often matches the string NodeId)
+
+    return 1;
+}
+
+# Add a tag to the ListView grid
+func lv_add_tag(row: i64, name: i64) -> i64 {
+    lv = load64(g_listview);
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);       # mask = LVIF_TEXT
+    store32(g_lvitem + 4, row);     # iItem
+    store32(g_lvitem + 8, 0);       # iSubItem = 0
+    store64(g_lvitem + 24, name);   # pszText (caller must ensure NUL-terminated)
+    SendMessageA(lv, 4103, 0, g_lvitem);   # LVM_INSERTITEMA
+    return 0;
+}
+
+# Update a cell in the ListView
+func lv_set_text(row: i64, col: i64, text: i64) -> i64 {
+    lv = load64(g_listview);
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 8, col);     # iSubItem
+    store64(g_lvitem + 24, text);   # pszText
+    SendMessageA(lv, 4142, row, g_lvitem);   # LVM_SETITEMTEXTA, wParam=iItem
+    return 0;
+}
+
+# ---- Polling functions ----
+func do_start_poll() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_rd_nocon); return 0; }
+    if load64(g_tag_count) == 0 { log_append(m_poll_nobrw); return 0; }
+    # Read interval from edit
+    SendMessageA(load64(g_interval_ed), 13, 15, g_interval_buf);
+    interval = str_to_int(g_interval_buf);
+    if interval < 100 { interval = 100; }
+    if interval > 60000 { interval = 60000; }
+    store64(g_polling, 1);
+    SetTimer(load64(g_hwnd), ID_TIMER_POLL, interval, 0);
+    log_append(m_poll_on);
+    int_to_str(g_numbuf, interval);
+    log_append(g_numbuf);
+    log_append(m_poll_on2);
+    return 0;
+}
+
+func do_stop_poll() -> i64 {
+    store64(g_polling, 0);
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+    log_append(m_poll_off);
+    return 0;
+}
+
+# Read a single tag by index and update the ListView cell
+func poll_read_tag(tag_idx: i64) -> i64 {
+    if load64(g_sock) == 0 { return 0; }
+    base = tag_idx * 48;
+    rd_ns = load64(g_tag_data + base + 0);
+    is_str_tag = load64(g_tag_data + base + 8);
+    num_id = load64(g_tag_data + base + 16);
+    name_off = load64(g_tag_data + base + 24);
+    name_len = load64(g_tag_data + base + 32);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = msg_header_start(sc_id, token_id);
+
+    # ReadRequest NodeId = 631
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 631);
+    off = off + 4;
+    off = write_request_header(g_txbuf, off);
+
+    # MaxAge=0, TimestampsToReturn=2, count=1
+    store32(g_txbuf + off, 0); store32(g_txbuf + off + 4, 0); off = off + 8;
+    store32(g_txbuf + off, 2); off = off + 4;
+    store32(g_txbuf + off, 1); off = off + 4;
+
+    # NodeId: use string encoding with the tag's display name as identifier
+    # (for this server, DisplayName = string NodeId)
+    store8(g_txbuf + off, 3);           # encoding = String
+    store16(g_txbuf + off + 1, rd_ns);  # namespace
+    store32(g_txbuf + off + 3, name_len);
+    memcpy(g_txbuf + off + 7, g_tag_names + name_off, name_len);
+    off = off + 7 + name_len;
+
+    # AttributeId=13, IndexRange=null, DataEncoding=null
+    store32(g_txbuf + off, 13); off = off + 4;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store16(g_txbuf + off, 0); off = off + 2;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { return 0; }
+
+    # Parse DataValue
+    dv_count = load32(g_rxbuf + roff); roff = roff + 4;
+    if dv_count < 1 { return 0; }
+    dv_enc = load8(g_rxbuf + roff); roff = roff + 1;
+
+    if band(dv_enc, 1) != 0 {
+        vt = load8(g_rxbuf + roff); roff = roff + 1;
+        vtype = band(vt, 0x3F);
+
+        # Decode value to string
+        memset(g_lv_txtbuf, 0, 256);
+        if vtype == 1 { bv = load8(g_rxbuf + roff); if bv != 0 { str_copy(g_lv_txtbuf, m_rd_bool_t); } if bv == 0 { str_copy(g_lv_txtbuf, m_rd_bool_f); } }
+        if vtype == 2 { int_to_str(g_lv_txtbuf, load8(g_rxbuf + roff)); }
+        if vtype == 3 { int_to_str(g_lv_txtbuf, load8(g_rxbuf + roff)); }
+        if vtype == 4 { raw16 = load16(g_rxbuf + roff); if raw16 >= 32768 { raw16 = raw16 - 65536; } int_to_str(g_lv_txtbuf, raw16); }
+        if vtype == 5 { int_to_str(g_lv_txtbuf, load16(g_rxbuf + roff)); }
+        if vtype == 6 { raw32 = load32(g_rxbuf + roff); if raw32 >= 2147483648 { raw32 = raw32 - 4294967296; } int_to_str(g_lv_txtbuf, raw32); }
+        if vtype == 7 { int_to_str(g_lv_txtbuf, load32(g_rxbuf + roff)); }
+        if vtype == 8 { int_to_str(g_lv_txtbuf, load64(g_rxbuf + roff)); }
+        if vtype == 9 { int_to_str(g_lv_txtbuf, load64(g_rxbuf + roff)); }
+        if vtype == 12 {
+            slen = load32(g_rxbuf + roff); roff = roff + 4;
+            if slen > 0 { if slen < 200 { memcpy(g_lv_txtbuf, g_rxbuf + roff, slen); store8(g_lv_txtbuf + slen, 0); } }
+        }
+        if vtype == 10 { decode_float32(g_lv_txtbuf, load32(g_rxbuf + roff)); }
+        if vtype == 11 { decode_float64(g_lv_txtbuf, load32(g_rxbuf + roff), load32(g_rxbuf + roff + 4)); }
+        if vtype == 13 { decode_datetime(g_lv_txtbuf, load32(g_rxbuf + roff), load32(g_rxbuf + roff + 4)); }
+
+        # Update ListView: col 1 = value, col 2 = type
+        lv_set_text(tag_idx, 1, g_lv_txtbuf);
+        lv_set_text(tag_idx, 2, get_type_name(vtype));
+        # Store vtype for type-aware writes
+        store64(g_tag_data + tag_idx * 48 + 40, vtype);
+    }
+    return 1;
+}
+
+func do_poll_tick() -> i64 {
+    if load64(g_sock) == 0 { do_stop_poll(); return 0; }
+    n = load64(g_tag_count);
+    fail_count = 0;
+    i = 0;
+    while i < n {
+        r = poll_read_tag(i);
+        if r == 0 { fail_count = fail_count + 1; }
+        i = i + 1;
+    }
+    # If ALL reads failed, the connection is probably dead
+    if fail_count == n {
+        log_append(m_poll_err);
+        do_stop_poll();
+        do_disconnect();
+    }
+    return 0;
+}
+
+# Navigate back one level in the browse tree
+func do_back() -> i64 {
+    depth = load64(g_browse_depth);
+    if depth == 0 { return 0; }
+    depth = depth - 1;
+    store64(g_browse_depth, depth);
+    if depth == 0 {
+        store64(g_browse_cur_id, 85);   # back to Objects folder
+    } else {
+        store64(g_browse_cur_id, load64(g_browse_stack + (depth - 1) * 8));
+    }
+    do_browse();
+    return 0;
+}
+
+# Browse into the selected ListView item (double-click handler)
+func do_browse_into() -> i64 {
+    if load64(g_sock) == 0 { return 0; }
+    # Get selected item index from ListView
+    lv = load64(g_listview);
+    sel = SendMessageA(lv, 4108, 0 - 1, 2);   # LVM_GETNEXTITEM(-1, LVNI_SELECTED)
+    if sel < 0 { return 0; }
+    if sel >= 32 { return 0; }
+
+    # Get the node's numeric ID from our stored tag data
+    base = sel * 48;
+    node_id = load64(g_tag_data + base + 16);   # num_id field
+    if node_id == 0 { return 0; }   # can't browse into a string-only node
+
+    log_append(m_brw_into);
+
+    # Push current node onto the browse stack
+    depth = load64(g_browse_depth);
+    if depth < 8 {
+        store64(g_browse_stack + depth * 8, load64(g_browse_cur_id));
+        store64(g_browse_depth, depth + 1);
+    }
+
+    # Set new browse target and browse
+    store64(g_browse_cur_id, node_id);
+    do_browse();
+    return 0;
+}
+
+# Write a value to the selected tag
+func do_write() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_rd_nocon); return 0; }
+
+    # Get selected item
+    lv = load64(g_listview);
+    sel = SendMessageA(lv, 4108, 0 - 1, 2);   # LVM_GETNEXTITEM(-1, LVNI_SELECTED)
+    if sel < 0 { log_append(m_wr_nosel); return 0; }
+    if sel >= 32 { return 0; }
+
+    # Get the tag info
+    base = sel * 48;
+    rd_ns = load64(g_tag_data + base + 0);
+    name_off = load64(g_tag_data + base + 24);
+    name_len = load64(g_tag_data + base + 32);
+
+    # Get the write value text
+    SendMessageA(load64(g_write_ed), 13, 127, g_write_buf);
+    write_val = str_to_int(g_write_buf);
+
+    # Parse fractional part for float/double writes (e.g. "13.6" -> int=13, frac=6, frac_div=10)
+    write_frac = 0;
+    write_frac_div = 1;
+    fp = g_write_buf;
+    while load8(fp) != 0 {
+        if load8(fp) == 46 {   # '.'
+            fp = fp + 1;
+            while load8(fp) != 0 {
+                c = load8(fp);
+                if c >= 48 { if c <= 57 { write_frac = write_frac * 10 + (c - 48); write_frac_div = write_frac_div * 10; } }
+                fp = fp + 1;
+            }
+        }
+        if load8(fp) != 0 { fp = fp + 1; }
+    }
+
+    log_append(m_wr_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for WriteRequest = ns=0, id=673
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 673);
+    off = off + 4;
+
+    # RequestHeader
+    off = write_request_header(g_txbuf, off);
+
+    # WriteRequest body:
+    #   NodesToWrite: Array of WriteValue (count=1)
+    store32(g_txbuf + off, 1); off = off + 4;
+
+    #   WriteValue[0]:
+    #     NodeId: String encoding (ns=rd_ns, s=tag_name)
+    store8(g_txbuf + off, 3);           # encoding = String
+    store16(g_txbuf + off + 1, rd_ns);
+    store32(g_txbuf + off + 3, name_len);
+    memcpy(g_txbuf + off + 7, g_tag_names + name_off, name_len);
+    off = off + 7 + name_len;
+    #     AttributeId: UInt32 = 13 (Value)
+    store32(g_txbuf + off, 13); off = off + 4;
+    #     IndexRange: String = null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    #     Value: DataValue
+    #       EncodingMask: 0x01 (has value only)
+    store8(g_txbuf + off, 1); off = off + 1;
+    #       Variant: use the tag's stored vtype
+    tag_vtype = load64(g_tag_data + sel * 48 + 40);
+    if tag_vtype == 0 { tag_vtype = 6; }   # default to Int32 if unknown
+
+    store8(g_txbuf + off, tag_vtype); off = off + 1;
+    # Encode value based on type
+    if tag_vtype == 1 { store8(g_txbuf + off, band(write_val, 1)); off = off + 1; }         # Boolean
+    if tag_vtype == 2 { store8(g_txbuf + off, band(write_val, 0xFF)); off = off + 1; }      # SByte
+    if tag_vtype == 3 { store8(g_txbuf + off, band(write_val, 0xFF)); off = off + 1; }      # Byte
+    if tag_vtype == 4 { store16(g_txbuf + off, band(write_val, 0xFFFF)); off = off + 2; }   # Int16
+    if tag_vtype == 5 { store16(g_txbuf + off, band(write_val, 0xFFFF)); off = off + 2; }   # UInt16
+    if tag_vtype == 6 { store32(g_txbuf + off, write_val); off = off + 4; }                  # Int32
+    if tag_vtype == 7 { store32(g_txbuf + off, write_val); off = off + 4; }                  # UInt32
+    if tag_vtype == 8 { store64(g_txbuf + off, write_val); off = off + 8; }                  # Int64
+    if tag_vtype == 9 { store64(g_txbuf + off, write_val); off = off + 8; }                  # UInt64
+    if tag_vtype == 10 {
+        # Float: convert value with decimal to IEEE-754 single (32-bit)
+        # Compute scaled value: (write_val * frac_div + frac) represents value * frac_div
+        fval = write_val;
+        fsign = 0;
+        if fval < 0 { fsign = 1; fval = 0 - fval; }
+        # Scale: fval_scaled = fval * frac_div + write_frac
+        fval_scaled = fval * write_frac_div + write_frac;
+        if fval_scaled == 0 {
+            store32(g_txbuf + off, 0);
+        } else {
+            # We need to encode (fval_scaled / frac_div) as float
+            # Float mantissa is 23 bits. Shift fval_scaled to fill 24 bits then track divisor.
+            # fexp starts at 150 (bias 127 + 23 mantissa bits)
+            fexp = 150;
+            fv = fval_scaled;
+            # Scale up to at least 2^23
+            while fv < 8388608 { fv = fv * 2; fexp = fexp - 1; }
+            while fv >= 16777216 { fv = fv / 2; fexp = fexp + 1; }
+            # Now divide by frac_div to get the actual mantissa
+            fv = fv / write_frac_div;
+            # Re-normalize after division
+            while fv < 8388608 { fv = fv * 2; fexp = fexp - 1; }
+            while fv >= 16777216 { fv = fv / 2; fexp = fexp + 1; }
+            fmant = fv - 8388608;
+            if fexp < 0 { fexp = 0; }
+            if fexp > 254 { fexp = 254; }
+            raw_f = shl(fsign, 31) + shl(fexp, 23) + fmant;
+            store32(g_txbuf + off, raw_f);
+        }
+        off = off + 4;
+    }
+    if tag_vtype == 11 {
+        # Double: convert value with decimal to IEEE-754 double (64-bit)
+        dval = write_val;
+        dsign = 0;
+        if dval < 0 { dsign = 1; dval = 0 - dval; }
+        dval_scaled = dval * write_frac_div + write_frac;
+        if dval_scaled == 0 {
+            store32(g_txbuf + off, 0); store32(g_txbuf + off + 4, 0);
+        } else {
+            dexp = 1075;   # bias(1023) + 52 mantissa bits
+            dv = dval_scaled;
+            while dv < 4503599627370496 { dv = dv * 2; dexp = dexp - 1; }
+            while dv >= 9007199254740992 { dv = dv / 2; dexp = dexp + 1; }
+            # Divide by frac_div
+            dv = dv / write_frac_div;
+            # Re-normalize
+            while dv < 4503599627370496 { dv = dv * 2; dexp = dexp - 1; }
+            while dv >= 9007199254740992 { dv = dv / 2; dexp = dexp + 1; }
+            dmant = dv - 4503599627370496;
+            if dexp < 0 { dexp = 0; }
+            if dexp > 2046 { dexp = 2046; }
+            raw_hi = shl(dsign, 31) + shl(dexp, 20) + shr(dmant, 32);
+            raw_lo = band(dmant, 0xFFFFFFFF);
+            store32(g_txbuf + off, raw_lo);
+            store32(g_txbuf + off + 4, raw_hi);
+        }
+        off = off + 8;
+    }
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_wr_fail); return 0; }
+
+    # WriteResponse: Results array of StatusCodes
+    res_count = load32(g_rxbuf + roff); roff = roff + 4;
+    if res_count >= 1 {
+        wr_status = load32(g_rxbuf + roff);
+        if wr_status == 0 { log_append(m_wr_ok); }
+        if wr_status != 0 {
+            log_append(m_svc_err);
+            to_hex8(wr_status);
+            log_append(g_hexbuf);
+            log_append(crlf);
+        }
+    }
+    return 1;
+}
+
+# Browse the Objects folder (ns=0, i=85) and log the results.
+# BrowseRequest encoding ID = 527, response = 530
+func do_browse() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_brw_nocon); return 0; }
+    log_append(m_brw_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for BrowseRequest = ns=0, id=527
+    store8(g_txbuf + off, 1);       # FourByte
+    store8(g_txbuf + off + 1, 0);   # ns=0
+    store16(g_txbuf + off + 2, 527);
+    off = off + 4;
+
+    # RequestHeader
+    off = write_request_header(g_txbuf, off);
+
+    # BrowseRequest body:
+    #   View (ViewDescription): ViewId=null(2 bytes) + Timestamp=0(8) + ViewVersion=0(4)
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0);  # ViewId = null NodeId
+    off = off + 2;
+    store64(g_txbuf + off, 0);     # Timestamp
+    off = off + 8;
+    store32(g_txbuf + off, 0);     # ViewVersion
+    off = off + 4;
+
+    #   RequestedMaxReferencesPerNode: UInt32 = 0 (no limit)
+    store32(g_txbuf + off, 0);
+    off = off + 4;
+
+    #   NodesToBrowse: Array of BrowseDescription (count=1)
+    store32(g_txbuf + off, 1);     # array length = 1
+    off = off + 4;
+
+    #   BrowseDescription[0]:
+    #     NodeId = current browse node (default: ns=0, i=85 = Objects folder)
+    #     FourByte encoding: 0x01, ns=0, id from g_browse_cur_id
+    cur_node = load64(g_browse_cur_id);
+    if cur_node == 0 { cur_node = 85; }
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, cur_node);
+    off = off + 4;
+    #     BrowseDirection: UInt32 = 0 (Forward)
+    store32(g_txbuf + off, 0);
+    off = off + 4;
+    #     ReferenceTypeId: NodeId = null (browse all reference types)
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0);
+    off = off + 2;
+    #     IncludeSubtypes: Boolean = 1
+    store8(g_txbuf + off, 1);
+    off = off + 1;
+    #     NodeClassMask: UInt32 = 0 (all node classes)
+    store32(g_txbuf + off, 0);
+    off = off + 4;
+    #     ResultMask: UInt32 = 63 (all fields)
+    store32(g_txbuf + off, 63);
+    off = off + 4;
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_brw_fail); return 0; }
+
+    # BrowseResponse body:
+    #   Results: Array of BrowseResult
+    result_count = load32(g_rxbuf + roff);
+    roff = roff + 4;
+
+    if result_count < 1 { log_append(m_brw_fail); return 0; }
+
+    # BrowseResult[0]:
+    #   StatusCode: UInt32
+    brw_status = load32(g_rxbuf + roff);
+    roff = roff + 4;
+    #   ContinuationPoint: ByteString (length + bytes)
+    cp_len = load32(g_rxbuf + roff);
+    roff = roff + 4;
+    if cp_len < 1000000 { roff = roff + cp_len; }
+    #   References: Array of ReferenceDescription
+    ref_count = load32(g_rxbuf + roff);
+    roff = roff + 4;
+
+    log_num(m_brw_ok, ref_count);
+
+    # Reset tag storage
+    store64(g_tag_count, 0);
+    store64(g_tag_names_off, 0);
+    # Clear ListView
+    SendMessageA(load64(g_listview), 4105, 0, 0);   # LVM_DELETEALLITEMS
+
+    # Parse each ReferenceDescription and log the DisplayName
+    ri = 0;
+    while ri < ref_count {
+        # ReferenceDescription:
+        #   ReferenceTypeId: NodeId (variable length)
+        #   IsForward: Boolean (1 byte)
+        #   NodeId (ExpandedNodeId): encoding byte + data
+        #   BrowseName: QualifiedName (ns UInt16 + String)
+        #   DisplayName: LocalizedText (encoding byte + optional locale + text)
+        #   NodeClass: UInt32
+        #   TypeDefinition: ExpandedNodeId
+
+        # Skip ReferenceTypeId (NodeId)
+        enc_r = load8(g_rxbuf + roff);
+        if enc_r == 0 { roff = roff + 2; }
+        if enc_r == 1 { roff = roff + 4; }
+        if enc_r == 2 { roff = roff + 7; }
+        if enc_r == 3 { slen3 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen3; }
+        if enc_r == 4 { roff = roff + 19; }
+
+        # IsForward: Boolean
+        roff = roff + 1;
+
+        # NodeId (ExpandedNodeId): has extra encoding bits
+        # ExpandedNodeId encoding: low 4 bits = NodeId type, bit 7 = has namespace URI, bit 6 = has server index
+        exp_enc = load8(g_rxbuf + roff);
+        nid_type = band(exp_enc, 0x0F);
+        ref_node_id = 0;
+        if nid_type == 0 { ref_node_id = load8(g_rxbuf + roff + 1); roff = roff + 2; }
+        if nid_type == 1 { ref_node_id = load16(g_rxbuf + roff + 2); roff = roff + 4; }
+        if nid_type == 2 { ref_node_id = load32(g_rxbuf + roff + 3); roff = roff + 7; }
+        if nid_type == 3 {
+            slen4 = load32(g_rxbuf + roff + 3);
+            roff = roff + 7 + slen4;
+        }
+        if nid_type == 4 { roff = roff + 19; }
+        if nid_type == 5 { slen5 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen5; }
+        # namespace URI (if bit 7 set)
+        if band(exp_enc, 0x80) != 0 {
+            nsuri_len = load32(g_rxbuf + roff);
+            roff = roff + 4;
+            if nsuri_len < 1000000 { roff = roff + nsuri_len; }
+        }
+        # server index (if bit 6 set)
+        if band(exp_enc, 0x40) != 0 { roff = roff + 4; }
+
+        # BrowseName: QualifiedName = namespace(UInt16) + name(String)
+        roff = roff + 2;   # namespace index
+        bn_len = load32(g_rxbuf + roff);
+        roff = roff + 4;
+        bn_ptr = g_rxbuf + roff;
+        if bn_len < 1000000 { roff = roff + bn_len; }
+
+        # DisplayName: LocalizedText
+        lt_enc = load8(g_rxbuf + roff);
+        roff = roff + 1;
+        # locale (if bit 0)
+        if band(lt_enc, 1) != 0 {
+            loc_len = load32(g_rxbuf + roff);
+            roff = roff + 4;
+            if loc_len < 1000000 { roff = roff + loc_len; }
+        }
+        # text (if bit 1)
+        dn_ptr = 0;
+        dn_len = 0;
+        if band(lt_enc, 2) != 0 {
+            dn_len = load32(g_rxbuf + roff);
+            roff = roff + 4;
+            dn_ptr = g_rxbuf + roff;
+            if dn_len < 1000000 { roff = roff + dn_len; }
+        }
+
+        # NodeClass: UInt32 (1=Object, 2=Variable, 4=Method, 8=ObjectType, etc.)
+        node_class = load32(g_rxbuf + roff);
+        roff = roff + 4;
+
+        # TypeDefinition: ExpandedNodeId (skip)
+        td_enc = load8(g_rxbuf + roff);
+        td_type = band(td_enc, 0x0F);
+        if td_type == 0 { roff = roff + 2; }
+        if td_type == 1 { roff = roff + 4; }
+        if td_type == 2 { roff = roff + 7; }
+        if td_type == 3 { slen6 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen6; }
+        if td_type == 4 { roff = roff + 19; }
+        if td_type == 5 { slen7 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen7; }
+        if band(td_enc, 0x80) != 0 {
+            tduri_len = load32(g_rxbuf + roff); roff = roff + 4;
+            if tduri_len < 1000000 { roff = roff + tduri_len; }
+        }
+        if band(td_enc, 0x40) != 0 { roff = roff + 4; }
+
+        # Only store Variable nodes (NodeClass == 2) in the grid
+        # Log all nodes but only add Variables to the tag list
+        log_append(m_brw_node);
+        printed = 0;
+        if dn_len > 0 {
+            if dn_len < 256 {
+                memcpy(g_logbuf, dn_ptr, dn_len);
+                store8(g_logbuf + dn_len, 0);
+                log_append(g_logbuf);
+                if node_class <= 2 {
+                    tag_idx = load64(g_tag_count);
+                    if tag_idx < 32 {
+                        store_tag(tag_idx, 1, 1, dn_ptr, dn_len, ref_node_id, dn_ptr, dn_len);
+                        pool_name_ptr = g_tag_names + load64(g_tag_data + tag_idx * 48 + 24);
+                        lv_add_tag(tag_idx, pool_name_ptr);
+                        w2 = str_copy(g_lv_txtbuf, lv_prefix);
+                        memcpy(w2, dn_ptr, dn_len);
+                        store8(w2 + dn_len, 0);
+                        lv_set_text(tag_idx, 3, g_lv_txtbuf);
+                        store64(g_tag_count, tag_idx + 1);
+                    }
+                }
+                printed = 1;
+            }
+        }
+        if printed == 0 {
+            if bn_len > 0 {
+                if bn_len < 256 {
+                    memcpy(g_logbuf, bn_ptr, bn_len);
+                    store8(g_logbuf + bn_len, 0);
+                    log_append(g_logbuf);
+                    if node_class <= 2 {
+                        tag_idx = load64(g_tag_count);
+                        if tag_idx < 32 {
+                            store_tag(tag_idx, 1, 1, bn_ptr, bn_len, ref_node_id, bn_ptr, bn_len);
+                            pool_name_ptr = g_tag_names + load64(g_tag_data + tag_idx * 48 + 24);
+                            lv_add_tag(tag_idx, pool_name_ptr);
+                            w2 = str_copy(g_lv_txtbuf, lv_prefix);
+                            memcpy(w2, bn_ptr, bn_len);
+                            store8(w2 + bn_len, 0);
+                            lv_set_text(tag_idx, 3, g_lv_txtbuf);
+                            store64(g_tag_count, tag_idx + 1);
+                        }
+                    }
+                    printed = 1;
+                }
+            }
+        }
+        log_append(crlf);
+
+        ri = ri + 1;
+    }
+
+    return 1;
+}
+
+# ============================================================================
+# OPC UA PHASE 4: Read
+# ============================================================================
+
+# Parse "ns;id" or "ns;s=name" from g_nodeid_buf
+# Sets g_rd_ns, g_rd_id (numeric), g_rd_is_string, g_rd_str_ptr, g_rd_str_len
+func parse_nodeid_input() -> i64 {
+    ns = 0;
+    id = 0;
+    p = g_nodeid_buf;
+    # parse ns (digits before ';')
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 59 { p = p + 1; break; }   # ';'
+        if c >= 48 { if c <= 57 { ns = ns * 10 + (c - 48); } }
+        p = p + 1;
+    }
+    store64(g_rd_ns_buf, ns);
+    # check if next is "s=" (string NodeId)
+    if load8(p) == 115 {       # 's'
+        if load8(p + 1) == 61 {  # '='
+            p = p + 2;
+            store64(g_rd_is_string, 1);
+            store64(g_rd_str_ptr, p);
+            store64(g_rd_str_len, strlen(p));
+            return 1;
+        }
+    }
+    # numeric id: parse digits
+    store64(g_rd_is_string, 0);
+    while load8(p) != 0 {
+        c = load8(p);
+        if c >= 48 { if c <= 57 { id = id * 10 + (c - 48); } }
+        p = p + 1;
+    }
+    store64(g_rd_id_buf, id);
+    return 1;
+}
+
+func do_read() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_rd_nocon); return 0; }
+
+    # Get the NodeId from the edit control
+    SendMessageA(load64(g_nodeid_ed), 13, 63, g_nodeid_buf);   # WM_GETTEXT
+    parse_nodeid_input();
+    rd_ns = load64(g_rd_ns_buf);
+    rd_id = load64(g_rd_id_buf);
+    is_str = load64(g_rd_is_string);
+
+    log_append(m_rd_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = msg_header_start(sc_id, token_id);
+
+    # NodeId for ReadRequest = ns=0, id=631
+    store8(g_txbuf + off, 1);       # FourByte
+    store8(g_txbuf + off + 1, 0);
+    store16(g_txbuf + off + 2, 631);
+    off = off + 4;
+
+    # RequestHeader
+    off = write_request_header(g_txbuf, off);
+
+    # ReadRequest body:
+    #   MaxAge: Double = 0.0 (return cached or fresh)
+    store32(g_txbuf + off, 0); store32(g_txbuf + off + 4, 0);
+    off = off + 8;
+    #   TimestampsToReturn: UInt32 = 2 (Both)
+    store32(g_txbuf + off, 2);
+    off = off + 4;
+    #   NodesToRead: Array of ReadValueId (count = 1)
+    store32(g_txbuf + off, 1);
+    off = off + 4;
+
+    #   ReadValueId[0]:
+    #     NodeId: depends on type
+    if is_str == 0 {
+        # Numeric: encoding=2, ns=UInt16, id=UInt32
+        store8(g_txbuf + off, 2);              # encoding = Numeric
+        store16(g_txbuf + off + 1, rd_ns);     # namespace
+        store32(g_txbuf + off + 3, rd_id);     # id
+        off = off + 7;
+    }
+    if is_str == 1 {
+        # String: encoding=3, ns=UInt16, then String (Int32 len + bytes)
+        str_ptr = load64(g_rd_str_ptr);
+        str_len = load64(g_rd_str_len);
+        store8(g_txbuf + off, 3);              # encoding = String
+        store16(g_txbuf + off + 1, rd_ns);     # namespace
+        store32(g_txbuf + off + 3, str_len);   # string length
+        memcpy(g_txbuf + off + 7, str_ptr, str_len);  # string bytes
+        off = off + 7 + str_len;
+    }
+    #     AttributeId: UInt32 = 13 (Value)
+    store32(g_txbuf + off, 13);
+    off = off + 4;
+    #     IndexRange: String = null
+    store32(g_txbuf + off, 0 - 1);
+    off = off + 4;
+    #     DataEncoding: QualifiedName = ns=0, name=null
+    store16(g_txbuf + off, 0);             # namespace
+    off = off + 2;
+    store32(g_txbuf + off, 0 - 1);         # name = null string
+    off = off + 4;
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    roff = msg_send_recv(off);
+    if roff == 0 { log_append(m_rd_fail); return 0; }
+
+    # ReadResponse body:
+    #   Results: Array of DataValue
+    dv_count = load32(g_rxbuf + roff);
+    roff = roff + 4;
+    if dv_count < 1 { log_append(m_rd_fail); return 0; }
+
+    # DataValue[0]:
+    #   EncodingMask: Byte (bit 0=has value, bit 1=has status, bit 2=has source ts, bit 3=has server ts)
+    dv_enc = load8(g_rxbuf + roff);
+    roff = roff + 1;
+
+    # Has Value? (bit 0)
+    if band(dv_enc, 1) != 0 {
+        # Variant:
+        #   EncodingByte: type id (low 6 bits = built-in type, bit 7 = array)
+        vt = load8(g_rxbuf + roff);
+        roff = roff + 1;
+        vtype = band(vt, 0x3F);   # built-in type id
+
+        log_append(m_rd_ok);
+
+        # Decode based on type
+        # 1=Boolean, 2=SByte, 3=Byte, 4=Int16, 5=UInt16, 6=Int32, 7=UInt32,
+        # 8=Int64, 9=UInt64, 10=Float, 11=Double, 12=String, 13=DateTime
+        if vtype == 1 {
+            # Boolean
+            bval = load8(g_rxbuf + roff);
+            roff = roff + 1;
+            if bval != 0 { log_append(m_rd_bool_t); }
+            if bval == 0 { log_append(m_rd_bool_f); }
+        }
+        if vtype == 2 { int_to_str(g_numbuf, load8(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 1; }   # SByte
+        if vtype == 3 { int_to_str(g_numbuf, load8(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 1; }   # Byte
+        if vtype == 4 {
+            # Int16 (sign-extend)
+            raw16 = load16(g_rxbuf + roff);
+            if raw16 >= 32768 { raw16 = raw16 - 65536; }
+            int_to_str(g_numbuf, raw16); log_append(g_numbuf); roff = roff + 2;
+        }
+        if vtype == 5 { int_to_str(g_numbuf, load16(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 2; }  # UInt16
+        if vtype == 6 {
+            # Int32 (sign-extend)
+            raw32 = load32(g_rxbuf + roff);
+            if raw32 >= 2147483648 { raw32 = raw32 - 4294967296; }
+            int_to_str(g_numbuf, raw32); log_append(g_numbuf); roff = roff + 4;
+        }
+        if vtype == 7 { int_to_str(g_numbuf, load32(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 4; }  # UInt32
+        if vtype == 8 { int_to_str(g_numbuf, load64(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 8; }  # Int64
+        if vtype == 9 { int_to_str(g_numbuf, load64(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 8; }  # UInt64
+        if vtype == 12 {
+            # String
+            slen = load32(g_rxbuf + roff);
+            roff = roff + 4;
+            if slen > 0 {
+                if slen < 256 {
+                    memcpy(g_logbuf, g_rxbuf + roff, slen);
+                    store8(g_logbuf + slen, 0);
+                    log_append(g_logbuf);
+                }
+                roff = roff + slen;
+            }
+        }
+        # Float/Double/DateTime
+        if vtype == 10 { decode_float32(g_numbuf, load32(g_rxbuf + roff)); log_append(g_numbuf); roff = roff + 4; }
+        if vtype == 11 { decode_float64(g_numbuf, load32(g_rxbuf + roff), load32(g_rxbuf + roff + 4)); log_append(g_numbuf); roff = roff + 8; }
+        if vtype == 13 { decode_datetime(g_numbuf, load32(g_rxbuf + roff), load32(g_rxbuf + roff + 4)); log_append(g_numbuf); roff = roff + 8; }
+
+        log_append(m_rd_type);
+        int_to_str(g_numbuf, vtype);
+        log_append(g_numbuf);
+        log_append(m_rd_close);
+    }
+    if band(dv_enc, 1) == 0 {
+        log_append(m_rd_fail);
+    }
+
+    return 1;
+}
+
+# ============================================================================
+# WIN32 GUI - NexusEdge Theme
+# ============================================================================
+
+# Window class registration helper
+func register_class(wndclass: ptr, clsname_arg: str, wndproc_fn: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    store32(wndclass + 0,  80);
+    store32(wndclass + 4,  3);
+    store64(wndclass + 8,  wndproc_fn);
+    store32(wndclass + 16, 0);
+    store32(wndclass + 20, 0);
+    store64(wndclass + 24, hinst);
+    store64(wndclass + 32, 0);
+    store64(wndclass + 40, cursor);
+    store64(wndclass + 48, brush);
+    store64(wndclass + 56, 0);
+    store64(wndclass + 64, clsname_arg);
+    store64(wndclass + 72, 0);
+    return RegisterClassExA(wndclass);
+}
+
+# =====================================================================
+#  GLOWBUTTON CONTROL
+# =====================================================================
+func GlowButtonWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+
+    if msg == 512 { # WM_MOUSEMOVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            new_state = bor(pressed, 1);
+            SetWindowLongA(hwnd, 0 - 21, new_state);
+            InvalidateRect(hwnd, 0, 1);
+
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+
+    if msg == 675 { # WM_MOUSELEAVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 513 { # WM_LBUTTONDOWN
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        new_state = bor(hover, 2);
+        SetWindowLongA(hwnd, 0 - 21, new_state);
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 514 { # WM_LBUTTONUP
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        l = load32(g_rect + 0);
+        t = load32(g_rect + 4);
+        r = load32(g_rect + 8);
+        b = load32(g_rect + 12);
+
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+
+        br = load64(g_brush_card);
+        if pressed == 2 {
+            br = load64(g_brush_input);
+        } else if hover == 1 {
+            br = load64(g_brush_hover);
+        }
+        old_brush = SelectObject(hdc, br);
+
+        pen = load64(g_pen_border);
+        if pressed == 2 {
+            pen = load64(g_pen_neon);
+        } else if hover == 1 {
+            pen = load64(g_pen_neon);
+        }
+        old_pen = SelectObject(hdc, pen);
+
+        RoundRect(hdc, l, t, r, b, 8, 8);
+
+        if hover == 1 {
+            SelectObject(hdc, load64(g_pen_neon));
+            RoundRect(hdc, l + 1, t + 1, r - 1, b - 1, 8, 8);
+        }
+
+        SetBkMode(hdc, 1);
+        if hover == 1 {
+            SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        } else if pressed == 2 {
+            SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        } else {
+            SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        }
+
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 128);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# =====================================================================
+#  PANEL CONTAINER (dark background, passes WM_COMMAND to parent)
+# =====================================================================
+func PanelWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 312 { # WM_CTLCOLORSTATIC
+        SetTextColor(wParam, COLOR_TEXT_PRIMARY);
+        SetBkColor(wParam, COLOR_BG_DEEP);
+        return load64(g_brush_deep);
+    }
+    if msg == 273 { # WM_COMMAND
+        parent = GetParent(hwnd);
+        SendMessageA(parent, msg, wParam, lParam);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    # WM_CREATE
+    if msg == 1 {
+        store64(g_hwnd, hwnd);
+        hinst = load64(g_hinst);
+
+        # Create Consolas font
+        store64(g_font, CreateFontA(0 - 14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 49, face_mono));
+
+        # Endpoint label
+        CreateWindowExA(0, cls_stat, lbl_ep, 0x50000000, 12, 14, 100, 20, hwnd, 0, hinst, 0);
+
+        # Endpoint edit
+        h = CreateWindowExA(512, cls_edit, def_ep, 0x50800000, 12, 36, 500, 24, hwnd, ID_EP_EDIT, hinst, 0);
+        store64(g_eped, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+
+        # Connect button (GlowButton)
+        CreateWindowExA(0, cls_glow_btn, btn_conn, 0x50000000, 520, 34, 85, 28, hwnd, ID_BTN_CONN, hinst, 0);
+
+        # Disconnect button (GlowButton)
+        CreateWindowExA(0, cls_glow_btn, btn_disc, 0x50000000, 612, 34, 90, 28, hwnd, ID_BTN_DISC, hinst, 0);
+
+        # Browse button (GlowButton)
+        CreateWindowExA(0, cls_glow_btn, btn_browse, 0x50000000, 520, 66, 90, 28, hwnd, ID_BTN_BROWSE, hinst, 0);
+
+        # Back button (GlowButton)
+        CreateWindowExA(0, cls_glow_btn, btn_back, 0x50000000, 616, 66, 60, 28, hwnd, ID_BTN_BACK, hinst, 0);
+
+        # NodeId label + edit + Read button (GlowButton)
+        CreateWindowExA(0, cls_stat, lbl_nodeid, 0x50000000, 12, 68, 150, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(512, cls_edit, def_nodeid, 0x50800000, 170, 66, 220, 24, hwnd, ID_NODEID_EDIT, hinst, 0);
+        store64(g_nodeid_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        CreateWindowExA(0, cls_glow_btn, btn_read, 0x50000000, 400, 66, 60, 28, hwnd, ID_BTN_READ, hinst, 0);
+
+        # Log label
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 12, 72, 100, 20, hwnd, 0, hinst, 0);
+
+        # Log multiline edit (read-only) - smaller now, right side
+        h = CreateWindowExA(512, cls_edit, gui_empty, 0x50A10044, 460, 94, 420, 280, hwnd, ID_LOG, hinst, 0);
+        store64(g_log, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+
+        # ListView (left side, below buttons)
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000804D, 12, 94, 440, 460, hwnd, ID_LISTVIEW, hinst, 0);
+        store64(g_listview, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        # LVS_EX_FULLROWSELECT (no gridlines - we draw our own via dark theme)
+        SendMessageA(h, 4150, 0x20, 0x20);
+
+        # Dark theme: disable visual styles then set colors
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);       # LVM_SETBKCOLOR
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);   # LVM_SETTEXTCOLOR (msg 4132 not 4129)
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);       # LVM_SETTEXTBKCOLOR
+        # Disable visual styles on the header control
+        hdr = SendMessageA(h, 4127, 0, 0);             # LVM_GETHEADER
+        SetWindowTheme(hdr, w_empty, w_empty);
+        SetWindowTheme(h, w_empty, w_empty);
+
+        # Add ListView columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+        store32(g_lvcol + 8, 140);
+        store64(g_lvcol + 16, col_name);
+        SendMessageA(h, 4123, 0, g_lvcol);
+
+        store32(g_lvcol + 8, 120);
+        store64(g_lvcol + 16, col_val);
+        store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+
+        store32(g_lvcol + 8, 70);
+        store64(g_lvcol + 16, col_type);
+        store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+
+        store32(g_lvcol + 8, 150);
+        store64(g_lvcol + 16, col_node);
+        store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+
+        # Poll buttons (right side, below log) - GlowButtons
+        CreateWindowExA(0, cls_stat, lbl_interval, 0x50000000, 460, 388, 90, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(512, cls_edit, def_interval, 0x50800000, 555, 386, 60, 24, hwnd, ID_INTERVAL_EDIT, hinst, 0);
+        store64(g_interval_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        CreateWindowExA(0, cls_glow_btn, btn_poll, 0x50000000, 625, 384, 90, 28, hwnd, ID_BTN_POLL, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 725, 384, 90, 28, hwnd, ID_BTN_STOP, hinst, 0);
+
+        # Write controls (right side, below poll)
+        CreateWindowExA(0, cls_stat, lbl_wrval, 0x50000000, 460, 424, 90, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(512, cls_edit, gui_empty, 0x50800000, 555, 422, 150, 24, hwnd, ID_WRITE_EDIT, hinst, 0);
+        store64(g_write_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        CreateWindowExA(0, cls_glow_btn, btn_write, 0x50000000, 715, 420, 70, 28, hwnd, ID_BTN_WRITE, hinst, 0);
+
+        # Status bar
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 12, 580, 870, 20, hwnd, ID_STATUS, hinst, 0);
+        store64(g_status, h);
+
+        return 0;
+    }
+
+    # WM_PAINT (draw neon accent line under title area)
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        r = load32(g_rect + 8);
+        old_pen = SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 0, 0, 0);
+        LineTo(hdc, r, 0);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    # WM_COMMAND (button clicks)
+    if msg == 273 {
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_CONN { do_connect(); }
+        if cmd_id == ID_BTN_DISC { do_disconnect(); }
+        if cmd_id == ID_BTN_BROWSE { store64(g_browse_cur_id, 85); store64(g_browse_depth, 0); do_browse(); }
+        if cmd_id == ID_BTN_READ { do_read(); }
+        if cmd_id == ID_BTN_POLL { do_start_poll(); }
+        if cmd_id == ID_BTN_STOP { do_stop_poll(); }
+        if cmd_id == ID_BTN_BACK { do_back(); }
+        if cmd_id == ID_BTN_WRITE { do_write(); }
+        return 0;
+    }
+
+    # WM_NOTIFY (double-click on ListView = browse into, + custom draw)
+    if msg == 78 {
+        code = load32(lp + 16);
+        # NM_DBLCLK = -3 (0xFFFFFFFD as unsigned 32-bit)
+        if code == 4294967293 { do_browse_into(); }
+        # NM_CUSTOMDRAW = -12 (0xFFFFFFF4)
+        if code == 0 - 12 {
+            draw_stage = load32(lp + 24);
+            if draw_stage == 1 { return 32; }         # CDDS_PREPAINT -> CDRF_NOTIFYITEMDRAW
+            if draw_stage == 65537 {                   # CDDS_ITEMPREPAINT
+                hdc2 = load64(lp + 32);
+                SetTextColor(hdc2, COLOR_TEXT_PRIMARY);
+                SetBkColor(hdc2, COLOR_BG_CARD);
+                return 2;   # CDRF_NEWFONT
+            }
+        }
+        return 0;
+    }
+
+    # WM_TIMER (polling)
+    if msg == 275 {
+        if band(wp, 0xFFFF) == ID_TIMER_POLL { do_poll_tick(); }
+        return 0;
+    }
+
+    # WM_CTLCOLORSTATIC (dark labels - NexusEdge)
+    if msg == 312 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_BG);
+        return load64(g_bg_brush);
+    }
+
+    # WM_CTLCOLOREDIT (dark edit backgrounds - NexusEdge)
+    if msg == 307 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_PANEL);
+        return load64(g_edit_brush);
+    }
+
+    # WM_ERASEBKGND
+    if msg == 20 {
+        GetClientRect(hwnd, g_rect);
+        FillRect(wp, g_rect, load64(g_bg_brush));
+        return 1;
+    }
+
+    # WM_NOTIFY - just pass through (ListView colors set via LVM messages)
+    if msg == 78 {
+        return 0;
+    }
+
+    # WM_DESTROY
+    if msg == 2 {
+        do_disconnect();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func main() -> i32 {
+    # Init Winsock
+    rc = WSAStartup(514, g_wsa);
+    if rc != 0 { return 1; }
+
+    store64(g_sock, 0);
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    # Create NexusEdge brushes and pens
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_lv_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COLOR_NEON_BLUE));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COLOR_NEON_BLUE));
+
+    # Header font
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+
+    # Init common controls (ListView)
+    store32(g_icc + 0, 8);
+    store32(g_icc + 4, 1);
+    InitCommonControlsEx(g_icc);
+
+    # Register GlowButton custom class
+    register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+
+    # Register Panel custom class
+    register_class(g_wndclass_pnl, cls_panel, &PanelWndProc, hinst, cursor, load64(g_brush_deep));
+
+    # Register main window class
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+
+    # Create main window (WS_OVERLAPPEDWINDOW)
+    hwnd = CreateWindowExA(0, clsname, title, 0x00CF0000, 100, 100, WIN_W, WIN_H, 0, 0, hinst, 0);
+
+    # Enable DWM immersive dark title bar (attribute 20 = DWMWA_USE_IMMERSIVE_DARK_MODE)
+    store32(g_dwm_val, 1);
+    DwmSetWindowAttribute(hwnd, 20, g_dwm_val, 4);
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    # Message loop
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+
+    return 0;
+}

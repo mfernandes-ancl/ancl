@@ -1,0 +1,19 @@
+# Local model stores and runtime state
+**/models/
+**/*_session.txt
+**/*_recovery*
+**/WebView2/
+**/chats/
+**/knowledge/
+
+# Common local/editor noise
+*.log
+.DS_Store
+Thumbs.db
+
+# Self-host verification scratch outputs
+**/stage2.exe
+**/anclc3.exe
+**/anclc4.exe
+**/audit_hello.exe
+**/audit_hello.asm

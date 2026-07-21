@@ -1,0 +1,171 @@
+# =====================================================================
+# canvas_document.ancl - small deterministic helpers for typed Canvas.
+# =====================================================================
+
+@CODE
+func lcd_space(c: i64) -> i64 {
+    if c == 32 { return 1; }
+    if c == 9 { return 1; }
+    if c == 10 { return 1; }
+    if c == 13 { return 1; }
+    return 0;
+}
+
+func lcd_lower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func lcd_label_eq(src: i64, a: i64, z: i64, label: i64) -> i64 {
+    i = 0;
+    while a + i < z {
+        if load8(label + i) == 0 { return 0; }
+        if lcd_lower(load8(src + a + i)) != lcd_lower(load8(label + i)) { return 0; }
+        i = i + 1;
+    }
+    if load8(label + i) != 0 { return 0; }
+    return 1;
+}
+
+func lcd_fence_label_ok(src: i64, a: i64, z: i64, kind: i64) -> i64 {
+    while a < z { if load8(src + a) == 32 { a = a + 1; } else { break; } }
+    while z > a { if load8(src + z - 1) == 32 { z = z - 1; } else { break; } }
+    if a == z { return 1; }
+    if kind == 1 {
+        if lcd_label_eq(src, a, z, "html") == 1 { return 1; }
+        if lcd_label_eq(src, a, z, "htm") == 1 { return 1; }
+    }
+    if kind == 2 { return lcd_label_eq(src, a, z, "svg"); }
+    if kind == 3 { return lcd_label_eq(src, a, z, "csv"); }
+    return 0;
+}
+
+# Remove one outer fence only when it encloses the complete typed response.
+# Inner fences and surrounding prose are never rewritten.
+func lcd_unwrap_typed_fence(src: i64, kind: i64) -> i64 {
+    if kind == 0 { return 0; }
+    n = strlen(src);
+    s = 0;
+    while s < n { if lcd_space(load8(src + s)) == 1 { s = s + 1; } else { break; } }
+    if s + 3 >= n { return 0; }
+    if load8(src + s) != 96 { return 0; }
+    if load8(src + s + 1) != 96 { return 0; }
+    if load8(src + s + 2) != 96 { return 0; }
+    line_end = s + 3;
+    while line_end < n {
+        c = load8(src + line_end);
+        if c == 10 { break; }
+        if c == 13 { break; }
+        line_end = line_end + 1;
+    }
+    if line_end >= n { return 0; }
+    if lcd_fence_label_ok(src, s + 3, line_end, kind) == 0 { return 0; }
+    content_start = line_end;
+    if load8(src + content_start) == 13 { content_start = content_start + 1; }
+    if load8(src + content_start) == 10 { content_start = content_start + 1; }
+
+    e = n;
+    while e > content_start { if lcd_space(load8(src + e - 1)) == 1 { e = e - 1; } else { break; } }
+    if e < content_start + 3 { return 0; }
+    fence = e - 3;
+    if load8(src + fence) != 96 { return 0; }
+    if load8(src + fence + 1) != 96 { return 0; }
+    if load8(src + fence + 2) != 96 { return 0; }
+    line_start = fence;
+    while line_start > content_start {
+        c = load8(src + line_start - 1);
+        if c == 10 { break; }
+        if c == 13 { break; }
+        line_start = line_start - 1;
+    }
+    i = line_start;
+    while i < fence {
+        if load8(src + i) != 32 { if load8(src + i) != 9 { return 0; } }
+        i = i + 1;
+    }
+    content_end = line_start;
+    if content_end > content_start { if load8(src + content_end - 1) == 10 { content_end = content_end - 1; } }
+    if content_end > content_start { if load8(src + content_end - 1) == 13 { content_end = content_end - 1; } }
+    i = 0;
+    while content_start + i < content_end {
+        store8(src + i, load8(src + content_start + i));
+        i = i + 1;
+    }
+    store8(src + i, 0);
+    return 1;
+}
+
+# RFC-4180-style structural validation. Quoted commas/newlines and doubled
+# quotes are accepted; bare quotes and inconsistent row widths are rejected.
+func lcd_csv_validate(src: i64, rows_out: i64, cols_out: i64) -> i64 {
+    n = strlen(src);
+    if n == 0 { return 0; }
+    i = 0;
+    if n >= 3 {
+        if load8(src) == 239 { if load8(src + 1) == 187 { if load8(src + 2) == 191 { i = 3; } } }
+    }
+    rows = 0;
+    cols = 1;
+    expected = 0;
+    in_quotes = 0;
+    at_start = 1;
+    after_quote = 0;
+    last_was_row = 0;
+    while i < n {
+        c = load8(src + i);
+        if in_quotes == 1 {
+            if c == 34 {
+                if i + 1 < n { if load8(src + i + 1) == 34 { i = i + 2; continue; } }
+                in_quotes = 0;
+                after_quote = 1;
+            }
+            i = i + 1;
+            last_was_row = 0;
+            continue;
+        }
+        if after_quote == 1 {
+            if c != 44 { if c != 10 { if c != 13 { return 0; } } }
+        }
+        if c == 34 {
+            if at_start == 0 { return 0; }
+            in_quotes = 1;
+            at_start = 0;
+            after_quote = 0;
+            last_was_row = 0;
+        } else if c == 44 {
+            cols = cols + 1;
+            at_start = 1;
+            after_quote = 0;
+            last_was_row = 0;
+        } else if c == 10 { 
+            if expected == 0 { expected = cols; } else { if cols != expected { return 0; } }
+            rows = rows + 1;
+            cols = 1;
+            at_start = 1;
+            after_quote = 0;
+            last_was_row = 1;
+        } else if c == 13 {
+            if i + 1 < n { if load8(src + i + 1) == 10 { i = i + 1; } }
+            if expected == 0 { expected = cols; } else { if cols != expected { return 0; } }
+            rows = rows + 1;
+            cols = 1;
+            at_start = 1;
+            after_quote = 0;
+            last_was_row = 1;
+        } else {
+            if after_quote == 1 { return 0; }
+            at_start = 0;
+            last_was_row = 0;
+        }
+        i = i + 1;
+    }
+    if in_quotes == 1 { return 0; }
+    if last_was_row == 0 {
+        if expected == 0 { expected = cols; } else { if cols != expected { return 0; } }
+        rows = rows + 1;
+    }
+    if rows == 0 { return 0; }
+    store64(rows_out, rows);
+    store64(cols_out, expected);
+    return 1;
+}

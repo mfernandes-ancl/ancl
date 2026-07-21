@@ -1,0 +1,47 @@
+# =====================================================================
+#  cstring.ancl - small C-string helpers for native ANCL modules.
+# =====================================================================
+
+@CODE
+
+# Copy at most cap-1 bytes, always NUL-terminate when cap > 0.
+# Returns the number of bytes copied.
+func cstr_copy_n(dst: ptr, src: str, cap: i64) -> i64 {
+    if cap <= 0 { return 0; }
+    i = 0;
+    limit = cap - 1;
+    while i < limit {
+        c = load8(src + i);
+        if c == 0 {
+            store8(dst + i, 0);
+            return i;
+        }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    store8(dst + i, 0);
+    return i;
+}
+
+# Append a quoted C-string at p, write a trailing NUL, return the new p.
+# This is a command-line helper, not a shell-escaping routine.
+func cstr_append_quoted(p: ptr, s: str) -> ptr {
+    store8(p, 34);
+    p = p + 1;
+    p = str_copy(p, s);
+    store8(p, 34);
+    p = p + 1;
+    store8(p, 0);
+    return p;
+}
+
+# Truthy for compact UI/config flags: 1, T/t, Y/y.
+func cstr_truthy(s: str) -> i64 {
+    c = load8(s);
+    if c == 49 { return 1; }
+    if c == 84 { return 1; }
+    if c == 89 { return 1; }
+    if c == 116 { return 1; }
+    if c == 121 { return 1; }
+    return 0;
+}

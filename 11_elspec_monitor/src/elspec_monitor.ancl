@@ -1,0 +1,1599 @@
+# ============================================================================
+#  elspec_monitor.ancl  -  Elspec G4430 Grid Analyzer Monitor
+#
+#  Native Modbus/TCP poller + built-in HTTP dashboard for 5 Elspec G4430
+#  grid analyzers across 2 wind farm substations.
+#
+#  Architecture:
+#   - Modbus TCP FC04 (Read Input Registers) polling engine
+#   - 5 device slots, individually enable/disable
+#   - 12 float32 registers per device (2-word big-endian IEEE 754)
+#   - Built-in HTTP/1.1 server on port 8080 serving live JSON + HTML dashboard
+#   - Configurable polling rate, unit ID per device
+#
+#  Devices:
+#   - Local site:   127.0.0.1, 127.0.0.1, 127.0.0.1
+#   - Local site: 127.0.0.1, 127.0.0.1
+#
+#  100% CRT-free PE32+, console subsystem.
+# ============================================================================
+
+import "std.ancl";
+import "win32_api.ancl";
+
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" select;             # int select(nfds, readfds, writefds, exceptfds, timeval*)
+extern "ws2_32.dll" setsockopt;         # int setsockopt(s, level, optname, optval, optlen)
+extern "ws2_32.dll" getsockopt;         # int getsockopt(s, level, optname, optval, optlen*)
+extern "ws2_32.dll" WSAGetLastError;    # int WSAGetLastError(void) -> last socket error code
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "kernel32.dll" GetConsoleWindow -> ptr;   # console HWND, to hide it after bind
+
+@DATA
+
+# ============================================================================
+# DEVICE CONFIGURATION (5 Elspec slots)
+# ============================================================================
+
+MAX_DEVICES:    i64 = 32;      # static capacity (buffers sized for this)
+NUM_REGS:       i64 = 12;
+g_num_devices:  buf = 8;       # LIVE device count (<= MAX_DEVICES), set at init/config/load
+
+# Per-device arrays, sized 32 * field-size (CRT-free static buffers, ~7 KB total)
+# Device IPs (null-terminated, 32 bytes each)
+g_dev_ips:      buf = 1024;    # 32 * 32 bytes
+
+# Device names (32 bytes each)
+g_dev_names:    buf = 1024;    # 32 * 32 bytes
+
+# Device wind farm names (32 bytes each)
+g_dev_farms:    buf = 1024;    # 32 * 32 bytes
+
+# Device config: unit_id (i64), port (i64), poll_ms (i64), enabled (i64)
+g_dev_unit_ids: buf = 256;     # 32 * 8
+g_dev_ports:    buf = 256;     # 32 * 8
+g_dev_poll_ms:  buf = 256;     # 32 * 8
+g_dev_enabled:  buf = 256;     # 32 * 8 (1=enabled, 0=disabled)
+g_dev_sockets:  buf = 256;     # 32 * 8 (active sockets, 0=disconnected)
+g_dev_connected:buf = 256;     # 32 * 8 (1=connected, 0=not)
+
+# ---- Register addresses (Elspec input register map) ----
+# 12 registers, each needs 2 words (float32 big-endian)
+# Stored as Modbus 0-based offsets (subtract 30001 from the 3xxxx address)
+g_reg_addrs:    buf = 96;      # 12 * 8 bytes (i64 per address)
+
+# Register tag names (16 bytes each)
+g_reg_names:    buf = 192;     # 12 * 16
+
+# ---- Live values: 32 devices x 12 floats, raw 32-bit IEEE 754 (4 bytes each) ----
+g_values:       buf = 1536;    # 32 * 12 * 4 bytes
+# Timestamp of last successful poll per device
+g_last_poll:    buf = 256;     # 32 * 8
+
+# ---- Per-device display SCALES (item 4) ----
+# 32 devices * 12 regs * 16-byte STRING each. Opaque to the backend (stored,
+# served, persisted verbatim; the dashboard parses & multiplies). Default "1".
+# slot(d,r) = g_dev_scales + (d * 12 + r) * 16
+g_dev_scales:   buf = 6144;    # 32 * 12 * 16
+
+# ---- Default strings ----
+ip_esq_1:       str = "127.0.0.1";
+ip_esq_2:       str = "127.0.0.1";
+ip_esq_3:       str = "127.0.0.1";
+ip_sl_1:        str = "127.0.0.1";
+ip_sl_2:        str = "127.0.0.1";
+
+nm_esq_1:       str = "Device-1";
+nm_esq_2:       str = "Device-2";
+nm_esq_3:       str = "Device-3";
+nm_sl_1:        str = "Device-4";
+nm_sl_2:        str = "Device-5";
+
+fm_esq:         str = "Local";
+fm_sl:          str = "Local";
+
+# Register tag names
+rn_mw:          str = "MW";
+rn_mvar:        str = "MVAr";
+rn_hz:          str = "Hz";
+rn_v12:         str = "V12_RMS";
+rn_v23:         str = "V23_RMS";
+rn_v31:         str = "V31_RMS";
+rn_i1:          str = "I1_RMS";
+rn_i2:          str = "I2_RMS";
+rn_i3:          str = "I3_RMS";
+rn_vavg:        str = "V_AVG";
+rn_iavg:        str = "I_AVG";
+rn_pf:          str = "PF";
+
+# ============================================================================
+# NETWORK BUFFERS
+# ============================================================================
+
+g_wsa:          buf = 512;
+g_addr:         buf = 16;
+g_poll_addr:    buf = 16;      # separate sockaddr for poller thread
+g_tx_buf:       buf = 64;
+g_rx_buf:       buf = 512;
+g_select_buf:   buf = 64;      # fd_set + timeval for non-blocking connect
+g_wfds:         buf = 32;      # write fd_set (fd_count + 1 socket) for connect timeout
+g_efds:         buf = 32;      # except fd_set (detects refused connection fast)
+g_tv:           buf = 8;       # timeval (tv_sec, tv_usec) for select
+g_soerr:        buf = 8;       # SO_ERROR out param (connect result)
+g_soerrlen:     buf = 8;       # getsockopt optlen in/out
+CONNECT_TMO_S:  i64 = 2;       # connect timeout (seconds)
+RECV_TMO_MS:    i64 = 1200;    # per-register recv timeout (ms)
+
+# ============================================================================
+# HTTP SERVER
+# ============================================================================
+
+HTTP_PORT:      i64 = 8080;
+g_http_sock:    buf = 8;       # HTTP listener socket
+g_http_saddr:   buf = 16;
+g_http_req:     buf = 4096;
+g_http_resp:    buf = 32768;   # 32KB response buffer
+g_http_hdr:     buf = 256;
+g_one:          buf = 8;
+
+# HTTP response parts
+hdr_200:        str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ";
+hdr_200_json:   str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ";
+hdr_sep:        str = "\r\n\r\n";
+dash_path:      str = "dashboard.html";
+dash_rel:       str = "showcase\\elspec_monitor\\bin\\dashboard.html";
+cfg_file:       str = "elspec_config.ini";
+ok_resp:        str = "{\"ok\":true}";
+cfg_w_ip:       str = "ip=";
+cfg_w_uid:      str = "unit_id=";
+cfg_w_poll:     str = "poll_ms=";
+cfg_w_en:       str = "enabled=";
+cfg_w_1:        str = "1";
+cfg_w_0:        str = "0";
+cfg_w_name:     str = "name=";
+cfg_w_farm:     str = "farm=";
+cfg_w_port:     str = "port=";
+cfg_num:        str = "num_devices=";
+
+# JSON keys for POST /api/config parsing (full config apply)
+jk_name:        str = "\"name\":\"";
+jk_farm:        str = "\"farm\":\"";
+jk_ip:          str = "\"ip\":\"";
+jk_uid:         str = "\"unit_id\":";
+jk_poll:        str = "\"poll_ms\":";
+jk_en:          str = "\"enabled\":";
+jk_dev:         str = "\"dev\":";
+jk_addrs:       str = "\"addrs\":";
+jk_scales:      str = "\"scales\":";
+clen_key:       str = "Content-Length:";
+
+# JSON fragments for serving register info + scales
+js_regs:        str = ",\"registers\":[";
+js_scales:      str = ",\"scales\":[";
+js_tagaddr1:    str = "{\"tag\":\"";
+js_tagaddr2:    str = "\",\"addr\":";
+
+# .ini keys for register addresses + per-device scales (CSV values)
+cfg_w_regs:     str = "reg_addrs=";
+cfg_w_scales:   str = "scales=";
+
+# ============================================================================
+# CONSOLE MESSAGES
+# ============================================================================
+
+m_boot:         str = "[elspec] Elspec G4430 Monitor v1.0\n";
+m_init:         str = "[elspec] devices initialized.\n";
+m_http_ok:      str = "[elspec] HTTP dashboard on http://localhost:8080/\n";
+m_http_fail:    str = "[elspec] HTTP bind failed.\n";
+m_poll_start:   str = "[elspec] polling started.\n";
+m_ready:        str = "[elspec] ready (idle) - press Start Polling in the dashboard.\n";
+m_watchdog:     str = "[elspec] dashboard closed - shutting down.\n";
+m_cfg_saved:    str = "[elspec] config saved.\n";
+m_conn_ok:      str = "[elspec] connected: ";
+m_conn_fail:    str = "[elspec] connect failed: ";
+m_poll_ok:      str = "[elspec] poll OK: ";
+m_poll_fail:    str = "[elspec] poll fail: ";
+m_disc:         str = "[elspec] disconnected: ";
+m_disabled:     str = "[elspec] disabled: ";
+m_err_pfx:      str = " err=";
+m_cfg_loaded:   str = "[elspec] config loaded.\n";
+m_nl:           str = "\n";
+m_sp:           str = " ";
+m_sep:          str = " | ";
+
+# ---- Scratch ----
+g_numbuf:       buf = 32;
+g_floatbuf:     buf = 32;
+g_i2s:          buf = 32;       # int_to_str scratch for float32_to_str (must NOT alias dst)
+g_logline:      buf = 256;
+g_written:      buf = 8;        # WriteFile bytes-written out param
+g_trans_id:     buf = 8;
+
+# ---- In-page log ring (mirrors the [elspec] console lines to /api/log) ----
+g_log_buf:      buf = 8192;     # recent console text (reset when full)
+g_log_len:      buf = 8;        # current length in g_log_buf
+se_open:        str = "open";
+se_url:         str = "http://localhost:8080/";
+noui_flag:      str = "noui";   # cmdline flag: skip auto-open browser + console hide (for testing)
+
+# ---- Timer ----
+g_tick_count:   buf = 8;
+g_polling_active: buf = 8;     # 0 = idle, 1 = polling active (set via /api/start)
+g_last_poll_ms: buf = 8;       # GetTickCount of last poll cycle (decoupled poll timer)
+g_last_conn_ms: buf = 8;       # GetTickCount of last reconnect attempt
+POLL_INTERVAL_MS: i64 = 1000;  # poll connected devices ~1x/sec, independent of HTTP
+CONN_INTERVAL_MS: i64 = 2000;  # one round-robin reconnect attempt every ~2s
+g_last_req_ms:  buf = 8;       # GetTickCount of the last HTTP request (UI heartbeat)
+g_client_seen:  buf = 8;       # 1 once the dashboard has connected at least once
+WATCHDOG_MS:    i64 = 12000;   # auto-shutdown if no HTTP request for this long (UI closed)
+
+@CODE
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+func store16_be(ptr: i64, val: i64) -> i64 {
+    store8(ptr + 0, band(shr(val, 8), 255));
+    store8(ptr + 1, band(val, 255));
+    return 0;
+}
+
+func load16_be(ptr: i64) -> i64 {
+    return shl(load8(ptr + 0), 8) + load8(ptr + 1);
+}
+
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return got; }
+        got = got + r;
+    }
+    return got;
+}
+
+# Receive exactly n bytes from a NON-BLOCKING socket, bounded by tmo_ms.
+# Returns bytes received (== n on success, < n on timeout/close). Never hangs:
+# recv on a non-blocking socket returns -1 (WSAEWOULDBLOCK) when no data is
+# ready, so we poll with a wall-clock deadline instead of blocking forever.
+# This is the same pattern proven in core_lib/ancl_wire (nbstat_query).
+func recv_n_timeout(s: i64, dst: i64, n: i64, tmo_ms: i64) -> i64 {
+    got = 0;
+    t0 = GetTickCount();
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r > 0 {
+            got = got + r;
+            t0 = GetTickCount();          # reset deadline on forward progress
+        } else {
+            if r == 0 { return got; }     # peer closed the connection
+            if GetTickCount() - t0 > tmo_ms { return got; }   # timed out
+            Sleep(2);
+        }
+    }
+    return got;
+}
+
+# Find `needle` in hay[start..hay_len); return index just AFTER the match, or -1.
+func find_after(hay: i64, start: i64, hay_len: i64, needle: i64) -> i64 {
+    nl = strlen(needle);
+    if nl == 0 { return 0 - 1; }
+    i = start;
+    while i + nl <= hay_len {
+        k = 0;
+        while k < nl {
+            if load8(hay + i + k) != load8(needle + k) { break; }
+            k = k + 1;
+        }
+        if k == nl { return i + nl; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+func parse_ip_to_sockaddr(host_ptr: i64, port: i64) -> i64 {
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);
+    pp = htons(port);
+    store16(g_addr + 2, pp);
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = host_ptr;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 {
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10;
+            octet = octet + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+    return 0;
+}
+
+# Append a C-string to the in-page log ring (served at /api/log) AND echo it to
+# stdout via WriteFile (harmless once the console window is hidden). The ring
+# resets when nearly full (the dashboard shows the most recent text).
+func log_msg(s: i64) -> i64 {
+    ln = 0;
+    while load8(s + ln) != 0 { ln = ln + 1; }
+    L = load64(g_log_len);
+    if L + ln >= 8000 { L = 0; }
+    j = 0;
+    while j < ln { store8(g_log_buf + L + j, load8(s + j)); j = j + 1; }
+    L = L + ln;
+    store8(g_log_buf + L, 0);
+    store64(g_log_len, L);
+    hcon = GetStdHandle(0 - 11);            # STD_OUTPUT_HANDLE
+    WriteFile(hcon, s, ln, g_written, 0);
+    return 0;
+}
+
+# Float32 to simple decimal string (integer part + 2 decimals)
+func float32_to_str(raw: i64, dst: i64) -> i64 {
+    # Extract IEEE 754 float32 components
+    sign = band(shr(raw, 31), 1);
+    exp = band(shr(raw, 23), 0xFF);
+    frac = band(raw, 0x7FFFFF);
+
+    if exp == 0 {
+        # Zero or denormal -> display as 0.00
+        if sign == 1 { store8(dst, 45); dst = dst + 1; }
+        store8(dst, 48); store8(dst + 1, 46);
+        store8(dst + 2, 48); store8(dst + 3, 48);
+        store8(dst + 4, 0);
+        return 0;
+    }
+
+    # Reconstruct value: (1 + frac/2^23) * 2^(exp-127)
+    # We multiply by 100 to get 2 decimal places, then format
+    # Use integer math: mantissa = (0x800000 | frac) = 24-bit
+    mantissa = bor(0x800000, frac);
+    e = exp - 127;
+
+    # Shift mantissa to get value * 100
+    # value * 100 = mantissa * 100 * 2^(e-23)
+    shift_amt = e - 23;
+    val100 = mantissa * 100;
+
+    if shift_amt >= 0 {
+        if shift_amt < 40 { val100 = shl(val100, shift_amt); }
+        else { val100 = 0; }
+    } else {
+        neg_shift = 0 - shift_amt;
+        if neg_shift < 40 { val100 = shr(val100, neg_shift); }
+        else { val100 = 0; }
+    }
+
+    p = dst;
+    if sign == 1 { store8(p, 45); p = p + 1; }  # '-'
+
+    int_part = val100 / 100;
+    dec_part = val100 - int_part * 100;
+
+    # Write integer part. Use a SEPARATE scratch (g_i2s), never g_floatbuf:
+    # build_json_response passes g_floatbuf as dst, so reusing it here made the
+    # scratch alias the destination. For a negative value that turned the copy
+    # below into a self-overwriting forward copy that never hit its NUL ->
+    # runaway write off the buffer -> access-violation crash.
+    int_to_str(g_i2s, int_part);
+    i = 0;
+    while load8(g_i2s + i) != 0 { store8(p + i, load8(g_i2s + i)); i = i + 1; }
+    p = p + i;
+
+    # Decimal point + 2 digits
+    store8(p, 46); p = p + 1;
+    store8(p, 48 + dec_part / 10); p = p + 1;
+    store8(p, 48 + dec_part - (dec_part / 10) * 10); p = p + 1;
+    store8(p, 0);
+    return 0;
+}
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+func init_devices() -> i64 {
+    # Device 0: Device-1
+    str_copy(g_dev_ips + 0, ip_esq_1);
+    str_copy(g_dev_names + 0, nm_esq_1);
+    str_copy(g_dev_farms + 0, fm_esq);
+    store64(g_dev_unit_ids + 0, 159);
+    store64(g_dev_ports + 0, 502);
+    store64(g_dev_poll_ms + 0, 1000);
+    store64(g_dev_enabled + 0, 0);
+
+    # Device 1: Device-2
+    str_copy(g_dev_ips + 32, ip_esq_2);
+    str_copy(g_dev_names + 32, nm_esq_2);
+    str_copy(g_dev_farms + 32, fm_esq);
+    store64(g_dev_unit_ids + 8, 159);
+    store64(g_dev_ports + 8, 502);
+    store64(g_dev_poll_ms + 8, 1000);
+    store64(g_dev_enabled + 8, 0);
+
+    # Device 2: Device-3
+    str_copy(g_dev_ips + 64, ip_esq_3);
+    str_copy(g_dev_names + 64, nm_esq_3);
+    str_copy(g_dev_farms + 64, fm_esq);
+    store64(g_dev_unit_ids + 16, 159);
+    store64(g_dev_ports + 16, 502);
+    store64(g_dev_poll_ms + 16, 1000);
+    store64(g_dev_enabled + 16, 0);
+
+    # Device 3: Local-1
+    str_copy(g_dev_ips + 96, ip_sl_1);
+    str_copy(g_dev_names + 96, nm_sl_1);
+    str_copy(g_dev_farms + 96, fm_sl);
+    store64(g_dev_unit_ids + 24, 159);
+    store64(g_dev_ports + 24, 502);
+    store64(g_dev_poll_ms + 24, 1000);
+    store64(g_dev_enabled + 24, 0);
+
+    # Device 4: Local-2
+    str_copy(g_dev_ips + 128, ip_sl_2);
+    str_copy(g_dev_names + 128, nm_sl_2);
+    str_copy(g_dev_farms + 128, fm_sl);
+    store64(g_dev_unit_ids + 32, 159);
+    store64(g_dev_ports + 32, 502);
+    store64(g_dev_poll_ms + 32, 1000);
+    store64(g_dev_enabled + 32, 0);
+
+    # Default live count = the 5 seeded devices (load_config_file may override).
+    store64(g_num_devices, 5);
+
+    # Zero sockets and connections (full capacity)
+    memset(g_dev_sockets, 0, 256);
+    memset(g_dev_connected, 0, 256);
+    memset(g_values, 0, 1536);
+    memset(g_last_poll, 0, 256);
+
+    # Register addresses: 3xxxx -> 0-based offset (subtract 30001)
+    # MW=31038 -> 1037, MVAr=31054 -> 1053, Hz=31000 -> 999
+    # V12=31110 -> 1109, V23=31112 -> 1111, V31=31114 -> 1113
+    # I1=31118 -> 1117, I2=31120 -> 1119, I3=31122 -> 1121
+    # V_AVG=31126 -> 1125, I_AVG=31128 -> 1127, PF=32156 -> 2155
+    store64(g_reg_addrs + 0, 1037);
+    store64(g_reg_addrs + 8, 1053);
+    store64(g_reg_addrs + 16, 999);
+    store64(g_reg_addrs + 24, 1109);
+    store64(g_reg_addrs + 32, 1111);
+    store64(g_reg_addrs + 40, 1113);
+    store64(g_reg_addrs + 48, 1117);
+    store64(g_reg_addrs + 56, 1119);
+    store64(g_reg_addrs + 64, 1121);
+    store64(g_reg_addrs + 72, 1125);
+    store64(g_reg_addrs + 80, 1127);
+    store64(g_reg_addrs + 88, 2155);
+
+    # Register names
+    str_copy(g_reg_names + 0, rn_mw);
+    str_copy(g_reg_names + 16, rn_mvar);
+    str_copy(g_reg_names + 32, rn_hz);
+    str_copy(g_reg_names + 48, rn_v12);
+    str_copy(g_reg_names + 64, rn_v23);
+    str_copy(g_reg_names + 80, rn_v31);
+    str_copy(g_reg_names + 96, rn_i1);
+    str_copy(g_reg_names + 112, rn_i2);
+    str_copy(g_reg_names + 128, rn_i3);
+    str_copy(g_reg_names + 144, rn_vavg);
+    str_copy(g_reg_names + 160, rn_iavg);
+    str_copy(g_reg_names + 176, rn_pf);
+
+    store64(g_trans_id, 0);
+
+    # Default every per-device scale string to "1" (32 devices * 12 regs).
+    si = 0;
+    while si < MAX_DEVICES * NUM_REGS {
+        store8(g_dev_scales + si * 16 + 0, 49);   # '1'
+        store8(g_dev_scales + si * 16 + 1, 0);
+        si = si + 1;
+    }
+    return 0;
+}
+
+# ============================================================================
+# MODBUS TCP CONNECTION & POLLING
+# ============================================================================
+
+func dev_connect(idx: i64) -> i64 {
+    ip_ptr = g_dev_ips + idx * 32;
+    port = load64(g_dev_ports + idx * 8);
+
+    s = socket(2, 1, 6);
+    if s == 0 - 1 { return 0; }
+
+    # Use poll_addr (thread-safe, separate from HTTP thread's g_addr)
+    memset(g_poll_addr, 0, 16);
+    store16(g_poll_addr + 0, 2);
+    pp = htons(port);
+    store16(g_poll_addr + 2, pp);
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = ip_ptr;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 {
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10;
+            octet = octet + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_poll_addr + 4, ip);
+
+    # ---- Non-blocking connect with a bounded timeout ----------------------
+    # Set FIONBIO=1 so connect() returns immediately instead of the OS default
+    # ~21 s blocking stall (which would freeze the HTTP dashboard). The socket
+    # is LEFT non-blocking afterwards so read_float_reg's recv_n_timeout() can
+    # never hang. Canonical flow: connect() either succeeds at once, fails at
+    # once (report WSAGetLastError), or returns WSAEWOULDBLOCK=10035 "in
+    # progress" -> wait for writability with select() then read SO_ERROR.
+    store32(g_soerr, 1);
+    ioctlsocket(s, 2147772030, g_soerr);          # FIONBIO = 0x8004667E, *arg = 1
+    crc  = connect(s, g_poll_addr, 16);
+    cerr = WSAGetLastError();
+
+    ok  = 0;
+    err = 0;
+    if crc == 0 {
+        ok = 1;                                    # connected immediately (rare, local)
+    } else {
+        if cerr == 10035 {                         # WSAEWOULDBLOCK -> in progress
+            memset(g_wfds, 0, 32); store32(g_wfds + 0, 1); store64(g_wfds + 8, s);  # writefds={s}
+            memset(g_efds, 0, 32); store32(g_efds + 0, 1); store64(g_efds + 8, s);  # exceptfds={s}
+            store32(g_tv + 0, CONNECT_TMO_S); store32(g_tv + 4, 0);
+            sel = select(0, 0, g_wfds, g_efds, g_tv);
+            if sel > 0 {
+                store32(g_soerr, 0); store32(g_soerrlen, 4);
+                getsockopt(s, 0xFFFF, 0x1007, g_soerr, g_soerrlen);   # SOL_SOCKET / SO_ERROR
+                if load32(g_soerr) == 0 { ok = 1; }
+                else { err = load32(g_soerr); }
+            } else {
+                err = 10060;                       # select timed out -> WSAETIMEDOUT
+            }
+        } else {
+            err = cerr;                            # immediate failure (e.g. 10051 no route)
+        }
+    }
+
+    if ok == 0 {
+        # Surface the real reason so the failure is no longer silent:
+        #   10061 = refused (device busy / single TCP client / port closed)
+        #   10060 = timed out (host reachable but no reply / filtered)
+        #   10051/10065 = network/host unreachable (no route)   10013 = firewall
+        log_msg(m_conn_fail);
+        log_msg(g_dev_names + idx * 32);
+        log_msg(m_err_pfx);
+        int_to_str(g_numbuf, err);
+        log_msg(g_numbuf);
+        log_msg(m_nl);
+        closesocket(s);
+        return 0;
+    }
+
+    store64(g_dev_sockets + idx * 8, s);
+    store64(g_dev_connected + idx * 8, 1);
+    return 1;
+}
+
+func dev_disconnect(idx: i64) -> i64 {
+    s = load64(g_dev_sockets + idx * 8);
+    if s != 0 { closesocket(s); }
+    store64(g_dev_sockets + idx * 8, 0);
+    store64(g_dev_connected + idx * 8, 0);
+    return 0;
+}
+
+# Read a single float32 register (2 words) via FC04.
+# On success: writes the raw 32-bit IEEE-754 value to out_ptr and returns 1.
+# On any failure (timeout / exception / short reply): returns 0, out_ptr is
+# left untouched. (The old version returned the raw value with 0==failure,
+# which was ambiguous with a real 0.0 and, worse, used recv_n(.,13) that hung
+# forever on a 9-byte Modbus exception reply. Both are fixed here.)
+func read_float_reg(sock: i64, unit_id: i64, reg_addr: i64, out_ptr: i64) -> i64 {
+    tid = load64(g_trans_id);
+    tid = tid + 1;
+    store64(g_trans_id, tid);
+
+    # Build Modbus TCP request: FC04, start=reg_addr, qty=2
+    store16_be(g_tx_buf + 0, tid);       # Transaction ID
+    store16_be(g_tx_buf + 2, 0);         # Protocol ID
+    store16_be(g_tx_buf + 4, 6);         # Length (Unit + FC + Start + Qty)
+    store8(g_tx_buf + 6, band(unit_id, 255));
+    store8(g_tx_buf + 7, 4);             # FC04 = Read Input Registers
+    store16_be(g_tx_buf + 8, reg_addr);  # Start register
+    store16_be(g_tx_buf + 10, 2);        # Quantity = 2 words
+
+    n = send(sock, g_tx_buf, 12, 0);
+    if n != 12 { return 0; }
+
+    # Read MBAP header (7) + function code (1) = 8 bytes FIRST, so we can tell
+    # a normal reply from a 9-byte exception without over-reading and hanging.
+    g = recv_n_timeout(sock, g_rx_buf, 8, RECV_TMO_MS);
+    if g < 8 { return 0; }
+
+    rx_fc = load8(g_rx_buf + 7);
+    if rx_fc >= 128 {
+        # Modbus exception (FC|0x80): 1 trailing exception-code byte. Drain it
+        # so the stream stays framed for the next register, then report fail.
+        recv_n_timeout(sock, g_rx_buf + 8, 1, RECV_TMO_MS);
+        return 0;
+    }
+
+    # Normal reply: byte-count (1) then that many data bytes.
+    g = recv_n_timeout(sock, g_rx_buf + 8, 1, RECV_TMO_MS);
+    if g < 1 { return 0; }
+    bc = load8(g_rx_buf + 8);
+    if bc < 4 {
+        if bc > 0 { recv_n_timeout(sock, g_rx_buf + 9, bc, RECV_TMO_MS); }
+        return 0;
+    }
+    g = recv_n_timeout(sock, g_rx_buf + 9, bc, RECV_TMO_MS);
+    if g < bc { return 0; }
+
+    # First register pair = float32, big-endian: [Hi-Hi][Hi-Lo][Lo-Hi][Lo-Lo]
+    b0 = load8(g_rx_buf + 9);
+    b1 = load8(g_rx_buf + 10);
+    b2 = load8(g_rx_buf + 11);
+    b3 = load8(g_rx_buf + 12);
+    raw = shl(b0, 24) + shl(b1, 16) + shl(b2, 8) + b3;
+    store32(out_ptr, raw);
+    return 1;
+}
+
+# Poll all 12 registers for a single device
+func poll_device(idx: i64) -> i64 {
+    sock = load64(g_dev_sockets + idx * 8);
+    if sock == 0 { return 0; }
+
+    unit_id = load64(g_dev_unit_ids + idx * 8);
+    val_base = g_values + idx * 48;  # 12 * 4 bytes per device
+
+    fails = 0;
+    r = 0;
+    while r < 12 {
+        reg_addr = load64(g_reg_addrs + r * 8);
+        ok = read_float_reg(sock, unit_id, reg_addr, val_base + r * 4);
+        if ok == 0 { fails = fails + 1; }   # leave the prior value in place
+        r = r + 1;
+    }
+
+    # Update timestamp
+    store64(g_last_poll + idx * 8, GetTickCount());
+
+    # If EVERY register failed, the link/protocol is dead (wrong unit id, peer
+    # gone, etc.) -> report failure so main() disconnects & retries rather than
+    # showing a frozen "ONLINE" card full of stale values.
+    if fails >= 12 { return 0; }
+    return 1;
+}
+
+# ============================================================================
+# HTTP DASHBOARD SERVER
+# ============================================================================
+
+func http_init() -> i64 {
+    srv = socket(2, 1, 6);
+    if srv == 0 - 1 { return 0; }
+
+    store16(g_http_saddr + 0, 2);
+    store16(g_http_saddr + 2, htons(HTTP_PORT));
+    store32(g_http_saddr + 4, 0);   # INADDR_ANY
+    store64(g_http_saddr + 8, 0);
+
+    rc = bind(srv, g_http_saddr, 16);
+    if rc != 0 { closesocket(srv); return 0; }
+
+    rc = listen(srv, 8);
+    if rc != 0 { closesocket(srv); return 0; }
+
+    store64(g_http_sock, srv);
+    return 1;
+}
+
+# Build JSON response with current values for all devices
+func build_json_response() -> i64 {
+    p = g_http_resp;
+
+    # Start JSON: {"polling":true/false,"devices":[
+    store8(p, 123); p = p + 1;  # {
+    p = str_copy(p, "\"polling\":");
+    if load64(g_polling_active) != 0 { p = str_copy(p, "true,"); }
+    else { p = str_copy(p, "false,"); }
+    p = str_copy(p, "\"devices\":[");
+
+    d = 0;
+    while d < load64(g_num_devices) {
+        if d > 0 { store8(p, 44); p = p + 1; }  # comma between objects
+
+        store8(p, 123); p = p + 1;  # {
+
+        # "name":"..."
+        p = str_copy(p, "\"name\":\"");
+        p = str_copy(p, g_dev_names + d * 32);
+        p = str_copy(p, "\",");
+
+        # "farm":"..."
+        p = str_copy(p, "\"farm\":\"");
+        p = str_copy(p, g_dev_farms + d * 32);
+        p = str_copy(p, "\",");
+
+        # "ip":"..."
+        p = str_copy(p, "\"ip\":\"");
+        p = str_copy(p, g_dev_ips + d * 32);
+        p = str_copy(p, "\",");
+
+        # "enabled":true/false
+        p = str_copy(p, "\"enabled\":");
+        if load64(g_dev_enabled + d * 8) != 0 { p = str_copy(p, "true,"); }
+        else { p = str_copy(p, "false,"); }
+
+        # "connected":true/false
+        p = str_copy(p, "\"connected\":");
+        if load64(g_dev_connected + d * 8) != 0 { p = str_copy(p, "true,"); }
+        else { p = str_copy(p, "false,"); }
+
+        # "values":{...}
+        p = str_copy(p, "\"values\":{");
+        val_base = g_values + d * 48;
+        r = 0;
+        while r < 12 {
+            if r > 0 { store8(p, 44); p = p + 1; }
+            store8(p, 34); p = p + 1;  # "
+            p = str_copy(p, g_reg_names + r * 16);
+            p = str_copy(p, "\":");
+            raw = load32(val_base + r * 4);
+            float32_to_str(raw, g_floatbuf);
+            p = str_copy(p, g_floatbuf);
+            r = r + 1;
+        }
+        store8(p, 125); p = p + 1;  # } close values
+
+        # ,"scales":["1","0.001",...]  (per-device display scales, opaque strings)
+        p = str_copy(p, js_scales);
+        r = 0;
+        while r < 12 {
+            if r > 0 { store8(p, 44); p = p + 1; }
+            store8(p, 34); p = p + 1;  # "
+            p = str_copy(p, g_dev_scales + (d * 12 + r) * 16);
+            store8(p, 34); p = p + 1;  # "
+            r = r + 1;
+        }
+        store8(p, 93); p = p + 1;  # ]
+
+        store8(p, 125); p = p + 1;  # } close device
+        d = d + 1;
+    }
+
+    p = str_copy(p, "]}");
+    store8(p, 0);
+    return p - g_http_resp;
+}
+
+# Serve a single HTTP request (non-blocking check)
+func http_serve_one(client: i64) -> i64 {
+    n = recv(client, g_http_req, 4095, 0);
+    if n <= 0 { closesocket(client); return 0; }
+    store8(g_http_req + n, 0);
+
+    # Detect method: GET or POST
+    is_get = 0;
+    is_post = 0;
+    if load8(g_http_req) == 71 {  # 'G'
+        if load8(g_http_req + 1) == 69 {
+            if load8(g_http_req + 2) == 84 { is_get = 1; }
+        }
+    }
+    if load8(g_http_req) == 80 {  # 'P'
+        if load8(g_http_req + 1) == 79 {
+            if load8(g_http_req + 2) == 83 {
+                if load8(g_http_req + 3) == 84 { is_post = 1; }
+            }
+        }
+    }
+
+    if is_get == 1 {
+        # Detect path after "GET "
+        # /api/data -> JSON data
+        # /api/config -> JSON config
+        # / -> HTML dashboard
+        is_api_data = 0;
+        is_api_config = 0;
+        is_api_log = 0;
+
+        if load8(g_http_req + 4) == 47 {  # '/'
+            if load8(g_http_req + 5) == 97 {  # 'a'
+                if load8(g_http_req + 6) == 112 {  # 'p'
+                    if load8(g_http_req + 7) == 105 {  # 'i'
+                        if load8(g_http_req + 8) == 47 {  # '/'
+                            if load8(g_http_req + 9) == 100 { is_api_data = 1; }   # 'd'ata
+                            if load8(g_http_req + 9) == 99 { is_api_config = 1; }  # 'c'onfig
+                            if load8(g_http_req + 9) == 108 { is_api_log = 1; }    # 'l'og
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_api_data == 1 {
+            body_len = build_json_response();
+            send_json(client, body_len);
+        } else if is_api_config == 1 {
+            body_len = build_config_json();
+            send_json(client, body_len);
+        } else if is_api_log == 1 {
+            # Serve the raw log ring buffer as text/plain-ish (dashboard reads it).
+            body_len = load64(g_log_len);
+            int_to_str(g_numbuf, body_len);
+            w = str_copy(g_http_hdr, hdr_200);
+            w = str_copy(w, g_numbuf);
+            w = str_copy(w, hdr_sep);
+            send(client, g_http_hdr, w - g_http_hdr, 0);
+            send(client, g_log_buf, body_len, 0);
+        } else {
+            body_len = load_dashboard();
+            if body_len > 0 {
+                int_to_str(g_numbuf, body_len);
+                w = str_copy(g_http_hdr, hdr_200);
+                w = str_copy(w, g_numbuf);
+                w = str_copy(w, hdr_sep);
+                hdr_len = w - g_http_hdr;
+                send(client, g_http_hdr, hdr_len, 0);
+                send(client, g_http_resp, body_len, 0);
+            }
+        }
+    }
+
+    if is_post == 1 {
+        # Read the FULL body. The browser sends Content-Length bytes after the
+        # \r\n\r\n; read exactly that many (recv_n won't over-read, so it can't
+        # block past what the client is sending). The old "one extra recv" was
+        # racy (could miss a split body) and could block on small requests.
+        body_off = find_after(g_http_req, 0, n, hdr_sep);
+        if body_off != 0 - 1 {
+            clen = http_content_length(g_http_req, n);
+            have = n - body_off;
+            need = clen - have;
+            if need > 0 {
+                if body_off + clen < 4095 {
+                    got = recv_n(client, g_http_req + n, need);
+                    n = n + got;
+                }
+            }
+        }
+        store8(g_http_req + n, 0);
+
+        # "POST /api/enable" -> pos 5='/', 6='a', 7='p', 8='i', 9='/', 10=first letter
+        is_enable = 0;
+        is_cfg_post = 0;
+        is_start = 0;
+        is_stop = 0;
+        is_registers = 0;
+        is_shutdown = 0;
+        is_logclear = 0;
+        if load8(g_http_req + 5) == 47 {
+            if load8(g_http_req + 9) == 47 {
+                if load8(g_http_req + 10) == 101 { is_enable = 1; }     # 'e'nable
+                if load8(g_http_req + 10) == 99 { is_cfg_post = 1; }    # 'c'onfig
+                if load8(g_http_req + 10) == 114 { is_registers = 1; }  # 'r'egisters
+                if load8(g_http_req + 10) == 108 { is_logclear = 1; }   # 'l'ogclear
+                if load8(g_http_req + 10) == 115 {                      # 's'tart/'s'top/'s'hutdown
+                    if load8(g_http_req + 11) == 116 {                  # 't'
+                        if load8(g_http_req + 12) == 97 { is_start = 1; }  # 'a'rt
+                        if load8(g_http_req + 12) == 111 { is_stop = 1; }  # 'o'p
+                    }
+                    if load8(g_http_req + 11) == 104 { is_shutdown = 1; }  # 's'h'utdown
+                }
+            }
+        }
+
+        if is_enable == 1 {
+            # Find the JSON body (after \r\n\r\n), then find device digit
+            body_off = 0;
+            i = 0;
+            while i < n - 3 {
+                if load8(g_http_req + i) == 13 {
+                    if load8(g_http_req + i + 1) == 10 {
+                        if load8(g_http_req + i + 2) == 13 {
+                            if load8(g_http_req + i + 3) == 10 {
+                                body_off = i + 4;
+                                break;
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            # Find first digit 0-4 in body
+            idx = 0;
+            i = body_off;
+            while i < n {
+                c = load8(g_http_req + i);
+                if c >= 48 {
+                    if c <= 52 { idx = c - 48; break; }
+                }
+                i = i + 1;
+            }
+            cur = load64(g_dev_enabled + idx * 8);
+            if cur != 0 { store64(g_dev_enabled + idx * 8, 0); }
+            else { store64(g_dev_enabled + idx * 8, 1); }
+        }
+
+        if is_cfg_post == 1 {
+            # Apply the full posted config (ip/unit_id/poll_ms/enabled), persist
+            # it to elspec_config.ini, and force a reconnect so it takes effect.
+            handle_post_config(g_http_req, n);
+        }
+
+        if is_registers == 1 {
+            # Apply register addresses (global) + one device's scales; persist.
+            handle_post_registers(g_http_req, n);
+        }
+
+        if is_logclear == 1 {
+            store64(g_log_len, 0);   # wipe the in-page log ring
+            store8(g_log_buf, 0);
+        }
+
+        if is_start == 1 {
+            store64(g_polling_active, 1);
+            log_msg(m_poll_start);
+        }
+
+        if is_stop == 1 {
+            store64(g_polling_active, 0);
+            # Disconnect all devices (full capacity, in case the count shrank)
+            d = 0;
+            while d < MAX_DEVICES {
+                dev_disconnect(d);
+                d = d + 1;
+            }
+        }
+
+        # Send OK response
+        ok_len = 11;   # length of {"ok":true}
+        int_to_str(g_numbuf, ok_len);
+        w = str_copy(g_http_hdr, hdr_200_json);
+        w = str_copy(w, g_numbuf);
+        w = str_copy(w, hdr_sep);
+        hdr_len = w - g_http_hdr;
+        send(client, g_http_hdr, hdr_len, 0);
+        send(client, ok_resp, ok_len, 0);
+
+        if is_shutdown == 1 {
+            closesocket(client);
+            ExitProcess(0);          # user pressed Shutdown in the dashboard
+        }
+    }
+
+    closesocket(client);
+    return 0;
+}
+
+func send_json(client: i64, body_len: i64) -> i64 {
+    int_to_str(g_numbuf, body_len);
+    w = str_copy(g_http_hdr, hdr_200_json);
+    w = str_copy(w, g_numbuf);
+    w = str_copy(w, hdr_sep);
+    hdr_len = w - g_http_hdr;
+    send(client, g_http_hdr, hdr_len, 0);
+    send(client, g_http_resp, body_len, 0);
+    return 0;
+}
+
+# Build config JSON for the config tab
+func build_config_json() -> i64 {
+    p = g_http_resp;
+    p = str_copy(p, "{\"devices\":[");
+
+    d = 0;
+    while d < load64(g_num_devices) {
+        if d > 0 { store8(p, 44); p = p + 1; }
+        store8(p, 123); p = p + 1;
+
+        p = str_copy(p, "\"name\":\"");
+        p = str_copy(p, g_dev_names + d * 32);
+        p = str_copy(p, "\",\"ip\":\"");
+        p = str_copy(p, g_dev_ips + d * 32);
+        p = str_copy(p, "\",\"farm\":\"");
+        p = str_copy(p, g_dev_farms + d * 32);
+        p = str_copy(p, "\",\"port\":");
+        int_to_str(g_numbuf, load64(g_dev_ports + d * 8));
+        p = str_copy(p, g_numbuf);
+        p = str_copy(p, ",\"unit_id\":");
+        int_to_str(g_numbuf, load64(g_dev_unit_ids + d * 8));
+        p = str_copy(p, g_numbuf);
+        p = str_copy(p, ",\"poll_ms\":");
+        int_to_str(g_numbuf, load64(g_dev_poll_ms + d * 8));
+        p = str_copy(p, g_numbuf);
+        p = str_copy(p, ",\"enabled\":");
+        if load64(g_dev_enabled + d * 8) != 0 { p = str_copy(p, "true"); }
+        else { p = str_copy(p, "false"); }
+
+        # ,"scales":["1",...]  (this device's display scales)
+        p = str_copy(p, js_scales);
+        r = 0;
+        while r < 12 {
+            if r > 0 { store8(p, 44); p = p + 1; }
+            store8(p, 34); p = p + 1;
+            p = str_copy(p, g_dev_scales + (d * 12 + r) * 16);
+            store8(p, 34); p = p + 1;
+            r = r + 1;
+        }
+        store8(p, 93); p = p + 1;  # ]
+
+        store8(p, 125); p = p + 1;  # } close device
+        d = d + 1;
+    }
+    store8(p, 93); p = p + 1;  # ] close devices
+
+    # ,"registers":[{"tag":"MW","addr":31038},...]  (addresses shown as 3xxxx)
+    p = str_copy(p, js_regs);
+    r = 0;
+    while r < 12 {
+        if r > 0 { store8(p, 44); p = p + 1; }
+        p = str_copy(p, js_tagaddr1);            # {"tag":"
+        p = str_copy(p, g_reg_names + r * 16);
+        p = str_copy(p, js_tagaddr2);            # ","addr":
+        int_to_str(g_numbuf, load64(g_reg_addrs + r * 8) + 30001);
+        p = str_copy(p, g_numbuf);
+        store8(p, 125); p = p + 1;               # }
+        r = r + 1;
+    }
+    store8(p, 93); p = p + 1;   # ] close registers
+    store8(p, 125); p = p + 1;  # } close root
+    store8(p, 0);
+    return p - g_http_resp;
+}
+
+# Handle POST /api/enable: toggle device enabled state
+# Body: {"device":N} where N is 0-4
+func handle_post_enable(body: i64) -> i64 {
+    # Simple scan: find first digit after ':' 
+    i = 0;
+    while i < 64 {
+        c = load8(body + i);
+        if c == 0 { return 0; }
+        if c >= 48 {
+            if c <= 52 {  # '0' to '4'
+                idx = c - 48;
+                # Toggle enabled state
+                cur = load64(g_dev_enabled + idx * 8);
+                if cur != 0 {
+                    store64(g_dev_enabled + idx * 8, 0);
+                } else {
+                    store64(g_dev_enabled + idx * 8, 1);
+                }
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Handle POST /api/config: apply ip / unit_id / poll_ms / enabled for ALL 5
+# devices from the posted JSON, persist to elspec_config.ini, and drop live
+# sockets so new addresses/unit-ids take effect on the next reconnect.
+# The dashboard posts devices in slot order, each object containing
+#   ..."ip":"A.B.C.D","unit_id":N,"poll_ms":N,"enabled":true/false
+# (Old version only flipped "enabled" and silently discarded everything else.)
+func handle_post_config(req: i64, n: i64) -> i64 {
+    body = find_after(req, 0, n, hdr_sep);   # skip HTTP headers
+    if body == 0 - 1 { return 0; }
+
+    d = 0;
+    pos = body;
+    while d < MAX_DEVICES {
+        # "enabled" is the LAST key of each device object: use it to bound this
+        # device's segment and to know where the next object begins. When no more
+        # "enabled" is found, we've parsed every device -> the count = d.
+        pe = find_after(req, pos, n, jk_en);
+        if pe == 0 - 1 { break; }
+
+        pnm = find_after(req, pos, n, jk_name);    # "name":"..."
+        if pnm != 0 - 1 { if pnm < pe { extract_json_str(req + pnm, g_dev_names + d * 32, 31); } }
+
+        pfm = find_after(req, pos, n, jk_farm);    # "farm":"..."
+        if pfm != 0 - 1 { if pfm < pe { extract_json_str(req + pfm, g_dev_farms + d * 32, 31); } }
+
+        pip = find_after(req, pos, n, jk_ip);      # "ip":"..."
+        if pip != 0 - 1 { if pip < pe { extract_json_str(req + pip, g_dev_ips + d * 32, 31); } }
+
+        puid = find_after(req, pos, n, jk_uid);    # "unit_id":N
+        if puid != 0 - 1 { if puid < pe { store64(g_dev_unit_ids + d * 8, parse_json_int(req + puid)); } }
+
+        ppm = find_after(req, pos, n, jk_poll);    # "poll_ms":N
+        if ppm != 0 - 1 { if ppm < pe { store64(g_dev_poll_ms + d * 8, parse_json_int(req + ppm)); } }
+
+        store64(g_dev_ports + d * 8, 502);          # Elspec Modbus/TCP port (fixed); also inits new slots
+
+        ev = pe;                                    # "enabled": value
+        while load8(req + ev) == 32 { ev = ev + 1; }
+        if load8(req + ev) == 116 { store64(g_dev_enabled + d * 8, 1); }   # 't'rue
+        else { store64(g_dev_enabled + d * 8, 0); }
+
+        pos = ev + 1;
+        d = d + 1;
+    }
+    if d > 0 { store64(g_num_devices, d); }   # adopt the posted device count
+
+    # Force a clean reconnect with the new ip/unit_id/port (full capacity).
+    d = 0;
+    while d < MAX_DEVICES { dev_disconnect(d); d = d + 1; }
+
+    save_config_file();   # writes elspec_config.ini AND prints "[elspec] config saved."
+    return 0;
+}
+
+# Handle POST /api/registers: body {"dev":D,"addrs":[31038,...],"scales":["1",...]}.
+# Sets the 12 global register addresses (3xxxx -> offset) and device D's 12 scale
+# strings, then persists. Addresses take effect on the next poll (no reconnect).
+func handle_post_registers(req: i64, n: i64) -> i64 {
+    body = find_after(req, 0, n, hdr_sep);
+    if body == 0 - 1 { return 0; }
+
+    dev = 0;
+    pd = find_after(req, body, n, jk_dev);
+    if pd != 0 - 1 { dev = parse_json_int(req + pd); }
+    if dev < 0 { dev = 0; }
+    if dev >= MAX_DEVICES { dev = 0; }
+
+    # "addrs":[ 31038, ... ]  -> 12 offsets
+    pa = find_after(req, body, n, jk_addrs);
+    if pa != 0 - 1 {
+        i = 0;
+        q = pa;
+        while i < 12 {
+            while load8(req + q) != 0 {
+                c = load8(req + q);
+                if c == 93 { break; }                 # ]
+                if c >= 48 { if c <= 57 { break; } }
+                q = q + 1;
+            }
+            c = load8(req + q);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            v = parse_json_int(req + q);
+            if v >= 30001 { store64(g_reg_addrs + i * 8, v - 30001); }
+            else { store64(g_reg_addrs + i * 8, v); }
+            while load8(req + q) != 0 { c = load8(req + q); if c < 48 { break; } if c > 57 { break; } q = q + 1; }
+            i = i + 1;
+        }
+    }
+
+    # "scales":[ "1","0.001", ... ]  -> 12 strings into device D
+    ps = find_after(req, body, n, jk_scales);
+    if ps != 0 - 1 {
+        i = 0;
+        q = ps;
+        while i < 12 {
+            while load8(req + q) != 0 {
+                c = load8(req + q);
+                if c == 34 { break; }                 # "
+                if c == 93 { break; }                 # ]
+                q = q + 1;
+            }
+            if load8(req + q) != 34 { break; }
+            q = q + 1;                                 # past opening quote
+            extract_json_str(req + q, g_dev_scales + (dev * 12 + i) * 16, 15);
+            while load8(req + q) != 0 { if load8(req + q) == 34 { break; } q = q + 1; }
+            if load8(req + q) == 34 { q = q + 1; }     # past closing quote
+            i = i + 1;
+        }
+    }
+
+    save_config_file();
+    return 0;
+}
+
+# Extract a JSON string value (between current pos and next ")
+func extract_json_str(src: i64, dst: i64, max: i64) -> i64 {
+    i = 0;
+    while i < max {
+        c = load8(src + i);
+        if c == 34 { break; }  # closing quote
+        if c == 0 { break; }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    store8(dst + i, 0);
+    return i;
+}
+
+# Parse an integer from JSON (skip whitespace, read digits)
+func parse_json_int(src: i64) -> i64 {
+    i = 0;
+    while load8(src + i) == 32 { i = i + 1; }
+    val = 0;
+    while 1 {
+        c = load8(src + i);
+        if c < 48 { break; }
+        if c > 57 { break; }
+        val = val * 10 + c - 48;
+        i = i + 1;
+    }
+    return val;
+}
+
+# Parse the Content-Length header value from an HTTP request (0 if absent).
+func http_content_length(req: i64, n: i64) -> i64 {
+    p = find_after(req, 0, n, clen_key);
+    if p == 0 - 1 { return 0; }
+    while load8(req + p) == 32 { p = p + 1; }
+    v = 0;
+    while 1 {
+        c = load8(req + p);
+        if c < 48 { break; }
+        if c > 57 { break; }
+        v = v * 10 + c - 48;
+        p = p + 1;
+    }
+    return v;
+}
+
+# Extract an INI value: copy from src until CR / LF / NUL.
+func extract_line_str(src: i64, dst: i64, max: i64) -> i64 {
+    i = 0;
+    while i < max {
+        c = load8(src + i);
+        if c == 13 { break; }
+        if c == 10 { break; }
+        if c == 0 { break; }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    store8(dst + i, 0);
+    return i;
+}
+
+# Load elspec_config.ini at startup (if present) and override the compiled-in
+# defaults, so IP / Unit ID / Poll / Enabled survive restarts. Format is what
+# save_config_file() writes: per device a [Name] block with ip=, unit_id=,
+# poll_ms=, enabled= lines.
+func load_config_file() -> i64 {
+    h = CreateFileA(cfg_file, 0x80000000, 1, 0, 3, 0x80, 0);   # GENERIC_READ, OPEN_EXISTING
+    if h == 0 - 1 { return 0; }
+    ReadFile(h, g_http_req, 4000, g_numbuf, 0);
+    CloseHandle(h);
+    n = load32(g_numbuf);
+    if n <= 0 { return 0; }
+    store8(g_http_req + n, 0);
+
+    # Device count (defaults to 5 if the line is absent / old-format file).
+    nd = 5;
+    pnd = find_after(g_http_req, 0, n, cfg_num);            # "num_devices="
+    if pnd != 0 - 1 { nd = parse_json_int(g_http_req + pnd); }
+    if nd < 1 { nd = 1; }
+    if nd > MAX_DEVICES { nd = MAX_DEVICES; }
+
+    d = 0;
+    pos = 0;
+    while d < nd {
+        pen = find_after(g_http_req, pos, n, cfg_w_en);     # "enabled=" bounds this device block
+        if pen == 0 - 1 { break; }
+
+        pnm = find_after(g_http_req, pos, n, cfg_w_name);   # "name="
+        if pnm != 0 - 1 { if pnm < pen { extract_line_str(g_http_req + pnm, g_dev_names + d * 32, 31); } }
+
+        pfm = find_after(g_http_req, pos, n, cfg_w_farm);   # "farm="
+        if pfm != 0 - 1 { if pfm < pen { extract_line_str(g_http_req + pfm, g_dev_farms + d * 32, 31); } }
+
+        pip = find_after(g_http_req, pos, n, cfg_w_ip);     # "ip="
+        if pip != 0 - 1 { if pip < pen { extract_line_str(g_http_req + pip, g_dev_ips + d * 32, 31); } }
+
+        puid = find_after(g_http_req, pos, n, cfg_w_uid);   # "unit_id="
+        if puid != 0 - 1 { if puid < pen { store64(g_dev_unit_ids + d * 8, parse_json_int(g_http_req + puid)); } }
+
+        ppt = find_after(g_http_req, pos, n, cfg_w_port);   # "port="
+        if ppt != 0 - 1 { if ppt < pen { store64(g_dev_ports + d * 8, parse_json_int(g_http_req + ppt)); } }
+        if load64(g_dev_ports + d * 8) == 0 { store64(g_dev_ports + d * 8, 502); }
+
+        ppm = find_after(g_http_req, pos, n, cfg_w_poll);   # "poll_ms="
+        if ppm != 0 - 1 { if ppm < pen { store64(g_dev_poll_ms + d * 8, parse_json_int(g_http_req + ppm)); } }
+
+        # scales=s0,s1,...,s11  (CSV of opaque scale strings for this device)
+        psc = find_after(g_http_req, pos, n, cfg_w_scales);
+        if psc != 0 - 1 { if psc < pen {
+            i = 0;
+            q = psc;
+            while i < 12 {
+                dst = g_dev_scales + (d * 12 + i) * 16;
+                k = 0;
+                while k < 15 {
+                    c = load8(g_http_req + q);
+                    if c == 44 { break; }                # ,
+                    if c == 13 { break; }
+                    if c == 10 { break; }
+                    if c == 0 { break; }
+                    store8(dst + k, c); k = k + 1; q = q + 1;
+                }
+                store8(dst + k, 0);
+                i = i + 1;
+                if load8(g_http_req + q) != 44 { break; }   # end of line
+                q = q + 1;                                   # skip comma
+            }
+        } }
+
+        if load8(g_http_req + pen) == 49 { store64(g_dev_enabled + d * 8, 1); }   # '1'
+        else { store64(g_dev_enabled + d * 8, 0); }
+
+        pos = pen + 1;
+        d = d + 1;
+    }
+    if d > 0 { store64(g_num_devices, d); }
+
+    # reg_addrs=31038,... (global register map, stored as offsets)
+    pra = find_after(g_http_req, 0, n, cfg_w_regs);
+    if pra != 0 - 1 {
+        i = 0;
+        q = pra;
+        while i < 12 {
+            while load8(g_http_req + q) != 0 {
+                c = load8(g_http_req + q);
+                if c >= 48 { if c <= 57 { break; } }
+                if c == 13 { break; }
+                if c == 10 { break; }
+                q = q + 1;
+            }
+            c = load8(g_http_req + q);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            v = parse_json_int(g_http_req + q);
+            if v >= 30001 { store64(g_reg_addrs + i * 8, v - 30001); }
+            else { store64(g_reg_addrs + i * 8, v); }
+            while load8(g_http_req + q) != 0 { c = load8(g_http_req + q); if c < 48 { break; } if c > 57 { break; } q = q + 1; }
+            i = i + 1;
+        }
+    }
+    log_msg(m_cfg_loaded);
+    return 1;
+}
+
+# Save current config to elspec_config.ini
+func save_config_file() -> i64 {
+    hf = CreateFileA(cfg_file, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 { return 0; }
+
+    # num_devices=N (so the count survives restarts)
+    p = g_logline;
+    p = str_copy(p, cfg_num);
+    int_to_str(g_numbuf, load64(g_num_devices));
+    p = str_copy(p, g_numbuf);
+    store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+    store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+    WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+    d = 0;
+    while d < load64(g_num_devices) {
+        # name= / farm= / ip=
+        p = g_logline;
+        p = str_copy(p, cfg_w_name); p = str_copy(p, g_dev_names + d * 32); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        p = str_copy(p, cfg_w_farm); p = str_copy(p, g_dev_farms + d * 32); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        p = str_copy(p, cfg_w_ip);   p = str_copy(p, g_dev_ips + d * 32);   store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+        # unit_id= / port= / poll_ms=
+        p = g_logline;
+        p = str_copy(p, cfg_w_uid);  int_to_str(g_numbuf, load64(g_dev_unit_ids + d * 8)); p = str_copy(p, g_numbuf); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        p = str_copy(p, cfg_w_port); int_to_str(g_numbuf, load64(g_dev_ports + d * 8));    p = str_copy(p, g_numbuf); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        p = str_copy(p, cfg_w_poll); int_to_str(g_numbuf, load64(g_dev_poll_ms + d * 8));  p = str_copy(p, g_numbuf); store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+        # scales=s0,s1,...,s11  (per-device display scales)
+        p = g_logline;
+        p = str_copy(p, cfg_w_scales);
+        r = 0;
+        while r < 12 {
+            if r > 0 { store8(p, 44); p = p + 1; }
+            p = str_copy(p, g_dev_scales + (d * 12 + r) * 16);
+            r = r + 1;
+        }
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+        # enabled= (LAST key in the block) + blank separator line
+        p = g_logline;
+        p = str_copy(p, cfg_w_en);
+        if load64(g_dev_enabled + d * 8) != 0 { p = str_copy(p, cfg_w_1); } else { p = str_copy(p, cfg_w_0); }
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+        WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+        d = d + 1;
+    }
+
+    # reg_addrs=31038,... (global register map, written as 3xxxx)
+    p = g_logline;
+    p = str_copy(p, cfg_w_regs);
+    r = 0;
+    while r < 12 {
+        if r > 0 { store8(p, 44); p = p + 1; }
+        int_to_str(g_numbuf, load64(g_reg_addrs + r * 8) + 30001);
+        p = str_copy(p, g_numbuf);
+        r = r + 1;
+    }
+    store8(p, 13); p = p + 1; store8(p, 10); p = p + 1;
+    WriteFile(hf, g_logline, p - g_logline, g_written, 0);
+
+    CloseHandle(hf);
+    log_msg(m_cfg_saved);
+    return 1;
+}
+
+# Load dashboard.html into g_http_resp, return byte count
+func load_dashboard() -> i64 {
+    h = CreateFileA(dash_path, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 {
+        h = CreateFileA(dash_rel, 0x80000000, 1, 0, 3, 0x80, 0);
+    }
+    if h == 0 - 1 { return 0; }
+    ReadFile(h, g_http_resp, 32000, g_numbuf, 0);
+    CloseHandle(h);
+    n = load32(g_numbuf);
+    return n;
+}
+
+# ============================================================================
+# HTTP PUMP: service at most one pending HTTP client WITHOUT blocking.
+# The listener is non-blocking, so accept() returns -1 (WSAEWOULDBLOCK) when
+# nobody is waiting. Each ACCEPTED socket is set back to blocking so
+# http_serve_one's recv() works unchanged. Pumping this between device polls is
+# what keeps the dashboard (and the Stop button) responsive while polling.
+# ============================================================================
+
+func http_pump() -> i64 {
+    http_srv = load64(g_http_sock);
+    client = accept(http_srv, 0, 0);
+    if client != 0 - 1 {
+        if client != 0 {
+            store64(g_last_req_ms, GetTickCount());      # UI heartbeat
+            store64(g_client_seen, 1);
+            store32(g_one, 0);                          # accepted socket -> BLOCKING
+            ioctlsocket(client, 2147772030, g_one);     # FIONBIO = 0
+            http_serve_one(client);
+        }
+    }
+    return 0;
+}
+
+# ============================================================================
+# MAIN: non-blocking HTTP pump + TIMER-driven Modbus polling (decoupled).
+# Previously polling ran once per HTTP request, so serving the dashboard was
+# coupled to (and stalled by) polling several real devices -> the UI, incl.
+# Stop, became unresponsive. Now HTTP is pumped every iteration AND between
+# each device poll, while polling + reconnect run on their own GetTickCount
+# timers.
+# ============================================================================
+
+func main() -> i32 {
+    log_msg(m_boot);
+
+    # Init Winsock
+    rc = WSAStartup(514, g_wsa);
+    if rc != 0 { return 1; }
+
+    # Initialize device configs, then override from elspec_config.ini if present
+    # (so user-edited IP / Unit ID / Poll / Enabled survive a restart).
+    init_devices();
+    load_config_file();
+    log_msg(m_init);
+
+    # Start HTTP server
+    rc = http_init();
+    if rc == 0 {
+        log_msg(m_http_fail);
+        # keep the console VISIBLE on bind failure so the error is seen
+    } else {
+        log_msg(m_http_ok);
+        # Normal launch (no "noui" cmdline flag): open the dashboard in the
+        # default browser, then hide the console window (the dashboard's Log
+        # panel mirrors these messages; the Shutdown button quits the app).
+        cl = GetCommandLineA();
+        cllen = 0;
+        while load8(cl + cllen) != 0 { cllen = cllen + 1; }
+        if find_after(cl, 0, cllen, noui_flag) == 0 - 1 {
+            ShellExecuteA(0, se_open, se_url, 0, 0, 1);   # SW_SHOWNORMAL
+            ShowWindow(GetConsoleWindow(), 0);            # SW_HIDE
+        }
+    }
+
+    # Make the listener NON-BLOCKING so accept() never stalls the poll timer.
+    store32(g_one, 1);
+    ioctlsocket(load64(g_http_sock), 2147772030, g_one);   # FIONBIO = 1
+
+    log_msg(m_ready);               # polling is IDLE at boot (starts only on the UI button)
+    store64(g_tick_count, 0);
+    store64(g_polling_active, 0);   # start idle, user activates via dashboard
+    store64(g_last_poll_ms, 0);
+    store64(g_last_conn_ms, 0);
+    store64(g_last_req_ms, 0);
+    store64(g_client_seen, 0);
+
+    while 1 {
+        # Always service HTTP first (non-blocking) so the UI stays responsive.
+        http_pump();
+
+        # Watchdog: once the dashboard has connected, if it stops making requests
+        # for WATCHDOG_MS (browser/tab closed), shut the service down on its own.
+        if load64(g_client_seen) == 1 {
+            if GetTickCount() - load64(g_last_req_ms) > WATCHDOG_MS {
+                log_msg(m_watchdog);
+                ExitProcess(0);
+            }
+        }
+
+        polling = load64(g_polling_active);
+        if polling == 1 {
+            now = GetTickCount();
+
+            # --- Poll connected devices on a fixed cadence (NOT per-request) ---
+            if now - load64(g_last_poll_ms) >= POLL_INTERVAL_MS {
+                store64(g_last_poll_ms, now);
+                d = 0;
+                while d < load64(g_num_devices) {
+                    if load64(g_polling_active) == 0 { break; }   # Stop pressed -> bail
+                    enabled = load64(g_dev_enabled + d * 8);
+                    connected = load64(g_dev_connected + d * 8);
+                    if enabled != 0 {
+                        if connected == 1 {
+                            rc = poll_device(d);
+                            if rc == 0 {
+                                dev_disconnect(d);
+                                log_msg(m_poll_fail);
+                                log_msg(g_dev_names + d * 32);
+                                log_msg(m_nl);
+                            }
+                        }
+                    }
+                    http_pump();          # keep HTTP snappy between device polls
+                    d = d + 1;
+                }
+            }
+
+            # --- Reconnect any disconnected enabled device on a slower cadence ---
+            now = GetTickCount();
+            if load64(g_polling_active) == 1 {
+                if now - load64(g_last_conn_ms) >= CONN_INTERVAL_MS {
+                    store64(g_last_conn_ms, now);
+                    d = 0;
+                    while d < load64(g_num_devices) {
+                        if load64(g_polling_active) == 0 { break; }
+                        enabled = load64(g_dev_enabled + d * 8);
+                        connected = load64(g_dev_connected + d * 8);
+                        if enabled != 0 {
+                            if connected == 0 {
+                                rc = dev_connect(d);
+                                if rc == 1 {
+                                    log_msg(m_conn_ok);
+                                    log_msg(g_dev_names + d * 32);
+                                    log_msg(m_nl);
+                                }
+                            }
+                        }
+                        http_pump();
+                        d = d + 1;
+                    }
+                }
+            }
+        }
+
+        # Yield so idle CPU stays low; HTTP latency remains ~5 ms.
+        Sleep(5);
+    }
+
+    return 0;
+}

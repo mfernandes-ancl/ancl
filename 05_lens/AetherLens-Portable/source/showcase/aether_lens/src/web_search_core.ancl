@@ -1,0 +1,53 @@
+# =====================================================================
+# web_search_core.ancl - deterministic Google browser-search URL builder.
+# Lens opens the result URL in the user's browser; it never scrapes Google.
+# =====================================================================
+
+@CODE
+func lws_hex(c: i64) -> i64 {
+    if c < 10 { return 48 + c; }
+    return 55 + c;
+}
+
+func lws_query_url(query: i64, dst: i64, cap: i64) -> i64 {
+    base = "https://www.google.com/search?q=";
+    n = strlen(query);
+    if n == 0 { return 0; }
+    if n > 256 { return 0; }
+    p = str_copy(dst, base); out = p - dst; useful = 0; i = 0;
+    while i < n {
+        c = load8(query + i);
+        if c > 32 { useful = 1; }
+        safe = 0;
+        if c >= 48 { if c <= 57 { safe = 1; } }
+        if c >= 65 { if c <= 90 { safe = 1; } }
+        if c >= 97 { if c <= 122 { safe = 1; } }
+        if c == 45 { safe = 1; }
+        if c == 46 { safe = 1; }
+        if c == 95 { safe = 1; }
+        if c == 126 { safe = 1; }
+        if c == 32 {
+            if out + 1 >= cap { return 0; }
+            store8(dst + out, 43); out = out + 1;
+        } else if safe == 1 {
+            if out + 1 >= cap { return 0; }
+            store8(dst + out, c); out = out + 1;
+        } else {
+            if out + 3 >= cap { return 0; }
+            store8(dst + out, 37);
+            store8(dst + out + 1, lws_hex(shr(c, 4)));
+            store8(dst + out + 2, lws_hex(band(c, 15)));
+            out = out + 3;
+        }
+        i = i + 1;
+    }
+    if useful == 0 { return 0; }
+    store8(dst + out, 0); return out;
+}
+
+# Compatibility stub for the removed inline-result path. Google results are
+# deliberately never scraped or parsed by Lens.
+func lws_parse_rss(src: i64, dst: i64, cap: i64, max_results: i64, count_out: i64) -> i64 {
+    if cap > 0 { store8(dst, 0); }
+    store64(count_out, 0); return 0;
+}

@@ -1,0 +1,88 @@
+# iec61850_client.ancl - IEC-61850 / MMS read / write / control / discovery STARTER.
+# 100% pure ANCL, zero-dep (NO iec61850.dll) - built on core_lib/iec61850.ancl.
+# A complete, compilable client: edit the CONFIG block, COMPILE, RUN. Then extend it -
+# Ctrl+Space (the op-brain) knows the ANCL idioms. Loaded by Aether Studio for
+# IEC-61850 / MMS / ICCP intent.  Dev oracle: showcase/iccp_simulator on :10103.
+import "../iec61850.ancl";
+
+@DATA
+mInfo:     str = "[61850] IEC-61850 / MMS client (ANCL starter)";
+mConnFail: str = "[61850] connect/associate failed - check IP / port / auth. stage=";
+mConnOK:   str = "[61850] associated OK.";
+mDevs:     str = "[61850] logical devices:";
+mVars:     str = "[61850] variables in first device:";
+mDash:     str = "  - ";
+mRead:     str = "[61850] read ";
+mWrite:    str = "[61850] write ";
+mCtl:      str = "[61850] control ";
+mOK:       str = " -> OK";
+mFail:     str = " -> FAIL err=";
+mArrow:    str = " =";
+nl:        str = "\r\n";
+
+# ==== CONFIG - edit these ====
+CFG_IP0:  i64 = 127;        # target IP, octet 1
+CFG_IP1:  i64 = 0;          #   octet 2
+CFG_IP2:  i64 = 0;          #   octet 3
+CFG_IP3:  i64 = 1;          #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 102;        # standard MMS port (use 10103 for the bundled iccp_simulator)
+CFG_OP:   i64 = 0;          # 0 read scalar | 1 write bool | 2 operate control | 3 discovery | 4 read dataset
+CFG_AUTH: i64 = 0;          # 1 = send ACSE password auth (e.g. Senvion 'sca.auto')
+CFG_CTLMODEL: i64 = 0 - 1;  # control model for OP=2 (-1 = auto-read from the device)
+CFG_VAL:  i64 = 1;          # value to write / command (bool 0 or 1)
+# ---- string targets (edit to match your device) ----
+s_user:    str = "sca.auto";                              # ACSE user     (when CFG_AUTH=1)
+s_pass:    str = "password";                              # ACSE password (when CFG_AUTH=1)
+s_domain:  str = "ICCP_SimBilateralTable1";               # MMS domain (= logical device)
+s_item:    str = "GGIO1$MX$AnIn1$mag$f";                  # scalar item "LN$FC$DO$DA" (OP 0/1)
+s_objref:  str = "ICCP_SimBilateralTable1/GGIO1.SPCSO1";  # control object "domain/LN.DO" (OP 2)
+s_dataset: str = "LLN0$Events";                           # dataset / named-variable-list (OP 4)
+# =============================
+
+@CODE
+func print_names(n: i64) -> i64 {
+    i = 0;
+    while i < n { syscall 1, mDash; puts_cstr(i61850_name_at(i)); syscall 1, nl; i = i + 1; }
+    return 0;
+}
+
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    up = 0; pp = 0;
+    if CFG_AUTH == 1 { up = s_user; pp = s_pass; }
+    s = i61850_connect(CFG_IP0, CFG_IP1, CFG_IP2, CFG_IP3, CFG_PORT, up, pp);
+    if s == 0 { syscall 1, mConnFail, load64(g_stage), nl; return 1; }
+    syscall 1, mConnOK, nl;
+
+    if CFG_OP == 0 {                          # ---- read a scalar ----
+        syscall 1, mRead; puts_cstr(s_item); syscall 1, mArrow, nl;
+        i61850_read_scalar(s, s_domain, s_item);
+    }
+    if CFG_OP == 1 {                          # ---- write a boolean scalar ----
+        r = i61850_write_bool(s, s_domain, s_item, CFG_VAL);
+        syscall 1, mWrite; puts_cstr(s_item);
+        if r == 1 { syscall 1, mOK, nl; } else { syscall 1, mFail, load64(g_res_err), nl; }
+    }
+    if CFG_OP == 2 {                          # ---- operate a control (Direct or SBO) ----
+        cm = CFG_CTLMODEL;
+        if cm < 0 { cm = i61850_ctl_model(s, s_objref); if cm < 0 { cm = 1; } }
+        if cm == 2 { i61850_select(s, s_objref); }
+        if cm == 4 { i61850_select_with_value_bool(s, s_objref, CFG_VAL); }
+        r = i61850_operate_bool(s, s_objref, CFG_VAL, cm);
+        syscall 1, mCtl; puts_cstr(s_objref);
+        if r == 1 { syscall 1, mOK, nl; } else { syscall 1, mFail, load64(g_res_err), nl; }
+    }
+    if CFG_OP == 3 {                          # ---- discovery (GetNameList) ----
+        nd = i61850_get_devices(s);
+        syscall 1, mDevs, nl; print_names(nd);
+        if nd > 0 {
+            nv = i61850_get_variables(s, i61850_name_at(0));
+            syscall 1, mVars, nl; print_names(nv);
+        }
+    }
+    if CFG_OP == 4 {                          # ---- read a dataset (named-variable-list) ----
+        i61850_read_dataset(s, s_domain, s_dataset);
+    }
+    closesocket(s);
+    return 0;
+}

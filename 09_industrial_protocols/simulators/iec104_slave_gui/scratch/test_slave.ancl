@@ -1,0 +1,211 @@
+# ============================================================================
+#  test_slave.ancl  -  Standalone ANCL IEC 104 Slave Verification client
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+extern "ws2_32.dll" socket -> i64;
+extern "ws2_32.dll" connect -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "kernel32.dll" ExitProcess;
+
+extern "kernel32.dll" GetStdHandle -> ptr;
+extern "kernel32.dll" WriteFile -> i32;
+
+@DATA
+g_wsa:       buf = 512;
+g_addr:      buf = 32;
+g_txbuf:     buf = 256;
+g_rxbuf:     buf = 4096;
+g_stdout:    buf = 8;
+g_written:   buf = 8;
+g_num:       buf = 32;
+
+msg_conn:    str = "[Test] Connecting to 127.0.0.1:2404...\n";
+msg_ok:      str = "[Test] Connected!\n";
+msg_fail:    str = "[FAIL] Connection failed.\n";
+msg_start_a: str = "[Test] Sending STARTDT act...\n";
+msg_start_c: str = "[SUCCESS] Received STARTDT con!\n";
+msg_start_f: str = "[FAIL] Unexpected response to STARTDT act.\n";
+msg_gi_send: str = "[Test] Sending General Interrogation (GI)...\n";
+msg_done:    str = "[Test] Verification Completed successfully.\n";
+
+func print(text: i64) -> i64 {
+    h = load64(g_stdout);
+    if h == 0 {
+        h = GetStdHandle(0 - 11);
+        store64(g_stdout, h);
+    }
+    p = text;
+    while load8(p) != 0 { p = p + 1; }
+    len = p - text;
+    WriteFile(h, text, len, g_written, 0);
+    return 0;
+}
+
+func print_hex(buf: i64, len: i64) -> i64 {
+    i = 0;
+    while i < len {
+        b = load8(buf + i);
+        h1 = (b / 16) % 16;
+        h2 = b % 16;
+        c1 = 48 + h1; if h1 >= 10 { c1 = 65 + (h1 - 10); }
+        c2 = 48 + h2; if h2 >= 10 { c2 = 65 + (h2 - 10); }
+        store8(g_num + 0, c1);
+        store8(g_num + 1, c2);
+        store8(g_num + 2, 32);
+        store8(g_num + 3, 0);
+        print(g_num);
+        i = i + 1;
+    }
+    print("\n");
+    return 0;
+}
+
+func main() -> i32 {
+    print("[Test] Starting verification...\n");
+    
+    res = WSAStartup(0x0202, g_wsa);
+    if res != 0 {
+        print("[FAIL] WSAStartup failed.\n");
+        return 1;
+    }
+    
+    s = socket(2, 1, 6);
+    if s == 0 - 1 {
+        print("[FAIL] Socket creation failed.\n");
+        WSACleanup();
+        return 1;
+    }
+    
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, 0x6409); # 2404
+    store8(g_addr + 4, 127);
+    store8(g_addr + 5, 0);
+    store8(g_addr + 6, 0);
+    store8(g_addr + 7, 1);
+    store64(g_addr + 8, 0);
+    
+    print(msg_conn);
+    res = connect(s, g_addr, 16);
+    if res != 0 {
+        print(msg_fail);
+        closesocket(s);
+        WSACleanup();
+        return 1;
+    }
+    print(msg_ok);
+    
+    # 1. Send STARTDT act
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, 0x04);
+    store8(g_txbuf + 2, 0x07);
+    store8(g_txbuf + 3, 0x00);
+    store8(g_txbuf + 4, 0x00);
+    store8(g_txbuf + 5, 0x00);
+    
+    print(msg_start_a);
+    send(s, g_txbuf, 6, 0);
+    
+    n = recv(s, g_rxbuf, 256, 0);
+    if n >= 6 {
+        print("[Test] Received response: ");
+        print_hex(g_rxbuf, n);
+        
+        if load8(g_rxbuf + 0) == 0x68 && load8(g_rxbuf + 2) == 0x0B {
+            print(msg_start_c);
+        } else {
+            print(msg_start_f);
+            closesocket(s);
+            WSACleanup();
+            return 1;
+        }
+    } else {
+        print("[FAIL] Recv failed or incomplete.\n");
+        closesocket(s);
+        WSACleanup();
+        return 1;
+    }
+    
+    # 2. Send GI
+    store8(g_txbuf + 0, 0x68);
+    store8(g_txbuf + 1, 14);
+    store8(g_txbuf + 2, 0x00); store8(g_txbuf + 3, 0x00);
+    store8(g_txbuf + 4, 0x00); store8(g_txbuf + 5, 0x00);
+    store8(g_txbuf + 6, 100);
+    store8(g_txbuf + 7, 1);
+    store8(g_txbuf + 8, 6);
+    store8(g_txbuf + 9, 0);
+    store8(g_txbuf + 10, 1); store8(g_txbuf + 11, 0);
+    store8(g_txbuf + 12, 0); store8(g_txbuf + 13, 0); store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 20);
+    
+    print(msg_gi_send);
+    send(s, g_txbuf, 16, 0);
+    
+    # Receive loop until we get GI Activation Termination (COT = 10)
+    found_conf = 0;
+    found_term = 0;
+    found_data = 0;
+    loop_count = 0;
+    
+    while found_term == 0 && loop_count < 10 {
+        n = recv(s, g_rxbuf, 4096, 0);
+        if n <= 0 {
+            print("[Test] Recv returned <= 0, breaking.\n");
+            loop_count = 10; # force break
+        } else {
+            print("[Test] Received data packet: ");
+            print_hex(g_rxbuf, n);
+            
+            offset = 0;
+            while offset < n {
+                if load8(g_rxbuf + offset) == 0x68 {
+                    flen = load8(g_rxbuf + offset + 1);
+                    ti = load8(g_rxbuf + offset + 6);
+                    cot = band(load8(g_rxbuf + offset + 8), 0x3F);
+                    
+                    if ti == 100 && cot == 7 {
+                        print("[SUCCESS] Found GI Activation Confirm (ASDU 100 COT 7)!\n");
+                        found_conf = 1;
+                    }
+                    if ti == 100 && cot == 10 {
+                        print("[SUCCESS] Found GI Activation Termination (ASDU 100 COT 10)!\n");
+                        found_term = 1;
+                    }
+                    if ti == 1 || ti == 3 || ti == 9 || ti == 11 || ti == 13 || ti == 30 || ti == 36 {
+                        found_data = found_data + 1;
+                        print("[SUCCESS] Received Data ASDU: TI=");
+                        store8(g_num + 0, 48 + (ti / 10) % 10);
+                        store8(g_num + 1, 48 + ti % 10);
+                        store8(g_num + 2, 10);
+                        store8(g_num + 3, 0);
+                        print(g_num);
+                    }
+                    
+                    offset = offset + 2 + flen;
+                } else {
+                    offset = offset + 1;
+                }
+            }
+        }
+        loop_count = loop_count + 1;
+    }
+    
+    closesocket(s);
+    WSACleanup();
+    
+    if found_conf == 1 && found_term == 1 && found_data > 0 {
+        print(msg_done);
+        return 0;
+    } else {
+        print("[FAIL] GI verification failed. Missing expected frames.\n");
+        return 1;
+    }
+}

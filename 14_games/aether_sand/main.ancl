@@ -1,0 +1,1968 @@
+# Project Aether-Sand - A Modern 2.5D Entity Sandbox in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+
+# FFI Declarations
+extern "user32.dll" GetAsyncKeyState -> i32;
+extern "kernel32.dll" QueryPerformanceCounter -> i32;
+extern "kernel32.dll" QueryPerformanceFrequency -> i32;
+extern "kernel32.dll" Beep -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "user32.dll" PeekMessageA -> i32;
+extern "gdi32.dll" CreateDIBSection -> ptr;
+extern "user32.dll" GetDC -> ptr;
+extern "user32.dll" ReleaseDC;
+
+@DATA
+class_name: str = "AetherSand";
+window_title: str = "Aether-Sand 2.5D - ANCL Entity Sandbox";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+
+# Brushes, Pens, and Fonts
+bg_brush: buf = 8;
+hud_font: buf = 8;
+title_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+hud_str: buf = 64;
+
+# DIB memory buffer variables
+ppv_bits: buf = 8;     # double-pointer to receive raw pixel bits address
+pbmi_buf: buf = 44;     # BITMAPINFOHEADER structure buffer
+hbitmap_dib: buf = 8;
+hdc_mem: buf = 8;       # persistent double buffer memory context
+
+# Timing variables
+qpc_freq: buf = 8;
+qpc_last: buf = 8;
+qpc_curr: buf = 8;
+rand_seed: buf = 8;
+
+# Game state
+score: buf = 8;
+saved_count: buf = 8;
+current_level: buf = 8;     # 0 = Level 1 (Columns), 1 = Level 2 (Maze)
+frame_tick: buf = 8;
+selected_tool: buf = 8;     # 0 = Walk, 1 = Dig, 2 = Build, 3 = Bomb, 4 = Spawn
+spawn_timer: buf = 8;
+
+# Hazard Zone Bounding Box
+hazard_x0: buf = 8;
+hazard_x1: buf = 8;
+hazard_y0: buf = 8;
+hazard_y1: buf = 8;
+
+# Portals coordinates
+portal_spawn_x: buf = 8;
+portal_spawn_y: buf = 8;
+portal_exit_x: buf = 8;
+portal_exit_y: buf = 8;
+
+# Destructible Terrain Matrix (800 x 600 bytes)
+# 0 = empty space, 1 = Soft Earth, 2 = Metal Platform, 3 = Builder brick
+terrain_mask: buf = 480000;
+
+# High-Density Entity Pool (200 lemming objects)
+lem_x: buf = 1600;              # scaled position X (x256)
+lem_y: buf = 1600;              # scaled position Y (x256)
+lem_vx: buf = 1600;             # scaled velocity X
+lem_vy: buf = 1600;             # scaled velocity Y
+lem_state: buf = 1600;          # 0 = inactive, 1 = Walker, 2 = Digger, 3 = Builder, 4 = Ragdoll Fall, 5 = Bombing, 6 = Escaped
+lem_dir: buf = 1600;            # horizontal direction: -1 or 1
+lem_anim_tick: buf = 1600;      # entity animation timer
+lem_action_timer: buf = 1600;   # custom action timers
+
+# Trig Lookup Tables (sin scaled by 100)
+sin_table: buf = 128;           # 32 values * 4 bytes
+
+# Lemming Sprite Frames Matrix (7 frames * 80 bytes = 560 bytes)
+sprite_frames: buf = 560;
+
+# Temporary string conversion buffer for Bomb
+ch_buf: buf = 2;
+
+# Particle Effects Pool (100 particle objects)
+part_x: buf = 800;
+part_y: buf = 800;
+part_vx: buf = 800;
+part_vy: buf = 800;
+part_life: buf = 800;
+
+@CODE
+
+# --- Math & Helpers ---
+func get_sin(angle: i64) -> i64 {
+    idx = band(angle, 31);
+    val = load32(sin_table + idx * 4);
+    if val >= 2147483648 {
+        val = val - 4294967296;
+    }
+    return val;
+}
+
+func get_cos(angle: i64) -> i64 {
+    return get_sin(angle + 8);
+}
+
+func get_random(max_val: i64) -> i64 {
+    seed = load64(rand_seed) * 2862933555777941757 + 3037000493;
+    store64(rand_seed, seed);
+    val = shr(seed, 32) % max_val;
+    if val < 0 { val = 0 - val; }
+    return val;
+}
+
+func spawn_particle(px: i64, py: i64, pvx: i64, pvy: i64) -> i64 {
+    i = 0;
+    while i < 100 {
+        life = load64(part_life + i * 8);
+        if life == 0 {
+            store64(part_x + i * 8, px * 256);
+            store64(part_y + i * 8, py * 256);
+            store64(part_vx + i * 8, pvx);
+            store64(part_vy + i * 8, pvy);
+            store64(part_life + i * 8, 30);
+            break;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func spawn_dirt_particles(cx: i64, cy: i64) -> i64 {
+    count = 0;
+    while count < 12 {
+        rvx = get_random(600) - 300;
+        rvy = 0 - 100 - get_random(300);
+        spawn_particle(cx, cy, rvx, rvy);
+        count = count + 1;
+    }
+    return 0;
+}
+
+func spawn_explosion_particles(cx: i64, cy: i64) -> i64 {
+    count = 0;
+    while count < 18 {
+        rvx = get_random(1000) - 500;
+        rvy = get_random(1000) - 700;
+        spawn_particle(cx, cy, rvx, rvy);
+        count = count + 1;
+    }
+    return 0;
+}
+
+func draw_text_num(hdc: ptr, x: i32, y: i32, prefix: ptr, val: i64) -> i64 {
+    str_len = strlen(prefix);
+    memset(hud_str, 0, 64);
+    memcpy(hud_str, prefix, str_len);
+    nf_u64dec(val, hud_str + str_len);
+    TextOutA(hdc, x, y, hud_str, strlen(hud_str));
+    return 0;
+}
+
+# --- Rasterization Primitives in raw ARGB buffer ---
+func draw_line_pixel(pixels: ptr, x0: i64, y0: i64, x1: i64, y1: i64, color: i32) -> i64 {
+    dx = x1 - x0;
+    dy = y1 - y0;
+    
+    # Absolute values
+    if dx < 0 { adx = 0 - dx; } else { adx = dx; }
+    if dy < 0 { ady = 0 - dy; } else { ady = dy; }
+    
+    sx = 1;
+    if x0 > x1 { sx = 0 - 1; }
+    sy = 1;
+    if y0 > y1 { sy = 0 - 1; }
+    
+    err = adx - ady;
+    cx = x0;
+    cy = y0;
+    
+    while 1 {
+        if cx >= 0 {
+            if cx < 800 {
+                if cy >= 0 {
+                    if cy < 520 { # draw only inside gameplay area
+                        store32(pixels + (cy * 800 + cx) * 4, color);
+                    }
+                }
+            }
+        }
+        
+        if cx == x1 {
+            if cy == y1 {
+                break;
+            }
+        }
+        
+        e2 = err * 2;
+        if e2 > (0 - ady) {
+            err = err - ady;
+            cx = cx + sx;
+        }
+        if e2 < adx {
+            err = err + adx;
+            cy = cy + sy;
+        }
+    }
+    return 0;
+}
+
+func draw_head_pixel(pixels: ptr, cx: i64, cy: i64, color: i32) -> i64 {
+    dy = 0 - 2;
+    while dy <= 2 {
+        dx = 0 - 2;
+        while dx <= 2 {
+            px = cx + dx;
+            py = cy + dy;
+            if px >= 0 {
+                if px < 800 {
+                    if py >= 0 {
+                        if py < 520 {
+                            store32(pixels + (py * 800 + px) * 4, color);
+                        }
+                    }
+                }
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+func draw_spark(pixels: ptr, sx: i64, sy: i64, color: i32) -> i64 {
+    if sx >= 0 {
+        if sx < 800 {
+            if sy >= 0 {
+                if sy < 520 {
+                    store32(pixels + (sy * 800 + sx) * 4, color);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+func blend_pixel(pixels: ptr, x: i64, y: i64, r: i64, g: i64, b: i64, alpha: i64) -> i64 {
+    if x >= 0 {
+        if x < 800 {
+            if y >= 0 {
+                if y < 520 {
+                    offset = (y * 800 + x) * 4;
+                    dest = load32(pixels + offset);
+                    
+                    db = band(dest, 0xFF);
+                    dg = band(shr(dest, 8), 0xFF);
+                    dr = band(shr(dest, 16), 0xFF);
+                    
+                    inv_alpha = 256 - alpha;
+                    nr = shr(r * alpha + dr * inv_alpha, 8);
+                    ng = shr(g * alpha + dg * inv_alpha, 8);
+                    nb = shr(b * alpha + db * inv_alpha, 8);
+                    
+                    packed = nb + shl(ng, 8) + shl(nr, 16) + 0xFF000000;
+                    store32(pixels + offset, packed);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+func draw_portal_glow(pixels: ptr, cx: i64, cy: i64, r: i64, g: i64, b: i64, max_radius: i64) -> i64 {
+    r2 = max_radius * max_radius;
+    dy = 0 - max_radius;
+    while dy <= max_radius {
+        dx = 0 - max_radius;
+        while dx <= max_radius {
+            dist = dx*dx + dy*dy;
+            if dist <= r2 {
+                alpha = 120 - (dist * 120) / r2;
+                if alpha > 0 {
+                    blend_pixel(pixels, cx + dx, cy + dy, r, g, b, alpha);
+                }
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+func draw_portal_core(pixels: ptr, cx: i64, cy: i64, color: i32) -> i64 {
+    dy = 0 - 8;
+    while dy <= 8 {
+        dx = 0 - 8;
+        while dx <= 8 {
+            if dx*dx + dy*dy <= 64 {
+                px = cx + dx;
+                py = cy + dy;
+                if px >= 0 {
+                    if px < 800 {
+                        if py >= 0 {
+                            if py < 520 {
+                                store32(pixels + (py * 800 + px) * 4, color);
+                            }
+                        }
+                    }
+                }
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+func draw_btn_border(pixels: ptr, x0: i64, x1: i64, y0: i64, y1: i64, active: i64) -> i64 {
+    color = 0xFF506070; # regular frame
+    if active == 1 {
+        color = 0xFFFFFF00; # yellow highlight
+    }
+    
+    # Horizontal lines
+    x = x0;
+    while x < x1 {
+        store32(pixels + (y0 * 800 + x) * 4, color);
+        store32(pixels + (y1 * 800 + x) * 4, color);
+        x = x + 1;
+    }
+    
+    # Vertical lines
+    y = y0;
+    while y <= y1 {
+        store32(pixels + (y * 800 + x0) * 4, color);
+        store32(pixels + (y * 800 + x1) * 4, color);
+        y = y + 1;
+    }
+    return 0;
+}
+
+# --- Sandbox Matrix Alterations ---
+func carve_terrain_blob(cx: i64, cy: i64, radius: i64) -> i64 {
+    r2 = radius * radius;
+    dy = 0 - radius;
+    while dy <= radius {
+        dx = 0 - radius;
+        while dx <= radius {
+            if dx*dx + dy*dy <= r2 {
+                tx = cx + dx;
+                ty = cy + dy;
+                if tx >= 0 {
+                    if tx < 800 {
+                        if ty >= 0 {
+                            if ty < 520 {
+                                idx = ty * 800 + tx;
+                                type = load8(terrain_mask + idx);
+                                if type == 1 { store8(terrain_mask + idx, 0); }
+                                if type == 3 { store8(terrain_mask + idx, 0); }
+                                if type == 4 { store8(terrain_mask + idx, 0); }
+                            }
+                        }
+                    }
+                }
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+func draw_terrain_blob(cx: i64, cy: i64, type: i64) -> i64 {
+    radius = 10;
+    r2 = radius * radius;
+    dy = 0 - radius;
+    while dy <= radius {
+        dx = 0 - radius;
+        while dx <= radius {
+            if dx*dx + dy*dy <= r2 {
+                tx = cx + dx;
+                ty = cy + dy;
+                if tx >= 0 {
+                    if tx < 800 {
+                        if ty >= 0 {
+                            if ty < 520 {
+                                idx = ty * 800 + tx;
+                                cur = load8(terrain_mask + idx);
+                                if cur != 2 { # do not overwrite metal
+                                    store8(terrain_mask + idx, type);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    return 0;
+}
+
+func draw_builder_brick(bx: i64, by: i64, dir: i64) -> i64 {
+    h = 0;
+    while h < 2 {
+        w = 0;
+        while w < 6 {
+            tx = bx + w * dir;
+            ty = by + h;
+            if tx >= 0 {
+                if tx < 800 {
+                    if ty >= 0 {
+                        if ty < 520 {
+                            store8(terrain_mask + ty * 800 + tx, 3);
+                        }
+                    }
+                }
+            }
+            w = w + 1;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+func add_metal_platform(x_start: i64, x_end: i64, y_val: i64, thickness: i64) -> i64 {
+    y = y_val;
+    while y < y_val + thickness {
+        x = x_start;
+        while x < x_end {
+            if x >= 0 {
+                if x < 800 {
+                    if y >= 0 {
+                        if y < 520 {
+                            store8(terrain_mask + y * 800 + x, 2);
+                        }
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+func init_sandbox_level() -> i64 {
+    memset(terrain_mask, 0, 480000);
+    level = load64(current_level);
+    
+    if level == 0 {
+        # --- LEVEL 1: Columns Gap ("Poles Apart" Style) ---
+        store64(portal_spawn_x, 80);
+        store64(portal_spawn_y, 100);
+        store64(portal_exit_x, 740);
+        store64(portal_exit_y, 290);
+        
+        store64(hazard_x0, 180);
+        store64(hazard_x1, 680);
+        store64(hazard_y0, 470);
+        store64(hazard_y1, 520);
+        
+        add_metal_platform(40, 160, 160, 8);
+        
+        x = 0;
+        while x < 180 {
+            edge_y = 160 + (get_sin(x / 4) * 8) / 100;
+            if x > 150 {
+                edge_y = edge_y + (x - 150) * 12;
+            }
+            y = edge_y;
+            while y < 520 {
+                if y >= 0 {
+                    if y < 520 {
+                        store8(terrain_mask + y * 800 + x, 1);
+                    }
+                }
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        
+        y = 220;
+        col1_offset = 0;
+        col1_dir = 1;
+        col1_tick = 0;
+        while y < 520 {
+            left_x = 280 + col1_offset;
+            right_x = 330 + col1_offset;
+            x = left_x;
+            while x < right_x {
+                store8(terrain_mask + y * 800 + x, 4);
+                x = x + 1;
+            }
+            col1_tick = col1_tick + 1;
+            if col1_tick >= 8 {
+                col1_tick = 0;
+                col1_offset = col1_offset + col1_dir;
+                if col1_offset >= 4 { col1_dir = 0 - 1; }
+                if col1_offset <= 0 - 4 { col1_dir = 1; }
+            }
+            y = y + 1;
+        }
+        add_metal_platform(280, 330, 220, 4);
+        
+        y = 180;
+        col2_offset = 0;
+        col2_dir = 1;
+        col2_tick = 0;
+        while y < 520 {
+            left_x = 450 + col2_offset;
+            right_x = 500 + col2_offset;
+            x = left_x;
+            while x < right_x {
+                store8(terrain_mask + y * 800 + x, 4);
+                x = x + 1;
+            }
+            col2_tick = col2_tick + 1;
+            if col2_tick >= 6 {
+                col2_tick = 0;
+                col2_offset = col2_offset + col2_dir;
+                if col2_offset >= 6 { col2_dir = 0 - 1; }
+                if col2_offset <= 0 - 6 { col2_dir = 1; }
+            }
+            y = y + 1;
+        }
+        add_metal_platform(450, 500, 180, 4);
+        
+        y = 260;
+        col3_offset = 0;
+        col3_dir = 1;
+        col3_tick = 0;
+        while y < 520 {
+            left_x = 600 + col3_offset;
+            right_x = 650 + col3_offset;
+            x = left_x;
+            while x < right_x {
+                store8(terrain_mask + y * 800 + x, 4);
+                x = x + 1;
+            }
+            col3_tick = col3_tick + 1;
+            if col3_tick >= 10 {
+                col3_tick = 0;
+                col3_offset = col3_offset + col3_dir;
+                if col3_offset >= 5 { col3_dir = 0 - 1; }
+                if col3_offset <= 0 - 5 { col3_dir = 1; }
+            }
+            y = y + 1;
+        }
+        add_metal_platform(600, 650, 260, 4);
+        
+        add_metal_platform(680, 800, 300, 8);
+        
+        x = 680;
+        while x < 800 {
+            edge_y = 300 + (get_sin(x / 3) * 6) / 100;
+            if x < 710 {
+                edge_y = edge_y + (710 - x) * 12;
+            }
+            y = edge_y;
+            while y < 520 {
+                if y >= 0 {
+                    if y < 520 {
+                        store8(terrain_mask + y * 800 + x, 1);
+                    }
+                }
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+    } else if level == 1 {
+        # --- LEVEL 2: The Intricate Maze ---
+        store64(portal_spawn_x, 100);
+        store64(portal_spawn_y, 80);
+        store64(portal_exit_x, 150);
+        store64(portal_exit_y, 440);
+        
+        store64(hazard_x0, 0);
+        store64(hazard_x1, 800);
+        store64(hazard_y0, 500);
+        store64(hazard_y1, 520);
+        
+        add_metal_platform(50, 600, 120, 8);
+        
+        x = 600;
+        while x < 660 {
+            y = 120;
+            while y < 128 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        add_metal_platform(660, 750, 120, 8);
+        add_metal_platform(42, 50, 50, 78);
+        add_metal_platform(750, 758, 50, 78);
+        
+        add_metal_platform(50, 200, 230, 8);
+        x = 200;
+        while x < 260 {
+            y = 230;
+            while y < 238 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        add_metal_platform(260, 750, 230, 8);
+        add_metal_platform(700, 708, 128, 102);
+        add_metal_platform(42, 50, 128, 110);
+        
+        add_metal_platform(50, 750, 340, 8);
+        x = 480;
+        while x < 520 {
+            y = 280;
+            while y < 340 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        
+        x = 600;
+        while x < 660 {
+            y = 340;
+            while y < 348 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        add_metal_platform(750, 758, 238, 110);
+        add_metal_platform(42, 50, 238, 110);
+        
+        add_metal_platform(50, 700, 450, 8);
+        add_metal_platform(700, 708, 348, 110);
+        add_metal_platform(42, 50, 348, 110);
+    } else {
+        # --- LEVEL 3: The Valley of Hazards ---
+        store64(portal_spawn_x, 100);
+        store64(portal_spawn_y, 100);
+        store64(portal_exit_x, 700);
+        store64(portal_exit_y, 100);
+        
+        store64(hazard_x0, 220);
+        store64(hazard_x1, 580);
+        store64(hazard_y0, 470);
+        store64(hazard_y1, 520);
+        
+        # Left Precipice
+        add_metal_platform(50, 220, 180, 8);
+        x = 0;
+        while x < 220 {
+            y = 188;
+            while y < 520 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        add_metal_platform(42, 50, 50, 138);
+        
+        # Right Precipice
+        add_metal_platform(580, 750, 180, 8);
+        x = 580;
+        while x < 800 {
+            y = 188;
+            while y < 520 {
+                store8(terrain_mask + y * 800 + x, 1);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        add_metal_platform(750, 758, 50, 138);
+        
+        # Floating metal platform in the middle
+        add_metal_platform(350, 450, 360, 12);
+    }
+    return 0;
+}
+
+func trigger_explosion(cx: i64, cy: i64) -> i64 {
+    carve_terrain_blob(cx, cy, 25);
+    Beep(220, 150);
+    
+    # physics impulse on nearby active lemmings
+    i = 0;
+    while i < 200 {
+        state = load64(lem_state + i * 8);
+        if state > 0 {
+            if state < 6 {
+                ex = load64(lem_x + i * 8) / 256;
+                ey = load64(lem_y + i * 8) / 256;
+                dx = ex - cx;
+                dy = ey - cy;
+                dist_sq = dx*dx + dy*dy;
+                if dist_sq < 1600 { # within 40 pixels
+                    if dist_sq < 256 { # very close, dies
+                        store64(lem_state + i * 8, 0);
+                    } else {
+                        store64(lem_state + i * 8, 4); # Ragdoll Fall
+                        vx = 0;
+                        if dx > 0 { vx = 1024; } else { vx = 0 - 1024; }
+                        vy = 0 - 1536;
+                        store64(lem_vx + i * 8, vx);
+                        store64(lem_vy + i * 8, vy);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- Game Engine Initialization ---
+func game_start() -> i64 {
+    store64(score, 0);
+    store64(saved_count, 0);
+    store64(selected_tool, 0);
+    store64(spawn_timer, 0);
+    
+    init_sandbox_level();
+    
+    # Deactivate all lemmings
+    i = 0;
+    while i < 200 {
+        store64(lem_state + i * 8, 0);
+        i = i + 1;
+    }
+    
+    return 0;
+}
+
+# --- Input Handlers (Mouse Interactions) ---
+func handle_click(mx: i64, my: i64) -> i64 {
+    sel_tool = load64(selected_tool);
+    if my >= 520 {
+        # Select tool buttons
+        if mx >= 20 {
+            if mx < 120 { store64(selected_tool, 0); Beep(1200, 30); }
+        }
+        if mx >= 140 {
+            if mx < 240 {
+                sel = load64(selected_tool);
+                if sel == 1 {
+                    store64(selected_tool, 8);
+                } else {
+                    store64(selected_tool, 1);
+                }
+                Beep(1200, 30);
+            }
+        }
+        if mx >= 260 {
+            if mx < 360 { store64(selected_tool, 2); Beep(1200, 30); }
+        }
+        if mx >= 380 {
+            if mx < 480 { store64(selected_tool, 3); Beep(1200, 30); }
+        }
+        if mx >= 500 {
+            if mx < 600 { store64(selected_tool, 4); Beep(1200, 30); }
+        }
+        if mx >= 620 {
+            if mx < 720 {
+                level = load64(current_level) + 1;
+                if level >= 3 { level = 0; }
+                store64(current_level, level);
+                game_start();
+                Beep(800, 80);
+            }
+        }
+        return 0;
+    }
+    
+    
+    
+    if sel_tool == 4 { # Spawn
+        i = 0;
+        while i < 200 {
+            if load64(lem_state + i * 8) == 0 {
+                store64(lem_state + i * 8, 1); # Walker
+                store64(lem_x + i * 8, mx * 256);
+                store64(lem_y + i * 8, my * 256);
+                store64(lem_vx + i * 8, 0);
+                store64(lem_vy + i * 8, 0);
+                store64(lem_dir + i * 8, 1);
+                store64(lem_anim_tick + i * 8, 0);
+                Beep(1500, 20);
+                break;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    
+    # Assign states to clicked lemming
+    entity_found = 0;
+    i = 0;
+    while i < 200 {
+        if load64(lem_state + i * 8) > 0 {
+            if load64(lem_state + i * 8) < 6 {
+                ex = load64(lem_x + i * 8) / 256;
+                ey = load64(lem_y + i * 8) / 256;
+                dx = ex - mx;
+                dy = ey - my;
+                if dx*dx + dy*dy < 400 { # within 20px
+                    if sel_tool == 0 { store64(lem_state + i * 8, 1); }
+                    if sel_tool == 1 { store64(lem_state + i * 8, 2); }
+                    if sel_tool == 8 { store64(lem_state + i * 8, 8); }
+                    if sel_tool == 2 { store64(lem_state + i * 8, 3); store64(lem_action_timer + i * 8, 12); }
+                    if sel_tool == 3 { store64(lem_state + i * 8, 5); store64(lem_action_timer + i * 8, 300); }
+                    Beep(1800, 30);
+                    entity_found = 1;
+                    break;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    # Environment interaction if no lemming selected
+    if entity_found == 0 {
+        if sel_tool == 3 {
+            trigger_explosion(mx, my);
+            spawn_explosion_particles(mx, my);
+        }
+        if sel_tool == 2 { draw_terrain_blob(mx, my, 3); } # place bricks
+        if sel_tool == 1 {
+            carve_terrain_blob(mx, my, 12);
+            spawn_dirt_particles(mx, my);
+        }
+        if sel_tool == 8 {
+            carve_terrain_blob(mx, my, 12);
+            spawn_dirt_particles(mx, my);
+        }
+    }
+    return 0;
+}
+
+func handle_drag(mx: i64, my: i64) -> i64 {
+    if my >= 520 { return 0; }
+    sel_tool = load64(selected_tool);
+    if sel_tool == 1 {
+        carve_terrain_blob(mx, my, 12);
+        spawn_dirt_particles(mx, my);
+    }
+    if sel_tool == 8 {
+        carve_terrain_blob(mx, my, 12);
+        spawn_dirt_particles(mx, my);
+    }
+    if sel_tool == 2 { draw_terrain_blob(mx, my, 3); }
+    return 0;
+}
+
+# --- Game State Simulation ---
+func game_update() -> i64 {
+    store64(frame_tick, load64(frame_tick) + 1);
+    # Spawner releases Lemming
+    s_timer = load64(spawn_timer);
+    if s_timer > 0 {
+        store64(spawn_timer, s_timer - 1);
+    } else {
+        i = 0;
+        while i < 200 {
+            if load64(lem_state + i * 8) == 0 {
+                store64(lem_state + i * 8, 1); # Walker
+                store64(lem_x + i * 8, load64(portal_spawn_x) * 256);
+                store64(lem_y + i * 8, load64(portal_spawn_y) * 256);
+                store64(lem_vx + i * 8, 0);
+                store64(lem_vy + i * 8, 0);
+                store64(lem_dir + i * 8, 1); # walk right
+                store64(lem_anim_tick + i * 8, 0);
+                store64(spawn_timer, 90); # 1.5 seconds
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    
+    # Physics updates
+    i = 0;
+    while i < 200 {
+        state = load64(lem_state + i * 8);
+        if state > 0 {
+            is_active_phys = 0;
+            if state < 6 { is_active_phys = 1; }
+            if state == 8 { is_active_phys = 1; }
+            
+            if is_active_phys == 1 {
+                ex = load64(lem_x + i * 8) / 256;
+                ey = load64(lem_y + i * 8) / 256;
+                dir = load64(lem_dir + i * 8);
+                tick = load64(lem_anim_tick + i * 8);
+                
+                # Check hazard zone
+                hz0 = load64(hazard_x0);
+                hz1 = load64(hazard_x1);
+                hy0 = load64(hazard_y0);
+                hy1 = load64(hazard_y1);
+                if ex >= hz0 {
+                    if ex <= hz1 {
+                        if ey >= hy0 {
+                            if ey <= hy1 {
+                                store64(lem_state + i * 8, 7);
+                                store64(lem_action_timer + i * 8, 24);
+                                Beep(120, 100);
+                                i = i + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                # Screen bounds check
+                if ey >= 520 {
+                    store64(lem_state + i * 8, 0); # dead
+                    i = i + 1;
+                    continue;
+                }
+                
+                # Check exit portal (within 12px horizontally and 16px vertically)
+                ex_portal = load64(portal_exit_x);
+                ey_portal = load64(portal_exit_y);
+                dx = ex - ex_portal;
+                dy = ey - ey_portal;
+                if dx >= 0 - 12 {
+                    if dx <= 12 {
+                        if dy >= 0 - 16 {
+                            if dy <= 16 {
+                                store64(lem_state + i * 8, 6); # Escaping Cheer
+                                store64(lem_action_timer + i * 8, 30);
+                                Beep(1800, 40);
+                                i = i + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                
+                # State logic
+                if state == 1 { # Walker
+                    solid_under = load8(terrain_mask + (ey + 1) * 800 + ex);
+                    if solid_under == 0 {
+                        store64(lem_state + i * 8, 4); # Ragdoll Fall
+                        store64(lem_vy + i * 8, 256);
+                        i = i + 1;
+                        continue;
+                    }
+                    
+                    # Slope climb / Obstacle reverse
+                    if load8(terrain_mask + ey * 800 + ex + dir) != 0 {
+                        dy = 1;
+                        while dy <= 6 {
+                            if load8(terrain_mask + (ey - dy) * 800 + ex + dir) == 0 { break; }
+                            dy = dy + 1;
+                        }
+                        if dy <= 6 {
+                            ey = ey - dy;
+                            ex = ex + dir;
+                            store64(lem_x + i * 8, ex * 256);
+                            store64(lem_y + i * 8, ey * 256);
+                        } else {
+                            dir = 0 - dir;
+                            store64(lem_dir + i * 8, dir);
+                        }
+                    } else {
+                        ex = ex + dir;
+                        store64(lem_x + i * 8, ex * 256);
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+                
+                else if state == 5 { # Bombing (Countdown + Stand Still)
+                    timer = load64(lem_action_timer + i * 8) - 1;
+                    store64(lem_action_timer + i * 8, timer);
+                    if timer <= 0 {
+                        trigger_explosion(ex, ey - 4);
+                        spawn_explosion_particles(ex, ey - 4);
+                        store64(lem_state + i * 8, 0); # dead
+                        i = i + 1;
+                        continue;
+                    }
+                    solid_under = load8(terrain_mask + (ey + 1) * 800 + ex);
+                    if solid_under == 0 {
+                        store64(lem_state + i * 8, 4);
+                        store64(lem_vy + i * 8, 256);
+                        i = i + 1;
+                        continue;
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+                
+                else if state == 2 { # Digger
+                    if tick % 4 == 0 {
+                        carve_terrain_blob(ex, ey + 4, 12);
+                        spawn_dirt_particles(ex, ey + 4);
+                        ey = ey + 1;
+                        store64(lem_y + i * 8, ey * 256);
+                    }
+                    if load8(terrain_mask + (ey + 1) * 800 + ex) == 0 {
+                        store64(lem_state + i * 8, 1); # Back to Walker
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+                
+                else if state == 8 { # Diagonal Miner
+                    if tick % 6 == 0 {
+                        carve_terrain_blob(ex + dir * 6, ey + 4, 12);
+                        spawn_dirt_particles(ex + dir * 6, ey + 4);
+                        ex = ex + dir;
+                        ey = ey + 1;
+                        store64(lem_x + i * 8, ex * 256);
+                        store64(lem_y + i * 8, ey * 256);
+                    }
+                    if load8(terrain_mask + (ey + 1) * 800 + ex) == 0 {
+                        store64(lem_state + i * 8, 1); # Back to Walker
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+                
+                else if state == 3 { # Builder
+                    timer = load64(lem_action_timer + i * 8);
+                    if tick % 12 == 0 {
+                        bx = ex + dir * 1;
+                        by = ey + 1;
+                        draw_builder_brick(bx, by, dir);
+                        
+                        ex = ex + dir * 4;
+                        ey = ey - 1;
+                        store64(lem_x + i * 8, ex * 256);
+                        store64(lem_y + i * 8, ey * 256);
+                        
+                        timer = timer - 1;
+                        store64(lem_action_timer + i * 8, timer);
+                        if timer <= 0 {
+                            store64(lem_state + i * 8, 1); # Back to Walker
+                        }
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+                
+                else if state == 4 { # Ragdoll Fall
+                    vy = load64(lem_vy + i * 8) + 60;
+                    vx = load64(lem_vx + i * 8);
+                    
+                    if vy > 2048 { vy = 2048; } # terminal velocity
+                    store64(lem_vy + i * 8, vy);
+                    
+                    ex = ex + vx / 256;
+                    ey = ey + vy / 256;
+                    
+                    if vx > 0 {
+                        vx = vx - 30; if vx < 0 { vx = 0; }
+                    } else if vx < 0 {
+                        vx = vx + 30; if vx > 0 { vx = 0; }
+                    }
+                    store64(lem_vx + i * 8, vx);
+                    
+                    if ex < 0 { ex = 0; vx = 0 - vx; store64(lem_vx + i * 8, vx); }
+                    if ex >= 800 { ex = 799; vx = 0 - vx; store64(lem_vx + i * 8, vx); }
+                    
+                    store64(lem_x + i * 8, ex * 256);
+                    store64(lem_y + i * 8, ey * 256);
+                    
+                    solid_under = load8(terrain_mask + ey * 800 + ex);
+                    if solid_under != 0 {
+                        while load8(terrain_mask + ey * 800 + ex) != 0 {
+                            ey = ey - 1;
+                        }
+                        store64(lem_y + i * 8, ey * 256);
+                        
+                        if vy >= 2304 { # Fall splat damage
+                            store64(lem_state + i * 8, 0); # dead
+                            Beep(150, 200);
+                        } else {
+                            store64(lem_state + i * 8, 1);
+                            store64(lem_vy + i * 8, 0);
+                            store64(lem_vx + i * 8, 0);
+                        }
+                    }
+                    store64(lem_anim_tick + i * 8, tick + 1);
+                }
+            }
+            else if state == 6 { # Escaping Cheer
+                timer = load64(lem_action_timer + i * 8) - 1;
+                store64(lem_action_timer + i * 8, timer);
+                
+                # float upward 1 pixel per frame (scaled by 256)
+                store64(lem_y + i * 8, load64(lem_y + i * 8) - 256);
+                
+                if timer <= 0 {
+                    store64(lem_state + i * 8, 0); # deactivate
+                    store64(saved_count, load64(saved_count) + 1);
+                    store64(score, load64(score) + 100);
+                }
+            }
+            else if state == 7 { # Disintegrating
+                timer = load64(lem_action_timer + i * 8) - 1;
+                store64(lem_action_timer + i * 8, timer);
+                if timer <= 0 {
+                    store64(lem_state + i * 8, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    # Update particles
+    p_idx = 0;
+    while p_idx < 100 {
+        plife = load64(part_life + p_idx * 8);
+        if plife > 0 {
+            store64(part_life + p_idx * 8, plife - 1);
+            pvx = load64(part_vx + p_idx * 8);
+            pvy = load64(part_vy + p_idx * 8) + 30; # gravity
+            store64(part_vy + p_idx * 8, pvy);
+            
+            px = load64(part_x + p_idx * 8) + pvx;
+            py = load64(part_y + p_idx * 8) + pvy;
+            store64(part_x + p_idx * 8, px);
+            store64(part_y + p_idx * 8, py);
+        }
+        p_idx = p_idx + 1;
+    }
+    
+    return 0;
+}
+
+# --- Visual Scene Pipeline ---
+func paint_scene(hdc: ptr) -> i64 {
+    pixels = load64(ppv_bits);
+    if pixels == 0 { return 0; }
+    
+    # 1. Clear with solid black background (underground cave)
+    y = 0;
+    while y < 520 {
+        color = 0xFF000000;
+        x = 0;
+        while x < 800 {
+            store32(pixels + (y * 800 + x) * 4, color);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    
+    # 2. Paint destructible terrain mask
+    y = 0;
+    while y < 520 {
+        flute = 0;
+        x = 0;
+        while x < 800 {
+            idx = y * 800 + x;
+            type = load8(terrain_mask + idx);
+            if type != 0 {
+                # Edge/border detection for glowing wireframe look
+                is_border = 0;
+                if x == 0 { is_border = 1; }
+                else if x == 799 { is_border = 1; }
+                else if y == 0 { is_border = 1; }
+                else if y == 519 { is_border = 1; }
+                else {
+                    if load8(terrain_mask + idx - 1) == 0 { is_border = 1; }
+                    else if load8(terrain_mask + idx + 1) == 0 { is_border = 1; }
+                    else if load8(terrain_mask + idx - 800) == 0 { is_border = 1; }
+                    else if load8(terrain_mask + idx + 800) == 0 { is_border = 1; }
+                }
+                
+                if type == 1 { # Soft Earth (Classic Golden-Brown Rock)
+                    # Check if this pixel is near the top surface of the earth (to draw green moss/grass)
+                    is_top_moss = 0;
+                    if y > 4 {
+                        is_near_top = 0;
+                        if load8(terrain_mask + idx - 800) == 0 { is_near_top = 1; }
+                        else if load8(terrain_mask + idx - 1600) == 0 { is_near_top = 1; }
+                        else if load8(terrain_mask + idx - 2400) == 0 { is_near_top = 1; }
+                        else if load8(terrain_mask + idx - 3200) == 0 { is_near_top = 1; }
+                        
+                        if is_near_top == 1 {
+                            # Ensure it's a flat/gentle surface (not a steep vertical cliff)
+                            left_solid = 1;
+                            if x > 0 { if load8(terrain_mask + idx - 1) == 0 { left_solid = 0; } }
+                            right_solid = 1;
+                            if x < 799 { if load8(terrain_mask + idx + 1) == 0 { right_solid = 0; } }
+                            
+                            if left_solid == 1 {
+                                if right_solid == 1 {
+                                    is_top_moss = 1;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if is_top_moss == 1 {
+                        # Green moss texture
+                        pat = band((x / 2) + (y / 2), 1);
+                        if pat == 0 { store32(pixels + idx * 4, 0xFF00B000); } # bright green
+                        else { store32(pixels + idx * 4, 0xFF008000); } # darker green
+                    } else {
+                        if is_border == 1 {
+                            store32(pixels + idx * 4, 0xFFE5A020); # Golden-orange rock edge
+                        } else {
+                            pat = band((x / 4) + (y / 4), 1);
+                            if pat == 0 { store32(pixels + idx * 4, 0xFFCD853F); } # Peru/Golden Brown
+                            else { store32(pixels + idx * 4, 0xFF8B5A2B); } # Sienna/Dark Golden Brown
+                        }
+                    }
+                }
+                else if type == 2 { # Indestructible Platform (Classic Golden Stone Bricks)
+                    if is_border == 1 {
+                        store32(pixels + idx * 4, 0xFFFFD700); # Gold highlight edge
+                    } else {
+                        is_brick_line = 0;
+                        if band(x, 15) == 0 { is_brick_line = 1; }
+                        if band(y, 7) == 0 { is_brick_line = 1; }
+                        if is_brick_line == 1 {
+                            store32(pixels + idx * 4, 0xFF503000); # Dark mortar joint
+                        } else {
+                            pat = band((x / 2) + (y / 2), 1);
+                            if pat == 0 { store32(pixels + idx * 4, 0xFFCD853F); }
+                            else { store32(pixels + idx * 4, 0xFFD2B48C); }
+                        }
+                    }
+                }
+                else if type == 3 { # Builder Bricks (Classic Clay Bricks)
+                    if is_border == 1 {
+                        store32(pixels + idx * 4, 0xFFE5A020); # Gold edge
+                    } else {
+                        pat = band((x / 2) + (y / 2), 1);
+                        if pat == 0 { store32(pixels + idx * 4, 0xFFCD853F); }
+                        else { store32(pixels + idx * 4, 0xFF8B4513); }
+                    }
+                }
+                else if type == 4 { # Classical Fluted Column (Type 4)
+                    is_capital = 0;
+                    y_top = 0;
+                    if x >= 270 {
+                        if x <= 340 {
+                            if y >= 220 {
+                                if y < 232 {
+                                    is_capital = 1;
+                                    y_top = 220;
+                                }
+                            }
+                        }
+                    }
+                    if x >= 440 {
+                        if x <= 510 {
+                            if y >= 180 {
+                                if y < 192 {
+                                    is_capital = 1;
+                                    y_top = 180;
+                                }
+                            }
+                        }
+                    }
+                    if x >= 590 {
+                        if x <= 660 {
+                            if y >= 260 {
+                                if y < 272 {
+                                    is_capital = 1;
+                                    y_top = 260;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if is_capital == 1 {
+                        col_cx = 305;
+                        if x >= 440 {
+                            if x <= 510 {
+                                col_cx = 475;
+                            }
+                        }
+                        if x >= 590 {
+                            if x <= 660 {
+                                col_cx = 625;
+                            }
+                        }
+                        
+                        rx = x - col_cx;
+                        ry = y - y_top; # No modulo
+                        
+                        if ry < 3 {
+                            store32(pixels + idx * 4, 0xFFFFA500);
+                        } else {
+                            lx = rx + 20;
+                            ly = ry - 7;
+                            dist_left_sq = lx * lx + ly * ly;
+                            
+                            rx_val = rx - 20;
+                            dist_right_sq = rx_val * rx_val + ly * ly;
+                            
+                            is_scroll = 0;
+                            if dist_left_sq < 36 {
+                                if dist_left_sq >= 25 { is_scroll = 1; }
+                                else if dist_left_sq >= 16 { is_scroll = 0; }
+                                else if dist_left_sq >= 9 { is_scroll = 1; }
+                                else if dist_left_sq >= 4 { is_scroll = 0; }
+                                else { is_scroll = 1; }
+                            }
+                            if dist_right_sq < 36 {
+                                if dist_right_sq >= 25 { is_scroll = 1; }
+                                else if dist_right_sq >= 16 { is_scroll = 0; }
+                                else if dist_right_sq >= 9 { is_scroll = 1; }
+                                else if dist_right_sq >= 4 { is_scroll = 0; }
+                                else { is_scroll = 1; }
+                            }
+                            
+                            if is_scroll == 1 {
+                                store32(pixels + idx * 4, 0xFFFFD700);
+                            } else {
+                                if ry >= 5 {
+                                    if ry <= 9 {
+                                        store32(pixels + idx * 4, 0xFF503000);
+                                    } else {
+                                        store32(pixels + idx * 4, 0xFFCD853F);
+                                    }
+                                } else {
+                                    store32(pixels + idx * 4, 0xFFCD853F);
+                                }
+                            }
+                        }
+                    } else {
+                        # 3D fluting body (uses additive flute index)
+                        if flute == 0 { store32(pixels + idx * 4, 0xFF503000); }
+                        else if flute == 1 { store32(pixels + idx * 4, 0xFF704500); }
+                        else if flute == 2 { store32(pixels + idx * 4, 0xFF906000); }
+                        else if flute == 3 { store32(pixels + idx * 4, 0xFFB07500); }
+                        else if flute == 4 { store32(pixels + idx * 4, 0xFFD09000); }
+                        else if flute == 5 { store32(pixels + idx * 4, 0xFFFFA500); }
+                        else if flute == 6 { store32(pixels + idx * 4, 0xFFFFA500); }
+                        else if flute == 7 { store32(pixels + idx * 4, 0xFFD09000); }
+                        else if flute == 8 { store32(pixels + idx * 4, 0xFF906000); }
+                        else { store32(pixels + idx * 4, 0xFF704500); }
+                    }
+                }
+            }
+            flute = flute + 1;
+            if flute >= 10 { flute = 0; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    
+    # 2.5 Paint animated bubbling molten hazard pools
+    hz0 = load64(hazard_x0);
+    hz1 = load64(hazard_x1);
+    hz_y0 = load64(hazard_y0);
+    hz_y1 = load64(hazard_y1);
+    tick = load64(frame_tick);
+    
+    if hz1 > hz0 {
+        hy = hz_y0 - 4;
+        while hy < hz_y1 {
+            if hy >= 0 {
+                if hy < 520 {
+                    hx = hz0;
+                    while hx < hz1 {
+                        val = get_sin(hx * 5 + tick * 4) * 3 + 300;
+                        wave_h = shr(val, 7) - 2;
+                        wave_y = hz_y0 + wave_h;
+                        if hy >= wave_y {
+                            idx = hy * 800 + hx;
+                            if hy == wave_y {
+                                store32(pixels + idx * 4, 0xFFFFFFFF);
+                            } else {
+                                bubble = band(hx * 3 + hy * 7 + tick, 63) == 0;
+                                if bubble == 1 {
+                                    store32(pixels + idx * 4, 0xFFB0E0FF);
+                                } else {
+                                    store32(pixels + idx * 4, 0xFF0055D4);
+                                }
+                            }
+                        }
+                        hx = hx + 1;
+                    }
+                }
+            }
+            hy = hy + 1;
+        }
+    }
+    
+    # 3. Draw Portals (Halos & cores)
+    sp_x = load64(portal_spawn_x);
+    sp_y = load64(portal_spawn_y);
+    ex_x = load64(portal_exit_x);
+    ex_y = load64(portal_exit_y);
+    
+    draw_portal_glow(pixels, sp_x, sp_y, 0, 255, 255, 35);
+    draw_portal_core(pixels, sp_x, sp_y, 0xFFCCFFFF);
+    
+    draw_portal_glow(pixels, ex_x, ex_y, 255, 120, 0, 35);
+    # Draw exit structural archway
+    ay = ex_y - 20;
+    while ay <= ex_y {
+        ax = ex_x - 12;
+        while ax <= ex_x - 8 {
+            if ax >= 0 {
+                if ax < 800 {
+                    if ay >= 0 {
+                        if ay < 520 {
+                            # Draw stone bricks for left pillar
+                            pat = ay % 6 == 0;
+                            if pat == 1 { store32(pixels + (ay * 800 + ax) * 4, 0xFF503000); }
+                            else { store32(pixels + (ay * 800 + ax) * 4, 0xFFCD853F); }
+                        }
+                    }
+                }
+            }
+            ax = ax + 1;
+        }
+        ay = ay + 1;
+    }
+    ay = ex_y - 20;
+    while ay <= ex_y {
+        ax = ex_x + 8;
+        while ax <= ex_x + 12 {
+            if ax >= 0 {
+                if ax < 800 {
+                    if ay >= 0 {
+                        if ay < 520 {
+                            # Draw stone bricks for right pillar
+                            pat = ay % 6 == 0;
+                            if pat == 1 { store32(pixels + (ay * 800 + ax) * 4, 0xFF503000); }
+                            else { store32(pixels + (ay * 800 + ax) * 4, 0xFFCD853F); }
+                        }
+                    }
+                }
+            }
+            ax = ax + 1;
+        }
+        ay = ay + 1;
+    }
+    ay = ex_y - 24;
+    while ay <= ex_y - 20 {
+        ax = ex_x - 12;
+        while ax <= ex_x + 12 {
+            if ax >= 0 {
+                if ax < 800 {
+                    if ay >= 0 {
+                        if ay < 520 {
+                            # Draw lintel top bar in solid gold highlight
+                            store32(pixels + (ay * 800 + ax) * 4, 0xFFFFA500);
+                        }
+                    }
+                }
+            }
+            ax = ax + 1;
+        }
+        ay = ay + 1;
+    }
+    
+    # 3.5 Render active dirt particles
+    p_idx = 0;
+    while p_idx < 100 {
+        plife = load64(part_life + p_idx * 8);
+        if plife > 0 {
+            px = load64(part_x + p_idx * 8) / 256;
+            py = load64(part_y + p_idx * 8) / 256;
+            if px >= 0 {
+                if px < 800 {
+                    if py >= 0 {
+                        if py < 520 {
+                            store32(pixels + (py * 800 + px) * 4, 0xFF8B5A2B);
+                        }
+                    }
+                }
+            }
+        }
+        p_idx = p_idx + 1;
+    }
+    
+    # 4. Render Lemming Retro Sprite frames
+    i = 0;
+    while i < 200 {
+        state = load64(lem_state + i * 8);
+        if state > 0 {
+            if state < 6 {
+                ex = shr(load64(lem_x + i * 8), 8);
+                ey = shr(load64(lem_y + i * 8), 8);
+                dir = load64(lem_dir + i * 8);
+                tick = load64(lem_anim_tick + i * 8);
+                
+                # Determine which sprite frame to draw (offset in bytes)
+                frame_offset = 0;
+                
+                # State mapping:
+                # 1 = Walker (4 walk frames)
+                # 2 = Digger (Frame 4)
+                # 3 = Builder (Frame 5)
+                # 4 = Ragdoll Fall (Frame 6)
+                # 5 = Bombing (Walker anim frame offset)
+                
+                if state == 1 {
+                    frame_idx = band(shr(tick, 2), 3); # slower walking cycle animation rate
+                    frame_offset = frame_idx * 80;
+                }
+                else if state == 5 {
+                    frame_idx = band(shr(tick, 2), 3);
+                    frame_offset = frame_idx * 80;
+                }
+                else if state == 2 {
+                    frame_offset = 320; # Digger frame
+                }
+                else if state == 3 {
+                    frame_offset = 400; # Builder frame
+                }
+                else if state == 4 {
+                    frame_offset = 480; # Ragdoll Fall frame
+                }
+                
+                # Draw 8x10 sprite using raw color injection
+                dy = 0;
+                while dy < 10 {
+                    dx = 0;
+                    while dx < 8 {
+                        # Horizontal mirroring depending on direction
+                        if dir == 0 - 1 {
+                            read_x = 7 - dx;
+                        } else {
+                            read_x = dx;
+                        }
+                        
+                        val = load8(sprite_frames + frame_offset + dy * 8 + read_x);
+                        if val != 0 {
+                            color = 0;
+                            if val == 1 { color = 0xFF00FF00; } # Hair: Bright Neon Green
+                            if val == 2 {
+                                color = 0xFF0000FF; # Tunic: Deep Classic Blue
+                                if state == 5 {
+                                    # Bombing Flash tunic to white
+                                    flash = band(tick, 8);
+                                    if flash == 0 { color = 0xFFFFFFFF; }
+                                }
+                            }
+                            if val == 3 { color = 0xFFFFCC99; } # Face/Skin: Soft Peach
+                            
+                            px = ex - 4 + dx;
+                            py = ey - 10 + dy;
+                            
+                            # Boundary check before drawing
+                            if px >= 0 {
+                                if px < 800 {
+                                    if py >= 0 {
+                                        if py < 520 {
+                                            store32(pixels + (py * 800 + px) * 4, color);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+                
+                # Render Bomb countdown overlay via GDI
+                if state == 5 {
+                    sec = shr(load64(lem_action_timer + i * 8) * 17, 10) + 1;
+                    SetTextColor(hdc, 0x00FFFFFF);
+                    SetBkMode(hdc, 1);
+                    store8(ch_buf, 48 + sec);
+                    TextOutA(hdc, ex - 4, ey - 24, ch_buf, 1);
+                }
+            }
+            if state == 6 { # Escaping Cheer
+                ex = shr(load64(lem_x + i * 8), 8);
+                ey = shr(load64(lem_y + i * 8), 8);
+                timer = load64(lem_action_timer + i * 8);
+                
+                # rapid animation cycle: Walk 0-3
+                frame_idx = band(shr(timer * 85, 8), 3);
+                frame_offset = frame_idx * 80;
+                
+                # flash cyan/green
+                flash = band(timer, 4);
+                r = 0;
+                g = 255;
+                b = 0;
+                if flash == 0 {
+                    b = 255; # cyan
+                }
+                
+                alpha = shr(timer * 2176, 8);
+                
+                # Draw sprite pixels using alpha blending
+                dy = 0;
+                while dy < 10 {
+                    dx = 0;
+                    while dx < 8 {
+                        val = load8(sprite_frames + frame_offset + dy * 8 + dx);
+                        if val != 0 {
+                            px = ex - 4 + dx;
+                            py = ey - 10 + dy;
+                            blend_pixel(pixels, px, py, r, g, b, alpha);
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+            if state == 7 {
+                ex = shr(load64(lem_x + i * 8), 8);
+                ey = shr(load64(lem_y + i * 8), 8);
+                timer = load64(lem_action_timer + i * 8);
+                t = 24 - timer;
+                
+                color = 0xFFFF0000;
+                if t < 8 { color = 0xFFFFFF00; }
+                else if t < 16 { color = 0xFFFF9900; }
+                
+                draw_spark(pixels, ex + t, ey, color);
+                draw_spark(pixels, ex - t, ey, color);
+                draw_spark(pixels, ex, ey + t, color);
+                draw_spark(pixels, ex, ey - t, color);
+                
+                diag = shr(t * 179, 8);
+                draw_spark(pixels, ex + diag, ey + diag, color);
+                draw_spark(pixels, ex - diag, ey + diag, color);
+                draw_spark(pixels, ex + diag, ey - diag, color);
+                draw_spark(pixels, ex - diag, ey - diag, color);
+            }
+        }
+        i = i + 1;
+    }
+    
+    # 5. Draw Bottom Toolbar
+    y = 520;
+    while y < 600 {
+        r = 21 - shr(y - 520, 3);
+        g = 25 - shr(y - 520, 3);
+        b = 32 - shr(y - 520, 3);
+        color = b + shl(g, 8) + shl(r, 16) + 0xFF000000;
+        
+        x = 0;
+        while x < 800 {
+            store32(pixels + (y * 800 + x) * 4, color);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    
+    # Cyan separator
+    x = 0;
+    while x < 800 {
+        store32(pixels + (520 * 800 + x) * 4, 0xFF00FFFF);
+        x = x + 1;
+    }
+    
+    # Draw button borders
+    sel = load64(selected_tool);
+    draw_btn_border(pixels, 20, 120, 535, 585, sel == 0);
+    
+    is_dig_mine_active = 0;
+    if sel == 1 { is_dig_mine_active = 1; }
+    if sel == 8 { is_dig_mine_active = 1; }
+    draw_btn_border(pixels, 140, 240, 535, 585, is_dig_mine_active);
+    
+    draw_btn_border(pixels, 260, 360, 535, 585, sel == 2);
+    draw_btn_border(pixels, 380, 480, 535, 585, sel == 3);
+    draw_btn_border(pixels, 500, 600, 535, 585, sel == 4);
+    draw_btn_border(pixels, 620, 720, 535, 585, 0); # LEVEL instant button
+    
+    # 6. Select Font and overlay HUD/UI texts via memory DC
+    old_font = SelectObject(hdc, load64(hud_font));
+    SetBkMode(hdc, 1);
+    
+    SetTextColor(hdc, 0x00FFFFFF);
+    TextOutA(hdc, 50, 550, "WALK", 4);
+    
+    if sel == 8 {
+        TextOutA(hdc, 175, 550, "MINE", 4);
+    } else {
+        TextOutA(hdc, 175, 550, "DIG", 3);
+    }
+    
+    TextOutA(hdc, 290, 550, "BUILD", 5);
+    TextOutA(hdc, 415, 550, "BOMB", 4);
+    TextOutA(hdc, 530, 550, "SPAWN", 5);
+    TextOutA(hdc, 655, 550, "LEVEL", 5);
+    
+    SetTextColor(hdc, 0x0000FFFF); # Cyan
+    draw_text_num(hdc, 20, 20, "SCORE: ", load64(score));
+    
+    SetTextColor(hdc, 0x0000FF00); # Green
+    draw_text_num(hdc, 300, 20, "SAVED: ", load64(saved_count));
+    
+    SetTextColor(hdc, 0x0000FFFF); # Cyan
+    draw_text_num(hdc, 460, 20, "LEVEL: ", load64(current_level) + 1);
+    
+    # Tool mode status overlay
+    SetTextColor(hdc, 0x00FF00FF); # Magenta
+    if sel == 0 { TextOutA(hdc, 600, 20, "TOOL: WALKER", 12); }
+    if sel == 1 { TextOutA(hdc, 600, 20, "TOOL: DIGGER", 12); }
+    if sel == 8 { TextOutA(hdc, 600, 20, "TOOL: MINER", 11); }
+    if sel == 2 { TextOutA(hdc, 600, 20, "TOOL: BUILDER", 13); }
+    if sel == 3 { TextOutA(hdc, 600, 20, "TOOL: EXPLODE", 13); }
+    if sel == 4 { TextOutA(hdc, 600, 20, "TOOL: SPAWNER", 13); }
+    
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        h_mem = load64(hdc_mem);
+        
+        # Draw and composite directly onto memory DIB context
+        paint_scene(h_mem);
+        
+        # Blit whole composite to screen
+        BitBlt(hdc, 0, 0, 800, 600, h_mem, 0, 0, 0x00CC0020);
+        
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+    
+    if msg == 513 { # WM_LBUTTONDOWN
+        mx = band(lParam, 0xFFFF);
+        my = band(shr(lParam, 16), 0xFFFF);
+        handle_click(mx, my);
+        return 0;
+    }
+    
+    if msg == 512 { # WM_MOUSEMOVE
+        lbutton = band(wParam, 1);
+        if lbutton == 1 {
+            mx = band(lParam, 0xFFFF);
+            my = band(shr(lParam, 16), 0xFFFF);
+            handle_drag(mx, my);
+        }
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize Solid brush for background
+    store64(bg_brush, CreateSolidBrush(0x00141920));
+    
+    # Initialize fonts
+    store64(hud_font, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(title_font, CreateFontA(28, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    
+    # Seed LCG
+    store64(rand_seed, GetTickCount());
+    
+    # Precalculate Trig sin_table (scaled x100)
+    # Sine values at 32 segments over a full cycle (11.25 degrees steps)
+    store32(sin_table + 0, 0); store32(sin_table + 4, 19); store32(sin_table + 8, 38); store32(sin_table + 12, 55);
+    store32(sin_table + 16, 70); store32(sin_table + 20, 83); store32(sin_table + 24, 92); store32(sin_table + 28, 98);
+    store32(sin_table + 32, 100); store32(sin_table + 36, 98); store32(sin_table + 40, 92); store32(sin_table + 44, 83);
+    store32(sin_table + 48, 70); store32(sin_table + 52, 55); store32(sin_table + 56, 38); store32(sin_table + 60, 19);
+    store32(sin_table + 64, 0); store32(sin_table + 68, 0 - 19); store32(sin_table + 72, 0 - 38); store32(sin_table + 76, 0 - 55);
+    store32(sin_table + 80, 0 - 70); store32(sin_table + 84, 0 - 83); store32(sin_table + 88, 0 - 92); store32(sin_table + 92, 0 - 98);
+    store32(sin_table + 96, 0 - 100); store32(sin_table + 100, 0 - 98); store32(sin_table + 104, 0 - 92); store32(sin_table + 108, 0 - 83);
+    store32(sin_table + 112, 0 - 70); store32(sin_table + 116, 0 - 55); store32(sin_table + 120, 0 - 38); store32(sin_table + 124, 0 - 19);
+    
+    # Initialize Lemming Sprite Frames Matrix
+    # Frame 0 (Walk 0)
+    store64(sprite_frames + 0, 0x0000000101010000);
+    store64(sprite_frames + 8, 0x0000010101010100);
+    store64(sprite_frames + 16, 0x0000030303010100);
+    store64(sprite_frames + 24, 0x0000030303010000);
+    store64(sprite_frames + 32, 0x0000000202020000);
+    store64(sprite_frames + 40, 0x0003020202020200);
+    store64(sprite_frames + 48, 0x0000020202020200);
+    store64(sprite_frames + 56, 0x0000000202020000);
+    store64(sprite_frames + 64, 0x0000000300030000);
+    store64(sprite_frames + 72, 0x0000030300030300);
+    
+    # Frame 1 (Walk 1)
+    store64(sprite_frames + 80, 0x0000000101010000);
+    store64(sprite_frames + 88, 0x0000010101010100);
+    store64(sprite_frames + 96, 0x0000030303010100);
+    store64(sprite_frames + 104, 0x0000030303010000);
+    store64(sprite_frames + 112, 0x0000000202020000);
+    store64(sprite_frames + 120, 0x0000020202020200);
+    store64(sprite_frames + 128, 0x0003020202020200);
+    store64(sprite_frames + 136, 0x0000000202020000);
+    store64(sprite_frames + 144, 0x0000000003000000);
+    store64(sprite_frames + 152, 0x0000000303030000);
+    
+    # Frame 2 (Walk 2)
+    store64(sprite_frames + 160, 0x0000000101010000);
+    store64(sprite_frames + 168, 0x0000010101010100);
+    store64(sprite_frames + 176, 0x0000030303010100);
+    store64(sprite_frames + 184, 0x0000030303010000);
+    store64(sprite_frames + 192, 0x0000000202020000);
+    store64(sprite_frames + 200, 0x0003020202020200);
+    store64(sprite_frames + 208, 0x0000020202020200);
+    store64(sprite_frames + 216, 0x0000000202020000);
+    store64(sprite_frames + 224, 0x0000000300030000);
+    store64(sprite_frames + 232, 0x0000030300030300);
+    
+    # Frame 3 (Walk 3)
+    store64(sprite_frames + 240, 0x0000000101010000);
+    store64(sprite_frames + 248, 0x0000010101010100);
+    store64(sprite_frames + 256, 0x0000030303010100);
+    store64(sprite_frames + 264, 0x0000030303010000);
+    store64(sprite_frames + 272, 0x0000000202020000);
+    store64(sprite_frames + 280, 0x0000020202020200);
+    store64(sprite_frames + 288, 0x0003020202020200);
+    store64(sprite_frames + 296, 0x0000000202020000);
+    store64(sprite_frames + 304, 0x0000000003000000);
+    store64(sprite_frames + 312, 0x0000000303030000);
+    
+    # Frame 4 (Digger)
+    store64(sprite_frames + 320, 0x0000000101010000);
+    store64(sprite_frames + 328, 0x0000010101010100);
+    store64(sprite_frames + 336, 0x0000030303010100);
+    store64(sprite_frames + 344, 0x0003030303010000);
+    store64(sprite_frames + 352, 0x0000030202020000);
+    store64(sprite_frames + 360, 0x0000020202020200);
+    store64(sprite_frames + 368, 0x0000020202020200);
+    store64(sprite_frames + 376, 0x0000000202020000);
+    store64(sprite_frames + 384, 0x0000000300030000);
+    store64(sprite_frames + 392, 0x0000030300030300);
+    
+    # Frame 5 (Builder)
+    store64(sprite_frames + 400, 0x0000000101010000);
+    store64(sprite_frames + 408, 0x0000010101010100);
+    store64(sprite_frames + 416, 0x0000030303010100);
+    store64(sprite_frames + 424, 0x0003030303010000);
+    store64(sprite_frames + 432, 0x0303020202020000);
+    store64(sprite_frames + 440, 0x0000020202020200);
+    store64(sprite_frames + 448, 0x0000020202020200);
+    store64(sprite_frames + 456, 0x0000000202020000);
+    store64(sprite_frames + 464, 0x0000000300030000);
+    store64(sprite_frames + 472, 0x0000030300030300);
+    
+    # Frame 6 (Ragdoll Fall)
+    store64(sprite_frames + 480, 0x0000030303000000);
+    store64(sprite_frames + 488, 0x0003010101030000);
+    store64(sprite_frames + 496, 0x0003010101010103);
+    store64(sprite_frames + 504, 0x0000010202020100);
+    store64(sprite_frames + 512, 0x0000020202020200);
+    store64(sprite_frames + 520, 0x0000020202020200);
+    store64(sprite_frames + 528, 0x0000000202020000);
+    store64(sprite_frames + 536, 0x0000030000000300);
+    store64(sprite_frames + 544, 0x0003000000000003);
+    store64(sprite_frames + 552, 0x0000000000000000);
+    
+    # Initialize BITMAPINFOHEADER structure (40 bytes)
+    store32(pbmi_buf + 0, 40);         # biSize
+    store32(pbmi_buf + 4, 800);        # biWidth
+    store32(pbmi_buf + 8, 0 - 600);    # biHeight (negative for top-down)
+    store16(pbmi_buf + 12, 1);         # biPlanes
+    store16(pbmi_buf + 14, 32);        # biBitCount (32-bit ARGB pixels)
+    store32(pbmi_buf + 16, 0);         # biCompression (BI_RGB)
+    store32(pbmi_buf + 20, 0);
+    store32(pbmi_buf + 24, 0);
+    store32(pbmi_buf + 28, 0);
+    store32(pbmi_buf + 32, 0);
+    store32(pbmi_buf + 36, 0);
+    
+    # Initialize sandbox simulation matrix
+    game_start();
+    
+    # Register window class
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3); # CS_HREDRAW | CS_VREDRAW
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+    
+    # Create main GUI window
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 150, 80, 816, 638, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    
+    if hwnd_val == 0 {
+        return 1;
+    }
+    
+    # Setup persistent double buffer compatible DC & DIB Section
+    hdc_screen = GetDC(hwnd_val);
+    h_mem = CreateCompatibleDC(hdc_screen);
+    store64(hdc_mem, h_mem);
+    
+    hbm_dib = CreateDIBSection(hdc_screen, pbmi_buf, 0, ppv_bits, 0, 0);
+    store64(hbitmap_dib, hbm_dib);
+    
+    SelectObject(h_mem, hbm_dib);
+    ReleaseDC(hwnd_val, hdc_screen);
+    
+    # Display Window
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    
+    # QPC stable 60 FPS anchor
+    QueryPerformanceFrequency(qpc_freq);
+    freq = load64(qpc_freq);
+    target_ticks = freq / 60;
+    
+    QueryPerformanceCounter(qpc_last);
+    
+    while 1 {
+        # Feed entropy
+        store64(rand_seed, load64(rand_seed) * 2862933555777941757 + GetTickCount() + 13);
+        
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; } # WM_QUIT
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            # Precise 60Hz timing tick
+            QueryPerformanceCounter(qpc_curr);
+            curr = load64(qpc_curr);
+            last = load64(qpc_last);
+            
+            if curr - last >= target_ticks {
+                store64(qpc_last, curr);
+                
+                # Update physics state machine
+                game_update();
+                
+                # Invalidate screen to request GDI redraw
+                InvalidateRect(hwnd_val, 0, 0);
+            } else {
+                Sleep(1); # yield CPU
+            }
+        }
+    }
+    
+    # Clean GDI resources
+    DeleteObject(load64(hbitmap_dib));
+    DeleteDC(load64(hdc_mem));
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(hud_font));
+    DeleteObject(load64(title_font));
+    
+    return 0;
+}

@@ -1,0 +1,247 @@
+# =====================================================================
+#  json.ancl  -  Minimal zero-dependency JSON parser (core_lib).
+#
+#  Parses a JSON text into a flat DOM node pool and exposes a small
+#  accessor API (object member lookup, array iteration, typed scalar
+#  reads). No CRT, no allocator beyond a fixed node pool + string arena.
+#  Tolerant: unknown keys are ignored by the reader, extra whitespace ok.
+#  Numbers are parsed as int64 (fraction/exponent are skipped for now).
+#
+#  Node record (48 bytes): type@0, child@8, sibling@16, sptr@24, ival@32, vidx@40
+#    OBJ  child = first key node
+#    ARR  child = first element node
+#    key  node (a STR used as an object key): sptr = key, vidx = value node, sibling = next key
+#    element node: any type, sibling = next element
+# =====================================================================
+
+@DATA
+J_OBJ:  i64 = 1;
+J_ARR:  i64 = 2;
+J_STR:  i64 = 3;
+J_NUM:  i64 = 4;
+J_BOOL: i64 = 5;
+J_NUL:  i64 = 6;
+
+J_MAXNODES: i64 = 4096;
+j_nodes:  buf = 196608;    # 4096 * 48
+j_arena:  buf = 131072;    # string arena
+j_src:    buf = 8;
+j_pos:    buf = 8;
+j_ncount: buf = 8;
+j_apos:   buf = 8;
+j_pv:     buf = 8;         # function pointer to j_parse_value (set at parse time; enables the obj/arr <-> value recursion)
+j_emptystr: str = "";
+
+@CODE
+func j_empty() -> i64 { return j_emptystr; }
+func j_node(idx: i64) -> i64 { return j_nodes + idx * 48; }
+func json_type(idx: i64) -> i64 { if idx < 0 { return 0; } return load64(j_node(idx) + 0); }
+func json_child(idx: i64) -> i64 { return load64(j_node(idx) + 8); }
+func json_next(idx: i64)  -> i64 { return load64(j_node(idx) + 16); }
+func json_str(idx: i64)   -> i64 { return load64(j_node(idx) + 24); }
+func json_int(idx: i64)   -> i64 { return load64(j_node(idx) + 32); }
+
+func j_streq(a: i64, b: i64) -> i64 {
+    i = 0;
+    while load8(a + i) != 0 { if load8(a + i) != load8(b + i) { return 0; } i = i + 1; }
+    if load8(b + i) != 0 { return 0; }
+    return 1;
+}
+
+func j_alloc(type: i64) -> i64 {
+    i = load64(j_ncount);
+    if i >= J_MAXNODES { return 0 - 1; }
+    n = j_node(i);
+    store64(n + 0, type); store64(n + 8, 0 - 1); store64(n + 16, 0 - 1);
+    store64(n + 24, 0); store64(n + 32, 0); store64(n + 40, 0 - 1);
+    store64(j_ncount, i + 1);
+    return i;
+}
+
+func j_peek() -> i64 { return load8(load64(j_src) + load64(j_pos)); }
+func j_adv() -> i64 { store64(j_pos, load64(j_pos) + 1); return 0; }
+func j_ws() -> i64 {
+    while 1 {
+        c = j_peek();
+        if c == 32 { j_adv(); }
+        else { if c == 9 { j_adv(); } else { if c == 10 { j_adv(); } else { if c == 13 { j_adv(); } else { return 0; } } } }
+    }
+    return 0;
+}
+
+# parse a string (also used for object keys). Copies into the arena, null-terminated.
+func j_parse_str() -> i64 {
+    j_adv();                                  # skip opening quote
+    start = j_arena + load64(j_apos);
+    src = load64(j_src);
+    while 1 {
+        c = load8(src + load64(j_pos));
+        if c == 34 { j_adv(); break; }         # closing quote
+        if c == 0 { break; }
+        if c == 92 {                           # backslash escape
+            j_adv();
+            e = load8(src + load64(j_pos));
+            o = e;
+            if e == 110 { o = 10; }            # \n
+            if e == 116 { o = 9; }             # \t
+            if e == 114 { o = 13; }            # \r
+            if e == 98 { o = 8; }              # \b
+            if e == 102 { o = 12; }            # \f
+            if e == 117 {                      # \uXXXX -> emit '?' and skip 4 hex
+                store8(j_arena + load64(j_apos), 63); store64(j_apos, load64(j_apos) + 1);
+                store64(j_pos, load64(j_pos) + 5);
+                o = 0 - 1;
+            }
+            if o != (0 - 1) {
+                store8(j_arena + load64(j_apos), o); store64(j_apos, load64(j_apos) + 1);
+                j_adv();
+            }
+        } else {
+            store8(j_arena + load64(j_apos), c); store64(j_apos, load64(j_apos) + 1);
+            j_adv();
+        }
+    }
+    store8(j_arena + load64(j_apos), 0); store64(j_apos, load64(j_apos) + 1);
+    idx = j_alloc(J_STR);
+    store64(j_node(idx) + 24, start);
+    return idx;
+}
+
+func j_parse_num() -> i64 {
+    src = load64(j_src);
+    neg = 0;
+    if load8(src + load64(j_pos)) == 45 { neg = 1; j_adv(); }
+    v = 0;
+    while 1 {
+        c = load8(src + load64(j_pos));
+        if c < 48 { break; }
+        if c > 57 { break; }
+        v = v * 10 + c - 48;
+        j_adv();
+    }
+    # skip any fraction / exponent (value read as int for now)
+    while 1 {
+        c = load8(src + load64(j_pos));
+        if c == 46 { j_adv(); }
+        else { if c >= 48 { if c <= 57 { j_adv(); } else { break; } }
+               else { if c == 101 { j_adv(); } else { if c == 69 { j_adv(); } else { if c == 43 { j_adv(); } else { if c == 45 { j_adv(); } else { break; } } } } } }
+    }
+    idx = j_alloc(J_NUM);
+    if neg == 1 { v = 0 - v; }
+    store64(j_node(idx) + 32, v);
+    return idx;
+}
+
+func j_parse_lit() -> i64 {
+    src = load64(j_src);
+    c = load8(src + load64(j_pos));
+    if c == 116 { store64(j_pos, load64(j_pos) + 4); idx = j_alloc(J_BOOL); store64(j_node(idx) + 32, 1); return idx; }  # true
+    if c == 102 { store64(j_pos, load64(j_pos) + 5); idx = j_alloc(J_BOOL); store64(j_node(idx) + 32, 0); return idx; }  # false
+    store64(j_pos, load64(j_pos) + 4);                                                                                   # null
+    return j_alloc(J_NUL);
+}
+
+func j_parse_arr() -> i64 {
+    j_adv();                                   # skip [
+    node = j_alloc(J_ARR);
+    j_ws();
+    if j_peek() == 93 { j_adv(); return node; }   # ]
+    last = 0 - 1;
+    while 1 {
+        child = callp(load64(j_pv));
+        if last == (0 - 1) { store64(j_node(node) + 8, child); }
+        else { store64(j_node(last) + 16, child); }
+        last = child;
+        j_ws();
+        c = j_peek();
+        if c == 44 { j_adv(); j_ws(); }         # ,
+        else { if c == 93 { j_adv(); break; } else { break; } }
+    }
+    return node;
+}
+
+func j_parse_obj() -> i64 {
+    j_adv();                                   # skip {
+    node = j_alloc(J_OBJ);
+    j_ws();
+    if j_peek() == 125 { j_adv(); return node; }  # }
+    last = 0 - 1;
+    while 1 {
+        j_ws();
+        key = j_parse_str();
+        j_ws();
+        j_adv();                                # skip :
+        val = callp(load64(j_pv));
+        store64(j_node(key) + 40, val);         # key.vidx = value
+        if last == (0 - 1) { store64(j_node(node) + 8, key); }
+        else { store64(j_node(last) + 16, key); }
+        last = key;
+        j_ws();
+        c = j_peek();
+        if c == 44 { j_adv(); }                 # ,
+        else { if c == 125 { j_adv(); break; } else { break; } }
+    }
+    return node;
+}
+
+func j_parse_value() -> i64 {
+    j_ws();
+    c = j_peek();
+    if c == 123 { return j_parse_obj(); }       # {
+    if c == 91 { return j_parse_arr(); }        # [
+    if c == 34 { return j_parse_str(); }        # "
+    if c == 116 { return j_parse_lit(); }       # t
+    if c == 102 { return j_parse_lit(); }       # f
+    if c == 110 { return j_parse_lit(); }       # n
+    return j_parse_num();
+}
+
+# Parse a JSON text; returns the root node index (or -1 on empty).
+func json_parse(src: i64) -> i64 {
+    store64(j_src, src);
+    store64(j_pos, 0);
+    if load8(src + 0) == 0xEF { if load8(src + 1) == 0xBB { if load8(src + 2) == 0xBF { store64(j_pos, 3); } } }  # skip UTF-8 BOM
+
+    store64(j_ncount, 0);
+    store64(j_apos, 0);
+    store64(j_pv, &j_parse_value);
+    return j_parse_value();
+}
+
+# ---- reader API ----
+# object member lookup -> value node index (or -1)
+func json_obj_get(obj: i64, key: i64) -> i64 {
+    if obj < 0 { return 0 - 1; }
+    if json_type(obj) != J_OBJ { return 0 - 1; }
+    k = json_child(obj);
+    while k != (0 - 1) {
+        if j_streq(json_str(k), key) == 1 { return load64(j_node(k) + 40); }
+        k = json_next(k);
+    }
+    return 0 - 1;
+}
+# object member as string ptr (empty string "" if absent/not-a-string)
+func json_obj_str(obj: i64, key: i64) -> i64 {
+    v = json_obj_get(obj, key);
+    if v < 0 { return j_empty(); }
+    if json_type(v) != J_STR { return j_empty(); }
+    return json_str(v);
+}
+func json_obj_int(obj: i64, key: i64, dflt: i64) -> i64 {
+    v = json_obj_get(obj, key);
+    if v < 0 { return dflt; }
+    t = json_type(v);
+    if t == J_NUM { return json_int(v); }
+    if t == J_BOOL { return json_int(v); }
+    return dflt;
+}
+func json_arr_first(arr: i64) -> i64 {
+    if arr < 0 { return 0 - 1; }
+    if json_type(arr) != J_ARR { return 0 - 1; }
+    return json_child(arr);
+}
+func json_arr_count(arr: i64) -> i64 {
+    n = 0; e = json_arr_first(arr);
+    while e != (0 - 1) { n = n + 1; e = json_next(e); }
+    return n;
+}

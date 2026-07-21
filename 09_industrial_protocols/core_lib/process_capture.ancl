@@ -1,0 +1,67 @@
+# =====================================================================
+#  process_capture.ancl - child process stdout/stderr capture helper.
+# =====================================================================
+import "win32_api.ancl";
+
+@DATA
+pcap_sa:    buf = 24;
+pcap_si:    buf = 104;
+pcap_pi:    buf = 24;
+pcap_hrd:   buf = 8;
+pcap_hwr:   buf = 8;
+pcap_nread: buf = 8;
+pcap_exit:  buf = 8;
+
+@CODE
+
+# Run writable cmdline hidden, capture stdout+stderr into outbuf, NUL terminate,
+# and return bytes captured. Negative returns: -1 pipe failure, -2 launch failure.
+func pcap_run_capture(cmdline: i64, outbuf: i64, cap: i64) -> i64 {
+    if cap <= 1 { return 0; }
+    store8(outbuf, 0);
+
+    memset(pcap_sa, 0, 24);
+    store32(pcap_sa + 0, 24);
+    store32(pcap_sa + 16, 1);
+    if CreatePipe(pcap_hrd, pcap_hwr, pcap_sa, 0) == 0 { return 0 - 1; }
+    SetHandleInformation(load64(pcap_hrd), 1, 0);
+
+    memset(pcap_si, 0, 104);
+    store32(pcap_si + 0, 104);
+    store32(pcap_si + 60, 0x100);           # STARTF_USESTDHANDLES
+    store64(pcap_si + 88, load64(pcap_hwr));
+    store64(pcap_si + 96, load64(pcap_hwr));
+
+    memset(pcap_pi, 0, 24);
+    ok = CreateProcessA(0, cmdline, 0, 0, 1, 0x08000000, 0, 0, pcap_si, pcap_pi);
+    if ok == 0 {
+        CloseHandle(load64(pcap_hrd));
+        CloseHandle(load64(pcap_hwr));
+        return 0 - 2;
+    }
+
+    CloseHandle(load64(pcap_hwr));
+    total = 0;
+    while 1 {
+        chunk = cap - total - 1;
+        if chunk <= 0 { break; }
+        if chunk > 65536 { chunk = 65536; }
+        r = ReadFile(load64(pcap_hrd), outbuf + total, chunk, pcap_nread, 0);
+        if r == 0 { break; }
+        n = load32(pcap_nread);
+        if n == 0 { break; }
+        total = total + n;
+    }
+    store8(outbuf + total, 0);
+    CloseHandle(load64(pcap_hrd));
+    WaitForSingleObject(load64(pcap_pi + 0), 0 - 1);
+    store32(pcap_exit, 0);
+    GetExitCodeProcess(load64(pcap_pi + 0), pcap_exit);
+    CloseHandle(load64(pcap_pi + 0));
+    CloseHandle(load64(pcap_pi + 8));
+    return total;
+}
+
+func pcap_last_exit() -> i64 {
+    return load32(pcap_exit);
+}

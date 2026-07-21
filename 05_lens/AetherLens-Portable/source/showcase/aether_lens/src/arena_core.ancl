@@ -1,0 +1,30 @@
+# Pure R5 Model Arena rules shared by Lens and its native regression gate.
+
+@CODE
+func lac_pair_valid(model_a: i64, model_b: i64) -> i64 {
+    if load8(model_a) == 0 { return 0; }
+    if load8(model_b) == 0 { return 0; }
+    if strcmp(model_a, model_b) == 0 { return 0; }
+    return 1;
+}
+
+# choice: -1 left, 0 tie, 1 right. Result: 0 tie, 1 model A, 2 model B,
+# or -1 for an invalid choice. left_is_a keeps blind side shuffling honest.
+func lac_choice_winner(choice: i64, left_is_a: i64) -> i64 {
+    if choice == 0 { return 0; }
+    if choice == 0 - 1 {
+        if left_is_a == 1 { return 1; }
+        return 2;
+    }
+    if choice == 1 {
+        if left_is_a == 1 { return 2; }
+        return 1;
+    }
+    return 0 - 1;
+}
+
+func lac_tokens_per_second(reply_tokens: i64, eval_ns: i64, wall_ms: i64) -> i64 {
+    if eval_ns > 0 { return reply_tokens * 1000000000 / eval_ns; }
+    if wall_ms > 0 { return reply_tokens * 1000 / wall_ms; }
+    return 0;
+}

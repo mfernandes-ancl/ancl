@@ -1,0 +1,467 @@
+# =============================================================================
+# core_lib/goose.ancl  -  Pure-ANCL IEC 61850-8-1 GOOSE decoder (decode-only).
+# -----------------------------------------------------------------------------
+# From a raw Ethernet byte buffer, extract the GOOSE session header + the
+# IECGoosePdu (goosePdu, tag 0x61) outer fields, and walk the 0xAB allData
+# SEQUENCE OF Data.  DECODE ONLY: no publisher / TX path here.
+#
+# This is a LIBRARY (no main): a driver/harness imports it, supplies main(),
+# calls goose_eth_parse() -> goose_hdr_parse() -> goose_pdu_parse(), then reads
+# results out of the g_* globals below and optionally goose_alldata_walk().
+#
+# REUSE POLICY: the BER/TLV primitives (ber_rdlen/ber_rdint/ber_rduint) and the
+# recursive Data-value walk (decode_value, bounded by g_fend) come from
+# core_lib/iec61850.ancl and are reused by import - NOT reimplemented here.  The
+# big-endian wire read style mirrors aether_agent/src/network.ancl (be16/be32).
+#
+# *** CORRECTNESS TRAP ***: the OUTER IECGoosePdu context tags 0x83 goID /
+# 0x84 t / 0x85 stNum / 0x86 sqNum / 0x87 test / 0x89 ndsCom / 0x8A
+# numDatSetEntries NUMERICALLY COLLIDE with the INNER Data-element tags of the
+# same byte value.  goose_pdu_parse parses the OUTER fields POSITIONALLY; ONLY
+# the bytes inside the 0xAB allData container ever go through decode_value.
+# =============================================================================
+import "iec61850.ancl";      # ber_rdlen/ber_rdint/ber_rduint/decode_value + g_dls/g_fend/g_res_* + ber_wr* / wr_data_*
+import "numfmt.ancl";        # (transitively pulled by iec61850; kept explicit per house idiom)
+import "win32_api.ancl";     # CreateFileA extern for the .frames publisher-as-sim (WriteFile/ReadFile/CloseHandle are built-ins)
+
+@DATA
+# ---- Ethernet / session-header extraction ----
+g_appid:   buf = 8;      # GOOSE APPID (u16, big-endian)
+g_golen:   buf = 8;      # GOOSE session Length field (APPID..end-of-APDU); APDU len = g_golen - 8
+g_vlan:    buf = 8;      # 1 if an 802.1Q VLAN tag was consumed, else 0
+g_ethtype: buf = 8;      # resolved EtherType (must be 0x88B8)
+
+# ---- IECGoosePdu outer fields (parsed positionally by goose_pdu_parse) ----
+g_gocbref:     buf = 8;  # absolute offset (ptr) of the gocbRef VisibleString content
+g_gocbref_len: buf = 8;  # gocbRef byte length
+g_tal:         buf = 8;  # timeAllowedToLive (INTEGER, ms)
+g_datset:      buf = 8;  # datSet VisibleString content ptr
+g_datset_len:  buf = 8;
+g_goid:        buf = 8;  # goID VisibleString content ptr
+g_goid_len:    buf = 8;
+g_t:           buf = 8;  # t UtcTime content ptr (8 octets: 4B secs + 3B frac + 1B quality)
+g_t_secs:      buf = 8;  # first 4 octets of t decoded as BE seconds-since-epoch
+g_stnum:       buf = 8;  # stNum   (INTEGER, treat unsigned)
+g_sqnum:       buf = 8;  # sqNum   (INTEGER, treat unsigned)
+g_test:        buf = 8;  # test    (BOOLEAN 0/1)
+g_confrev:     buf = 8;  # confRev (INTEGER)
+g_ndscom:      buf = 8;  # ndsCom  (BOOLEAN 0/1)
+g_numentries:  buf = 8;  # numDatSetEntries (INTEGER)
+
+# ---- allData (0xAB) container located by goose_pdu_parse ----
+g_alldata_off: buf = 8;  # absolute offset of the 0xAB tag byte
+g_alldata_len: buf = 8;  # content length of the 0xAB SEQUENCE OF Data
+g_alldata_cnt: buf = 8;  # number of Data elements found by goose_alldata_walk
+
+# ---- gocbRef copy scratch (NUL-terminated, for printing) ----
+g_gref_str: buf = 256;
+
+# =============================================================================
+# ENCODER / PUBLISH-AS-SIM state (the TX half, wpcap-free).  Everything below
+# BUILDS bytes into a caller-owned buffer and (optionally) streams .frames.
+# Back-patch bookkeeping (set by goose_wr_hdr / goose_wr_pdu, consumed by
+# goose_patchlen) lives in these @DATA slots so the writers can stay multi-
+# return-free (ANCL house idiom: multi-return via @DATA globals).
+# =============================================================================
+gw_lenoff:   buf = 8;    # abs offset of the 2-byte GOOSE session Length field (back-patched)
+gw_apduoff:  buf = 8;    # abs offset of the 0x61 goosePdu tag byte
+gw_apdubody: buf = 8;    # abs offset of the first outer field (0x80 gocbRef) = after 0x61 + len
+
+# ---- encoder scratch buffers (build container BODY here, measure, then prepend
+#      tag + long-form-aware ber_wrlen so the length is ALWAYS canonical/minimal
+#      even when the content is >= 128 bytes; the old 1-byte store8 hole corrupted
+#      any container whose content crossed 127 bytes) ----
+gw_addscr:   buf = 4096;  # allData (0xAB) inner-Data body scratch
+gw_pdubody:  buf = 4096;  # goosePdu (0x61) outer-fields + allData body scratch
+
+# ---- .frames writer state (kernel32, CRT-free, no wpcap) ----
+gw_fh:   buf = 8;        # open .frames file HANDLE
+gw_nio:  buf = 8;        # WriteFile/ReadFile bytes-transferred out-param
+gw_rec:  buf = 8;        # scratch for the 5-byte [dir u8][len u32 LE] record header
+gw_rdh:  buf = 8;        # read-side: 5-byte record-header scratch on read-back
+
+@CODE
+# ---- big-endian wire readers (mirrors aether_agent/src/network.ancl be16/be32;
+#      GOOSE is big-endian on the wire, so these NOT the LE socket helpers) ----
+func be16(p: i64) -> i64 { return shl(load8(p), 8) + load8(p + 1); }
+func be32(p: i64) -> i64 {
+    return shl(load8(p), 24) + shl(load8(p + 1), 16) + shl(load8(p + 2), 8) + load8(p + 3);
+}
+
+# ============================ Ethernet / VLAN ============================
+
+# EtherType at frame+12; if 0x8100 (802.1Q) consume the 4-byte VLAN tag and
+# re-read EtherType at frame+16; require 0x88B8.  Returns the ABSOLUTE offset of
+# the GOOSE session header (frame+14 or frame+18), or 0 on error / not-GOOSE.
+# (mirrors aether_agent/src/network.ancl parse_goose EtherType/VLAN logic.)
+func goose_eth_parse(p: i64, len: i64) -> i64 {
+    if len < 16 { return 0; }
+    store64(g_vlan, 0);
+    et = be16(p + 12);                                   # be16 reused from iec61850/network wire style
+    hdr = p + 14;                                        # default GOOSE header after 14-byte Eth II hdr
+    if et == 0x8100 {                                    # 802.1Q VLAN tag present
+        if len < 20 { return 0; }
+        et = be16(p + 16);                               # real EtherType past the 4-byte tag
+        hdr = p + 18;                                    # header shifts +14 -> +18
+        store64(g_vlan, 1);
+    }
+    store64(g_ethtype, et);
+    if et != 0x88B8 { return 0; }                        # not GOOSE
+    return hdr;
+}
+
+# Read the 8-byte GOOSE session header at off: APPID(2) + Length(2) + Resv1(2) +
+# Resv2(2), all big-endian.  The APDU starts after the 8-byte header.  BOUND the
+# APDU by (Length-8), NOT the frame length.  Returns the APDU start offset, or 0.
+func goose_hdr_parse(p: i64, off: i64) -> i64 {
+    store64(g_appid, be16(off + 0));
+    store64(g_golen, be16(off + 2));
+    if load64(g_golen) < 9 { return 0; }                 # Length must cover the 8B hdr + >=1B APDU
+    return off + 8;
+}
+
+# ============================ IECGoosePdu (0x61) ============================
+
+# Parse the goosePdu at apdu_off (bounded by apdu_len = Length-8) positionally.
+# Walks the OUTER context tags 0x80..0x8A + 0xAB into the g_* globals above.
+# Returns 1 on success, 0 on a malformed / non-0x61 PDU.
+func goose_pdu_parse(p: i64, apdu_off: i64, apdu_len: i64) -> i64 {
+    q = apdu_off;
+    hard_end = apdu_off + apdu_len;                      # (Length-8) bound - the authoritative APDU end
+    if load8(q) != 0x61 { return 0; }                    # goosePdu = [APPLICATION 1] IMPLICIT SEQUENCE
+    q = q + 1;
+    plen = ber_rdlen(q); q = q + load64(g_dls);          # q -> first outer field
+    pdu_end = q + plen;
+    if pdu_end > hard_end { pdu_end = hard_end; }        # clamp to the declared (Length-8) bound
+
+    # zero the optional/positional out-slots so a caller can tell what was present
+    store64(g_gocbref, 0);     store64(g_gocbref_len, 0);
+    store64(g_tal, 0);
+    store64(g_datset, 0);      store64(g_datset_len, 0);
+    store64(g_goid, 0);        store64(g_goid_len, 0);
+    store64(g_t, 0);           store64(g_t_secs, 0);
+    store64(g_stnum, 0);       store64(g_sqnum, 0);
+    store64(g_test, 0);        store64(g_confrev, 0);
+    store64(g_ndscom, 0);      store64(g_numentries, 0);
+    store64(g_alldata_off, 0); store64(g_alldata_len, 0);
+
+    while q < pdu_end {
+        tag = load8(q);
+        q = q + 1;
+        ln = ber_rdlen(q);
+        q = q + load64(g_dls);                           # q -> this field's content
+        if q + ln > pdu_end { ln = pdu_end - q; }        # clamp any lying length to the PDU bound
+        if ln < 0 { return 0; }
+
+        if tag == 0x80 {                                 # gocbRef  VisibleString
+            store64(g_gocbref, q); store64(g_gocbref_len, ln);
+        } else { if tag == 0x81 {                        # timeAllowedToLive  INTEGER (ms)
+            store64(g_tal, ber_rduint(q, ln));
+        } else { if tag == 0x82 {                        # datSet  VisibleString
+            store64(g_datset, q); store64(g_datset_len, ln);
+        } else { if tag == 0x83 {                        # goID  VisibleString  (OUTER -> string, NOT bool)
+            store64(g_goid, q); store64(g_goid_len, ln);
+        } else { if tag == 0x84 {                        # t  UtcTime (OUTER -> 8 octets, NOT bitstring)
+            store64(g_t, q);
+            store64(g_t_secs, ber_rduint(q, 4));         # first 4 octets = BE seconds-since-epoch
+        } else { if tag == 0x85 {                        # stNum  INTEGER (unsigned)
+            store64(g_stnum, ber_rduint(q, ln));
+        } else { if tag == 0x86 {                        # sqNum  INTEGER (unsigned)
+            store64(g_sqnum, ber_rduint(q, ln));
+        } else { if tag == 0x87 {                        # test  BOOLEAN (OUTER -> bool, NOT float)
+            v = 0; if ln >= 1 { if load8(q) != 0 { v = 1; } }
+            store64(g_test, v);
+        } else { if tag == 0x88 {                        # confRev  INTEGER
+            store64(g_confrev, ber_rduint(q, ln));
+        } else { if tag == 0x89 {                        # ndsCom  BOOLEAN (OUTER -> bool, NOT octet-str)
+            v = 0; if ln >= 1 { if load8(q) != 0 { v = 1; } }
+            store64(g_ndscom, v);
+        } else { if tag == 0x8A {                        # numDatSetEntries  INTEGER (OUTER -> int)
+            store64(g_numentries, ber_rduint(q, ln));
+        } else { if tag == 0xAB {                        # allData  SEQUENCE OF Data (constructed)
+            store64(g_alldata_off, q - load64(g_dls) - 1);   # offset of the 0xAB tag byte
+            store64(g_alldata_len, ln);
+        } } } } } } } } } } } }                          # unrecognized outer tags are skipped
+
+        q = q + ln;                                      # advance to the next TLV
+    }
+    return 1;
+}
+
+# ============================ allData walk ============================
+
+# Iterate the 0xAB allData SEQUENCE OF Data at off (off = the 0xAB tag byte),
+# invoking the REUSED iec61850 decode_value on each child element.  Returns the
+# number of Data elements decoded.  (mirrors i61850_read_dataset lines 936-941.)
+func goose_alldata_walk(p: i64, off: i64, len: i64) -> i64 {
+    q = off;
+    q = q + 1;                                           # skip 0xAB tag
+    ln = ber_rdlen(q); q = q + load64(g_dls);            # ln = content length, q -> first child
+    endoff = q + ln;
+    if endoff > load64(g_fend) { endoff = load64(g_fend); }   # never exceed the frame bound
+    store64(g_fend, endoff);                             # tighten the decode bound for the walk
+    cnt = 0;
+    while q < endoff {
+        q = decode_value(q, 0);                          # leaf value lands in g_res_*; PRINTS it
+        cnt = cnt + 1;
+    }
+    store64(g_alldata_cnt, cnt);
+    return cnt;
+}
+
+# ============================ double-point helper ============================
+
+# Decode a GOOSE 0x84 BIT STRING double-point (Dbpos): the first content octet is
+# the unused-bits count, the second octet carries the 2-bit position in its two
+# MSBs (00 intermediate / 01 off / 10 on / 11 bad) plus quality bits.  'bits' is
+# the offset of the 0x84 TLV content (the unused-bits octet).  Returns the 2-bit
+# double-point code (0..3), or -1 if there is no value octet.
+func goose_dbpos(bits: i64) -> i64 {
+    v = load8(bits + 1);                                 # octet after the unused-bits count
+    return band(shr(v, 6), 3);                           # top 2 bits = the double-point position
+}
+
+# Copy the located gocbRef VisibleString into g_gref_str (NUL-terminated) so a
+# caller can print it (a raw buf can't go through syscall 1 as text).  Returns
+# the byte length copied.  (mirrors the VisibleString copy at iec61850.ancl:774.)
+func goose_gocbref_cstr() -> i64 {
+    src = load64(g_gocbref);
+    n = load64(g_gocbref_len);
+    cap = n; if cap > 255 { cap = 255; }
+    i = 0;
+    while i < cap { store8(g_gref_str + i, load8(src + i)); i = i + 1; }
+    store8(g_gref_str + cap, 0);
+    return n;
+}
+
+# =============================================================================
+# GOOSE ENCODER  (IEC 61850-8-1 publish path, wpcap-free byte builder)
+# -----------------------------------------------------------------------------
+# All writers take a cursor and RETURN the advanced cursor (mirrors ber_wrstr /
+# wr_data_* in iec61850.ancl).  Integer helpers are REUSED, not re-derived:
+#   ber_wrlen / ber_wruint / ber_wrstr / wr_data_bool / wr_data_int   (iec61850)
+# The 2-byte GOOSE session Length and the 0x61 BER length are back-patched by
+# goose_patchlen AFTER the full APDU is written (the classic publisher bug is a
+# wrong Length or wrong 0x61 length - both patched in one place).
+# =============================================================================
+
+# ---- big-endian u16 writer (network order) for APPID/Length/Resv/EtherType/TCI.
+#      Mirror of the decoder's be16(): high byte first.  Returns advanced cursor.
+func be16_wr(p: i64, v: i64) -> i64 {
+    store8(p + 0, band(shr(v, 8), 255));
+    store8(p + 1, band(v, 255));
+    return p + 2;
+}
+
+# ---- Ethernet II header (+ optional 802.1Q) ----
+# dst/src = 6-byte MAC buffers.  If vid >= 0 an 802.1Q tag is inserted (TPID
+# 0x8100, TCI = pcp<<13 | 0<<12 | vid) BEFORE the EtherType.  EtherType is always
+# 0x88B8 (GOOSE), big-endian.  Returns the cursor just past the EtherType, i.e.
+# the offset where the 8-byte GOOSE session header begins.
+func goose_wr_eth_hdr(buf: i64, dst: i64, src: i64, pcp: i64, vid: i64) -> i64 {
+    i = 0;
+    while i < 6 { store8(buf + i, load8(dst + i)); i = i + 1; }         # dstMAC [0..6)
+    i = 0;
+    while i < 6 { store8(buf + 6 + i, load8(src + i)); i = i + 1; }     # srcMAC [6..12)
+    p = buf + 12;
+    if vid >= 0 {                                                       # 802.1Q VLAN tag
+        p = be16_wr(p, 0x8100);                                        # TPID
+        tci = bor(bor(shl(band(pcp, 7), 13), shl(0, 12)), band(vid, 4095));
+        p = be16_wr(p, tci);                                           # TCI (PCP<<13|DEI<<12|VID)
+    }
+    p = be16_wr(p, 0x88B8);                                            # EtherType GOOSE
+    return p;
+}
+
+# ---- GOOSE session header (8 bytes, big-endian) ----
+# APPID(u16) + Length(u16 PLACEHOLDER, patched later) + Reserved1(u16=0) +
+# Reserved2(u16=0).  Remembers the Length-field offset in gw_lenoff for
+# goose_patchlen.  off = cursor returned by goose_wr_eth_hdr.  Returns the
+# cursor where the APDU (0x61) begins.
+func goose_wr_hdr(buf: i64, off: i64, appid: i64) -> i64 {
+    p = off;
+    p = be16_wr(p, appid);                                            # APPID
+    store64(gw_lenoff, p);                                            # remember Length offset
+    p = be16_wr(p, 0);                                                # Length placeholder (patched)
+    p = be16_wr(p, 0);                                                # Reserved1
+    p = be16_wr(p, 0);                                                # Reserved2
+    return p;
+}
+
+# ---- allData (0xAB SEQUENCE OF Data) ----
+# Builds the inner Data elements into a SCRATCH buffer via the REUSED
+# wr_data_bool / wr_data_int, MEASURES the content length, then emits
+# 0xAB + ber_wrlen(len) + body into buf.  ber_wrlen is long-form aware (0x81/0x82
+# when len >= 128), so a real GOOSE dataset whose allData content crosses 127
+# bytes encodes CANONICALLY instead of corrupting into a bogus long-form byte.
+# For content < 128 ber_wrlen emits the identical 1-byte short form, so the
+# Step-1 hand frame still matches byte-for-byte.  Returns the advanced cursor.
+func goose_wr_alldata(buf: i64, off: i64, bval: i64, ival: i64) -> i64 {
+    s = gw_addscr;                                                   # inner-Data body scratch
+    e = s;
+    e = wr_data_bool(e, bval);                                       # 0x83 BOOL   (inner)
+    e = wr_data_int(e, ival);                                        # 0x85 INT    (inner)
+    clen = e - s;                                                    # 0xAB content length
+    p = off;
+    store8(p, 0xAB); p = p + 1;                                      # allData tag
+    p = ber_wrlen(p, clen);                                          # long-form-aware length
+    i = 0;
+    while i < clen { store8(p + i, load8(s + i)); i = i + 1; }       # copy body after tag+len
+    return p + clen;
+}
+
+# ---- IECGoosePdu (0x61) + all outer fields + 0xAB allData ----
+# Emits 0x61 + a 1-byte BER length PLACEHOLDER, then the OUTER context tags in
+# ascending order 0x80..0x8A (libiec61850 order) then 0xAB last.  Strings/ints
+# reuse ber_wrstr / ber_wruint (UNSIGNED: keeps the leading 0x00 pad so a signed
+# reader never sees stNum/sqNum/confRev as negative).  t is a fixed 8-octet
+# UtcTime; test/ndsCom are 1-byte BOOLEANs.  Remembers the 0x61 length offset +
+# body offset for goose_patchlen.  off = cursor from goose_wr_hdr.  Returns the
+# cursor one past the last APDU byte.
+#   gocbRef/datSet/goID  : NUL-terminated ANCL strings
+#   tal/stnum/sqnum/confrev/numentries : unsigned integers
+#   tsecs                : UtcTime seconds (first 4 octets, BE); frac+quality = 0
+#   test/ndscom          : 0/1 booleans
+#   bval/ival            : the single BOOL + single INT inside allData
+func goose_wr_pdu(buf: i64, off: i64,
+                  gocbRef: i64, tal: i64, datSet: i64, goID: i64, tsecs: i64,
+                  stnum: i64, sqnum: i64, test: i64, confrev: i64, ndscom: i64,
+                  numentries: i64, bval: i64, ival: i64) -> i64 {
+    # Build the OUTER fields + 0xAB allData into a scratch buffer FIRST, measure
+    # the total content length, then emit 0x61 + ber_wrlen(len) + body into buf.
+    # This makes the 0x61 BER length long-form aware (0x81/0x82 when >= 128) with
+    # NO fixed 1-byte hole to overflow - a realistic APDU (long gocbRef/datSet,
+    # a full dataset) that crosses 127 content bytes now encodes CANONICALLY.
+    s = gw_pdubody;
+    p = s;
+
+    p = ber_wrstr(p, 0x80, gocbRef);                               # gocbRef  VisibleString
+    p = ber_wruint(p, 0x81, tal);                                  # timeAllowedToLive INTEGER
+    p = ber_wrstr(p, 0x82, datSet);                                # datSet   VisibleString
+    p = ber_wrstr(p, 0x83, goID);                                 # goID     VisibleString
+
+    store8(p, 0x84); store8(p + 1, 8);                            # t  UtcTime (8 octets)
+    store8(p + 2, band(shr(tsecs, 24), 255));
+    store8(p + 3, band(shr(tsecs, 16), 255));
+    store8(p + 4, band(shr(tsecs, 8), 255));
+    store8(p + 5, band(tsecs, 255));
+    store8(p + 6, 0); store8(p + 7, 0); store8(p + 8, 0); store8(p + 9, 0);
+    p = p + 10;
+
+    p = ber_wruint(p, 0x85, stnum);                               # stNum    INTEGER (unsigned)
+    p = ber_wruint(p, 0x86, sqnum);                               # sqNum    INTEGER (unsigned)
+
+    store8(p, 0x87); store8(p + 1, 1);                            # test  BOOLEAN
+    bb = 0; if test != 0 { bb = 1; } store8(p + 2, bb); p = p + 3;
+
+    p = ber_wruint(p, 0x88, confrev);                            # confRev  INTEGER
+
+    store8(p, 0x89); store8(p + 1, 1);                           # ndsCom  BOOLEAN
+    nb = 0; if ndscom != 0 { nb = 1; } store8(p + 2, nb); p = p + 3;
+
+    p = ber_wruint(p, 0x8A, numentries);                        # numDatSetEntries INTEGER
+    p = goose_wr_alldata(s, p, bval, ival);                     # 0xAB allData last (into scratch)
+    blen = p - s;                                               # 0x61 CONTENT length
+
+    # now emit 0x61 + ber_wrlen(blen) + body into the real buffer
+    d = off;
+    store64(gw_apduoff, off);                                    # remember 0x61 tag offset
+    store8(d, 0x61); d = d + 1;                                  # goosePdu = [APPLICATION 1]
+    d = ber_wrlen(d, blen);                                      # long-form-aware 0x61 length
+    store64(gw_apdubody, d);                                     # first outer field (after 0x61+len)
+    i = 0;
+    while i < blen { store8(d + i, load8(s + i)); i = i + 1; }   # copy the built body
+    return d + blen;
+}
+
+# ---- back-patch the GOOSE session Length after the APDU is fully written ----
+# end = the cursor one past the last APDU byte (returned by goose_wr_pdu).
+# The 0x61 BER length is now written CANONICALLY (long-form aware) at build time
+# in goose_wr_pdu - it is NOT patched here.  This only patches:
+#   GOOSE session Length = 8 + APDU_total   where APDU_total = end - gw_apduoff
+#       (spans APPID..end-of-APDU: 8-byte header + full APDU incl its 0x61+length),
+#       written big-endian into the 2-byte Length placeholder at gw_lenoff.
+# Returns the total GOOSE Length value written (for a caller sanity check).
+func goose_patchlen(buf: i64, end: i64) -> i64 {
+    apdu_total = end - load64(gw_apduoff);                       # 0x61..end (whole APDU)
+    golen = 8 + apdu_total;                                     # session Length = hdr + APDU
+    be16_wr(load64(gw_lenoff), golen);                        # big-endian into the placeholder
+    return golen;
+}
+
+# =============================================================================
+# .frames CORPUS I/O  (publisher-as-sim; unblocks the offline anomaly pipeline)
+# -----------------------------------------------------------------------------
+# Record layout (per GOOSE_BUILD_PLAN §3, matches labeltap.ancl write_rec +
+# frame_tools.py iter_frames EXACTLY):  [dir u8][len u32 LE][raw frame bytes].
+# len counts ONLY the frame bytes.  dir convention: 0 = client->sim (RX-into-
+# sim / request), 1 = sim->client (TX-from-sim / response).  A published GOOSE
+# frame is TX-from-sim, so goose_frames_append uses dir=1 by default; callers
+# that need the RX direction pass dir explicitly via goose_frames_append_dir.
+# Uses kernel32 CreateFileA/WriteFile/CloseHandle (built-ins) - NO wpcap.
+# =============================================================================
+
+# Open (create/truncate) a .frames file for writing.  Returns 1 on success, 0 on
+# failure (INVALID_HANDLE_VALUE == -1).  path = NUL-terminated ANCL string.
+func goose_frames_open(path: i64) -> i64 {
+    h = CreateFileA(path, 0x40000000, 0, 0, 2, 0x80, 0);        # GENERIC_WRITE, CREATE_ALWAYS
+    if h == 0 - 1 { store64(gw_fh, 0); return 0; }
+    store64(gw_fh, h);
+    return 1;
+}
+
+# Append one record with an EXPLICIT direction byte.  buf = frame bytes, len =
+# frame byte count.  Header is written UNPADDED: [dir(1)][len u32 LE(4)] then the
+# len payload bytes, as two WriteFile calls (the established labeltap idiom).
+# store32 emits little-endian on x64 - do NOT byte-swap.  Returns 1.
+func goose_frames_append_dir(dir: i64, buf: i64, len: i64) -> i64 {
+    if load64(gw_fh) == 0 { return 0; }
+    store8(gw_rec + 0, dir);                                    # u8 dir
+    store32(gw_rec + 1, len);                                  # u32 LE len
+    WriteFile(load64(gw_fh), gw_rec, 5, gw_nio, 0);           # 5-byte record header
+    WriteFile(load64(gw_fh), buf, len, gw_nio, 0);           # len payload bytes
+    return 1;
+}
+
+# Append one PUBLISHED GOOSE frame (dir=1 = sim->client / TX-from-sim).  This is
+# the publisher-as-sim entry point: it writes the frame the encoder just built
+# straight into the corpus, no wire needed.  Returns 1.
+func goose_frames_append(buf: i64, len: i64) -> i64 {
+    return goose_frames_append_dir(1, buf, len);
+}
+
+# Close the open .frames file.  Returns 1.
+func goose_frames_close() -> i64 {
+    if load64(gw_fh) != 0 { CloseHandle(load64(gw_fh)); store64(gw_fh, 0); }
+    return 1;
+}
+
+# ---- read-back side (for the round-trip self-test) ----
+# Open a .frames file for READING.  Returns 1 on success, 0 on failure.
+func goose_frames_ropen(path: i64) -> i64 {
+    h = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);       # GENERIC_READ, OPEN_EXISTING, SHARE_READ
+    if h == 0 - 1 { store64(gw_fh, 0); return 0; }
+    store64(gw_fh, h);
+    return 1;
+}
+
+# Read the next record's 5-byte header into gw_rdh; sets g_res-style out via the
+# g_* pattern is not used here - instead the caller reads dir from load8(gw_rdh)
+# and len from load32(gw_rdh+1) after this returns 1.  Returns 1 if a full 5-byte
+# header was read, 0 at EOF / short read.
+func goose_frames_rhdr() -> i64 {
+    if load64(gw_fh) == 0 { return 0; }
+    store64(gw_nio, 0);
+    ReadFile(load64(gw_fh), gw_rdh, 5, gw_nio, 0);
+    if load64(gw_nio) != 5 { return 0; }
+    return 1;
+}
+
+# Read the current record's len payload bytes into dst (len from the last
+# goose_frames_rhdr).  Returns the number of bytes actually read.
+func goose_frames_rbody(dst: i64, len: i64) -> i64 {
+    if load64(gw_fh) == 0 { return 0; }
+    store64(gw_nio, 0);
+    ReadFile(load64(gw_fh), dst, len, gw_nio, 0);
+    return load64(gw_nio);
+}

@@ -1,0 +1,16 @@
+@DATA
+base:  i64 = 0x1000;                    # 4096
+flags: i64 = 0x10000000 + 0x00CF0000;   # 282001408 (WS_OVERLAPPEDWINDOW|WS_VISIBLE)
+derived: i64 = base * 2 + 1;            # 8193 (references earlier const)
+bufsz: buf = base / 16;                 # 256-byte buffer sized by const expr
+m1: str = "base    = ";
+m2: str = "flags   = ";
+m3: str = "derived = ";
+nl: str = "\n";
+@CODE
+func main() -> i32 {
+    syscall 1, m1, base, nl;
+    syscall 1, m2, flags, nl;
+    syscall 1, m3, derived, nl;
+    return 0;
+}

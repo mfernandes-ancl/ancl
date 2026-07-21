@@ -1,0 +1,595 @@
+# =====================================================================
+#  maze_runner_3d.ancl  -  Playable First-Person 3D Maze Runner
+#
+#  Open-Source Showcase Engine (Aether-Run)
+#  100% CRT-free, native 3D raycasting engine.
+#  Uses fixed-point integer math and Win32 GDI drawing calls.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" StretchDIBits;
+extern "user32.dll" GetAsyncKeyState;
+
+@DATA
+clsname:      str = "AETHERRUN3DWND";
+title:        str = "Aether-Run: First-Person 3D Maze";
+
+# Trigonometry LUT Buffers (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# 16x16 Grid Map Buffer (256 bytes)
+g_gridmap: buf = 256;
+
+# Framebuffer (320x240 pixels * 4 bytes per pixel = 307200 bytes)
+g_framebuffer: buf = 307200;
+
+# BITMAPINFO structure (48 bytes)
+g_bitmapinfo: buf = 48;
+
+# Player Position & State (fixed point, scaled by 65536)
+g_playerX:     buf = 8;
+g_playerY:     buf = 8;
+g_playerAngle: buf = 8;
+g_steps:       buf = 8;
+g_accum_dist:  buf = 8;
+
+# Win32 structures & brushes
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+# Temporary string formatting buffer
+g_txt_buf:    buf = 128;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Math & String Utilities
+# ---------------------------------------------------------------------
+
+func iabs(x: i64) -> i64 {
+    if x < 0 { return 0 - x; }
+    return x;
+}
+
+func strcpy(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i, c);
+        if c == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func itoa(val: i64, buf: i64) -> i64 {
+    if val == 0 {
+        store8(buf, 48); # '0'
+        store8(buf + 1, 0);
+        return 1;
+    }
+    
+    negative = 0;
+    temp = val;
+    if temp < 0 {
+        negative = 1;
+        temp = 0 - temp;
+    }
+    
+    p = buf;
+    if negative == 1 {
+        store8(p, 45); # '-'
+        p = p + 1;
+    }
+    
+    start_digits = p;
+    while temp > 0 {
+        digit = temp % 10;
+        store8(p, 48 + digit); # '0' + digit
+        p = p + 1;
+        temp = temp / 10;
+    }
+    store8(p, 0); # Null terminator
+    
+    # Reverse digits
+    end_digits = p - 1;
+    while start_digits < end_digits {
+        c1 = load8(start_digits);
+        c2 = load8(end_digits);
+        store8(start_digits, c2);
+        store8(end_digits, c1);
+        start_digits = start_digits + 1;
+        end_digits = end_digits - 1;
+    }
+    
+    return p - buf;
+}
+
+# ---------------------------------------------------------------------
+# Bhaskara I's Sine Approximation
+# Approximates sin(theta) for theta in [0, 1024) using integer math.
+# Scaled to 65536 amplitude (1.0 = 65536).
+# ---------------------------------------------------------------------
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        # bhaskara formula for sin(x) where x is in [0, pi] mapped to [0, 512]
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    
+    # Cosine is Sine shifted by 90 degrees (256 units)
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Procedural 16x16 Grid Map Setup
+# ---------------------------------------------------------------------
+func set_row(row: i64, v0: i64, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64, v6: i64, v7: i64, v8: i64, v9: i64, v10: i64, v11: i64, v12: i64, v13: i64, v14: i64, v15: i64) -> i64 {
+    base = g_gridmap + row * 16;
+    store8(base + 0, v0);
+    store8(base + 1, v1);
+    store8(base + 2, v2);
+    store8(base + 3, v3);
+    store8(base + 4, v4);
+    store8(base + 5, v5);
+    store8(base + 6, v6);
+    store8(base + 7, v7);
+    store8(base + 8, v8);
+    store8(base + 9, v9);
+    store8(base + 10, v10);
+    store8(base + 11, v11);
+    store8(base + 12, v12);
+    store8(base + 13, v13);
+    store8(base + 14, v14);
+    store8(base + 15, v15);
+    return 0;
+}
+
+func init_grid_map() -> i64 {
+    set_row(0,  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    set_row(1,  1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
+    set_row(2,  1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1);
+    set_row(3,  1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1);
+    set_row(4,  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1);
+    set_row(5,  1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1);
+    set_row(6,  1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1);
+    set_row(7,  1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1);
+    set_row(8,  1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1);
+    set_row(9,  1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1);
+    set_row(10, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1);
+    set_row(11, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1);
+    set_row(12, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1);
+    set_row(13, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1);
+    set_row(14, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 9, 1);
+    set_row(15, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+    return 0;
+}
+
+func load_grid_tile(x: i64, y: i64) -> i64 {
+    if x < 0 || x >= 16 || y < 0 || y >= 16 {
+        return 1;
+    }
+    return load8(g_gridmap + y * 16 + x);
+}
+
+# ---------------------------------------------------------------------
+# Collision Checking & Movement Controls
+# ---------------------------------------------------------------------
+
+func is_walkable(px: i64, py: i64) -> i64 {
+    gridX = px / 65536;
+    gridY = py / 65536;
+    
+    tile = load_grid_tile(gridX, gridY);
+    if tile == 1 {
+        return 0; # Wall is not walkable
+    }
+    return 1;
+}
+
+func check_collision(px: i64, py: i64) -> i64 {
+    r = 10000; # player bounding box radius (approx 0.15 of a cell size)
+    
+    if is_walkable(px - r, py - r) == 0 { return 0; }
+    if is_walkable(px + r, py - r) == 0 { return 0; }
+    if is_walkable(px - r, py + r) == 0 { return 0; }
+    if is_walkable(px + r, py + r) == 0 { return 0; }
+    
+    return 1;
+}
+
+func update_player() -> i64 {
+    # Keyboard steering (A and D for camera rotation)
+    angle = load64(g_playerAngle);
+    if GetAsyncKeyState(65) != 0 { # A: Turn Left
+        angle = band(angle - 16 + 1024, 1023);
+    }
+    if GetAsyncKeyState(68) != 0 { # D: Turn Right
+        angle = band(angle + 16, 1023);
+    }
+    store64(g_playerAngle, angle);
+    
+    cosVal = load64(g_cos + angle * 8);
+    sinVal = load64(g_sin + angle * 8);
+    
+    dx = 0;
+    dy = 0;
+    
+    # speed is 0.05 units per frame: 0.05 * 65536 = 3276
+    speed = 3276;
+    
+    move = 0;
+    if GetAsyncKeyState(87) != 0 { # W: Forward
+        dx = (cosVal * speed) / 65536;
+        dy = (sinVal * speed) / 65536;
+        move = 1;
+    }
+    if GetAsyncKeyState(83) != 0 { # S: Backward
+        dx = (0 - cosVal * speed) / 65536;
+        dy = (0 - sinVal * speed) / 65536;
+        move = 1;
+    }
+    
+    if move == 1 {
+        oldX = load64(g_playerX);
+        oldY = load64(g_playerY);
+        
+        newX = oldX + dx;
+        newY = oldY + dy;
+        
+        # Test X movement alone for wall-sliding
+        if check_collision(newX, oldY) == 1 {
+            store64(g_playerX, newX);
+        } else {
+            dx = 0;
+        }
+        
+        # Test Y movement alone for wall-sliding
+        if check_collision(oldX, newY) == 1 {
+            store64(g_playerY, newY);
+        } else {
+            dy = 0;
+        }
+        
+        # Calculate step count from actual moved distance
+        dist = iabs(dx) + iabs(dy);
+        accum = load64(g_accum_dist) + dist;
+        if accum >= 65536 {
+            store64(g_steps, load64(g_steps) + 1);
+            accum = accum - 65536;
+        }
+        store64(g_accum_dist, accum);
+    }
+    return 0;
+}
+
+func check_win() -> i64 {
+    px = load64(g_playerX);
+    py = load64(g_playerY);
+    
+    gridX = px / 65536;
+    gridY = py / 65536;
+    
+    tile = load_grid_tile(gridX, gridY);
+    if tile == 9 {
+        return 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# First-Person Raycaster Engine
+# ---------------------------------------------------------------------
+
+func render_frame() -> i64 {
+    posX = load64(g_playerX);
+    posY = load64(g_playerY);
+    playerAngle = load64(g_playerAngle);
+    
+    x = 0;
+    while x < 320 {
+        # Ray angle relative to player view angle (FOV = ~60 degrees = 170 units)
+        rayAngle = playerAngle - 85 + (x * 170) / 320;
+        rayAngle = band(rayAngle + 1024, 1023);
+        
+        cosVal = load64(g_cos + rayAngle * 8);
+        sinVal = load64(g_sin + rayAngle * 8);
+        
+        if cosVal == 0 { cosVal = 1; }
+        if sinVal == 0 { sinVal = 1; }
+        
+        # DeltaDistX/Y (scaled by 65536)
+        if cosVal < 0 {
+            deltaDistX = (0 - 4294967296) / cosVal;
+        } else {
+            deltaDistX = 4294967296 / cosVal;
+        }
+        
+        if sinVal < 0 {
+            deltaDistY = (0 - 4294967296) / sinVal;
+        } else {
+            deltaDistY = 4294967296 / sinVal;
+        }
+        
+        mapX = posX / 65536;
+        mapY = posY / 65536;
+        
+        if cosVal < 0 {
+            stepX = 0 - 1;
+            sideDistX = ((posX - mapX * 65536) * deltaDistX) / 65536;
+        } else {
+            stepX = 1;
+            sideDistX = (((mapX + 1) * 65536 - posX) * deltaDistX) / 65536;
+        }
+        
+        if sinVal < 0 {
+            stepY = 0 - 1;
+            sideDistY = ((posY - mapY * 65536) * deltaDistY) / 65536;
+        } else {
+            stepY = 1;
+            sideDistY = (((mapY + 1) * 65536 - posY) * deltaDistY) / 65536;
+        }
+        
+        hit = 0;
+        side = 0;
+        wallType = 0;
+        
+        ddaSteps = 0;
+        while hit == 0 {
+            if ddaSteps > 64 {
+                hit = 1;
+            }
+            ddaSteps = ddaSteps + 1;
+            
+            if sideDistX < sideDistY {
+                sideDistX = sideDistX + deltaDistX;
+                mapX = mapX + stepX;
+                side = 0;
+            } else {
+                sideDistY = sideDistY + deltaDistY;
+                mapY = mapY + stepY;
+                side = 1;
+            }
+            
+            if mapX < 0 || mapX > 15 || mapY < 0 || mapY > 15 {
+                hit = 1;
+                wallType = 1;
+            } else {
+                tile = load_grid_tile(mapX, mapY);
+                if tile != 0 {
+                    hit = 1;
+                    wallType = tile;
+                }
+            }
+        }
+        
+        if side == 0 {
+            perpWallDist = sideDistX - deltaDistX;
+        } else {
+            perpWallDist = sideDistY - deltaDistY;
+        }
+        
+        if perpWallDist < 100 { perpWallDist = 100; }
+        
+        # Wall column projection height
+        wallHeight = 15728640 / perpWallDist; # 240 * 65536 = 15728640
+        
+        drawStart = 120 - wallHeight / 2;
+        drawEnd = 120 + wallHeight / 2;
+        if drawStart < 0 { drawStart = 0; }
+        if drawEnd > 240 { drawEnd = 240; }
+        
+        # Depth shading factor (max distance 8.0 units)
+        shade = 255 - (perpWallDist * 220) / 524288;
+        if shade < 35 { shade = 35; }
+        if shade > 255 { shade = 255; }
+        
+        # Shading for X vs Y walls for 3D realism
+        if wallType == 9 {
+            # Amber: R = 255, G = 191, B = 0
+            shadedR = (255 * shade) / 255;
+            shadedG = (191 * shade) / 255;
+            shadedB = 0;
+        } else {
+            # Cobalt: R = 0, G = 71, B = 171
+            if side == 1 {
+                shade = (shade * 3) / 4; # Darker shading on Y-facing walls
+            }
+            shadedR = 0;
+            shadedG = (71 * shade) / 255;
+            shadedB = (171 * shade) / 255;
+        }
+        color = shl(shadedR, 16) + shl(shadedG, 8) + shadedB;
+        
+        # Write column to DIB framebuffer
+        y = 0;
+        while y < drawStart {
+            store32(g_framebuffer + (y * 320 + x) * 4, 0x00151515); # Ceiling
+            y = y + 1;
+        }
+        y = drawStart;
+        while y < drawEnd {
+            store32(g_framebuffer + (y * 320 + x) * 4, color); # Wall
+            y = y + 1;
+        }
+        y = drawEnd;
+        while y < 240 {
+            store32(g_framebuffer + (y * 320 + x) * 4, 0x00242020); # Floor
+            y = y + 1;
+        }
+        
+        x = x + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Transparent Heads-Up Display (HUD) Rendering
+# ---------------------------------------------------------------------
+
+func draw_angle_hud(hdc: i64, angle: i64, x: i64, y: i64) -> i64 {
+    strcpy(g_txt_buf, "ANGLE: ");
+    len_val = itoa(angle, g_txt_buf + 7);
+    TextOutA(hdc, x, y, g_txt_buf, 7 + len_val);
+    return 0;
+}
+
+func draw_steps_hud(hdc: i64, steps: i64, x: i64, y: i64) -> i64 {
+    strcpy(g_txt_buf, "STEPS: ");
+    len_val = itoa(steps, g_txt_buf + 7);
+    TextOutA(hdc, x, y, g_txt_buf, 7 + len_val);
+    return 0;
+}
+
+func draw_winner_hud(hdc: i64, x: i64, y: i64) -> i64 {
+    strcpy(g_txt_buf, "WINNER!");
+    TextOutA(hdc, x, y, g_txt_buf, 7);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 WndProc
+# ---------------------------------------------------------------------
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetTimer(hwnd, 1, 16, 0); # ~60 FPS update
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        update_player();
+        InvalidateRect(hwnd, 0, 0); # No background erase to eliminate flicker
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Render raycast column buffers
+        render_frame();
+        
+        # Blast pixel buffer via StretchDIBits
+        StretchDIBits(hdc, 0, 0, w, h, 0, 0, 320, 240, g_framebuffer, g_bitmapinfo, 0, 0x00CC0020);
+        
+        # Draw GDI transparent HUD labels on top of StretchDIBits
+        SetBkMode(hdc, 1);
+        
+        if check_win() == 1 {
+            SetTextColor(hdc, 0x0000D7FF); # Amber/Gold
+            draw_winner_hud(hdc, w / 2 - 40, h / 2 - 10);
+        } else {
+            SetTextColor(hdc, 0x00FFFFFF); # White
+        }
+        
+        hud_y = h - 40;
+        angle = load64(g_playerAngle);
+        steps = load64(g_steps);
+        
+        draw_angle_hud(hdc, angle, 40, hud_y);
+        draw_steps_hud(hdc, steps, 200, hud_y);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Execution Loop
+# ---------------------------------------------------------------------
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize lookup tables, maze layout and states
+    init_lut();
+    init_grid_map();
+    
+    # Start coordinates (1.5, 1.5)
+    store64(g_playerX, 98304); # 1.5 * 65536
+    store64(g_playerY, 98304); # 1.5 * 65536
+    store64(g_playerAngle, 0); # facing east
+    store64(g_steps, 0);
+    store64(g_accum_dist, 0);
+    
+    # Setup BITMAPINFO Header values
+    store32(g_bitmapinfo + 0, 40);      # biSize = 40
+    store32(g_bitmapinfo + 4, 320);     # biWidth = 320
+    store32(g_bitmapinfo + 8, 0 - 240); # biHeight = -240 (top-down)
+    store16(g_bitmapinfo + 12, 1);      # biPlanes = 1
+    store16(g_bitmapinfo + 14, 32);     # biBitCount = 32
+    store32(g_bitmapinfo + 16, 0);      # biCompression = BI_RGB
+    store32(g_bitmapinfo + 20, 0);
+    store32(g_bitmapinfo + 24, 0);
+    store32(g_bitmapinfo + 28, 0);
+    store32(g_bitmapinfo + 32, 0);
+    store32(g_bitmapinfo + 36, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F));
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA: full size window
+    # WS_OVERLAPPEDWINDOW | WS_VISIBLE = 0x10CF0000 = 282001408
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 150, 150, 640, 480, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

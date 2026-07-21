@@ -1,0 +1,47 @@
+# =====================================================================
+#  process.ancl - hidden child-process launch helper for Windows ANCL apps.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "kernel32.dll" TerminateProcess -> i32;
+
+@DATA
+proc_si:   buf = 104;  # STARTUPINFOA
+proc_pi:   buf = 24;   # PROCESS_INFORMATION
+proc_exit: buf = 8;    # DWORD exit code sink
+
+@CODE
+
+# Run a writable command line hidden, wait up to timeout_ms, write exit code
+# to exit_out, and return 1 for a completed child.
+# Negative returns: -1 launch failure, -2 timeout, -3 exit-code query failure.
+func proc_run_hidden_wait(cmdline: ptr, timeout_ms: i64, exit_out: ptr) -> i64 {
+    memset(proc_si, 0, 104);
+    memset(proc_pi, 0, 24);
+    store32(proc_si + 0, 104);
+
+    ok = CreateProcessA(0, cmdline, 0, 0, 0, 0x08000000, 0, 0, proc_si, proc_pi);
+    if ok == 0 { return 0 - 1; }
+
+    wait_rc = WaitForSingleObject(load64(proc_pi + 0), timeout_ms);
+    if wait_rc == 258 {
+        TerminateProcess(load64(proc_pi + 0), 1);
+        CloseHandle(load64(proc_pi + 0));
+        CloseHandle(load64(proc_pi + 8));
+        store64(exit_out, 1);
+        return 0 - 2;
+    }
+
+    store64(proc_exit, 999);
+    if GetExitCodeProcess(load64(proc_pi + 0), proc_exit) == 0 {
+        CloseHandle(load64(proc_pi + 0));
+        CloseHandle(load64(proc_pi + 8));
+        store64(exit_out, 999);
+        return 0 - 3;
+    }
+
+    store64(exit_out, load32(proc_exit));
+    CloseHandle(load64(proc_pi + 0));
+    CloseHandle(load64(proc_pi + 8));
+    return 1;
+}

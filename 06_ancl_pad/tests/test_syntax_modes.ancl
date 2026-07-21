@@ -1,0 +1,56 @@
+import "../core_lib/syntax_ancl.ancl";
+
+@DATA
+j: str = "\"key\": true";
+x: str = "<node id=\"7\">";
+q: str = "SELECT value FROM readings";
+m: str = "# Heading";
+mb: str = "* **Protocol**: HTTPS GET";
+me: str = "\\[not a link\\]";
+i: str = "[network]";
+ik: str = "address=10";
+p: str = "$value";
+pc: str = "Get-Item";
+pyf: str = "f\"value={value}\"";
+pyd: str = "@service.route";
+csi: str = "$\"value={value}\"";
+csa: str = "[Obsolete]";
+cst: str = "Widget";
+
+@CODE
+func expect(mode: i64, src: i64, kind: i64) -> i64 {
+    n = syn_mode_next(mode, src, 0);
+    if n <= 0 { return 0; }
+    if load64(syn_ancl_tok_kind) != kind { return 0; }
+    return 1;
+}
+
+func expect_at(mode: i64, src: i64, pos: i64, kind: i64) -> i64 {
+    n = syn_mode_next(mode, src, pos);
+    if n <= 0 { return 0; }
+    if load64(syn_ancl_tok_kind) != kind { return 0; }
+    return 1;
+}
+
+func main() -> i32 {
+    if expect(SYN_MODE_JSON, j, SYN_ANCL_TAG) == 0 { return 11; }
+    if expect(SYN_MODE_XML, x, SYN_ANCL_TAG) == 0 { return 12; }
+    if expect(SYN_MODE_SQL, q, SYN_ANCL_KEYWORD) == 0 { return 13; }
+    if expect(SYN_MODE_MARKDOWN, m, SYN_ANCL_TAG) == 0 { return 14; }
+    if expect(SYN_MODE_MARKDOWN, mb, SYN_ANCL_BUILTIN) == 0 { return 24; }
+    if expect_at(SYN_MODE_MARKDOWN, mb, 2, SYN_ANCL_KEYWORD) == 0 { return 25; }
+    if expect(SYN_MODE_MARKDOWN, me, SYN_ANCL_DEFAULT) == 0 { return 26; }
+    if expect(SYN_MODE_INI, i, SYN_ANCL_TAG) == 0 { return 15; }
+    if expect(SYN_MODE_INI, ik, SYN_ANCL_KEYWORD) == 0 { return 16; }
+    if expect(SYN_MODE_POWERSHELL, p, SYN_ANCL_TAG) == 0 { return 17; }
+    if expect(SYN_MODE_POWERSHELL, pc, SYN_ANCL_BUILTIN) == 0 { return 18; }
+    if expect(SYN_MODE_PYTHON, pyf, SYN_ANCL_TEXT) == 0 { return 19; }
+    if expect(SYN_MODE_PYTHON, pyd, SYN_ANCL_TAG) == 0 { return 20; }
+    if expect(SYN_MODE_CSHARP, csi, SYN_ANCL_TEXT) == 0 { return 21; }
+    if expect(SYN_MODE_CSHARP, csa, SYN_ANCL_TAG) == 0 { return 22; }
+    if expect(SYN_MODE_CSHARP, cst, SYN_ANCL_TYPE) == 0 { return 23; }
+    if expect(SYN_MODE_HTML, "<main class=\"app\">", SYN_ANCL_TAG) == 0 { return 27; }
+    if expect(SYN_MODE_HTML, "<!-- note -->", SYN_ANCL_TEXT) == 0 { return 28; }
+    if expect(SYN_MODE_HTML, "&amp;", SYN_ANCL_BUILTIN) == 0 { return 29; }
+    return 0;
+}

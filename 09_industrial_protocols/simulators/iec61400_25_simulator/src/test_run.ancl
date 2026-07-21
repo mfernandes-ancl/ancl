@@ -1,0 +1,276 @@
+# ============================================================================
+#  test_run.ancl  -  Wind Simulator Automated Test Client (Command Line)
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+import "../../../core_lib/iec61850_compat.ancl";
+
+extern "kernel32.dll" Sleep;
+
+@DATA
+g_mms_val_offset: buf = 8;
+g_val_str:  buf = 256;
+g_type_str: buf = 64;
+g_err:      buf = 8;
+g_numbuf:   buf = 32;
+
+host_ip:    str = "127.0.0.1";
+port_num:   i64 = 10104;
+
+ref_wind:   str = "WTG1Sim/Wmet1.HorWdSpd.mag.f";
+ref_rotor:  str = "WTG1Sim/WROT1.RotSpd.mag.f";
+ref_turst:  str = "WTG1Sim/Wnac1.TurSt.stVal";
+ref_start:  str = "WTG1Sim/Wnac1.Start";
+ref_stop:   str = "WTG1Sim/Wnac1.Stop";
+
+@CODE
+
+func detect_mms_alignment() -> i64 {
+    val1 = MmsValue_newBoolean(1);
+    val0 = MmsValue_newBoolean(0);
+    offset = 8;
+    
+    if val1 != 0 {
+        if load8(val1 + 5) == 1 {
+            if val0 != 0 {
+                if load8(val0 + 5) == 0 {
+                    offset = 5;
+                }
+            }
+        }
+    }
+    
+    if val1 != 0 { MmsValue_delete(val1); }
+    if val0 != 0 { MmsValue_delete(val0); }
+    
+    store64(g_mms_val_offset, offset);
+    return offset;
+}
+
+func decode_mms_value(val_ptr: i64) -> i64 {
+    type = MmsValue_getType(val_ptr);
+    offset = load64(g_mms_val_offset);
+    
+    store8(g_val_str, 0);
+    store8(g_type_str, 0);
+    
+    if type == 2 {
+        str_copy(g_type_str, "Boolean");
+        b_val = load8(val_ptr + offset);
+        if b_val != 0 { str_copy(g_val_str, "True"); }
+        else { str_copy(g_val_str, "False"); }
+        return 0;
+    }
+    
+    if type == 4 {
+        str_copy(g_type_str, "Integer");
+        int_val = MmsValue_toInt64(val_ptr);
+        int_to_str(g_val_str, int_val);
+        return 0;
+    }
+    
+    if type == 5 {
+        str_copy(g_type_str, "Unsigned");
+        int_val = MmsValue_toInt64(val_ptr);
+        int_to_str(g_val_str, int_val);
+        return 0;
+    }
+    
+    if type == 6 {
+        format_width = load8(val_ptr + offset + 1);
+        if format_width == 32 {
+            str_copy(g_type_str, "Float32");
+            f_bits = load32(val_ptr + offset + 2);
+            nf_ftoa(f_bits, g_val_str);
+        } else {
+            str_copy(g_type_str, "Float64");
+            d_bits = load64(val_ptr + offset + 2);
+            nf_dtoa(d_bits, g_val_str);
+        }
+        return 0;
+    }
+    
+    # Fallback
+    str_copy(g_type_str, "Structure");
+    int_to_str(g_val_str, type);
+    return 0;
+}
+
+func str_equal(s1: i64, s2: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c1 = load8(s1 + i);
+        c2 = load8(s2 + i);
+        if c1 != c2 { return 0; }
+        if c1 == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func main() -> i32 {
+    detect_mms_alignment();
+    
+    puts_cstr("[TEST] Creating IedConnection...\n");
+    con = IedConnection_create();
+    if con == 0 {
+        puts_cstr("      -> FAILED to create IedConnection.\n");
+        return 1;
+    }
+    
+    puts_cstr("[TEST] Connecting to 127.0.0.1:10104...\n");
+    store32(g_err, 0);
+    IedConnection_connect(con, g_err, host_ip, port_num);
+    err_val = load32(g_err);
+    if err_val != 0 {
+        puts_cstr("      -> FAILED to connect. Error code: ");
+        int_to_str(g_numbuf, err_val);
+        puts_cstr(g_numbuf);
+        puts_cstr("\n");
+        IedConnection_destroy(con);
+        return 1;
+    }
+    puts_cstr("      -> Connected successfully!\n");
+    
+    # Read Initial Turbine State (should be Stopped / False)
+    puts_cstr("[TEST] Reading initial Turbine State (TurSt.stVal)...\n");
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_turst, 0); # FC: ST = 0
+    if load32(g_err) != 0 {
+        puts_cstr("      -> Read FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    decode_mms_value(val);
+    MmsValue_delete(val);
+    puts_cstr("      -> Value: ");
+    puts_cstr(g_val_str);
+    puts_cstr("\n");
+    if str_equal(g_val_str, "False") == 0 {
+        puts_cstr("      -> ERROR: Expected False initially.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    
+    # Operate Start control to True
+    puts_cstr("[TEST] Issuing START command (WTG1Sim/Wnac1.Start -> True)...\n");
+    control = ControlObjectClient_create(ref_start, con);
+    if control == 0 {
+        puts_cstr("      -> FAILED to create control client.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    ctlVal = MmsValue_newBoolean(1);
+    ControlObjectClient_setOrigin(control, 0, 3);
+    res = ControlObjectClient_operate(control, ctlVal, 0);
+    MmsValue_delete(ctlVal);
+    ControlObjectClient_destroy(control);
+    if res == 0 {
+        puts_cstr("      -> Operate command FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    puts_cstr("      -> Operate command succeeded.\n");
+    
+    # Wait for simulation updates
+    puts_cstr("      -> Sleeping 1.5 seconds for simulator loop to run...\n");
+    Sleep(1500);
+    
+    # Read Turbine State (should be Running / True)
+    puts_cstr("[TEST] Reading Turbine State after Start...\n");
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_turst, 0); # FC: ST = 0
+    if load32(g_err) != 0 {
+        puts_cstr("      -> Read FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    decode_mms_value(val);
+    MmsValue_delete(val);
+    puts_cstr("      -> Value: ");
+    puts_cstr(g_val_str);
+    puts_cstr("\n");
+    if str_equal(g_val_str, "True") == 0 {
+        puts_cstr("      -> ERROR: Expected True after start command.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    
+    # Read Rotor speed (should be > 0.0)
+    puts_cstr("[TEST] Reading Rotor Speed (RotSpd.mag.f)...\n");
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_rotor, 1); # FC: MX = 1
+    if load32(g_err) != 0 {
+        puts_cstr("      -> Read FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    decode_mms_value(val);
+    MmsValue_delete(val);
+    puts_cstr("      -> Value: ");
+    puts_cstr(g_val_str);
+    puts_cstr(" rpm\n");
+    
+    # Operate Stop control to True
+    puts_cstr("[TEST] Issuing STOP command (WTG1Sim/Wnac1.Stop -> True)...\n");
+    control = ControlObjectClient_create(ref_stop, con);
+    if control == 0 {
+        puts_cstr("      -> FAILED to create control client.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    ctlVal = MmsValue_newBoolean(1);
+    ControlObjectClient_setOrigin(control, 0, 3);
+    res = ControlObjectClient_operate(control, ctlVal, 0);
+    MmsValue_delete(ctlVal);
+    ControlObjectClient_destroy(control);
+    if res == 0 {
+        puts_cstr("      -> Operate command FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    puts_cstr("      -> Operate command succeeded.\n");
+    
+    # Wait for simulation updates
+    puts_cstr("      -> Sleeping 1.5 seconds for simulator loop to run...\n");
+    Sleep(1500);
+    
+    # Read Turbine State (should be Stopped / False)
+    puts_cstr("[TEST] Reading Turbine State after Stop...\n");
+    store32(g_err, 0);
+    val = IedConnection_readObject(con, g_err, ref_turst, 0); # FC: ST = 0
+    if load32(g_err) != 0 {
+        puts_cstr("      -> Read FAILED.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    decode_mms_value(val);
+    MmsValue_delete(val);
+    puts_cstr("      -> Value: ");
+    puts_cstr(g_val_str);
+    puts_cstr("\n");
+    if str_equal(g_val_str, "False") == 0 {
+        puts_cstr("      -> ERROR: Expected False after stop command.\n");
+        IedConnection_close(con);
+        IedConnection_destroy(con);
+        return 1;
+    }
+    
+    puts_cstr("[TEST] Closing connection...\n");
+    IedConnection_close(con);
+    IedConnection_destroy(con);
+    puts_cstr("[TEST] All integration checks PASSED.\n");
+    return 0;
+}

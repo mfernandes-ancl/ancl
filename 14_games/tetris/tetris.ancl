@@ -1,0 +1,744 @@
+# Neon Tetris - A Native Win32 Game in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+extern "gdi32.dll"  DeleteDC;
+extern "gdi32.dll"  SetTextAlign;
+
+extern "user32.dll" PeekMessageA -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+class_name: str = "NeonTetris";
+window_title: str = "Neon Tetris - ANCL Native Showcase";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+
+# Brushes and Fonts
+bg_brush: buf = 8;
+hud_brush: buf = 8;
+board_brush: buf = 8;
+border_brush: buf = 8;
+
+# Piece brushes (7 classic colors in 0x00bbggrr)
+brick_brush0: buf = 8; # 0: Cyan (0xFFFF00)
+brick_brush1: buf = 8; # 1: Yellow (0x00FFFF)
+brick_brush2: buf = 8; # 2: Purple (0xFF00FF)
+brick_brush3: buf = 8; # 3: Green (0x00FF00)
+brick_brush4: buf = 8; # 4: Red (0x0000FF)
+brick_brush5: buf = 8; # 5: Blue (0xFF0000)
+brick_brush6: buf = 8; # 6: Orange (0x00A5FF)
+
+title_font: buf = 8;
+hud_font: buf = 8;
+small_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+cell_rect: buf = 16;
+hud_str: buf = 64;
+
+# Game state
+game_state: buf = 8; # 0 = Start, 1 = Playing, 2 = Game Over
+score: buf = 8;
+high_score: buf = 8;
+level: buf = 8;
+lines_cleared: buf = 8;
+tick_delay: buf = 8;
+last_tick: buf = 8;
+rand_seed: buf = 8;
+
+# Board state: 10 columns x 20 rows
+board: buf = 200;
+
+# Active piece state
+cur_piece_type: buf = 8;
+cur_piece_x: buf = 8;
+cur_piece_y: buf = 8;
+next_piece_type: buf = 8;
+
+# Offsets (7 types * 4 blocks * 2 coords)
+base_offsets: buf = 56;
+cur_offsets: buf = 8;
+temp_offsets: buf = 8;
+
+@CODE
+
+# --- Helper Functions ---
+func draw_rect(hdc: ptr, x1: i32, y1: i32, x2: i32, y2: i32, brush: ptr) -> i64 {
+    store32(cell_rect + 0, x1);
+    store32(cell_rect + 4, y1);
+    store32(cell_rect + 8, x2);
+    store32(cell_rect + 12, y2);
+    FillRect(hdc, cell_rect, brush);
+    return 0;
+}
+
+func draw_text_num(hdc: ptr, x: i32, y: i32, prefix: ptr, val: i64) -> i64 {
+    str_len = strlen(prefix);
+    memset(hud_str, 0, 64);
+    memcpy(hud_str, prefix, str_len);
+    nf_u64dec(val, hud_str + str_len);
+    TextOutA(hdc, x, y, hud_str, strlen(hud_str));
+    return 0;
+}
+
+func get_piece_brush(type: i64) -> ptr {
+    if type == 0 { return load64(brick_brush0); }
+    if type == 1 { return load64(brick_brush1); }
+    if type == 2 { return load64(brick_brush2); }
+    if type == 3 { return load64(brick_brush3); }
+    if type == 4 { return load64(brick_brush4); }
+    if type == 5 { return load64(brick_brush5); }
+    return load64(brick_brush6);
+}
+
+func set_offset(piece: i64, block: i64, dx: i64, dy: i64) -> i64 {
+    idx = piece * 8 + block * 2;
+    store8(base_offsets + idx, dx);
+    store8(base_offsets + idx + 1, dy);
+    return 0;
+}
+
+func load_piece_offsets(type: i64) -> i64 {
+    i = 0;
+    while i < 4 {
+        store8(cur_offsets + i * 2, load8(base_offsets + type * 8 + i * 2));
+        store8(cur_offsets + i * 2 + 1, load8(base_offsets + type * 8 + i * 2 + 1));
+        i = i + 1;
+    }
+    return 0;
+}
+
+func rotate_offsets() -> i64 {
+    if load64(cur_piece_type) == 1 { return 0; } # O square does not rotate
+    
+    i = 0;
+    while i < 4 {
+        dx = nf_sext8(load8(cur_offsets + i * 2));
+        dy = nf_sext8(load8(cur_offsets + i * 2 + 1));
+        
+        # Clockwise rotation: new_dx = -dy, new_dy = dx
+        store8(cur_offsets + i * 2, 0 - dy);
+        store8(cur_offsets + i * 2 + 1, dx);
+        i = i + 1;
+    }
+    return 0;
+}
+
+func check_collision(px: i64, py: i64) -> i64 {
+    i = 0;
+    while i < 4 {
+        dx = nf_sext8(load8(cur_offsets + i * 2));
+        dy = nf_sext8(load8(cur_offsets + i * 2 + 1));
+        
+        gx = px + dx;
+        gy = py + dy;
+        
+        if gx < 0 { return 1; }
+        if gx >= 10 { return 1; }
+        if gy >= 20 { return 1; }
+        
+        if gy >= 0 {
+            if load8(board + gy * 10 + gx) != 0 {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func try_rotate() -> i64 {
+    i = 0;
+    while i < 8 {
+        store8(temp_offsets + i, load8(cur_offsets + i));
+        i = i + 1;
+    }
+    
+    rotate_offsets();
+    
+    px = load64(cur_piece_x);
+    py = load64(cur_piece_y);
+    
+    if check_collision(px, py) == 1 {
+        # Wall kick left 1
+        if check_collision(px - 1, py) == 0 {
+            store64(cur_piece_x, px - 1);
+            return 0;
+        }
+        # Wall kick right 1
+        if check_collision(px + 1, py) == 0 {
+            store64(cur_piece_x, px + 1);
+            return 0;
+        }
+        # Wall kick left 2
+        if check_collision(px - 2, py) == 0 {
+            store64(cur_piece_x, px - 2);
+            return 0;
+        }
+        # Wall kick right 2
+        if check_collision(px + 2, py) == 0 {
+            store64(cur_piece_x, px + 2);
+            return 0;
+        }
+        
+        # Revert on overlap
+        i = 0;
+        while i < 8 {
+            store8(cur_offsets + i, load8(temp_offsets + i));
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+func shift_rows_down(target_y: i64) -> i64 {
+    y = target_y;
+    while y > 0 {
+        x = 0;
+        while x < 10 {
+            store8(board + y * 10 + x, load8(board + (y - 1) * 10 + x));
+            x = x + 1;
+        }
+        y = y - 1;
+    }
+    
+    # Clear top row
+    x = 0;
+    while x < 10 {
+        store8(board + x, 0);
+        x = x + 1;
+    }
+    return 0;
+}
+
+func check_line_clears() -> i64 {
+    cleared = 0;
+    y = 19;
+    while y >= 0 {
+        full = 1;
+        x = 0;
+        while x < 10 {
+            if load8(board + y * 10 + x) == 0 {
+                full = 0;
+                break;
+            }
+            x = x + 1;
+        }
+        
+        if full == 1 {
+            shift_rows_down(y);
+            cleared = cleared + 1;
+        } else {
+            y = y - 1;
+        }
+    }
+    
+    if cleared > 0 {
+        points = 0;
+        if cleared == 1 { points = 100; }
+        else if cleared == 2 { points = 300; }
+        else if cleared == 3 { points = 500; }
+        else if cleared == 4 { points = 800; }
+        
+        lvl = load64(level);
+        points = points * (lvl + 1);
+        
+        s = load64(score) + points;
+        store64(score, s);
+        if s > load64(high_score) { store64(high_score, s); }
+        
+        tot_lines = load64(lines_cleared) + cleared;
+        store64(lines_cleared, tot_lines);
+        
+        new_lvl = tot_lines / 10;
+        if new_lvl > lvl {
+            store64(level, new_lvl);
+            cur_delay = load64(tick_delay);
+            if cur_delay > 100 {
+                store64(tick_delay, cur_delay - 100); # speed scaling
+            }
+        }
+    }
+    return 0;
+}
+
+func spawn_piece() -> i64 {
+    seed = load64(rand_seed);
+    seed = seed * 2862933555777941757 + 3037000493;
+    store64(rand_seed, seed);
+    
+    next_type = band(shr(seed, 32), 0xFFFF) % 7;
+    curr = load64(next_piece_type);
+    
+    if curr < 0 {
+        curr = band(shr(seed, 16), 0xFFFF) % 7;
+    }
+    
+    store64(cur_piece_type, curr);
+    store64(next_piece_type, next_type);
+    
+    store64(cur_piece_x, 4);
+    store64(cur_piece_y, 0);
+    
+    load_piece_offsets(curr);
+    
+    # Check Spawn Overlap -> Game Over
+    if check_collision(4, 0) == 1 {
+        store64(game_state, 2);
+    }
+    return 0;
+}
+
+func lock_piece() -> i64 {
+    px = load64(cur_piece_x);
+    py = load64(cur_piece_y);
+    type = load64(cur_piece_type);
+    
+    i = 0;
+    while i < 4 {
+        dx = nf_sext8(load8(cur_offsets + i * 2));
+        dy = nf_sext8(load8(cur_offsets + i * 2 + 1));
+        
+        gx = px + dx;
+        gy = py + dy;
+        
+        if gy >= 0 {
+            if gy < 20 {
+                if gx >= 0 {
+                    if gx < 10 {
+                        store8(board + gy * 10 + gx, type + 1);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    check_line_clears();
+    spawn_piece();
+    return 0;
+}
+
+func hard_drop() -> i64 {
+    px = load64(cur_piece_x);
+    py = load64(cur_piece_y);
+    while 1 {
+        if check_collision(px, py + 1) == 1 {
+            break;
+        }
+        py = py + 1;
+    }
+    store64(cur_piece_y, py);
+    lock_piece();
+    return 0;
+}
+
+func game_start() -> i64 {
+    store64(score, 0);
+    store64(lines_cleared, 0);
+    store64(level, 0);
+    store64(game_state, 1);
+    store64(tick_delay, 800); # 800ms initial speed
+    
+    memset(board, 0, 200);
+    store64(next_piece_type, 0 - 1);
+    spawn_piece();
+    
+    store64(last_tick, GetTickCount());
+    InvalidateRect(load64(hwnd), 0, 0);
+    return 0;
+}
+
+func game_update() -> i64 {
+    if load64(game_state) != 1 { return 0; }
+    
+    px = load64(cur_piece_x);
+    py = load64(cur_piece_y);
+    
+    if check_collision(px, py + 1) == 1 {
+        lock_piece();
+    } else {
+        store64(cur_piece_y, py + 1);
+    }
+    return 0;
+}
+
+func game_render(hdc: ptr) -> i64 {
+    GetClientRect(load64(hwnd), client_rect);
+    width = load32(client_rect + 8);
+    height = load32(client_rect + 12);
+    
+    # Render main background
+    draw_rect(hdc, 0, 0, width, height, load64(bg_brush));
+    draw_rect(hdc, 0, 0, width, 90, load64(hud_brush));
+    
+    SetBkMode(hdc, 1);
+    old_font = SelectObject(hdc, load64(hud_font));
+    
+    # HUD Scores
+    SetTextColor(hdc, 0x00FF00); # Neon Green
+    draw_text_num(hdc, 30, 15, "SCORE: ", load64(score));
+    
+    SetTextColor(hdc, 0x00A5FF); # Orange
+    draw_text_num(hdc, 30, 48, "LEVEL: ", load64(level));
+    
+    SetTextColor(hdc, 0x00D898); # Gold High Score
+    SetTextAlign(hdc, 2);                            # TA_RIGHT â€” anchor to the right edge
+    draw_text_num(hdc, width - 30, 30, "HIGH SCORE: ", load64(high_score));
+    SetTextAlign(hdc, 0);                            # restore TA_LEFT
+    
+    # Centered game board (200x400)
+    start_x = (width - 200) / 2;
+    start_y = 120;
+    
+    draw_rect(hdc, start_x - 4, start_y - 4, start_x + 204, start_y + 404, load64(border_brush));
+    draw_rect(hdc, start_x, start_y, start_x + 200, start_y + 400, load64(board_brush));
+    
+    state = load64(game_state);
+    
+    if state == 0 {
+        # Start menu screen â€” centered neon layout
+        cx = start_x + 100;                              # board centre x
+        SetTextAlign(hdc, 6);                            # TA_CENTER (horizontal)
+
+        # Title
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0xFFFF00);                     # cyan
+        TextOutA(hdc, cx, start_y + 58, "NEON TETRIS", 11);
+        # neon accent underline
+        draw_rect(hdc, cx - 92, start_y + 108, cx + 92, start_y + 111, load64(brick_brush0));
+
+        # Subtitle
+        SelectObject(hdc, load64(small_font));
+        SetTextColor(hdc, 0x8A8A8A);
+        TextOutA(hdc, cx, start_y + 122, "A NATIVE ANCL GAME", 18);
+
+        # Controls hint
+        SetTextColor(hdc, 0x00A5FF);                     # orange
+        TextOutA(hdc, cx, start_y + 244, "ARROWS   MOVE / ROTATE", 22);
+        TextOutA(hdc, cx, start_y + 268, "SPACE   HARD DROP", 17);
+
+        # Flashing prompt
+        SelectObject(hdc, load64(hud_font));
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0xFFFFFF);
+            TextOutA(hdc, cx, start_y + 330, "PRESS SPACE TO PLAY", 19);
+        }
+
+        SetTextAlign(hdc, 0);                            # restore TA_LEFT
+    }
+    
+    if state == 1 {
+        # Render Board content (locked blocks)
+        y = 0;
+        while y < 20 {
+            x = 0;
+            while x < 10 {
+                val = load8(board + y * 10 + x);
+                if val != 0 {
+                    brush = get_piece_brush(val - 1);
+                    draw_rect(hdc, start_x + x * 20 + 1, start_y + y * 20 + 1, start_x + x * 20 + 19, start_y + y * 20 + 19, brush);
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        
+        # Render Active Block
+        px = load64(cur_piece_x);
+        py = load64(cur_piece_y);
+        type = load64(cur_piece_type);
+        brush = get_piece_brush(type);
+        
+        i = 0;
+        while i < 4 {
+            dx = nf_sext8(load8(cur_offsets + i * 2));
+            dy = nf_sext8(load8(cur_offsets + i * 2 + 1));
+            gx = px + dx;
+            gy = py + dy;
+            
+            if gy >= 0 {
+                draw_rect(hdc, start_x + gx * 20 + 1, start_y + gy * 20 + 1, start_x + gx * 20 + 19, start_y + gy * 20 + 19, brush);
+            }
+            i = i + 1;
+        }
+        
+        # Next Piece Preview Box (on right side)
+        draw_rect(hdc, start_x + 220, start_y + 20, start_x + 320, start_y + 120, load64(border_brush));
+        draw_rect(hdc, start_x + 224, start_y + 24, start_x + 316, start_y + 116, load64(board_brush));
+        
+        next = load64(next_piece_type);
+        if next >= 0 {
+            next_brush = get_piece_brush(next);
+            i = 0;
+            while i < 4 {
+                ndx = nf_sext8(load8(base_offsets + next * 8 + i * 2));
+                ndy = nf_sext8(load8(base_offsets + next * 8 + i * 2 + 1));
+                
+                # Offset alignment to center it within the 4x4 preview panel
+                gx = 2 + ndx;
+                gy = 2 + ndy;
+                
+                draw_rect(hdc, start_x + 220 + gx * 20, start_y + 30 + gy * 20, start_x + 220 + gx * 20 + 19, start_y + 30 + gy * 20 + 19, next_brush);
+                i = i + 1;
+            }
+        }
+    }
+    
+    if state == 2 {
+        # Game Over Screen
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x0000FF);
+        TextOutA(hdc, start_x - 45, start_y + 100, "GAME OVER", 9);
+        
+        SelectObject(hdc, load64(hud_font));
+        SetTextColor(hdc, 0xCCCCCC);
+        draw_text_num(hdc, start_x - 10, start_y + 190, "FINAL SCORE: ", load64(score));
+        
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0x00FFFF);
+            TextOutA(hdc, start_x - 55, start_y + 270, "PRESS SPACE TO RESTART", 22);
+        }
+    }
+    
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { # WM_PAINT (double-buffered: render off-screen, blit once â€” no flicker)
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        GetClientRect(hwnd_val, client_rect);
+        db_w = load32(client_rect + 8);
+        db_h = load32(client_rect + 12);
+        db_dc = CreateCompatibleDC(hdc);
+        db_bmp = CreateCompatibleBitmap(hdc, db_w, db_h);
+        db_old = SelectObject(db_dc, db_bmp);
+        game_render(db_dc);
+        BitBlt(hdc, 0, 0, db_w, db_h, db_dc, 0, 0, 0x00CC0020);
+        SelectObject(db_dc, db_old);
+        DeleteObject(db_bmp);
+        DeleteDC(db_dc);
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    if msg == 256 { # WM_KEYDOWN
+        state = load64(game_state);
+        if state == 0 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        if state == 2 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        
+        if state == 1 {
+            px = load64(cur_piece_x);
+            py = load64(cur_piece_y);
+            
+            # Left (Arrow Left or A)
+            if wParam == 37 {
+                if check_collision(px - 1, py) == 0 { store64(cur_piece_x, px - 1); }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            if wParam == 65 {
+                if check_collision(px - 1, py) == 0 { store64(cur_piece_x, px - 1); }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            
+            # Right (Arrow Right or D)
+            if wParam == 39 {
+                if check_collision(px + 1, py) == 0 { store64(cur_piece_x, px + 1); }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            if wParam == 68 {
+                if check_collision(px + 1, py) == 0 { store64(cur_piece_x, px + 1); }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            
+            # Soft Drop (Arrow Down or S)
+            if wParam == 40 {
+                if check_collision(px, py + 1) == 0 {
+                    store64(cur_piece_y, py + 1);
+                } else {
+                    lock_piece();
+                }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            if wParam == 83 {
+                if check_collision(px, py + 1) == 0 {
+                    store64(cur_piece_y, py + 1);
+                } else {
+                    lock_piece();
+                }
+                InvalidateRect(hwnd_val, 0, 0);
+                return 0;
+            }
+            
+            # Rotate (Arrow Up or W)
+            if wParam == 38 { try_rotate(); InvalidateRect(hwnd_val, 0, 0); return 0; }
+            if wParam == 87 { try_rotate(); InvalidateRect(hwnd_val, 0, 0); return 0; }
+            
+            # Hard Drop (Space or Enter)
+            if wParam == 32 { hard_drop(); InvalidateRect(hwnd_val, 0, 0); return 0; }
+            if wParam == 13 { hard_drop(); InvalidateRect(hwnd_val, 0, 0); return 0; }
+        }
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize GDI Brushes
+    store64(bg_brush, CreateSolidBrush(0x1E1E1E));
+    store64(hud_brush, CreateSolidBrush(0x252525));
+    store64(board_brush, CreateSolidBrush(0x121212));
+    store64(border_brush, CreateSolidBrush(0x444444));
+    
+    # Piece brushes (7 standard Tetris colors)
+    store64(brick_brush0, CreateSolidBrush(0xFFFF00)); # 0: Cyan
+    store64(brick_brush1, CreateSolidBrush(0x00FFFF)); # 1: Yellow
+    store64(brick_brush2, CreateSolidBrush(0xFF00FF)); # 2: Purple
+    store64(brick_brush3, CreateSolidBrush(0x00FF00)); # 3: Green
+    store64(brick_brush4, CreateSolidBrush(0x0000FF)); # 4: Red
+    store64(brick_brush5, CreateSolidBrush(0xFF0000)); # 5: Blue
+    store64(brick_brush6, CreateSolidBrush(0x00A5FF)); # 6: Orange
+    
+    # Custom Bold Fonts
+    store64(title_font, CreateFontA(36, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(hud_font, CreateFontA(20, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(small_font, CreateFontA(15, 0, 0, 0, 500, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    
+    # Set coordinates for all 7 base pieces
+    # 0: I
+    set_offset(0, 0, 0 - 1, 0); set_offset(0, 1, 0, 0); set_offset(0, 2, 1, 0); set_offset(0, 3, 2, 0);
+    # 1: O
+    set_offset(1, 0, 0, 0);     set_offset(1, 1, 1, 0); set_offset(1, 2, 0, 1); set_offset(1, 3, 1, 1);
+    # 2: T
+    set_offset(2, 0, 0, 0 - 1); set_offset(2, 1, 0 - 1, 0); set_offset(2, 2, 0, 0); set_offset(2, 3, 1, 0);
+    # 3: S
+    set_offset(3, 0, 0, 0 - 1); set_offset(3, 1, 1, 0 - 1); set_offset(3, 2, 0 - 1, 0); set_offset(3, 3, 0, 0);
+    # 4: Z
+    set_offset(4, 0, 0 - 1, 0 - 1); set_offset(4, 1, 0, 0 - 1); set_offset(4, 2, 0, 0); set_offset(4, 3, 1, 0);
+    # 5: J
+    set_offset(5, 0, 0 - 1, 0 - 1); set_offset(5, 1, 0 - 1, 0); set_offset(5, 2, 0, 0); set_offset(5, 3, 1, 0);
+    # 6: L
+    set_offset(6, 0, 1, 0 - 1); set_offset(6, 1, 0 - 1, 0); set_offset(6, 2, 0, 0); set_offset(6, 3, 1, 0);
+    
+    # Initialize variables
+    store64(game_state, 0);
+    store64(score, 0);
+    store64(high_score, 0);
+    store64(level, 0);
+    store64(lines_cleared, 0);
+    store64(rand_seed, GetTickCount());
+    
+    # Initialize WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3);
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+    
+    # CreateWindowExA (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 200, 100, 600, 650, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    
+    if hwnd_val == 0 {
+        return 1;
+    }
+    
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    
+    store64(last_tick, GetTickCount());
+    
+    while 1 {
+        store64(rand_seed, load64(rand_seed) * 2862933555777941757 + GetTickCount() + 13);
+        
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; }
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            Sleep(1);
+        }
+        
+        # Timing checks
+        if load64(game_state) == 1 {
+            current_tick = GetTickCount();
+            delay = load64(tick_delay);
+            if current_tick - load64(last_tick) >= delay {
+                game_update();
+                store64(last_tick, current_tick);
+                InvalidateRect(hwnd_val, 0, 0);
+            }
+        } else {
+            # Update menu at 60Hz to animate flashing text
+            current_tick = GetTickCount();
+            if current_tick - load64(last_tick) >= 16 {
+                store64(last_tick, current_tick);
+                InvalidateRect(hwnd_val, 0, 0);
+            }
+        }
+    }
+    
+    # Clean GDI
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(hud_brush));
+    DeleteObject(load64(board_brush));
+    DeleteObject(load64(border_brush));
+    DeleteObject(load64(brick_brush0));
+    DeleteObject(load64(brick_brush1));
+    DeleteObject(load64(brick_brush2));
+    DeleteObject(load64(brick_brush3));
+    DeleteObject(load64(brick_brush4));
+    DeleteObject(load64(brick_brush5));
+    DeleteObject(load64(brick_brush6));
+    DeleteObject(load64(title_font));
+    DeleteObject(load64(hud_font));
+    DeleteObject(load64(small_font));
+    
+    return 0;
+}

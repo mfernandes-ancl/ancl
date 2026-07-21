@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ANCL — Aether Natural Coding Language</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 3rem 1.5rem;
+    }
+    header { text-align: center; margin-bottom: 3rem; }
+    header h1 { font-size: 2.8rem; color: #58a6ff; letter-spacing: -1px; }
+    header p  { font-size: 1.15rem; color: #8b949e; margin-top: 0.5rem; }
+    .badge {
+      display: inline-block;
+      background: #1f6feb;
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.2rem 0.65rem;
+      border-radius: 2rem;
+      margin-top: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem;
+      width: 100%;
+      max-width: 900px;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 1.5rem;
+    }
+    .card h2 { font-size: 1rem; color: #58a6ff; margin-bottom: 0.6rem; }
+    .card p  { font-size: 0.9rem; color: #8b949e; line-height: 1.6; }
+    .code-block {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin: 2rem 0;
+      width: 100%;
+      max-width: 900px;
+      overflow-x: auto;
+    }
+    .code-block pre {
+      font-family: 'Cascadia Code', 'Consolas', monospace;
+      font-size: 0.88rem;
+      line-height: 1.7;
+      color: #c9d1d9;
+    }
+    .kw  { color: #ff7b72; }
+    .cm  { color: #6a737d; }
+    .str { color: #a5d6ff; }
+    .fn  { color: #d2a8ff; }
+    .num { color: #79c0ff; }
+    footer {
+      margin-top: 3rem;
+      font-size: 0.8rem;
+      color: #484f58;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>ANCL</h1>
+  <p>Aether Natural Coding Language — native executables, zero runtime</p>
+  <span class="badge">Self-hosting &nbsp;&#x2022;&nbsp; Windows PE32+ &amp; Linux ELF &nbsp;&#x2022;&nbsp; CRT-free</span>
+</header>
+
+<div class="card-grid">
+  <div class="card">
+    <h2>&#x26A1; Compiles to native code</h2>
+    <p>The <code>anclc</code> compiler emits hand-encoded x86-64 machine code
+       and writes a valid Windows <code>PE32+</code> or Linux <code>ELF</code>
+       executable directly — no assembler, no linker, no LLVM, no C runtime.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F50C; Direct Win32 FFI</h2>
+    <p>One-line <code>extern "dll"</code> declarations bind any Windows API at
+       compile time. COM vtable dispatch is supported via
+       <code>callp(fnptr, args...)</code>.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F504; Self-hosting compiler</h2>
+    <p>ANCL compiles itself — on both Windows and Linux. The self-hosted
+       compiler (<code>anclc2</code>) is written entirely in ANCL and reproduces
+       itself byte-for-byte.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F4E6; Single-binary deployment</h2>
+    <p>Every ANCL program compiles to one <code>.exe</code> that imports only
+       DLLs Windows already ships. No installer, no runtime, no admin.
+       Drop it on a locked-down field box and it runs.</p>
+  </div>
+</div>
+
+<div class="code-block">
+  <pre><span class="cm"># This very server — written in ANCL, compiled to a bare-metal .exe</span>
+
+<span class="kw">import</span> <span class="str">"../../../core_lib/std.ancl"</span>;
+<span class="kw">import</span> <span class="str">"../../../core_lib/win32_api.ancl"</span>;
+
+<span class="kw">@DATA</span>
+HTTP_PORT: i64 = <span class="num">8080</span>;
+hdr_200:   <span class="kw">str</span> = <span class="str">"HTTP/1.1 200 OK\r\nContent-Length: "</span>;
+
+<span class="kw">@CODE</span>
+<span class="kw">func</span> <span class="fn">main</span>() -&gt; i32 {
+    WSAStartup(<span class="num">514</span>, g_wsa);
+    srv = <span class="fn">socket</span>(<span class="num">2</span>, <span class="num">1</span>, <span class="num">6</span>);
+    <span class="fn">bind</span>(srv, g_saddr, <span class="num">16</span>);
+    <span class="fn">listen</span>(srv, <span class="num">16</span>);
+    <span class="kw">while</span> <span class="num">1</span> {
+        client = <span class="fn">accept</span>(srv, <span class="num">0</span>, <span class="num">0</span>);
+        <span class="fn">serve</span>(client);   <span class="cm"># &lt;-- you are reading this line's output right now</span>
+    }
+    <span class="kw">return</span> <span class="num">0</span>;
+}</pre>
+</div>
+
+<div class="card-grid">
+  <div class="card">
+    <h2>&#x1F3D7; Runtime code generation</h2>
+    <p>ANCL programs can write ANCL source and invoke the compiler at
+       runtime — generating, compiling, and executing new native tools
+       on the fly without leaving the language.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F9EA; OPC DA in 46 KB</h2>
+    <p>A full native OPC DA client with COM vtable dispatch, server
+       enumeration, tag browsing, and live polling — in a single 46 KB
+       executable. The same tool in C# is 64 MB.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F4CA; Industrial protocol support</h2>
+    <p>Built-in sockets + raw FFI make it straightforward to implement
+       Modbus/TCP, FINS, S7Comm, IEC-104, IEC-61850/MMS, DNP3, BACnet,
+       EtherNet/IP, and OPC UA clients — all as tiny native binaries.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F9E0; Pure-ANCL AI engine</h2>
+    <p>A complete LLaMA/GGUF inference engine — tokenizer, transformer, sampler,
+       and a hand-emitted Vulkan GPU backend — written entirely in ANCL with
+       zero ML dependencies. It runs real models on CPU and GPU, and fetches
+       them over a pure-ANCL TLS 1.3 stack.</p>
+  </div>
+  <div class="card">
+    <h2>&#x1F527; Rebuild it yourself</h2>
+    <p>The compiler ships as its own ANCL source. Feed it to <code>anclc</code>
+       and it recompiles itself into a byte-for-byte identical binary —
+       verifiable self-hosting, no external toolchain required.</p>
+  </div>
+</div>
+
+<footer>
+  <p>You are served by a native ANCL executable &mdash; no Node, no Python, no .NET, no libc.</p>
+  <p style="margin-top:0.4rem">ANCL &mdash; Aether Natural Coding Language</p>
+</footer>
+
+</body>
+</html>

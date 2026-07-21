@@ -1,0 +1,569 @@
+# =====================================================================
+#  core_lib/iec61850_server.ancl  (was showcase/iccp_simulator/src/mms_server.ancl)
+#  Pure-ANCL IEC-61850 / MMS SERVER (no libiec61850 / IedServer_*).
+#
+#  The inverse of core_lib/iec61850.ancl (the client): TCP listen/accept,
+#  COTP CR->CC, ISO session/presentation/ACSE associate (AARE), then serve the
+#  MMS confirmed services GetNameList / Read / Write / Control over a small
+#  in-memory model that replicates the iccp_simulator (LD ICCP_SimBilateralTable1,
+#  LN GGIO1, AnIn1/AnIn2 MV, Ind1 SPS, SPCSO1 direct-SPC, SPCSO2 SBO-SPC).
+#
+#  Response bytes are byte-compatible with what libiec61850 sends (verified
+#  against the capture showcase/iccp_simulator/mms_capture.frames + the client's
+#  own parsers).  100% CRT-free, zero-dep.
+#
+#  This file exposes a callable server (srv_open / srv_serve_one) + `main` for a
+#  standalone test build; iccp_simulator.ancl imports it for the GUI (S-E).
+#  Build (standalone): bin\anclc.exe showcase\iccp_simulator\src\mms_server.ancl <exe>
+# =====================================================================
+import "win32_api.ancl";     # GetStdHandle/WriteFile + kernel32
+extern "ws2_32.dll" WSAStartup  -> i32;
+extern "ws2_32.dll" socket      -> i64;
+extern "ws2_32.dll" bind        -> i32;
+extern "ws2_32.dll" listen      -> i32;
+extern "ws2_32.dll" accept      -> i64;
+extern "ws2_32.dll" recv        -> i32;
+extern "ws2_32.dll" send        -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" setsockopt  -> i32;
+
+@DATA
+srv_ls:  buf = 8;         # listen socket
+g_wsa:   buf = 512;
+g_sa:    buf = 16;
+g_rx:    buf = 16384;     # one received TPKT
+g_tx:    buf = 16384;     # one outgoing TPKT (framed)
+g_mms:   buf = 16384;     # the MMS response PDU (pre-framing)
+g_nio:   buf = 8;
+g_one:   buf = 8;
+g_cc:    buf = 22;        # writable CC
+g_inv:   buf = 16;        # echoed invokeID bytes
+g_invlen: buf = 8;
+g_item:  buf = 256;       # parsed itemId (read/write)
+g_dom:   buf = 256;       # parsed domainId
+g_val:   buf = 64;        # a single encoded leaf value
+g_dls:   buf = 8;         # ber length: content-length out
+g_dsz:   buf = 8;         # ber length: header size out
+
+# ---- settable model (shared with the GUI via the IedServer_* shim) ----
+# 10 tag slots matching iccp_simulator's g_tag_refs order:
+#   0 AnIn1.mag.f(f32 bits) 1 AnIn1.q 2 AnIn2.mag.f 3 AnIn2.q
+#   4 SPCSO1.stVal 5 SPCSO1.ctlVal 6 SPCSO2.stVal 7 SPCSO2.ctlVal 8 Ind1.stVal 9 Ind1.q
+g_model:   buf = 80;      # i64[10]
+st_sbo_sel: buf = 8;      # SPCSO2 SBO selected flag
+g_srv_run: buf = 8;       # 1 while the accept loop should run
+g_srv_tid: buf = 8;       # worker thread id out-param
+g_fakeval: buf = 64;      # shim MmsValue (bool@8, f32 bits@10, quality@16)
+g_srv_domain_p: buf = 8;  # override domain ptr (0 = default ICCP)
+g_srv_names_p:  buf = 8;   # override \n-name-list ptr (0 = default ICCP)
+
+# ---- the model: 60 variable names, NEWLINE-separated, in libiec61850 order ----
+# (\n = the separator; ANCL string literals don't take \x00. handle_getnamelist splits on 10.)
+MODEL_DOMAIN: str = "ICCP_SimBilateralTable1";
+var_names: str = "GGIO1\nGGIO1$CF\nGGIO1$CF$SPCSO1\nGGIO1$CF$SPCSO1$ctlModel\nGGIO1$CF$SPCSO2\nGGIO1$CF$SPCSO2$ctlModel\nGGIO1$CO\nGGIO1$CO$SPCSO1\nGGIO1$CO$SPCSO1$Oper\nGGIO1$CO$SPCSO1$Oper$Check\nGGIO1$CO$SPCSO1$Oper$ctlNum\nGGIO1$CO$SPCSO1$Oper$ctlVal\nGGIO1$CO$SPCSO1$Oper$origin\nGGIO1$CO$SPCSO1$Oper$origin$orCat\nGGIO1$CO$SPCSO1$Oper$origin$orIdent\nGGIO1$CO$SPCSO1$Oper$T\nGGIO1$CO$SPCSO1$Oper$Test\nGGIO1$CO$SPCSO2\nGGIO1$CO$SPCSO2$Oper\nGGIO1$CO$SPCSO2$Oper$Check\nGGIO1$CO$SPCSO2$Oper$ctlNum\nGGIO1$CO$SPCSO2$Oper$ctlVal\nGGIO1$CO$SPCSO2$Oper$origin\nGGIO1$CO$SPCSO2$Oper$origin$orCat\nGGIO1$CO$SPCSO2$Oper$origin$orIdent\nGGIO1$CO$SPCSO2$Oper$T\nGGIO1$CO$SPCSO2$Oper$Test\nGGIO1$CO$SPCSO2$SBOw\nGGIO1$CO$SPCSO2$SBOw$Check\nGGIO1$CO$SPCSO2$SBOw$ctlNum\nGGIO1$CO$SPCSO2$SBOw$ctlVal\nGGIO1$CO$SPCSO2$SBOw$origin\nGGIO1$CO$SPCSO2$SBOw$origin$orCat\nGGIO1$CO$SPCSO2$SBOw$origin$orIdent\nGGIO1$CO$SPCSO2$SBOw$T\nGGIO1$CO$SPCSO2$SBOw$Test\nGGIO1$MX\nGGIO1$MX$AnIn1\nGGIO1$MX$AnIn1$mag\nGGIO1$MX$AnIn1$mag$f\nGGIO1$MX$AnIn1$q\nGGIO1$MX$AnIn1$t\nGGIO1$MX$AnIn2\nGGIO1$MX$AnIn2$mag\nGGIO1$MX$AnIn2$mag$f\nGGIO1$MX$AnIn2$q\nGGIO1$MX$AnIn2$t\nGGIO1$ST\nGGIO1$ST$Ind1\nGGIO1$ST$Ind1$q\nGGIO1$ST$Ind1$stVal\nGGIO1$ST$Ind1$t\nGGIO1$ST$SPCSO1\nGGIO1$ST$SPCSO1$q\nGGIO1$ST$SPCSO1$stVal\nGGIO1$ST$SPCSO1$t\nGGIO1$ST$SPCSO2\nGGIO1$ST$SPCSO2$q\nGGIO1$ST$SPCSO2$stVal\nGGIO1$ST$SPCSO2$t\n";
+
+# IEC 61400-25 wind model (iec61400_25_simulator): domain WTG1Sim, 68 vars.
+WIND_DOMAIN: str = "WTG1Sim";
+wind_names: str = "WAPC1\nWAPC1$MX\nWAPC1$MX$W\nWAPC1$MX$W$mag\nWAPC1$MX$W$mag$f\nWAPC1$MX$W$q\nWAPC1$MX$W$t\nWGEN1\nWGEN1$MX\nWGEN1$MX$Tmp\nWGEN1$MX$Tmp$mag\nWGEN1$MX$Tmp$mag$f\nWGEN1$MX$Tmp$q\nWGEN1$MX$Tmp$t\nWmet1\nWmet1$MX\nWmet1$MX$HorWdSpd\nWmet1$MX$HorWdSpd$mag\nWmet1$MX$HorWdSpd$mag$f\nWmet1$MX$HorWdSpd$q\nWmet1$MX$HorWdSpd$t\nWnac1\nWnac1$CF\nWnac1$CF$Start\nWnac1$CF$Start$ctlModel\nWnac1$CF$Stop\nWnac1$CF$Stop$ctlModel\nWnac1$CO\nWnac1$CO$Start\nWnac1$CO$Start$Oper\nWnac1$CO$Start$Oper$Check\nWnac1$CO$Start$Oper$ctlNum\nWnac1$CO$Start$Oper$ctlVal\nWnac1$CO$Start$Oper$origin\nWnac1$CO$Start$Oper$origin$orCat\nWnac1$CO$Start$Oper$origin$orIdent\nWnac1$CO$Start$Oper$T\nWnac1$CO$Start$Oper$Test\nWnac1$CO$Stop\nWnac1$CO$Stop$Oper\nWnac1$CO$Stop$Oper$Check\nWnac1$CO$Stop$Oper$ctlNum\nWnac1$CO$Stop$Oper$ctlVal\nWnac1$CO$Stop$Oper$origin\nWnac1$CO$Stop$Oper$origin$orCat\nWnac1$CO$Stop$Oper$origin$orIdent\nWnac1$CO$Stop$Oper$T\nWnac1$CO$Stop$Oper$Test\nWnac1$ST\nWnac1$ST$Start\nWnac1$ST$Start$q\nWnac1$ST$Start$stVal\nWnac1$ST$Start$t\nWnac1$ST$Stop\nWnac1$ST$Stop$q\nWnac1$ST$Stop$stVal\nWnac1$ST$Stop$t\nWnac1$ST$TurSt\nWnac1$ST$TurSt$q\nWnac1$ST$TurSt$stVal\nWnac1$ST$TurSt$t\nWROT1\nWROT1$MX\nWROT1$MX$RotSpd\nWROT1$MX$RotSpd$mag\nWROT1$MX$RotSpd$mag$f\nWROT1$MX$RotSpd$q\nWROT1$MX$RotSpd$t\n";
+
+# COTP CC template (capture REC 1); dst-ref patched from the CR's src-ref
+srv_cc: i8[22] = { 0x03,0x00,0x00,0x16, 0x11,0xd0,0x00,0x01,0x00,0x01,0x00,
+                   0xc0,0x01,0x0d, 0xc2,0x02,0x00,0x01, 0xc1,0x02,0x00,0x01 };
+# ISO session ACCEPT + presentation CPA + ACSE AARE + MMS Initiate-Response
+# (capture REC 3, 143 bytes) - sent verbatim.
+srv_aare: i8[143] = {
+  0x03,0x00,0x00,0x8f, 0x02,0xf0,0x80,
+  0x0e,0x86,0x05,0x06,0x13,0x01,0x00,0x16,0x01,0x02,0x14,0x02,0x00,0x02,0x34,0x02,0x00,0x01,
+  0xc1,0x74,0x31,0x72,0xa0,0x03,0x80,0x01,0x01,0xa2,0x6b,0x83,0x04,0x00,0x00,0x00,0x01,
+  0xa5,0x12,0x30,0x07,0x80,0x01,0x00,0x81,0x02,0x51,0x01,0x30,0x07,0x80,0x01,0x00,0x81,0x02,0x51,0x01,
+  0x61,0x4f,0x30,0x4d,0x02,0x01,0x01,0xa0,0x48,0x61,0x46,0xa1,0x07,0x06,0x05,0x28,0xca,0x22,0x02,0x03,
+  0xa2,0x03,0x02,0x01,0x00,0xa3,0x05,0xa1,0x03,0x02,0x01,0x00,
+  0xbe,0x2f,0x28,0x2d,0x02,0x01,0x03,0xa0,0x28,0xa9,0x26,0x80,0x03,0x00,0xfd,0xe8,0x81,0x01,0x05,
+  0x82,0x01,0x05,0x83,0x01,0x0a,0xa4,0x16,0x80,0x01,0x01,0x81,0x03,0x05,0xf1,0x00,
+  0x82,0x0c,0x03,0xee,0x1c,0x00,0x00,0x00,0x02,0x00,0x00,0x40,0xed,0x18 };
+
+@CODE
+# ---------------- transport ----------------
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+func recv_tpkt(s: i64) -> i64 {
+    if recv_n(s, g_rx, 4) < 0 { return 0 - 1; }
+    tl = load8(g_rx + 2) * 256 + load8(g_rx + 3);
+    if tl < 7 { return 0 - 1; }
+    if tl > 16384 { return 0 - 1; }
+    if recv_n(s, g_rx + 4, tl - 4) < 0 { return 0 - 1; }
+    return tl;
+}
+
+# ---------------- BER helpers ----------------
+# write a definite length at p; return bytes written (1/2/3). Sets nothing else.
+func wr_len(p: i64, len: i64) -> i64 {
+    if len < 128 { store8(p, len); return 1; }
+    if len < 256 { store8(p, 0x81); store8(p + 1, len); return 2; }
+    store8(p, 0x82); store8(p + 1, band(shr(len, 8), 0xFF)); store8(p + 2, band(len, 0xFF)); return 3;
+}
+func len_sz(len: i64) -> i64 { if len < 128 { return 1; } if len < 256 { return 2; } return 3; }
+
+# read a BER length at p: stores content-length in g_dls, header-size (1/2/3) in g_dsz
+func rd_len(p: i64) -> i64 {
+    b = load8(p);
+    if b < 128 { store64(g_dls, b); store64(g_dsz, 1); return b; }
+    if b == 0x81 { store64(g_dls, load8(p + 1)); store64(g_dsz, 2); return load8(p + 1); }
+    if b == 0x82 { v = load8(p + 1) * 256 + load8(p + 2); store64(g_dls, v); store64(g_dsz, 3); return v; }
+    store64(g_dls, 0); store64(g_dsz, 1); return 0;
+}
+
+# ---------------- framing: wrap an MMS PDU (g_mms, mlen) + send ----------------
+func send_mms(cs: i64, mlen: i64) -> i64 {
+    l3 = mlen;                                            # a0 presentation-data-values content
+    l2 = 3 + (1 + len_sz(l3)) + l3;                       # 30 PDV-list: 02 01 03 + a0+len + mms
+    l1 = (1 + len_sz(l2)) + l2;                           # 61 fully-encoded: 30+len + ...
+    ptot = 1 + len_sz(l1) + l1;                           # 61 + len + content
+    tpkt = 4 + 3 + 4 + ptot;                              # TPKT + COTP + session + presentation
+    p = g_tx;
+    store8(p, 0x03); store8(p + 1, 0x00);
+    store8(p + 2, band(shr(tpkt, 8), 0xFF)); store8(p + 3, band(tpkt, 0xFF)); p = p + 4;
+    store8(p, 0x02); store8(p + 1, 0xF0); store8(p + 2, 0x80); p = p + 3;            # COTP DT
+    store8(p, 0x01); store8(p + 1, 0x00); store8(p + 2, 0x01); store8(p + 3, 0x00); p = p + 4;  # session GT+DT
+    store8(p, 0x61); p = p + 1; p = p + wr_len(p, l1);
+    store8(p, 0x30); p = p + 1; p = p + wr_len(p, l2);
+    store8(p, 0x02); store8(p + 1, 0x01); store8(p + 2, 0x03); p = p + 3;            # context-id 3
+    store8(p, 0xA0); p = p + 1; p = p + wr_len(p, l3);
+    memcpy(p, g_mms, mlen); p = p + mlen;
+    send(cs, g_tx, tpkt, 0);
+    return 0;
+}
+
+# ---------------- model helpers ----------------
+func str_ends(s: i64, suf: i64) -> i64 {
+    ls = strlen(s); lf = strlen(suf);
+    if lf > ls { return 0; }
+    i = 0;
+    while i < lf { if load8(s + ls - lf + i) != load8(suf + i) { return 0; } i = i + 1; }
+    return 1;
+}
+func str_has(hay: i64, needle: i64) -> i64 {
+    lh = strlen(hay); ln = strlen(needle);
+    if ln > lh { return 0; }
+    i = 0;
+    while i <= lh - ln {
+        j = 0;
+        while j < ln { if load8(hay + i + j) != load8(needle + j) { break; } j = j + 1; }
+        if j == ln { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Is `item` a stVal state item -> which control? returns 1=SPCSO1 2=SPCSO2 0=Ind1/other
+func stval_of(item: i64) -> i64 {
+    if str_has(item, "SPCSO1") == 1 { return 1; }
+    if str_has(item, "SPCSO2") == 1 { return 2; }
+    return 0;
+}
+
+# Encode the leaf value for `item` into `out` with its MMS Data tag.
+# Returns the encoded length, or 0 if `item` is a non-leaf/unknown (-> caller errors).
+func encode_leaf(item: i64, out: i64) -> i64 {
+    # float:  87 05 08 <4 BE IEEE754>   (value from the shared model)
+    if str_ends(item, "$f") == 1 {
+        bits = load64(g_model + 0 * 8);                  # AnIn1 / HorWdSpd (tag 0)
+        if str_has(item, "AnIn2") == 1 { bits = load64(g_model + 2 * 8); }   # ICCP AnIn2
+        if str_has(item, "RotSpd") == 1 { bits = load64(g_model + 1 * 8); }  # wind RotSpd
+        if str_has(item, "Tmp") == 1 { bits = load64(g_model + 2 * 8); }     # wind Tmp
+        if str_has(item, "W$mag") == 1 { bits = load64(g_model + 3 * 8); }   # wind W (active power)
+        store8(out, 0x87); store8(out + 1, 0x05); store8(out + 2, 0x08);
+        store8(out + 3, band(shr(bits, 24), 0xFF)); store8(out + 4, band(shr(bits, 16), 0xFF));
+        store8(out + 5, band(shr(bits, 8), 0xFF)); store8(out + 6, band(bits, 0xFF));
+        return 7;
+    }
+    # ctlModel: 85 01 <n>   (SPCSO1=1 direct, SPCSO2=4 SBO-enh)
+    if str_ends(item, "$ctlModel") == 1 {
+        n = 1; if str_has(item, "SPCSO2") == 1 { n = 4; }
+        store8(out, 0x85); store8(out + 1, 0x01); store8(out + 2, n); return 3;
+    }
+    # stVal: 83 01 <bool>   (from the shared model)
+    if str_ends(item, "$stVal") == 1 {
+        v = 0;
+        w = stval_of(item);
+        if w == 1 { v = load64(g_model + 4 * 8); }       # SPCSO1.stVal
+        if w == 2 { v = load64(g_model + 6 * 8); }       # SPCSO2.stVal
+        if str_has(item, "Ind1") == 1 { v = load64(g_model + 8 * 8); }
+        if str_has(item, "TurSt") == 1 { v = load64(g_model + 4 * 8); }   # wind TurSt
+        if str_has(item, "Start") == 1 { v = load64(g_model + 5 * 8); }   # wind Start.stVal
+        if str_has(item, "Stop")  == 1 { v = load64(g_model + 7 * 8); }   # wind Stop.stVal
+        if v != 0 { v = 1; }
+        store8(out, 0x83); store8(out + 1, 0x01); store8(out + 2, v); return 3;
+    }
+    # ctlVal / Test: 83 01 00 (boolean, default false)
+    if str_ends(item, "$ctlVal") == 1 { store8(out, 0x83); store8(out + 1, 0x01); store8(out + 2, 0); return 3; }
+    if str_ends(item, "$Test")   == 1 { store8(out, 0x83); store8(out + 1, 0x01); store8(out + 2, 0); return 3; }
+    # ctlNum: 86 01 00 (unsigned)
+    if str_ends(item, "$ctlNum") == 1 { store8(out, 0x86); store8(out + 1, 0x01); store8(out + 2, 0); return 3; }
+    # orCat: 85 01 00 (integer)
+    if str_ends(item, "$orCat")  == 1 { store8(out, 0x85); store8(out + 1, 0x01); store8(out + 2, 0); return 3; }
+    # orIdent: 89 00 (octet-string, empty)
+    if str_ends(item, "$orIdent") == 1 { store8(out, 0x89); store8(out + 1, 0x00); return 2; }
+    # quality q: 84 03 03 00 00 (bit-string, validity Good)
+    if str_ends(item, "$q") == 1 {
+        store8(out, 0x84); store8(out + 1, 0x03); store8(out + 2, 0x03); store8(out + 3, 0x00); store8(out + 4, 0x00); return 5;
+    }
+    # time t / Oper$T: 91 08 <8 zero> (utc-time)
+    if str_ends(item, "$t") == 1 { store8(out, 0x91); store8(out + 1, 0x08); i = 0; while i < 8 { store8(out + 2 + i, 0); i = i + 1; } return 10; }
+    if str_ends(item, "$T") == 1 { store8(out, 0x91); store8(out + 1, 0x08); i = 0; while i < 8 { store8(out + 2 + i, 0); i = i + 1; } return 10; }
+    # Check: 84 02 06 00 (bit-string, 2 bits)
+    if str_ends(item, "$Check") == 1 { store8(out, 0x84); store8(out + 1, 0x02); store8(out + 2, 0x06); store8(out + 3, 0x00); return 4; }
+    return 0;                                            # non-leaf / unknown
+}
+
+# ---------------- MMS request parse ----------------
+# unwrap presentation to the MMS PDU; returns offset of the MMS PDU in g_rx, or -1.
+func mms_pdu_off(tl: i64) -> i64 {
+    p = 4 + 3 + 4;                                       # TPKT + COTP + session
+    if load8(g_rx + p) != 0x61 { return 0 - 1; }         # fully-encoded-data
+    p = p + 1; rd_len(g_rx + p); p = p + load64(g_dsz);  # 61 len
+    if load8(g_rx + p) != 0x30 { return 0 - 1; }         # PDV-list seq
+    p = p + 1; rd_len(g_rx + p); p = p + load64(g_dsz);  # 30 len
+    if load8(g_rx + p) != 0x02 { return 0 - 1; }         # context-id INTEGER
+    p = p + 1; il = rd_len(g_rx + p); p = p + load64(g_dsz) + il;
+    if load8(g_rx + p) != 0xA0 { return 0 - 1; }         # presentation-data-values [0]
+    p = p + 1; rd_len(g_rx + p); p = p + load64(g_dsz);  # a0 len -> MMS PDU
+    return p;
+}
+
+# parse invokeID (02 LL bytes) at p -> g_inv/g_invlen; return offset past it
+func parse_invoke(p: i64) -> i64 {
+    if load8(g_rx + p) != 0x02 { store64(g_invlen, 1); store8(g_inv, 1); return p; }
+    p = p + 1; il = rd_len(g_rx + p); p = p + load64(g_dsz);
+    if il > 15 { il = 15; }
+    i = 0; while i < il { store8(g_inv + i, load8(g_rx + p + i)); i = i + 1; }
+    store64(g_invlen, il);
+    return p + il;
+}
+
+# copy the k-th VisibleString (tag 1a) found from offset p within `end` into `dst`.
+# k is 0-based. Returns 1 if found.
+func nth_vstr(p: i64, end: i64, k: i64, dst: i64) -> i64 {
+    cnt = 0;
+    while p < end {
+        if load8(g_rx + p) == 0x1a {
+            ln = load8(g_rx + p + 1);
+            if cnt == k {
+                i = 0; while i < ln { store8(dst + i, load8(g_rx + p + 2 + i)); i = i + 1; }
+                store8(dst + ln, 0);
+                return 1;
+            }
+            cnt = cnt + 1;
+            p = p + 2 + ln;
+        } else { p = p + 1; }
+    }
+    return 0;
+}
+
+# ---------------- MMS response builders (into g_mms) ----------------
+# write "a1 { 02 <inv> <inner(ilen)@ipos> }" ; inner already at g_mms+ipos. Returns total.
+# Build confirmed-Response wrapper: a1 L { 02 invlen inv ; <service resp bytes at src,srclen> }
+func wrap_confirmed(src: i64, srclen: i64) -> i64 {
+    invtl = 2 + load64(g_invlen);                        # 02 LL <inv>
+    inner = invtl + srclen;
+    # a1 + len(inner) + inner
+    p = g_mms;
+    store8(p, 0xA1); p = p + 1; p = p + wr_len(p, inner);
+    store8(p, 0x02); p = p + 1; store8(p, load64(g_invlen)); p = p + 1;
+    i = 0; while i < load64(g_invlen) { store8(p, load8(g_inv + i)); p = p + 1; i = i + 1; }
+    memcpy(p, src, srclen); p = p + srclen;
+    return p - g_mms;
+}
+
+# GetNameList response: identifiers list `names` (concat of 1a LL name, total nlen), moreFollows mf.
+# service-resp = a1 L { a0 L { <names> } 81 01 mf }
+func build_namelist(names: i64, nlen: i64, mf: i64) -> i64 {
+    # inner a0
+    a0tot = 1 + len_sz(nlen) + nlen;
+    svc = 1 + len_sz(a0tot + 3) + (a0tot + 3);           # a1 { a0.. + 81 01 mf(3) }
+    # assemble the service-resp into g_val-adjacent? build directly into a scratch after g_mms end.
+    # We build service bytes into g_tx (reused later before send) then wrap.
+    q = g_mms + 4096;                                    # scratch area inside g_mms buffer
+    p = q;
+    store8(p, 0xA1); p = p + 1; p = p + wr_len(p, a0tot + 3);
+    store8(p, 0xA0); p = p + 1; p = p + wr_len(p, nlen);
+    memcpy(p, names, nlen); p = p + nlen;
+    store8(p, 0x81); store8(p + 1, 0x01); store8(p + 2, mf); p = p + 3;
+    return wrap_confirmed(q, p - q);
+}
+
+# Read response for a single value already encoded at `valp`,`vlen`:
+# service-resp = a4 L { a1 L { <value> } }
+func build_read(valp: i64, vlen: i64) -> i64 {
+    q = g_mms + 4096;
+    a1tot = 1 + len_sz(vlen) + vlen;
+    p = q;
+    store8(p, 0xA4); p = p + 1; p = p + wr_len(p, a1tot);
+    store8(p, 0xA1); p = p + 1; p = p + wr_len(p, vlen);
+    memcpy(p, valp, vlen); p = p + vlen;
+    return wrap_confirmed(q, p - q);
+}
+
+# model selection (default = ICCP; iec61400_25_simulator calls srv_set_model for WTG1Sim)
+func srv_domain() -> i64 { d = load64(g_srv_domain_p); if d == 0 { return MODEL_DOMAIN; } return d; }
+func srv_names()  -> i64 { n = load64(g_srv_names_p);  if n == 0 { return var_names;    } return n; }
+func srv_set_model(dom: i64, names: i64) -> i64 { store64(g_srv_domain_p, dom); store64(g_srv_names_p, names); return 0; }
+func srv_use_wind() -> i64 { store64(g_srv_domain_p, WIND_DOMAIN); store64(g_srv_names_p, wind_names); return 0; }
+
+# ---------------- service handlers ----------------
+func handle_getnamelist(cs: i64, svc_off: i64, mms_end: i64) -> i64 {
+    # objectClass: a0 { 80 01 CC }. find the 80 after svc_off.
+    oc = 0 - 1;
+    p = svc_off;
+    while p < mms_end {
+        if load8(g_rx + p) == 0xA0 { if load8(g_rx + p + 2) == 0x80 { oc = load8(g_rx + p + 4); break; } }
+        p = p + 1;
+    }
+    q = g_tx + 8192;                                     # names scratch
+    nlen = 0;
+    if oc == 9 {                                         # domain list
+        d = srv_domain(); dl = strlen(d);
+        store8(q, 0x1a); store8(q + 1, dl); memcpy(q + 2, d, dl); nlen = 2 + dl;
+    } else {                                             # variable list (namedVariable, oc=0)
+        np = srv_names();
+        while load8(np) != 0 {
+            seg = np; vl = 0;
+            while load8(np) != 0 { if load8(np) == 10 { break; } np = np + 1; vl = vl + 1; }
+            if vl > 0 {
+                store8(q + nlen, 0x1a); store8(q + nlen + 1, vl);
+                memcpy(q + nlen + 2, seg, vl); nlen = nlen + 2 + vl;
+            }
+            if load8(np) == 10 { np = np + 1; }
+        }
+    }
+    total = build_namelist(q, nlen, 0);                  # moreFollows = false
+    send_mms(cs, total);
+    return 0;
+}
+
+# Write [5] / Control: item = 2nd VisibleString; ctlVal = first "83 01 XX".
+# Updates model state (Oper -> stVal; SBOw -> select ack) and replies write-success
+# a5 { 81 00 }.  Control is an MMS Write to $Oper/$SBOw, so this covers both.
+func find_ctlval(svc_off: i64, mms_end: i64) -> i64 {
+    p = svc_off;
+    while p < mms_end - 2 {
+        if load8(g_rx + p) == 0x83 { if load8(g_rx + p + 1) == 0x01 { return load8(g_rx + p + 2); } }
+        p = p + 1;
+    }
+    return 0;
+}
+func handle_write(cs: i64, svc_off: i64, mms_end: i64) -> i64 {
+    nth_vstr(svc_off, mms_end, 0, g_dom);
+    if nth_vstr(svc_off, mms_end, 1, g_item) == 0 { return 0; }
+    cv = find_ctlval(svc_off, mms_end);
+    w = stval_of(g_item);
+    # $Oper -> operate: reflect ctlVal into stVal (model tags). $SBOw -> SBO select.
+    if str_ends(g_item, "$Oper") == 1 {
+        if w == 1 { store64(g_model + 5 * 8, cv); store64(g_model + 4 * 8, cv); }   # SPCSO1 ctlVal + stVal
+        if w == 2 { store64(g_model + 7 * 8, cv); store64(g_model + 6 * 8, cv); }   # SPCSO2 ctlVal + stVal
+        if str_has(g_item, "Start") == 1 { store64(g_model + 6 * 8, cv); store64(g_model + 5 * 8, cv); }  # wind Start
+        if str_has(g_item, "Stop")  == 1 { store64(g_model + 8 * 8, cv); store64(g_model + 7 * 8, cv); }  # wind Stop
+    }
+    if str_ends(g_item, "$SBOw") == 1 { store64(st_sbo_sel, 1); }
+    # write-success: a5 { 81 00 }
+    q = g_mms + 4096;
+    store8(q, 0xA5); store8(q + 1, 0x02); store8(q + 2, 0x81); store8(q + 3, 0x00);
+    total = wrap_confirmed(q, 4);
+    send_mms(cs, total);
+    return 0;
+}
+
+func handle_read(cs: i64, svc_off: i64, mms_end: i64) -> i64 {
+    # itemId = the 2nd VisibleString (1st = domainId) in the read request
+    nth_vstr(svc_off, mms_end, 0, g_dom);
+    if nth_vstr(svc_off, mms_end, 1, g_item) == 0 { return 0; }
+    vlen = encode_leaf(g_item, g_val);
+    if vlen == 0 {                                       # non-leaf -> data-access-error object-non-existent(10)
+        store8(g_val, 0x80); store8(g_val + 1, 0x01); store8(g_val + 2, 0x0a); vlen = 3;
+    }
+    total = build_read(g_val, vlen);
+    send_mms(cs, total);
+    return 0;
+}
+
+# ---------------- serve one client (associate + request loop) ----------------
+func srv_serve_one(cs: i64) -> i64 {
+    # COTP CR -> CC
+    if recv_tpkt(cs) < 0 { return 0; }
+    memcpy(g_cc, srv_cc, 22);
+    store8(g_cc + 6, load8(g_rx + 8)); store8(g_cc + 7, load8(g_rx + 9));
+    send(cs, g_cc, 22, 0);
+    # associate -> AARE
+    if recv_tpkt(cs) < 0 { return 0; }
+    send(cs, srv_aare, 143, 0);
+    # request loop
+    while 1 {
+        tl = recv_tpkt(cs);
+        if tl < 0 { return 0; }
+        off = mms_pdu_off(tl);
+        if off < 0 { } else {
+            if load8(g_rx + off) == 0xA0 {                   # confirmed-RequestPDU
+                p = off + 1; rd_len(g_rx + p); mms_end = p + load64(g_dsz) + load64(g_dls);
+                p = p + load64(g_dsz);
+                p = parse_invoke(p);                          # -> g_inv, past invokeID
+                svc = load8(g_rx + p);
+                if svc == 0xA1 { handle_getnamelist(cs, p, mms_end); }
+                else { if svc == 0xA4 { handle_read(cs, p, mms_end); }
+                else { if svc == 0xA5 { handle_write(cs, p, mms_end); } } }
+            }
+        }
+    }
+    return 0;
+}
+
+func srv_open(port: i64) -> i64 {
+    WSAStartup(514, g_wsa);
+    ls = socket(2, 1, 6);
+    if ls == 0 - 1 { return 0; }
+    store32(g_one, 1);
+    setsockopt(ls, 0xffff, 0x0004, g_one, 4);
+    store16(g_sa + 0, 2);
+    store8(g_sa + 2, band(shr(port, 8), 0xFF)); store8(g_sa + 3, band(port, 0xFF));
+    store32(g_sa + 4, 0); store64(g_sa + 8, 0);
+    if bind(ls, g_sa, 16) != 0 { return 0; }
+    if listen(ls, 4) != 0 { return 0; }
+    store64(srv_ls, ls);
+    return ls;
+}
+
+# default model values (AnIn1=100.0, AnIn2=25.5, rest 0)
+func srv_model_init() -> i64 {
+    i = 0; while i < 10 { store64(g_model + i * 8, 0); i = i + 1; }
+    store64(g_model + 0 * 8, 0x42C80000);                # AnIn1 = 100.0 (f32 bits)
+    store64(g_model + 2 * 8, 0x41CC0000);                # AnIn2 = 25.5
+    store64(st_sbo_sel, 0);
+    return 0;
+}
+
+# background accept loop: serve one client at a time until g_srv_run clears
+func srv_accept_loop(param: i64) -> i64 {
+    while load64(g_srv_run) == 1 {
+        cs = accept(load64(srv_ls), 0, 0);
+        if cs == 0 - 1 { return 0; }                     # listen socket closed (stop) -> exit
+        srv_serve_one(cs);
+        closesocket(cs);
+    }
+    return 0;
+}
+
+# =====================================================================
+#  IedServer_* / IedModel_* / CDC_* / MmsValue_* SHIM
+#  Lets iccp_simulator.ancl keep its libiec61850-style code while running on
+#  this pure-ANCL server.  The model tree is fixed (served by srv_*), so the
+#  builder calls are no-ops; getModelNodeByObjectReference maps an object ref
+#  to a tag id (1..10) the GUI stores as an "attr", and update/get bridge those
+#  tags to the shared g_model.  MmsValue is a small struct: bool@8, f32 bits@10,
+#  quality@16 (offset 8, matching detect_mms_alignment via MmsValue_newBoolean).
+# =====================================================================
+@DATA
+g_fakenew: buf = 64;      # MmsValue returned by MmsValue_new* (float-hack / detect)
+@CODE
+func IedModel_create(name: i64) -> i64 { return 1; }
+func IedModel_destroy(m: i64) -> i64 { return 0; }
+func LogicalDevice_create(n: i64, m: i64) -> i64 { return 1; }
+func LogicalNode_create(n: i64, ld: i64) -> i64 { return 1; }
+func CDC_MV_create(n: i64, ln: i64, a: i64, b: i64) -> i64 { return 1; }
+func CDC_SPS_create(n: i64, ln: i64, a: i64) -> i64 { return 1; }
+func CDC_SPC_create(n: i64, ln: i64, a: i64, b: i64) -> i64 { return 1; }
+
+# object ref -> tag id+1 (1..10), or 200/201 for a control node, or 0
+func IedModel_getModelNodeByObjectReference(m: i64, ref: i64) -> i64 {
+    if str_ends(ref, ".AnIn1.mag.f") == 1 { return 1; }
+    if str_ends(ref, ".AnIn1.q") == 1 { return 2; }
+    if str_ends(ref, ".AnIn2.mag.f") == 1 { return 3; }
+    if str_ends(ref, ".AnIn2.q") == 1 { return 4; }
+    if str_ends(ref, ".SPCSO1.stVal") == 1 { return 5; }
+    if str_ends(ref, ".SPCSO1.Oper.ctlVal") == 1 { return 6; }
+    if str_ends(ref, ".SPCSO2.stVal") == 1 { return 7; }
+    if str_ends(ref, ".SPCSO2.Oper.ctlVal") == 1 { return 8; }
+    if str_ends(ref, ".Ind1.stVal") == 1 { return 9; }
+    if str_ends(ref, ".Ind1.q") == 1 { return 10; }
+    # IEC 61400-25 wind refs (iec61400_25_simulator g_tag_refs order) -> g_model 0..8
+    if str_ends(ref, ".HorWdSpd.mag.f") == 1 { return 1; }
+    if str_ends(ref, ".RotSpd.mag.f") == 1 { return 2; }
+    if str_ends(ref, ".Tmp.mag.f") == 1 { return 3; }
+    if str_ends(ref, ".W.mag.f") == 1 { return 4; }
+    if str_ends(ref, ".TurSt.stVal") == 1 { return 5; }
+    if str_ends(ref, ".Start.stVal") == 1 { return 6; }
+    if str_ends(ref, ".Start.Oper.ctlVal") == 1 { return 7; }
+    if str_ends(ref, ".Stop.stVal") == 1 { return 8; }
+    if str_ends(ref, ".Stop.Oper.ctlVal") == 1 { return 9; }
+    if str_ends(ref, ".SPCSO1") == 1 { return 200; }     # control node (setControlHandler)
+    if str_ends(ref, ".SPCSO2") == 1 { return 201; }
+    if str_ends(ref, ".Start") == 1 { return 202; }
+    if str_ends(ref, ".Stop") == 1 { return 203; }
+    return 0;
+}
+
+func IedServer_create(m: i64) -> i64 { return 1; }
+func IedServer_destroy(s: i64) -> i64 { return 0; }
+func IedServer_setConnectionIndicationHandler(s: i64, h: i64, p: i64) -> i64 { return 0; }
+func IedServer_setControlHandler(s: i64, node: i64, h: i64, p: i64) -> i64 { return 0; }
+
+func IedServer_start(s: i64, port: i64) -> i64 {
+    if srv_open(port) == 0 { store64(g_srv_run, 0); return 0; }
+    store64(g_srv_run, 1);
+    CreateThread(0, 0, &srv_accept_loop, 0, 0, g_srv_tid);
+    return 0;
+}
+func IedServer_stop(s: i64) -> i64 {
+    store64(g_srv_run, 0);
+    ls = load64(srv_ls);
+    if ls != 0 { closesocket(ls); store64(srv_ls, 0); }
+    return 0;
+}
+func IedServer_isRunning(s: i64) -> i32 { return load64(g_srv_run); }
+
+# update helpers: attr = tag id (1..10) -> g_model[attr-1]
+func IedServer_updateBooleanAttributeValue(s: i64, attr: i64, v: i64) -> i64 {
+    if attr >= 1 { if attr <= 10 { store64(g_model + (attr - 1) * 8, v); } } return 0;
+}
+func IedServer_updateInt32AttributeValue(s: i64, attr: i64, v: i64) -> i64 {
+    if attr >= 1 { if attr <= 10 { store64(g_model + (attr - 1) * 8, v); } } return 0;
+}
+func IedServer_updateInt64AttributeValue(s: i64, attr: i64, v: i64) -> i64 {
+    if attr >= 1 { if attr <= 10 { store64(g_model + (attr - 1) * 8, v); } } return 0;
+}
+func IedServer_updateQuality(s: i64, attr: i64, v: i64) -> i64 {
+    if attr >= 1 { if attr <= 10 { store64(g_model + (attr - 1) * 8, v); } } return 0;
+}
+func IedServer_updateUTCTimeAttributeValue(s: i64, attr: i64, v: i64) -> i64 { return 0; }
+# updateAttributeValue with the float-hack MmsValue: read f32 bits at mmsVal+10
+func IedServer_updateAttributeValue(s: i64, attr: i64, mmsVal: i64) -> i64 {
+    if attr >= 1 { if attr <= 10 { store64(g_model + (attr - 1) * 8, load32(mmsVal + 10)); } } return 0;
+}
+# getAttributeValue: build a fake MmsValue from g_model[attr-1]. MODEL-AGNOSTIC:
+# the value is written into ALL of bool@8 / float bits@10 / quality@16, and the
+# caller (the sim GUI) reads whichever field matches its own type_code -- so the
+# same shim serves both the ICCP and wind models without knowing which is active.
+func IedServer_getAttributeValue(s: i64, attr: i64) -> i64 {
+    if attr < 1 { return 0; }
+    if attr > 10 { return 0; }
+    v = load64(g_model + (attr - 1) * 8);
+    memset(g_fakeval, 0, 64);
+    store8(g_fakeval + 8, band(v, 0xFF));   # boolean (low byte)
+    store8(g_fakeval + 9, 32);              # float width
+    store32(g_fakeval + 10, v);             # float bits (low 32)
+    store32(g_fakeval + 16, v);             # quality / bitstring
+    return g_fakeval;
+}
+
+func MmsValue_newInteger(v: i64) -> i64 { memset(g_fakenew, 0, 64); store32(g_fakenew + 0, 5); store64(g_fakenew + 8, v); return g_fakenew; }
+func MmsValue_newBoolean(b: i64) -> i64 { memset(g_fakenew, 0, 64); store32(g_fakenew + 0, 2); if b != 0 { store8(g_fakenew + 8, 1); } return g_fakenew; }
+func MmsValue_getType(v: i64) -> i32 { if v == 0 { return 0; } return load32(v + 0); }
+func MmsValue_toInt64(v: i64) -> i64 { if v == 0 { return 0; } return load64(v + 8); }
+func MmsValue_getBoolean(v: i64) -> i32 { if v == 0 { return 0; } return load8(v + 8); }
+func MmsValue_getBitStringAsInteger(v: i64) -> i32 { if v == 0 { return 0; } return load32(v + 16); }
+func MmsValue_delete(v: i64) -> i64 { return 0; }

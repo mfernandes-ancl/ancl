@@ -1,0 +1,98 @@
+# ANCL OPC DA Server Simulator
+# Simulates a legacy OPC DA Data Access Server data pump engine.
+# Manages 3 tags in a raw byte buffer: Substation_Status (i64 bitmask),
+# Frequency_Hz (f64), Voltage_kV (f64). Values oscillate in real-time.
+
+@DATA
+# ---- Tag Address Space (64-byte buffer) ----
+tags: buf = 64;
+# Layout (byte offsets from tags base):
+#  +0: Substation_Status  (i64, 8 bytes)
+#      bitmask: bit0=Running, bit1=Alarm, bit2=Maintenance
+#  +8: Frequency_Hz        (f64, 8 bytes) — stored via fbits/store64
+# +16: Voltage_kV          (f64, 8 bytes) — stored via fbits/store64
+
+s_head: str = "=== OPC DA Server Simulator ===\n";
+s_sep:  str = "--------------------------------\n";
+s_cyc:  str = "Cycle:";
+s_tim:  str = "  Time:";
+s_ms:   str = " ms\n";
+s_st:   str = "  Status:";
+s_fr:   str = "  Freq(hHz):";
+s_vl:   str = "  Volt(hkV):";
+s_m0:   str = "  Mem[0]:";
+s_m8:   str = "  [8]:";
+s_m16:  str = "  [16]:";
+s_nl:   str = "\n";
+
+extern "kernel32.dll" Sleep;
+extern "kernel32.dll" GetTickCount -> ptr;
+
+@CODE
+func main() -> i32 {
+    syscall 1, s_head;
+    syscall 1, s_sep;
+
+    store64(tags + 0, 1);
+    store64(tags + 8, fbits(itof(5000) / itof(100)));
+    store64(tags + 16, fbits(itof(22000) / itof(100)));
+
+    counter: i64 = 0;
+    cycle: i64 = 0;
+    fi: i64 = 5000;
+    vi: i64 = 22000;
+    st: i64 = 1;
+    t: i64 = 0;
+    tc: i64 = 0;
+
+    while 1 {
+        tc = GetTickCount();
+
+        if counter <= 100 {
+            fi = 4900 + counter * 2;
+        } else {
+            t = counter - 100;
+            fi = 5100 - t * 2;
+        }
+
+        if counter <= 100 {
+            vi = 21500 + counter * 10;
+        } else {
+            t = counter - 100;
+            vi = 22500 - t * 10;
+        }
+
+        if cycle % 4 == 0 {
+            st = 1;
+        } else {
+            if cycle % 4 == 1 {
+                st = 3;
+            } else {
+                if cycle % 4 == 2 {
+                    st = 5;
+                } else {
+                    st = 7;
+                }
+            }
+        }
+
+        store64(tags + 0, st);
+        store64(tags + 8, fbits(itof(fi) / itof(100)));
+        store64(tags + 16, fbits(itof(vi) / itof(100)));
+
+        syscall 1, s_cyc, cycle, s_tim, tc, s_ms;
+        syscall 1, s_st, st, s_fr, fi, s_vl, vi, s_nl;
+        syscall 1, s_m0, load64(tags + 0), s_m8, load64(tags + 8), s_m16, load64(tags + 16), s_nl;
+        syscall 1, s_sep;
+
+        counter = counter + 1;
+        if counter > 200 {
+            counter = 0;
+        }
+        cycle = cycle + 1;
+
+        Sleep(500);
+    }
+
+    return 0;
+}

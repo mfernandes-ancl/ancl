@@ -1,0 +1,195 @@
+# =====================================================================
+# webview2_host.ancl - minimal native ANCL host for Edge WebView2.
+# Locates the installed Evergreen runtime from Windows registry state and loads
+# it directly, so Lens needs no bundled WebView2 loader DLL.
+# =====================================================================
+
+extern "kernel32.dll" LoadLibraryA -> ptr;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "ole32.dll" CoInitializeEx;
+extern "ole32.dll" CoUninitialize;
+extern "advapi32.dll" RegOpenKeyExA;
+extern "advapi32.dll" RegQueryValueExA;
+extern "advapi32.dll" RegCloseKey;
+
+@DATA
+lwv2_create_name: str = "CreateWebViewEnvironmentWithOptionsInternal";
+lwv2_state_hkcu: str = "Software\\Microsoft\\EdgeUpdate\\ClientState\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+lwv2_state_hklm: str = "SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\ClientState\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+lwv2_clients_hkcu: str = "Software\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+lwv2_clients_hklm: str = "SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+lwv2_value_path: str = "EBWebView";
+lwv2_value_location: str = "location";
+lwv2_value_version: str = "pv";
+lwv2_runtime_suffix: str = "\\EBWebView\\x64\\EmbeddedBrowserWebView.dll";
+lwv2_runtime_module: buf = 8;
+lwv2_create_fn: buf = 8;
+lwv2_parent: buf = 8;
+lwv2_environment: buf = 8;
+lwv2_controller: buf = 8;
+lwv2_core: buf = 8;
+lwv2_state: buf = 8;       # 0 idle, 1 initializing, 2 ready, 3 failed
+lwv2_com_init: buf = 8;
+lwv2_bounds: buf = 16;
+lwv2_profile_w: buf = 2048;
+lwv2_url_w: buf = 4096;
+lwv2_runtime_root: buf = 1024;
+lwv2_runtime_location: buf = 1024;
+lwv2_runtime_version: buf = 128;
+lwv2_runtime_dll: buf = 1400;
+lwv2_reg_key: buf = 8;
+lwv2_reg_type: buf = 8;
+lwv2_reg_size: buf = 8;
+
+lwv2_env_vt: buf = 32;
+lwv2_env_obj: buf = 8;
+lwv2_ctrl_vt: buf = 32;
+lwv2_ctrl_obj: buf = 8;
+
+@CODE
+func lwv2_vmeth(obj: i64, idx: i64) -> i64 { return load64(load64(obj) + idx * 8); }
+
+func lwv2_reg_string(root: i64, subkey: i64, value: i64, dst: i64, cap: i64) -> i64 {
+    store64(lwv2_reg_key, 0); store64(lwv2_reg_type, 0); store64(lwv2_reg_size, cap);
+    if RegOpenKeyExA(root, subkey, 0, 0x20019, lwv2_reg_key) != 0 { return 0; }
+    h = load64(lwv2_reg_key);
+    rc = RegQueryValueExA(h, value, 0, lwv2_reg_type, dst, lwv2_reg_size);
+    RegCloseKey(h);
+    if rc != 0 { store8(dst, 0); return 0; }
+    if load64(lwv2_reg_type) != 1 { if load64(lwv2_reg_type) != 2 { store8(dst, 0); return 0; } }
+    store8(dst + cap - 1, 0); return load8(dst) != 0;
+}
+
+func lwv2_build_runtime_dll(root: i64) -> i64 {
+    p = str_copy(lwv2_runtime_dll, root); str_copy(p, lwv2_runtime_suffix);
+    if band(GetFileAttributesA(lwv2_runtime_dll), 4294967295) == 4294967295 { return 0; }
+    return 1;
+}
+
+func lwv2_find_runtime() -> i64 {
+    # Prefer the exact runtime directory maintained by EdgeUpdate ClientState.
+    if lwv2_reg_string(0 - 2147483647, lwv2_state_hkcu, lwv2_value_path, lwv2_runtime_root, 1024) == 1 {
+        if lwv2_build_runtime_dll(lwv2_runtime_root) == 1 { return 1; }
+    }
+    if lwv2_reg_string(0 - 2147483646, lwv2_state_hklm, lwv2_value_path, lwv2_runtime_root, 1024) == 1 {
+        if lwv2_build_runtime_dll(lwv2_runtime_root) == 1 { return 1; }
+    }
+    # Older installs expose a base location and current product version instead.
+    if lwv2_reg_string(0 - 2147483647, lwv2_clients_hkcu, lwv2_value_location, lwv2_runtime_location, 1024) == 1 {
+        if lwv2_reg_string(0 - 2147483647, lwv2_clients_hkcu, lwv2_value_version, lwv2_runtime_version, 128) == 1 {
+            p = str_copy(lwv2_runtime_root, lwv2_runtime_location); store8(p, 92); p = p + 1; str_copy(p, lwv2_runtime_version);
+            if lwv2_build_runtime_dll(lwv2_runtime_root) == 1 { return 1; }
+        }
+    }
+    if lwv2_reg_string(0 - 2147483646, lwv2_clients_hklm, lwv2_value_location, lwv2_runtime_location, 1024) == 1 {
+        if lwv2_reg_string(0 - 2147483646, lwv2_clients_hklm, lwv2_value_version, lwv2_runtime_version, 128) == 1 {
+            p = str_copy(lwv2_runtime_root, lwv2_runtime_location); store8(p, 92); p = p + 1; str_copy(p, lwv2_runtime_version);
+            if lwv2_build_runtime_dll(lwv2_runtime_root) == 1 { return 1; }
+        }
+    }
+    return 0;
+}
+
+func lwv2_a2w(dst: i64, src: i64, cap_units: i64) -> i64 {
+    i = 0;
+    while i + 1 < cap_units {
+        c = load8(src + i); store16(dst + i * 2, c);
+        if c == 0 { return i; }
+        i = i + 1;
+    }
+    store16(dst + i * 2, 0); return i;
+}
+
+func lwv2_qi(this: i64, iid: i64, ppv: i64) -> i64 {
+    if ppv == 0 { return 0 - 2147467261; }
+    store64(ppv, this); return 0;
+}
+func lwv2_addref(this: i64) -> i64 { return 2; }
+func lwv2_release(this: i64) -> i64 { return 1; }
+
+func lwv2_resize(left: i64, top: i64, right: i64, bottom: i64) -> i64 {
+    store32(lwv2_bounds + 0, left); store32(lwv2_bounds + 4, top);
+    store32(lwv2_bounds + 8, right); store32(lwv2_bounds + 12, bottom);
+    c = load64(lwv2_controller);
+    if c != 0 { return callp(lwv2_vmeth(c, 6), c, lwv2_bounds); }
+    return 0;
+}
+
+func lwv2_navigate(url: i64) -> i64 {
+    lwv2_a2w(lwv2_url_w, url, 2048);
+    c = load64(lwv2_core);
+    if c == 0 { return 0; }
+    return callp(lwv2_vmeth(c, 5), c, lwv2_url_w) == 0;
+}
+
+func lwv2_controller_invoke(this: i64, error_code: i64, result: i64) -> i64 {
+    if load64(lwv2_parent) == 0 { return 0; }
+    if error_code != 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); return 0; }
+    if result == 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); return 0; }
+    store64(lwv2_controller, result); callp(lwv2_vmeth(result, 1), result);
+    callp(lwv2_vmeth(result, 25), result, lwv2_core);
+    if load64(lwv2_core) == 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); return 0; }
+    callp(lwv2_vmeth(result, 4), result, 1);
+    lwv2_resize(load32(lwv2_bounds), load32(lwv2_bounds + 4), load32(lwv2_bounds + 8), load32(lwv2_bounds + 12));
+    store64(lwv2_state, 2);
+    if load16(lwv2_url_w) != 0 { callp(lwv2_vmeth(load64(lwv2_core), 5), load64(lwv2_core), lwv2_url_w); }
+    PostMessageA(load64(lwv2_parent), 0x800F, 1, 0); return 0;
+}
+
+func lwv2_environment_invoke(this: i64, error_code: i64, result: i64) -> i64 {
+    if load64(lwv2_parent) == 0 { return 0; }
+    if error_code != 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); return 0; }
+    if result == 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); return 0; }
+    store64(lwv2_environment, result); callp(lwv2_vmeth(result, 1), result);
+    hr = callp(lwv2_vmeth(result, 3), result, load64(lwv2_parent), lwv2_ctrl_obj);
+    if hr != 0 { store64(lwv2_state, 3); PostMessageA(load64(lwv2_parent), 0x800F, 0, 0); }
+    return 0;
+}
+
+func lwv2_vtables_init() -> i64 {
+    store64(lwv2_env_vt + 0, &lwv2_qi); store64(lwv2_env_vt + 8, &lwv2_addref);
+    store64(lwv2_env_vt + 16, &lwv2_release); store64(lwv2_env_vt + 24, &lwv2_environment_invoke);
+    store64(lwv2_env_obj, lwv2_env_vt);
+    store64(lwv2_ctrl_vt + 0, &lwv2_qi); store64(lwv2_ctrl_vt + 8, &lwv2_addref);
+    store64(lwv2_ctrl_vt + 16, &lwv2_release); store64(lwv2_ctrl_vt + 24, &lwv2_controller_invoke);
+    store64(lwv2_ctrl_obj, lwv2_ctrl_vt); return 1;
+}
+
+func lwv2_open(parent: i64, profile_ascii: i64) -> i64 {
+    if load64(lwv2_state) == 2 { return 1; }
+    if load64(lwv2_state) == 1 { return 1; }
+    if load64(lwv2_runtime_module) == 0 {
+        if lwv2_find_runtime() == 0 { store64(lwv2_state, 3); return 0; }
+        h = LoadLibraryA(lwv2_runtime_dll); store64(lwv2_runtime_module, h);
+        if h == 0 { store64(lwv2_state, 3); return 0; }
+        fn = GetProcAddress(h, lwv2_create_name); store64(lwv2_create_fn, fn);
+        if fn == 0 { store64(lwv2_state, 3); return 0; }
+    }
+    if load64(lwv2_com_init) == 0 {
+        hr = CoInitializeEx(0, 2);
+        if hr < 0 { store64(lwv2_state, 3); return 0; }
+        store64(lwv2_com_init, 1);
+    }
+    lwv2_vtables_init(); store64(lwv2_parent, parent); store64(lwv2_state, 1);
+    lwv2_a2w(lwv2_profile_w, profile_ascii, 1024);
+    hr = callp(load64(lwv2_create_fn), 1, 0, lwv2_profile_w, 0, lwv2_env_obj);
+    if hr != 0 { store64(lwv2_state, 3); return 0; }
+    return 1;
+}
+
+func lwv2_ready() -> i64 { return load64(lwv2_state) == 2; }
+
+func lwv2_close() -> i64 {
+    store64(lwv2_parent, 0); store16(lwv2_url_w, 0);
+    c = load64(lwv2_controller); if c != 0 { callp(lwv2_vmeth(c, 24), c); }
+    p = load64(lwv2_core); if p != 0 { callp(lwv2_vmeth(p, 2), p); store64(lwv2_core, 0); }
+    if c != 0 { callp(lwv2_vmeth(c, 2), c); store64(lwv2_controller, 0); }
+    e = load64(lwv2_environment); if e != 0 { callp(lwv2_vmeth(e, 2), e); store64(lwv2_environment, 0); }
+    store64(lwv2_state, 0); return 1;
+}
+
+func lwv2_shutdown() -> i64 {
+    lwv2_close();
+    if load64(lwv2_com_init) != 0 { CoUninitialize(); store64(lwv2_com_init, 0); }
+    return 1;
+}

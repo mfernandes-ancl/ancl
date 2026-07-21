@@ -1,0 +1,51 @@
+# Phase 1 feature test: while / else-if / break / continue, and the
+# operators  %  !=  <=  >=  &&  ||  !  with proper precedence.
+
+@DATA
+sFizz:     str = "Fizz\n";
+sBuzz:     str = "Buzz\n";
+sFizzBuzz: str = "FizzBuzz\n";
+nl:        str = "\n";
+msum:      str = "sum of odds 1..99 (break/continue) = ";
+sand:      str = "&& works (5>=5 && 5<=10)\n";
+sor:       str = "|| works (5!=6 || 5==0)\n";
+snot:      str = "! works (!0 is true)\n";
+sle:       str = "<= and >= and != all OK\n";
+
+@CODE
+func main() -> i32 {
+    # --- FizzBuzz 1..20 : exercises while, %, ==, else if ---
+    i = 1;
+    while i <= 20 {
+        if i % 15 == 0 {
+            syscall 1, sFizzBuzz;
+        } else if i % 3 == 0 {
+            syscall 1, sFizz;
+        } else if i % 5 == 0 {
+            syscall 1, sBuzz;
+        } else {
+            syscall 1, i, nl;
+        }
+        i = i + 1;
+    }
+
+    # --- break / continue : sum the odd numbers in 1..99 ---
+    j = 0;
+    sum = 0;
+    while 1 {
+        j = j + 1;
+        if j > 100 { break; }
+        if j % 2 == 0 { continue; }
+        sum = sum + j;
+    }
+    syscall 1, msum, sum, nl;          # expect 2500
+
+    # --- logical / comparison operators ---
+    a = 5;
+    if a >= 5 && a <= 10 { syscall 1, sand; }
+    if a != 6 || a == 0 { syscall 1, sor; }
+    if !0 { syscall 1, snot; }
+    if a <= 5 && a >= 5 && a != 0 { syscall 1, sle; }
+
+    return 0;
+}

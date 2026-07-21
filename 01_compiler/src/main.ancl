@@ -1,0 +1,431 @@
+# =====================================================================
+#  main.ancl  -  Entry point for anclc2 (self-hosting ANCL compiler)
+#
+#  Usage:  anclc2 <input.ancl> <output.exe>
+# =====================================================================
+import "lexer.ancl";
+import "parser.ancl";
+import "pe_writer.ancl";
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+
+@DATA
+m_banner:  str = "anclc2 - ANCL self-hosting bootstrap compiler\n";
+m_usage:   str = "usage: anclc2 <input.ancl> <output.exe>\n";
+m_lex_ok:  str = "[anclc2] lexed: ";
+m_tok:     str = " tokens\n";
+m_par_ok:  str = "[anclc2] parsed: ";
+m_funcs:   str = " funcs\n";
+m_cg_ok:   str = "[anclc2] codegen: ";
+m_bytes:   str = " code bytes\n";
+m_ok:      str = "[anclc2] written OK\n";
+m_read_err:str = "[anclc2] cannot read input file\n";
+
+# Input source buffer: 2 MB so the compiler can read large sources
+# (the self-host source anclc2_all.ancl is ~150 KB; old 64 KB silently
+# truncated it mid-file). One extra byte is reserved for the NUL terminator.
+g_src:     buf = 2097152;
+g_nread:   buf = 8;
+g_arg1:    buf = 1024;
+g_arg2:    buf = 1024;
+
+# ---- SC1 self-correcting `--fix` (backport of compiler/anclc.cpp; docs/sc1_scope.md) ----
+# F3 (// -> #) + F4 (strip let/var; bool/true/false/f32/float/double -> ANCL) text pre-passes.
+# Gated by g_fix_mode so the NORMAL compile path is byte-identical (the anclc3==anclc4 fixpoint
+# never sees --fix). F1/F2 (parser-driven missing-token insertion) now backported too -- see
+# sc_tok_text/sc_splice/sc_fix_parse_loop below + the g_recover/g_perr recovery in parser.ancl.
+g_arg3:      buf = 1024;     # scratch token slot for flag parsing
+g_fix_mode:  buf = 8;        # 1 under --fix
+g_fix_write: buf = 8;        # 1 under --write (rewrite the file)
+g_check_mode: buf = 8;       # SC4: 1 under --check (build an intent-oracle checker)
+g_fix_count: buf = 8;        # number of fixes applied
+g_bak_path:  buf = 1100;     # <in>.bak scratch
+fx_ffix:   str = "--fix";
+fx_fwrite: str = "--write";
+fx_fcheck: str = "--check";
+fx_tlinux: str = "--target=linux";     # M5: emit a static Linux ELF instead of a Windows PE
+fx_tlinuxdyn: str = "--target=linux-dyn"; # L4a: a DYNAMIC ELF (dlopen/dlsym via .rela.plt); implies --target=linux
+kw_bool:   str = "bool";
+kw_true:   str = "true";
+kw_false:  str = "false";
+kw_f32:    str = "f32";
+kw_float:  str = "float";
+kw_double: str = "double";
+kw_let:    str = "let";
+kw_var:    str = "var";
+rep_i64:   str = "i64";
+rep_1:     str = "1";
+rep_0:     str = "0";
+rep_f64:   str = "f64";
+mf_pre:    str = "anclc2 --fix: ";
+mf_mid:    str = " fix(es) ";
+mf_prop:   str = "proposed (dry run; add --write to apply)\n";
+mf_appl:   str = "applied\n";
+mf_none:   str = "anclc2 --fix: no mechanical fixes needed\n";
+# F1/F2 insertion-text table (mirror of anclc.cpp scTokText)
+ins_semi:   str = ";";
+ins_rparen: str = ")";
+ins_lparen: str = "(";
+ins_rbrace: str = "}";
+ins_lbrace: str = "{";
+ins_rbrack: str = "]";
+ins_lbrack: str = "[";
+ins_arrow:  str = "->";
+ins_fatarw: str = "=>";
+ins_colon:  str = ":";
+ins_assign: str = "=";
+ins_comma:  str = ",";
+g_ins_len:  buf = 8;        # byte length of the last sc_tok_text result
+
+@CODE
+
+# ----------------------------------------------------------------
+#  skip_spaces(p) -> ptr past leading spaces/tabs
+# ----------------------------------------------------------------
+func skip_spaces(p: i64) -> i64 {
+    going = 1;
+    while going == 1 {
+        c = load8(p);
+        if c == 32 { p = p + 1; }
+        if c == 9  { p = p + 1; }
+        if c != 32 { if c != 9 { going = 0; } }
+        if c == 0  { going = 0; }
+    }
+    return p;
+}
+
+# ----------------------------------------------------------------
+#  copy_token(src, dst) -> src pointer past the token
+#  Copies a whitespace-delimited (or quoted) token into dst.
+# ----------------------------------------------------------------
+func copy_token(src: i64, dst: i64) -> i64 {
+    di     = 0;
+    quoted = 0;
+    if load8(src) == 34 { quoted = 1; src = src + 1; }
+    going = 1;
+    while going == 1 {
+        c = load8(src);
+        if c == 0 { going = 0; }
+        if going == 1 {
+            if quoted == 1 {
+                if c == 34 { src = src + 1; going = 0; }
+                if going == 1 {
+                    store8(dst + di, c);
+                    di = di + 1; src = src + 1;
+                }
+            }
+            if quoted == 0 {
+                if c == 32 { going = 0; }
+                if c == 9  { going = 0; }
+                if going == 1 {
+                    store8(dst + di, c);
+                    di = di + 1; src = src + 1;
+                }
+            }
+        }
+    }
+    store8(dst + di, 0);
+    return src;
+}
+
+# ---- SC1 --fix helpers (self-correcting pass; mirror of compiler/anclc.cpp) ----
+func arg_is(a: i64, b: i64) -> i64 {
+    i = 0; going = 1; eq = 1;
+    while going == 1 {
+        ca = load8(a + i); cb = load8(b + i);
+        if ca != cb { eq = 0; going = 0; }
+        if going == 1 { if ca == 0 { going = 0; } else { i = i + 1; } }
+    }
+    return eq;
+}
+func sc_strcpy(dst: i64, src: i64) -> i64 {
+    i = 0; going = 1;
+    while going == 1 { c = load8(src + i); store8(dst + i, c); if c == 0 { going = 0; } else { i = i + 1; } }
+    return i;
+}
+func sc_isident(c: i64) -> i64 {
+    if c >= 97 { if c <= 122 { return 1; } }
+    if c >= 65 { if c <= 90  { return 1; } }
+    if c >= 48 { if c <= 57  { return 1; } }
+    if c == 95 { return 1; }
+    return 0;
+}
+func sc_match(buf: i64, at: i64, wlen: i64, lit: i64, litlen: i64) -> i64 {
+    if wlen != litlen { return 0; }
+    k = 0; going = 1; eq = 1;
+    while going == 1 {
+        if k >= wlen { going = 0; }
+        else { if load8(buf + at + k) != load8(lit + k) { eq = 0; going = 0; } else { k = k + 1; } }
+    }
+    return eq;
+}
+# overwrite wlen bytes at buf+at with rep (replen bytes) padded with spaces (equal length)
+func sc_swap(buf: i64, at: i64, wlen: i64, rep: i64, replen: i64) -> i64 {
+    k = 0;
+    while k < replen { store8(buf + at + k, load8(rep + k)); k = k + 1; }
+    while k < wlen   { store8(buf + at + k, 32); k = k + 1; }
+    return 0;
+}
+# delete n bytes at buf+at (shift the tail left); returns new length
+func sc_splice_del(buf: i64, at: i64, n: i64, len: i64) -> i64 {
+    k = at;
+    while k + n < len { store8(buf + k, load8(buf + k + n)); k = k + 1; }
+    return len - n;
+}
+# F3: '//' -> '#'  (string/comment-aware; equal-length, no memmove). Returns len.
+func fix_f3_comments(buf: i64, len: i64) -> i64 {
+    i = 0; instr = 0;
+    while i < len {
+        c = load8(buf + i);
+        if instr == 1 {
+            if c == 92 { i = i + 2; }
+            else { if c == 34 { instr = 0; } i = i + 1; }
+        } else {
+            if c == 34 { instr = 1; i = i + 1; }
+            else {
+                if c == 35 {
+                    g2 = 1;
+                    while g2 == 1 { if i >= len { g2 = 0; } else { if load8(buf + i) == 10 { g2 = 0; } else { i = i + 1; } } }
+                } else {
+                    if c == 47 {
+                        if load8(buf + i + 1) == 47 {
+                            store8(buf + i, 35); store8(buf + i + 1, 32);
+                            store64(g_fix_count, load64(g_fix_count) + 1);
+                            i = i + 2;
+                        } else { i = i + 1; }
+                    } else { i = i + 1; }
+                }
+            }
+        }
+    }
+    return len;
+}
+# F4: strip let/var; bool->i64 true->1 false->0 f32/float/double->f64 (string/comment-aware). Returns len.
+func fix_f4_keywords(buf: i64, len: i64) -> i64 {
+    i = 0; instr = 0;
+    while i < len {
+        c = load8(buf + i);
+        if instr == 1 {
+            if c == 92 { i = i + 2; }
+            else { if c == 34 { instr = 0; } i = i + 1; }
+        } else {
+            if c == 34 { instr = 1; i = i + 1; }
+            else {
+                if c == 35 {
+                    g2 = 1;
+                    while g2 == 1 { if i >= len { g2 = 0; } else { if load8(buf + i) == 10 { g2 = 0; } else { i = i + 1; } } }
+                } else {
+                    boundary = 0;
+                    if i == 0 { boundary = 1; } else { if sc_isident(load8(buf + i - 1)) == 0 { boundary = 1; } }
+                    handled = 0;
+                    if boundary == 1 { if sc_isident(c) == 1 {
+                        j = i; gw = 1;
+                        while gw == 1 { if j >= len { gw = 0; } else { if sc_isident(load8(buf + j)) == 1 { j = j + 1; } else { gw = 0; } } }
+                        wlen = j - i;
+                        if sc_match(buf, i, wlen, kw_bool, 4) == 1   { sc_swap(buf, i, wlen, rep_i64, 3); store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_true, 4) == 1  { sc_swap(buf, i, wlen, rep_1, 1);   store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_false, 5) == 1 { sc_swap(buf, i, wlen, rep_0, 1);   store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_f32, 3) == 1   { sc_swap(buf, i, wlen, rep_f64, 3); store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_float, 5) == 1 { sc_swap(buf, i, wlen, rep_f64, 3); store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_double, 6) == 1{ sc_swap(buf, i, wlen, rep_f64, 3); store64(g_fix_count, load64(g_fix_count)+1); i = j; handled = 1; } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_let, 3) == 1 {
+                            sp = j; gs = 1;
+                            while gs == 1 { if sp >= len { gs = 0; } else { cc = load8(buf + sp); if cc == 32 { sp = sp + 1; } else { if cc == 9 { sp = sp + 1; } else { gs = 0; } } } }
+                            len = sc_splice_del(buf, i, sp - i, len);
+                            store64(g_fix_count, load64(g_fix_count)+1); handled = 1;
+                        } }
+                        if handled == 0 { if sc_match(buf, i, wlen, kw_var, 3) == 1 {
+                            sp = j; gs = 1;
+                            while gs == 1 { if sp >= len { gs = 0; } else { cc = load8(buf + sp); if cc == 32 { sp = sp + 1; } else { if cc == 9 { sp = sp + 1; } else { gs = 0; } } } }
+                            len = sc_splice_del(buf, i, sp - i, len);
+                            store64(g_fix_count, load64(g_fix_count)+1); handled = 1;
+                        } }
+                        if handled == 0 { i = j; handled = 1; }
+                    } }
+                    if handled == 0 { i = i + 1; }
+                }
+            }
+        }
+    }
+    return len;
+}
+
+# ---- SC1 F1/F2: parser-driven missing-token insertion (backport of anclc.cpp scTokText/scFixSource) ----
+# After the F3/F4 text passes, re-parse in recover mode; on a missing STRUCTURAL token the parser
+# poisons (g_perr) and records the expected kind + source splice point (start of the failing token).
+# Insert the token's text + re-parse. Bounded (40) + a no-progress guard => guaranteed halt. ALL of
+# this is inert outside --fix: g_recover stays 0, so par_expect never poisons on the self-compile.
+
+# insertion text for a missing token kind (0 = not auto-insertable); sets g_ins_len.
+func sc_tok_text(k: i64) -> i64 {
+    if k == TOK_SEMI     { store64(g_ins_len, 1); return ins_semi;   }
+    if k == TOK_RPAREN   { store64(g_ins_len, 1); return ins_rparen; }
+    if k == TOK_LPAREN   { store64(g_ins_len, 1); return ins_lparen; }
+    if k == TOK_RBRACE   { store64(g_ins_len, 1); return ins_rbrace; }
+    if k == TOK_LBRACE   { store64(g_ins_len, 1); return ins_lbrace; }
+    if k == TOK_RBRACKET { store64(g_ins_len, 1); return ins_rbrack; }
+    if k == TOK_LBRACKET { store64(g_ins_len, 1); return ins_lbrack; }
+    if k == TOK_ARROW    { store64(g_ins_len, 2); return ins_arrow;  }
+    if k == TOK_FATARROW { store64(g_ins_len, 2); return ins_fatarw; }
+    if k == TOK_COLON    { store64(g_ins_len, 1); return ins_colon;  }
+    if k == TOK_ASSIGN   { store64(g_ins_len, 1); return ins_assign; }
+    if k == TOK_COMMA    { store64(g_ins_len, 1); return ins_comma;  }
+    store64(g_ins_len, 0);
+    return 0;
+}
+
+# splice txtlen bytes from txt into buf at offset off (shift the tail right). Returns new length.
+func sc_splice(buf: i64, len: i64, off: i64, txt: i64, txtlen: i64) -> i64 {
+    i = len;
+    while i > off {
+        store8(buf + i - 1 + txtlen, load8(buf + i - 1));
+        i = i - 1;
+    }
+    j = 0;
+    while j < txtlen {
+        store8(buf + off + j, load8(txt + j));
+        j = j + 1;
+    }
+    return len + txtlen;
+}
+
+# F1/F2 driver: re-parse g_src in recover mode; on a missing-token poison, splice + re-parse.
+# Returns the new source length (each insert grows it by g_ins_len). Mirrors scFixSource.
+func sc_fix_parse_loop(srclen: i64) -> i64 {
+    store64(g_recover, 1);
+    last_off = 0 - 1; last_kind = 0 - 1;
+    guard = 0;
+    while guard < 40 {
+        store64(g_perr, 0);
+        lex_init(g_src, srclen);
+        par_init();
+        par_program();
+        if load64(g_perr) == 0 { guard = 40; }                # parses clean -> done
+        if load64(g_perr) != 0 {
+            k   = load64(g_exp_tok);
+            off = load64(g_exp_off);
+            txt = sc_tok_text(k);
+            if txt == 0 { guard = 40; }                       # not auto-insertable -> stop honestly
+            if txt != 0 {
+                if off > srclen { off = srclen; }
+                stop = 0;
+                if off == last_off { if k == last_kind { stop = 1; } }   # no-progress guard
+                if stop == 1 { guard = 40; }
+                if stop == 0 {
+                    last_off = off; last_kind = k;
+                    srclen = sc_splice(g_src, srclen, off, txt, load64(g_ins_len));
+                    store8(g_src + srclen, 0);
+                    store64(g_fix_count, load64(g_fix_count) + 1);
+                    guard = guard + 1;
+                }
+            }
+        }
+    }
+    store64(g_recover, 0);
+    store64(g_perr, 0);
+    return srclen;
+}
+
+func main() -> i32 {
+    cmdline = GetCommandLineA();
+    p       = cmdline;
+
+    # skip argv[0]  (the .exe path)
+    p = skip_spaces(p);
+    if load8(p) == 0 { syscall 1, m_banner, m_usage; return 1; }
+    p = copy_token(p, g_arg3);   # argv[0] discarded
+
+    # remaining tokens: flags (--fix / --write) + up to two positionals (in, out).
+    # With NO flags this leaves g_arg1=in, g_arg2=out exactly as before (fixpoint-safe).
+    npos = 0;
+    going = 1;
+    while going == 1 {
+        p = skip_spaces(p);
+        if load8(p) == 0 { going = 0; }
+        if going == 1 {
+            p = copy_token(p, g_arg3);
+            if arg_is(g_arg3, fx_ffix) == 1 { store64(g_fix_mode, 1); }
+            else {
+                if arg_is(g_arg3, fx_fwrite) == 1 { store64(g_fix_write, 1); }
+                else {
+                    if arg_is(g_arg3, fx_fcheck) == 1 { store64(g_check_mode, 1); }   # SC4
+                    else {
+                        if arg_is(g_arg3, fx_tlinux) == 1 { store64(g_targetlinux, 1); }   # M5: Linux ELF (does NOT advance npos)
+                        else {
+                            if arg_is(g_arg3, fx_tlinuxdyn) == 1 { store64(g_targetlinux, 1); store64(g_targetlinuxdyn, 1); }   # L4a: dynamic ELF
+                            else {
+                                if npos == 0 { sc_strcpy(g_arg1, g_arg3); npos = 1; }
+                                else { if npos == 1 { sc_strcpy(g_arg2, g_arg3); npos = 2; } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if load64(g_fix_mode) == 0 { if npos < 2 { syscall 1, m_banner, m_usage; return 1; } }
+    else { if npos < 1 { syscall 1, m_banner, m_usage; return 1; } }
+
+    in_path  = g_arg1;
+    out_path = g_arg2;
+
+    # Read input file
+    fh = CreateFileA(in_path, 2147483648, 1, 0, 3, 128, 0);
+    if fh == 0 - 1 { syscall 1, m_read_err; return 1; }
+    ReadFile(fh, g_src, 2097151, g_nread, 0);
+    CloseHandle(fh);
+    srclen = load64(g_nread);
+    store8(g_src + srclen, 0);
+
+    # SC1 --fix: deterministic text pre-passes, then report/write and STOP
+    # (never lex/parse/codegen in fix mode). Only reachable under --fix.
+    if load64(g_fix_mode) == 1 {
+        srclen = fix_f3_comments(g_src, srclen);
+        srclen = fix_f4_keywords(g_src, srclen);
+        store8(g_src + srclen, 0);
+        srclen = sc_fix_parse_loop(srclen);          # F1/F2: insert missing structural tokens, then re-parse
+        store8(g_src + srclen, 0);
+        if load64(g_fix_count) == 0 { syscall 1, mf_none; return 0; }
+        syscall 1, mf_pre, load64(g_fix_count), mf_mid;
+        if load64(g_fix_write) == 1 {
+            wn = sc_strcpy(g_bak_path, in_path);
+            store8(g_bak_path + wn, 46); store8(g_bak_path + wn + 1, 98);
+            store8(g_bak_path + wn + 2, 97); store8(g_bak_path + wn + 3, 107);
+            store8(g_bak_path + wn + 4, 0);                       # ".bak\0"
+            CopyFileA(in_path, g_bak_path, 0);                    # back up original (in_path not yet overwritten)
+            wf = CreateFileA(in_path, 1073741824, 0, 0, 2, 128, 0);  # GENERIC_WRITE, CREATE_ALWAYS
+            WriteFile(wf, g_src, srclen, g_nread, 0);
+            CloseHandle(wf);
+            syscall 1, mf_appl;
+        } else {
+            syscall 1, mf_prop;
+        }
+        return 0;
+    }
+
+    # Lex
+    ntok = lex_init(g_src, srclen);
+    syscall 1, m_lex_ok, ntok, m_tok;
+
+    # Parse
+    par_init();
+    par_program();
+    if load64(g_check_mode) == 1 { par_check_runner(); }   # SC4: (re)define main as the intent runner
+    build_tool_registry();         # assemble the tools_json array (no-op if no `tool` decls)
+    nfuncs = load64(g_fn_count);
+    syscall 1, m_par_ok, nfuncs, m_funcs;
+
+    # Codegen
+    code_bytes = cg_run();
+    syscall 1, m_cg_ok, code_bytes, m_bytes;
+
+    # Write the binary: dynamic Linux ELF (--target=linux-dyn), static Linux ELF (--target=linux), or Windows PE (default)
+    if load64(g_targetlinux) == 1 {
+        if load64(g_targetlinuxdyn) == 1 { elf_write_dyn(out_path); }
+        else { elf_write(out_path); }
+    }
+    else { pe_write(out_path); }
+    syscall 1, m_ok;
+
+    return 0;
+}

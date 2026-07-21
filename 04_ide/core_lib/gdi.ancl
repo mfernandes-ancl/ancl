@@ -1,0 +1,92 @@
+# =====================================================================
+#  gdi.ancl - small GDI drawing helpers for native ANCL Win32 apps.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "gdi32.dll"  GetStockObject -> ptr;
+extern "user32.dll" DrawTextA;
+
+@DATA
+gdi_rect_scratch: buf = 16;
+
+@CODE
+
+# Windows COLORREF is 0x00BBGGRR.
+func gdi_rgb(r: i64, g: i64, b: i64) -> i64 {
+    return band(r, 255) + shl(band(g, 255), 8) + shl(band(b, 255), 16);
+}
+
+func gdi_rect_set(rect: ptr, left: i64, top: i64, right: i64, bottom: i64) -> ptr {
+    store32(rect + 0, left);
+    store32(rect + 4, top);
+    store32(rect + 8, right);
+    store32(rect + 12, bottom);
+    return rect;
+}
+
+func gdi_fill_rect(hdc: i64, rect: ptr, brush: i64) -> i64 {
+    FillRect(hdc, rect, brush);
+    return 0;
+}
+
+func gdi_fill_xy(hdc: i64, left: i64, top: i64, right: i64, bottom: i64, brush: i64) -> i64 {
+    gdi_rect_set(gdi_rect_scratch, left, top, right, bottom);
+    FillRect(hdc, gdi_rect_scratch, brush);
+    return 0;
+}
+
+func gdi_frame_rect(hdc: i64, left: i64, top: i64, right: i64, bottom: i64, pen: i64) -> i64 {
+    old_brush = SelectObject(hdc, GetStockObject(5)); # NULL_BRUSH
+    old_pen = SelectObject(hdc, pen);
+    Rectangle(hdc, left, top, right, bottom);
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    return 0;
+}
+
+func gdi_fill_frame_rect(hdc: i64, left: i64, top: i64, right: i64, bottom: i64, brush: i64, pen: i64) -> i64 {
+    old_brush = SelectObject(hdc, brush);
+    old_pen = SelectObject(hdc, pen);
+    Rectangle(hdc, left, top, right, bottom);
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    return 0;
+}
+
+func gdi_line(hdc: i64, x1: i64, y1: i64, x2: i64, y2: i64, pen: i64) -> i64 {
+    old_pen = SelectObject(hdc, pen);
+    MoveToEx(hdc, x1, y1, 0);
+    LineTo(hdc, x2, y2);
+    SelectObject(hdc, old_pen);
+    return 0;
+}
+
+func gdi_text_out(hdc: i64, x: i64, y: i64, text: str, color: i64, font: i64) -> i64 {
+    old_font = 0;
+    if font != 0 { old_font = SelectObject(hdc, font); }
+    SetBkMode(hdc, 1); # TRANSPARENT
+    SetTextColor(hdc, color);
+    TextOutA(hdc, x, y, text, strlen(text));
+    if old_font != 0 { SelectObject(hdc, old_font); }
+    return 0;
+}
+
+func gdi_draw_text(hdc: i64, rect: ptr, text: str, color: i64, font: i64, flags: i64) -> i64 {
+    old_font = 0;
+    if font != 0 { old_font = SelectObject(hdc, font); }
+    SetBkMode(hdc, 1); # TRANSPARENT
+    SetTextColor(hdc, color);
+    DrawTextA(hdc, text, 0 - 1, rect, flags);
+    if old_font != 0 { SelectObject(hdc, old_font); }
+    return 0;
+}
+
+func gdi_make_font(height: i64, weight: i64, face: str) -> ptr {
+    return CreateFontA(height, 0, 0, 0, weight, 0, 0, 0, 0, 0, 0, 0, 49, face);
+}
+
+func gdi_delete(obj: i64) -> i64 {
+    if obj != 0 { DeleteObject(obj); }
+    return 0;
+}

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aether Studio — User Guide</title>
+<style>
+  :root{
+    --bg:#0E0E11; --bg2:#141417; --card:#1C1C21; --card2:#212128;
+    --bd:#2A2A33; --tx:#E7E7EF; --mut:#9A9AAC; --acc:#A78BFA; --acc2:#7C5CFF;
+    --grn:#7EE787; --org:#FFB86C; --cyan:#56D4DD; --code:#0B0B0E; --red:#FF7B72;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:linear-gradient(180deg,#101014,#0B0B0E);color:var(--tx);
+    font:15px/1.6 "Segoe UI",system-ui,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  a{color:var(--acc);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,kbd,pre{font-family:"Cascadia Code",Consolas,"Courier New",monospace}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+  header.hero{padding:54px 0 30px;border-bottom:1px solid var(--bd);
+    background:radial-gradient(900px 320px at 18% -8%,rgba(124,92,255,.18),transparent)}
+  .badge{display:inline-flex;align-items:center;gap:10px;font-weight:600;letter-spacing:.3px}
+  .logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--acc),var(--acc2));
+    display:inline-block;box-shadow:0 0 20px rgba(124,92,255,.5)}
+  h1{font-size:40px;margin:18px 0 8px;letter-spacing:-.5px}
+  h1 .g{background:linear-gradient(120deg,var(--acc),#C9B6FF);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--mut);font-size:17px;max-width:680px}
+  .tagrow{margin-top:18px;display:flex;gap:8px;flex-wrap:wrap}
+  .tag{font-size:12px;color:var(--acc);border:1px solid var(--bd);background:#16161b;
+    padding:4px 11px;border-radius:999px}
+  .layout{display:grid;grid-template-columns:210px 1fr;gap:34px;margin:34px 0 70px}
+  nav.toc{position:sticky;top:18px;align-self:start;font-size:13.5px}
+  nav.toc div.t{color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-size:11px;margin:16px 0 7px}
+  nav.toc a{display:block;color:#B9B9C9;padding:3px 0}
+  nav.toc a:hover{color:var(--acc);text-decoration:none}
+  section{margin:0 0 40px;scroll-margin-top:18px}
+  h2{font-size:25px;margin:8px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--bd)}
+  h2 .n{color:var(--acc);font-size:15px;font-weight:600;margin-right:8px;vertical-align:2px}
+  h3{font-size:17px;margin:22px 0 8px;color:#F2F2F8}
+  p{margin:9px 0}
+  ul,ol{margin:9px 0;padding-left:22px}
+  li{margin:5px 0}
+  .card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--bd);
+    border-radius:13px;padding:18px 20px;margin:16px 0;box-shadow:0 1px 0 rgba(255,255,255,.02) inset}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:820px){.layout{grid-template-columns:1fr}nav.toc{position:static}.grid{grid-template-columns:1fr}}
+  pre{background:var(--code);border:1px solid var(--bd);border-radius:10px;padding:14px 16px;overflow:auto;
+    margin:12px 0;font-size:13.5px;line-height:1.55}
+  pre .k{color:#FF7B9C}.pre .t{color:#FFB0A0}
+  pre .c{color:#6A6A7A;font-style:italic}
+  pre .s{color:var(--grn)}
+  pre .b{color:var(--acc)}
+  pre .o{color:var(--org)}
+  kbd{background:#23232b;border:1px solid #3a3a46;border-bottom-width:2px;border-radius:6px;
+    padding:1px 7px;font-size:12.5px;color:#EDEDF5;white-space:nowrap}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--bd)}
+  th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+  td kbd{margin-right:3px}
+  .pill{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.4px;padding:2px 8px;border-radius:6px}
+  .pill.new{background:rgba(167,139,250,.16);color:var(--acc);border:1px solid rgba(167,139,250,.4)}
+  .callout{border-left:3px solid var(--acc);background:#16161c;border-radius:0 10px 10px 0;padding:12px 16px;margin:14px 0}
+  .callout.tip{border-left-color:var(--grn)}
+  .callout.warn{border-left-color:var(--org)}
+  .callout b{color:#fff}
+  .step{display:flex;gap:13px;margin:12px 0}
+  .step .num{flex:0 0 28px;height:28px;border-radius:8px;background:var(--acc);color:#15131f;font-weight:800;
+    display:flex;align-items:center;justify-content:center;font-size:14px}
+  .feat{display:flex;gap:11px;align-items:flex-start}
+  .feat .ic{flex:0 0 30px;height:30px;border-radius:8px;background:#22222a;border:1px solid var(--bd);
+    display:flex;align-items:center;justify-content:center;color:var(--acc);font-weight:700}
+  footer{border-top:1px solid var(--bd);color:var(--mut);font-size:13px;padding:26px 0 60px;text-align:center}
+  hr{border:0;border-top:1px solid var(--bd);margin:26px 0}
+  .muted{color:var(--mut)}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <div class="badge"><span class="logo"></span> AETHER&nbsp;STUDIO</div>
+    <h1>The <span class="g">Aether Studio</span> User Guide</h1>
+    <p class="sub">A native, AI-assisted IDE for the ANCL language — editor, compiler, and an
+      agentic AI assistant in one tiny CRT-free executable. No Electron. No runtime. No bloat.</p>
+    <div class="tagrow">
+      <span class="tag">Native Win32</span><span class="tag">Self-correcting compiler</span>
+      <span class="tag">Local + cloud AI</span><span class="tag">Written in ANCL itself</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+<div class="layout">
+
+  <nav class="toc">
+    <div class="t">Get started</div>
+    <a href="#what">What is it</a>
+    <a href="#quick">Quick start</a>
+    <a href="#tour">The interface</a>
+    <div class="t">Build</div>
+    <a href="#code">Write &amp; run code</a>
+    <a href="#smart">The smart compiler</a>
+    <a href="#editor">Editor features</a>
+    <div class="t">AI</div>
+    <a href="#ai">The AI assistant</a>
+    <a href="#backends">Backends &amp; settings</a>
+    <div class="t">Reference</div>
+    <a href="#lang">ANCL in 5 minutes</a>
+    <a href="#keys">Keyboard shortcuts</a>
+    <a href="#faq">Tips &amp; FAQ</a>
+  </nav>
+
+  <main>
+
+  <section id="what">
+    <h2><span class="n">01</span>What is Aether Studio?</h2>
+    <p>Aether Studio is a complete development environment for <b>ANCL</b> — a from-scratch systems
+      language whose compiler emits native Windows <code>PE32+</code> executables directly (hand-encoded
+      x86-64, its own PE writer, <b>no C runtime, VM, assembler, or linker</b>). Remarkably, the IDE
+      itself is written <i>in ANCL</i> and compiles its own source.</p>
+    <div class="grid">
+      <div class="card"><div class="feat"><div class="ic">&#9632;</div><div>
+        <h3 style="margin-top:0">All in one</h3>
+        <p class="muted">A syntax-highlighting editor, a file tree, a one-key compiler, a program
+          runner, and an AI agent — a single ~390&nbsp;KB native binary.</p></div></div></div>
+      <div class="card"><div class="feat"><div class="ic">&#9650;</div><div>
+        <h3 style="margin-top:0">AI-native</h3>
+        <p class="muted">Chat with a coding agent that can read, compile, and edit your files —
+          powered by a local model, a cloud API, or an offline ANCL brain.</p></div></div></div>
+    </div>
+  </section>
+
+  <section id="quick">
+    <h2><span class="n">02</span>Quick start (60 seconds)</h2>
+    <div class="card">
+      <div class="step"><div class="num">1</div><div><b>Open a file.</b> Your projects live in
+        <code>Documents\Aether Projects</code>. Click <code>hello.ancl</code> in the tree on the left to open it,
+        or use <kbd>Ctrl</kbd>+<kbd>O</kbd>.</div></div>
+      <div class="step"><div class="num">2</div><div><b>Edit it.</b> Type in the editor. Code is colored
+        as you type; the gutter shows line numbers and the status bar shows <code>Ln, Col</code>.</div></div>
+      <div class="step"><div class="num">3</div><div><b>Compile.</b> Press <kbd>Ctrl</kbd>+<kbd>B</kbd>
+        (or the <b>Compile</b> button). The compiler's output streams into the pane at the bottom.
+        Errors are clickable — the editor jumps to the failing line.</div></div>
+      <div class="step"><div class="num">4</div><div><b>Run.</b> Press <kbd>F5</kbd> to build <i>and</i> run;
+        the program's output and exit code appear in the output pane.</div></div>
+      <div class="step"><div class="num">5</div><div><b>Stuck on an error?</b> Press <b>Fix</b> for a
+        one-click mechanical repair, or ask the AI assistant on the right.</div></div>
+    </div>
+    <div class="callout tip"><b>Tip —</b> <b>New</b> (or <kbd>Ctrl</kbd>+? from the File menu) scaffolds a
+      ready-to-compile console app from a template, so you always start from working code.</div>
+  </section>
+
+  <section id="tour">
+    <h2><span class="n">03</span>The interface</h2>
+    <p>The window is split into five working areas:</p>
+    <ul>
+      <li><b>Activity rail</b> (far left) — quick icons: open folder, search, AI, settings.</li>
+      <li><b>File tree</b> — your workspace folder. Click a file to open it in a tab. Double-click a name to rename it. Binary files (<code>.exe</code>, <code>.ico</code>, …) are protected from being opened as garbage text.</li>
+      <li><b>Editor</b> (center) — a syntax-colored code editor with a line-number gutter and multi-file tabs (up to 8 open documents).</li>
+      <li><b>Output pane</b> (bottom) — compiler messages, program output, and smart-compiler reports.</li>
+      <li><b>AI chat rail</b> (right) — the Aether Agent: a transcript, an input box, <b>Send</b>/<b>Stop</b>, and an image-attach button for vision.</li>
+    </ul>
+    <p>A <b>menu bar</b> (File · Edit · Build · Help) and a <b>toolbar</b> (Open · Save · Compile · Run ·
+      Settings · <b>Fix</b>) sit across the top; a <b>status bar</b> runs along the bottom.</p>
+  </section>
+
+  <section id="code">
+    <h2><span class="n">04</span>Writing &amp; running code</h2>
+    <table>
+      <tr><th>Action</th><th>How</th><th>What it does</th></tr>
+      <tr><td><b>New</b></td><td>File &#8250; New</td><td>Starts a fresh console app from a template.</td></tr>
+      <tr><td><b>New Project</b></td><td>File &#8250; New Project…</td><td>Pick a folder; scaffolds <code>main.ancl</code> and opens it.</td></tr>
+      <tr><td><b>Save</b></td><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>Writes the active tab to disk (clean LF line endings).</td></tr>
+      <tr><td><b>Compile</b></td><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td><td>Builds the current file; output + errors stream to the pane.</td></tr>
+      <tr><td><b>Run</b></td><td><kbd>F5</kbd></td><td>Builds, then runs the program and captures its output + exit code.</td></tr>
+      <tr><td><b>Stop</b></td><td>Build &#8250; Stop Run</td><td>Terminates a running program (or cancels the agent).</td></tr>
+      <tr><td><b>View ASM</b></td><td>Build &#8250; View ASM</td><td>Shows the generated x86-64 assembly listing.</td></tr>
+    </table>
+    <div class="callout"><b>Note —</b> The compiler is bundled with the IDE (<code>bin\ancl_compiler.exe</code>),
+      so builds work out of the box with nothing else installed.</div>
+  </section>
+
+  <section id="smart">
+    <h2><span class="n">05</span>The smart compiler <span class="pill new">SELF-CORRECTING</span></h2>
+    <p>Aether's compiler doesn't just reject mistakes — it can <b>heal</b> them. Two tiers are built
+      right into the IDE:</p>
+
+    <h3>Fix — mechanical auto-fix (offline, instant)</h3>
+    <p>Press the <b>Fix</b> button (toolbar), <b>Build &#8250; Auto-Fix</b>, or just type <code>fix</code>
+      in the chat box. The compiler runs a <b>dry run</b> first and shows exactly what it would change in
+      the output pane; you confirm, and it applies the fixes and reloads the healed source. Your original
+      is always preserved as a <code>.bak</code> file. It's fully deterministic and needs no AI.</p>
+    <p>It heals the most common slips automatically:</p>
+    <div class="grid">
+      <div class="card">
+        <p style="margin-top:0"><b>You wrote (C habits):</b></p>
+<pre><span class="c">// add two numbers</span>
+func add(a: i32, b: i32) -> i32 {
+    return a + b   <span class="c">&lt;- missing ;</span>
+}</pre>
+      </div>
+      <div class="card">
+        <p style="margin-top:0"><b>Fix heals it to:</b></p>
+<pre><span class="c"># add two numbers</span>
+func add(a: i32, b: i32) -> i32 {
+    return a + b;
+}</pre>
+      </div>
+    </div>
+    <p class="muted">Handles: <code>//</code> &#8594; <code>#</code> comments; missing <code>;</code>
+      <code>)</code> <code>]</code> <code>}</code> <code>-&gt;</code> <code>=&gt;</code>;
+      and C-isms like <code>bool</code>/<code>true</code>/<code>false</code>/<code>float</code>/<code>double</code>
+      &#8594; their ANCL equivalents.</p>
+
+    <h3>AI Repair — when the fix isn't mechanical</h3>
+    <p>For logic and structural errors, use <b>Build &#8250; AI Repair…</b> (or type <code>repair</code>
+      in chat). The IDE compiles your file, captures the <i>real</i> compiler errors, and hands them —
+      with your source — to the AI agent. The agent reads the file, fixes only what's needed, and writes
+      a corrected version back. You review the proposed change before it's applied (type <code>apply</code>
+      or <code>reject</code> in the chat).</p>
+    <div class="callout"><b>The compiler is the judge.</b> A wrong AI patch simply fails to compile and the
+      loop tries again — a broken program can never be silently shipped.</div>
+  </section>
+
+  <section id="editor">
+    <h2><span class="n">06</span>Editor features</h2>
+    <div class="grid">
+      <div class="card"><h3 style="margin-top:0">Find &amp; Replace</h3>
+        <p class="muted">Press <kbd>Ctrl</kbd>+<kbd>F</kbd>. The bar appears in the toolbar row. Type and
+          press <kbd>Enter</kbd> to find the next match (case-insensitive, wraps around). Close it with the
+          <b>✕</b> button or <kbd>Esc</kbd>.</p></div>
+      <div class="card"><h3 style="margin-top:0">Command palette</h3>
+        <p class="muted">Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> for a searchable list of every
+          command — New, Compile, Run, Auto-Fix, AI Repair, Settings, User Guide, and more.</p></div>
+      <div class="card"><h3 style="margin-top:0">Tabs</h3>
+        <p class="muted">Open up to 8 files at once. Unsaved tabs show a <code>*</code>. Switch tabs from
+          the strip above the editor.</p></div>
+      <div class="card"><h3 style="margin-top:0">Syntax highlighting</h3>
+        <p class="muted">Keywords, types, builtins, strings, and comments are colored live as you type,
+          driven by a native ANCL tokenizer.</p></div>
+    </div>
+  </section>
+
+  <section id="ai">
+    <h2><span class="n">07</span>The AI assistant</h2>
+    <p>The right-hand rail is an <b>agentic</b> assistant, not just a chat box. It can use tools to act on
+      your project:</p>
+    <ul>
+      <li><b>read_file</b> — read a file in your workspace.</li>
+      <li><b>list_dir</b> — list a folder.</li>
+      <li><b>compile_file</b> — invoke the native compiler and read back the result.</li>
+      <li><b>write_file</b> / <b>create_file</b> — propose edits to your code.</li>
+    </ul>
+    <p>When the agent edits the file you have open, the change is shown to you first — type
+      <code>apply</code> to accept it into the editor or <code>reject</code> to discard it. Press
+      <b>Stop</b> to cancel mid-generation.</p>
+    <h3>Chat shortcuts</h3>
+    <table>
+      <tr><th>Type this</th><th>Result</th></tr>
+      <tr><td><code>fix</code></td><td>Runs the mechanical auto-fix on the current file.</td></tr>
+      <tr><td><code>repair</code></td><td>Runs AI Repair against the live compiler errors.</td></tr>
+      <tr><td><code>apply</code> / <code>reject</code></td><td>Accept or discard a proposed edit.</td></tr>
+    </table>
+    <div class="callout tip"><b>Vision —</b> Click the <b>Img</b> button to attach a screenshot or diagram;
+      a vision-capable model can then "see" it (e.g. "build this UI" or "what's wrong here?").</div>
+
+    <h3>AI-native completion &amp; intent <span class="pill new">NEW</span></h3>
+    <p>Beyond the chat, Aether Studio has a tiny, local <b>op-brain</b> that predicts code
+      <em>structure</em> (the compiler's AST) rather than text — so it is instant, fully offline, and
+      can only ever suggest valid ANCL constructs.</p>
+    <table>
+      <tr><th>Shortcut</th><th>What it does</th></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Space</kbd></td><td><b>AI autocomplete</b> — the op-brain predicts the next code structure; suggestions appear in the Output pane.</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></td><td><b>Plan from Intent</b> — reads your <code>#&nbsp;@INTENT</code> goal, the router classifies it (ancl&nbsp;/&nbsp;protocol&nbsp;/&nbsp;both&nbsp;/&nbsp;chat), and the Aether Agent is <b>pre-loaded</b> with a prompt to implement it. Then just press <b>Send</b>.</td></tr>
+    </table>
+    <p>State your goal at the top of a file in an <b>@INTENT block</b> (<b>New Project</b> seeds one for you):</p>
+    <pre><code># @INTENT
+# goal: build a modbus tcp logger with a gui window
+# skills:</code></pre>
+    <p>This is the <b>intent-driven pipeline</b>: you state the goal &rarr; the router picks the skills
+      &amp; a starter template &rarr; the Agent (or templates) fill it in &rarr; the <b>compiler verifies
+      every step</b>. AI output is checked, not trusted.</p>
+    <div class="callout tip"><b>Tiered &amp; local-first —</b> the op-brain routes &amp; completes for free
+      and offline; it escalates to your chosen LLM only for the heavy generation.</div>
+
+    <h3>Captured-frame tools <span class="pill new">NEW</span></h3>
+    <p>Sniffed some industrial traffic and want to know what it is — or whether it's <em>safe</em>? Paste a
+      captured frame's raw hex bytes into the editor, then:</p>
+    <table>
+      <tr><th>Shortcut</th><th>What it does</th></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd></td><td><b>Identify protocol</b> — the learned frame brain names the industrial protocol and loads a compile-ready starter client to talk to it.</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd></td><td><b>Anomaly-check</b> — the edge-IDS brain reports <code>normal</code> or <code>ANOMALY</code> with the reason (out-of-profile access, malformed frame, or out-of-range value) plus the decoded op / address / value. Modbus, FINS &amp; IEC-104 today.</td></tr>
+    </table>
+    <p>Both run fully offline against tiny pure-ANCL models — no cloud, no dependencies, CRT-free like the rest of Aether Studio.</p>
+  </section>
+
+  <section id="backends">
+    <h2><span class="n">08</span>Backends &amp; settings</h2>
+    <p>Open <b>Settings</b> (toolbar) to choose where the AI runs. Pick the one that fits your hardware
+      and privacy needs:</p>
+    <table>
+      <tr><th>Backend</th><th>Best for</th><th>Notes</th></tr>
+      <tr><td><b>Ollama</b></td><td>Free, private, local</td><td>Point at <code>http://localhost:11434</code>; use <b>Refresh models</b> to list what you have installed. Smaller models run on modest hardware.</td></tr>
+      <tr><td><b>OpenAI-compatible</b></td><td>Hosted models</td><td>Base URL + model; key from the <code>OPENAI_API_KEY</code> environment variable.</td></tr>
+      <tr><td><b>Anthropic</b></td><td>Claude (single-shot)</td><td>Key from <code>ANTHROPIC_API_KEY</code>. Great for explanations.</td></tr>
+      <tr><td><b>Local Brain (ANCL)</b></td><td>Fully offline autocomplete</td><td>A tiny ANCL neural net — completes the open file from the caret, no server needed.</td></tr>
+      <tr><td><b>Aether Engine (local)</b></td><td>Real LLMs, zero dependencies</td><td><b>The default.</b> The pure-ANCL inference engine (<code>aether_engine.exe</code> beside the IDE). The IDE starts and stops the server for you — <b>Refresh models</b> lists everything you have (the shared store <i>and</i> your Ollama models), or type a name and click <b>Pull model</b> to download it. Replies <b>stream live</b>; the model loads once (a one-time "loading…" wait), then chat is fast. Click <b>Options…</b> for friendly settings — Hardware, Output, Style, Reply length, Speculation, and <b>Agent tools</b> (Off = fast chat, the default; On = read/write/compile files, best on a 7B+, slower first response on big prompts). Runs on any Vulkan GPU, falls back to CPU.</td></tr>
+    </table>
+    <div class="callout warn"><b>Privacy —</b> API keys are read from environment variables at request time
+      and are <b>never</b> written to the config file. Ollama, the Local Brain and the Aether Engine keep
+      everything on your machine.</div>
+    <div class="callout tip"><b>Modest PC?</b> Choose a small Ollama model (e.g. a 1–2&nbsp;B model). Bigger
+      models give better tool-use but need more RAM.</div>
+  </section>
+
+  <section id="lang">
+    <h2><span class="n">09</span>ANCL in 5 minutes</h2>
+    <p>Enough to read and write the examples. A program is a set of <code>func</code>s; execution starts
+      at <code>main</code>, whose return value is the process exit code.</p>
+    <h3>Hello, world</h3>
+<pre><span class="o">@DATA</span>
+banner: <span class="b">str</span> = <span class="s">"Hello from a native ANCL program!\n"</span>;
+
+<span class="o">@CODE</span>
+func main() -> i32 {
+    syscall 1, banner;   <span class="c"># write the string to stdout</span>
+    return 0;            <span class="c"># exit code 0</span>
+}</pre>
+    <h3>Functions, types, and an exit code</h3>
+<pre>func square(n: i64) -> i64 {
+    return n * n;
+}
+
+func main() -> i64 {
+    return square(7);    <span class="c"># the process exits with code 49</span>
+}</pre>
+    <ul>
+      <li><b>Comments</b> start with <code>#</code>.</li>
+      <li><b>Integer types:</b> <code>i32</code>, <code>i64</code>; <b>floats:</b> <code>f64</code>; strings live in <code>@DATA</code> as <code>str</code>.</li>
+      <li><b>Sections:</b> <code>@DATA</code> for constants/strings, <code>@CODE</code> for functions.</li>
+      <li><b>Statements end in <code>;</code></b> — and if you forget, the <b>Fix</b> button has your back.</li>
+    </ul>
+    <div class="callout"><b>Learn by example —</b> use <b>New</b> for a working console app, or open the bundled
+      <code>templates\</code> and <code>src\</code> files (the IDE's own source) to see real, substantial ANCL.</div>
+  </section>
+
+  <section id="keys">
+    <h2><span class="n">10</span>Keyboard shortcuts</h2>
+    <table>
+      <tr><th>Key</th><th>Action</th><th>Key</th><th>Action</th></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>Save</td><td><kbd>Ctrl</kbd>+<kbd>B</kbd></td><td>Compile</td></tr>
+      <tr><td><kbd>F5</kbd></td><td>Build &amp; Run</td><td><kbd>F1</kbd></td><td>This guide</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>O</kbd></td><td>Open file</td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd></td><td>Save As</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>Find / Replace</td><td><kbd>Esc</kbd></td><td>Close find bar</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd></td><td>Command palette</td><td><kbd>Enter</kbd></td><td>Send chat / Find next</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Y</kbd></td><td>Undo / Redo</td><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>Select all</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd></td><td>Identify a captured frame</td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd></td><td>Anomaly-check a frame</td></tr>
+    </table>
+  </section>
+
+  <section id="faq">
+    <h2><span class="n">11</span>Tips &amp; FAQ</h2>
+    <h3>The AI reply is empty / never comes.</h3>
+    <p>Check <b>Settings</b>: for Ollama, make sure the server is running and a model is selected (use
+      <b>Refresh models</b>). Small local models can be slow on the first call while they load — give it a
+      few seconds. For cloud backends, confirm the relevant API-key environment variable is set.</p>
+    <h3>My build fails with a parse error.</h3>
+    <p>Click the error in the output pane to jump to the line, then press <b>Fix</b> for mechanical slips
+      (missing <code>;</code>, <code>//</code> comments) or <b>AI Repair</b> for anything deeper.</p>
+    <h3>Where are my files?</h3>
+    <p><code>Documents\Aether Projects</code> by default. Use <b>Open Folder</b> (File menu or the rail's
+      folder icon) to work anywhere else. The IDE's own install folder is kept separate so you can't break it.</p>
+    <h3>Is anything sent to the cloud?</h3>
+    <p>Only if you choose a cloud backend. Ollama, the Local Brain and the Aether Engine are fully offline.</p>
+  </section>
+
+  <footer>
+    Aether Studio &mdash; a native ANCL IDE, written in ANCL. No Electron. No CRT. No runtime.<br>
+    Press <kbd>F1</kbd> any time to reopen this guide.
+  </footer>
+
+  </main>
+</div>
+</div>
+</body>
+</html>

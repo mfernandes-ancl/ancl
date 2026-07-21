@@ -1,0 +1,1173 @@
+# ============================================================================
+#  opc_explorer.ancl  -  ANCL OPC DA Explorer  (Phase 6.11, native Win32 GUI)
+#
+#  A "normal" Windows OPC DA test client, written entirely in ANCL:
+#    * Browses OPC DA servers (OpcEnum: IOPCServerList -> IEnumGUID), LOCAL or
+#      on a remote box via the Host/IP field (DCOM CoCreateInstanceEx).
+#    * Connect / Disconnect (CoCreateInstanceEx(IOPCServer) + AddGroup).
+#    * Browse Tags -> IOPCBrowseServerAddressSpace flat browse -> AddItems
+#      every tag -> a comctl32 ListView grid (Item ID | Value | Type | Quality).
+#    * Start/Stop Poll (poll-rate + WM_TIMER) -> IOPCSyncIO::Read of ALL tag
+#      handles each tick -> live cells. Values typed via core_lib/numfmt.ancl
+#      (signed ints, BOOL, IEEE-754 R4/R8 floats, OLE DATE) -- integer-only.
+#    * (also a single Item-ID box + Read.)
+#
+#  100% CRT-free PE32+, GUI subsystem. Imports kernel32 + user32 + comctl32 +
+#  ole32. Built on the Phase 6.11 `callp` primitive + win32_com + numfmt.
+# ============================================================================
+
+# ============================================================================
+# 1. TOP-LEVEL IMPORTS
+# ============================================================================
+import "../../core_lib/win32_api.ancl";
+import "../../core_lib/win32_com.ancl";
+import "../../core_lib/numfmt.ancl";
+extern "comctl32.dll" InitCommonControlsEx;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "gdi32.dll" CreatePen -> ptr;
+extern "gdi32.dll" SelectObject -> ptr;
+extern "gdi32.dll" Rectangle -> i32;
+extern "gdi32.dll" SetBkMode -> i32;
+extern "user32.dll" DrawTextA -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "gdi32.dll" RoundRect -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "user32.dll" GetWindowRect -> i32;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+
+# ============================================================================
+# 2. GLOBAL SYSTEM MEMORY SEGMENT
+# ============================================================================
+@DATA
+
+clsname:  str = "ANCLOPCEXPLORER";
+title:    str = "ANCL OPC DA Explorer";
+cls_stat: str = "STATIC";
+cls_btn:  str = "BUTTON";
+cls_edit: str = "EDIT";
+cls_list: str = "LISTBOX";
+cls_lv:   str = "SysListView32";
+gui_empty:str = "";
+lbl_srv:  str = "OPC DA servers (Refresh to (re)list; uses Host/IP if set):";
+lbl_item: str = "Item ID:";
+lbl_poll: str = "Poll ms:";
+lbl_log:  str = "Log:";
+lbl_host: str = "Host / IP  (blank = local; remote = DCOM):";
+lbl_dcom: str = "OPC DA needs no client port (DCOM/RPC 135).";
+btn_refr: str = "Refresh";
+btn_conn: str = "Connect";
+btn_disc: str = "Disconnect";
+btn_brws: str = "Browse Tags";
+btn_read: str = "Read";
+btn_pon:  str = "Start Poll";
+btn_poff: str = "Stop Poll";
+def_item: str = "Random.Int4";
+def_poll: str = "1000";
+g_group:  str = "AnclGrp";
+crlf:     str = "\r\n";
+col_item: str = "Item ID";
+col_val:  str = "Value";
+col_type: str = "Type";
+col_qual: str = "Quality";
+
+m_st_disc: str = "Status: DISCONNECTED";
+m_st_conn: str = "Status: CONNECTED to ";
+m_enum:    str = "[enum] browsing OPC DA servers via OpcEnum...\r\n";
+m_enum_e:  str = "[enum] OpcEnum unavailable, hr = ";
+m_enum_n:  str = "[enum] OpcEnum returned a null interface.\r\n";
+m_enum_d:  str = "[enum] servers found = ";
+m_already: str = "[connect] already connected - disconnect first.\r\n";
+m_nosel:   str = "[connect] select a server in the list first.\r\n";
+m_conn_p:  str = "[connect] -> ";
+m_cci_e:   str = "[connect] CoCreateInstanceEx failed, hr = ";
+m_cci_n:   str = "[connect] server pointer was null.\r\n";
+m_grp_e:   str = "[connect] AddGroup failed, hr = ";
+m_grp_n:   str = "[connect] item-manager pointer was null.\r\n";
+m_sio_e:   str = "[connect] QueryInterface(IOPCSyncIO) failed, hr = ";
+m_conn_ok: str = "[connect] connected. Press Browse Tags, or read a single item.\r\n";
+m_disc_ok: str = "[disconnect] released group + server interfaces.\r\n";
+m_noconn:  str = "[op] not connected - press Connect first.\r\n";
+m_read_p:  str = "[read] item = ";
+m_add_e:   str = "[read] AddItems failed, hr = ";
+m_item_e:  str = "[read] item-level error, hr = ";
+m_read_e:  str = "[read] Read failed, hr = ";
+m_val_p:   str = ">>> VALUE = ";
+m_vt_p:    str = "   [VT=";
+m_q_p:     str = " quality=";
+m_close:   str = "]\r\n";
+m_browse:  str = "[browse] flat-browsing the server address space...\r\n";
+m_brws_e:  str = "[browse] failed, hr = ";
+m_brws_n:  str = "[browse] no browse interface (server may not support it).\r\n";
+m_brws_d:  str = "[browse] tags added to grid = ";
+m_nobrws:  str = "[poll] press Browse Tags first.\r\n";
+m_poll_on: str = "[poll] polling every ms = ";
+m_poll_off:str = "[poll] stopped.\r\n";
+
+v_dash:  str = "--";
+v_true:  str = "TRUE";
+v_false: str = "FALSE";
+ty_i2:   str = "I2";
+ty_i4:   str = "I4";
+ty_r4:   str = "R4";
+ty_r8:   str = "R8";
+ty_bstr: str = "BSTR";
+ty_bool: str = "BOOL";
+ty_ui1:  str = "UI1";
+ty_i8:   str = "I8";
+ty_date: str = "DATE";
+ty_i1:   str = "I1";
+ty_ui2:  str = "UI2";
+ty_ui4:  str = "UI4";
+ty_ui8:  str = "UI8";
+ty_vt:   str = "VT=";
+ql_good: str = "GOOD";
+ql_unc:  str = "UNCERTAIN";
+ql_bad:  str = "BAD";
+
+clsidEnum:  buf = 16;
+iidSrvList: buf = 16;
+catidDA20:  buf = 16;
+iidServer:  buf = 16;
+iidItemMgt: buf = 16;
+iidSyncIO:  buf = 16;
+iidBrowse:  buf = 16;
+
+g_hinst:   buf = 8;
+g_hwnd:    buf = 8;
+g_list:    buf = 8;
+g_status:  buf = 8;
+g_itemed:  buf = 8;
+g_polled:  buf = 8;
+g_grid:    buf = 8;
+g_log:     buf = 8;
+g_oldGridProc: buf = 8;
+COLOR_BG_DEEP:     i64 = 0x1C1008;      # #08101C
+COLOR_BG_PANEL:    i64 = 0x060402;      # #020406
+COLOR_BG_CARD:     i64 = 0x180D05;      # #050D18
+COLOR_BG_INPUT:    i64 = 0x080604;      # #040608
+COLOR_BG_HOVER:    i64 = 0x301F0D;      # #0D1F30
+COLOR_TEXT_PRIMARY:i64 = 0xAB9687;      # #8796AB
+COLOR_TEXT_BRIGHT: i64 = 0xFFFFFF;      # #FFFFFF
+COLOR_TEXT_DIM:    i64 = 0x68554A;      # #4A5568
+COLOR_NEON_BLUE:   i64 = 0xFFFF29;      # #29FFFF
+COLOR_BLUE:        i64 = 0xFFA846;      # #46A8FF
+COLOR_GREEN:       i64 = 0x53D339;      # #39D353
+COLOR_RED:         i64 = 0x703AF5;      # #F53A70
+COLOR_BORDER:      i64 = 0x7C6543;      # #43657C
+
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_pen_border:   buf = 8;
+g_pen_blue:     buf = 8;
+g_pen_neon:     buf = 8;
+g_font_normal:  buf = 8;
+g_font_header:  buf = 8;
+g_btn_txt:      buf = 64;
+g_hostHwnd:buf = 8;
+g_wndcls:  buf = 96;
+g_msg:     buf = 64;
+g_rect:    buf = 16;
+g_ps:      buf = 72;
+g_icc:     buf = 8;
+lvcol:     buf = 64;
+lvitem:    buf = 96;
+
+g_pserver: buf = 8;
+g_pitemmgt:buf = 8;
+g_psyncio: buf = 8;
+g_conn:    buf = 8;
+g_polling: buf = 8;
+h_srvgrp:  buf = 8;
+d_revrate: buf = 8;
+g_tagcount:buf = 8;
+g_taghnd:  buf = 1024;
+
+g_csi:      buf = 32;     # COSERVERINFO
+g_mqi:      buf = 24;     # MULTI_QI
+g_hostbuf:  buf = 128;    # ASCII host typed by the user
+g_hostwide: buf = 256;    # widened host (COSERVERINFO.pwszName)
+g_srvclsids:buf = 4096;   # CLSID[256] for the enumerated servers (connect uses these)
+g_srvcount: buf = 8;
+
+w_group:   buf = 64;
+w_item:    buf = 1024;
+w_empty:   buf = 8;
+w_space:   buf = 8;
+w_filter:  buf = 8;
+g_selprog: buf = 256;
+g_itembuf: buf = 256;
+g_narrow:  buf = 512;
+g_numbuf:  buf = 32;
+g_statbuf: buf = 320;
+g_valbuf:  buf = 64;
+g_typebuf: buf = 32;
+g_qualbuf: buf = 32;
+itemdef:   buf = 48;
+srv_h:     buf = 8;
+g_clsbuf:  buf = 16;
+g_fetch:   buf = 8;
+
+pp_list:   buf = 8;
+pp_enum:   buf = 8;
+pp_progid: buf = 8;
+pp_utype:  buf = 8;
+pp_server: buf = 8;
+pp_itemmgt:buf = 8;
+pp_syncio: buf = 8;
+pp_browse: buf = 8;
+pp_enumstr:buf = 8;
+pp_str:    buf = 8;
+pp_results:buf = 8;
+pp_adderr: buf = 8;
+pp_values: buf = 8;
+pp_readerr:buf = 8;
+pp_rmerr:  buf = 8;
+
+# ============================================================================
+# 3. EXECUTABLE LOGIC SEGMENT
+# ============================================================================
+@CODE
+
+func init_iids() -> i64 {
+    store64(clsidEnum + 0, 0x11D2482113486D51);
+    store64(clsidEnum + 8, 0x0000C106B33C94A4);
+    store64(iidSrvList + 0, 0x11D2482113486D50);
+    store64(iidSrvList + 8, 0x0000C106B33C94A4);
+    store64(catidDA20 + 0, 0x11D1CFE463D5F432);
+    store64(catidDA20 + 8, 0xFBA13B086000C8B2);
+    store64(iidServer + 0, 0x11D0011E39C13A4D);
+    store64(iidServer + 8, 0xB3ADD8AF20007596);
+    store64(iidItemMgt + 0, 0x11D0011E39C13A54);
+    store64(iidItemMgt + 8, 0xB3ADD8AF20007596);
+    store64(iidSyncIO + 0, 0x11D0011E39C13A52);
+    store64(iidSyncIO + 8, 0xB3ADD8AF20007596);
+    store64(iidBrowse + 0, 0x11D0011E39C13A4F);
+    store64(iidBrowse + 8, 0xB3ADD8AF20007596);
+    return 0;
+}
+
+func append_log(s: ptr) -> i64 {
+    h = load64(g_log);
+    SendMessageA(h, 177, 2147483647, 2147483647);
+    SendMessageA(h, 194, 0, s);
+    return 0;
+}
+func loghr(pfx: ptr, v: i64) -> i64 {
+    append_log(pfx);
+    int_to_str(g_numbuf, v);
+    append_log(g_numbuf);
+    append_log(crlf);
+    return 0;
+}
+
+func build_itemdef(witem: ptr, vtreq: i64) -> i64 {
+    store64(itemdef + 0,  w_empty);
+    store64(itemdef + 8,  witem);
+    store32(itemdef + 16, 1);
+    store32(itemdef + 20, 1);
+    store32(itemdef + 24, 0);
+    store64(itemdef + 32, 0);
+    store16(itemdef + 40, vtreq);
+    store16(itemdef + 42, 0);
+    return 0;
+}
+
+func type_name(vt: i64, dst: ptr) -> i64 {
+    if vt == 2 { str_copy(dst, ty_i2); return 0; }
+    if vt == 3 { str_copy(dst, ty_i4); return 0; }
+    if vt == 4 { str_copy(dst, ty_r4); return 0; }
+    if vt == 5 { str_copy(dst, ty_r8); return 0; }
+    if vt == 7 { str_copy(dst, ty_date); return 0; }
+    if vt == 8 { str_copy(dst, ty_bstr); return 0; }
+    if vt == 11 { str_copy(dst, ty_bool); return 0; }
+    if vt == 16 { str_copy(dst, ty_i1); return 0; }
+    if vt == 17 { str_copy(dst, ty_ui1); return 0; }
+    if vt == 18 { str_copy(dst, ty_ui2); return 0; }
+    if vt == 19 { str_copy(dst, ty_ui4); return 0; }
+    if vt == 20 { str_copy(dst, ty_i8); return 0; }
+    if vt == 21 { str_copy(dst, ty_ui8); return 0; }
+    e = str_copy(dst, ty_vt);
+    int_to_str(e, vt);
+    return 0;
+}
+
+func qual_name(q: i64, dst: ptr) -> i64 {
+    m = band(q, 192);
+    if m == 192 { str_copy(dst, ql_good); return 0; }
+    if m == 64 { str_copy(dst, ql_unc); return 0; }
+    str_copy(dst, ql_bad);
+    return 0;
+}
+
+# VARIANT at OPCITEMSTATE+16 (vt @+16, data @+24) -> text in dst, fully typed
+func fmt_value(pv: ptr, dst: ptr) -> i64 {
+    vt = load16(pv + 16);
+    if vt == 2  { int_to_str(dst, nf_sext16(load16(pv + 24))); return 0; }
+    if vt == 3  { int_to_str(dst, nf_sext32(load32(pv + 24))); return 0; }
+    if vt == 16 { int_to_str(dst, nf_sext8(load8(pv + 24)));   return 0; }
+    if vt == 17 { int_to_str(dst, load8(pv + 24));  return 0; }
+    if vt == 18 { int_to_str(dst, load16(pv + 24)); return 0; }
+    if vt == 19 { int_to_str(dst, load32(pv + 24)); return 0; }
+    if vt == 20 { int_to_str(dst, load64(pv + 24)); return 0; }
+    if vt == 21 { int_to_str(dst, load64(pv + 24)); return 0; }
+    if vt == 11 {
+        if load16(pv + 24) != 0 { str_copy(dst, v_true); } else { str_copy(dst, v_false); }
+        return 0;
+    }
+    if vt == 4 { nf_ftoa(load32(pv + 24), dst); return 0; }
+    if vt == 5 { nf_dtoa(load64(pv + 24), dst); return 0; }
+    if vt == 7 { nf_oadate(load64(pv + 24), dst); return 0; }
+    if vt == 8 {
+        bstr = load64(pv + 24);
+        if bstr != 0 { w2a(dst, bstr); return 0; }
+    }
+    str_copy(dst, v_dash);
+    return 0;
+}
+
+func log_value(pv: ptr) -> i64 {
+    fmt_value(pv, g_valbuf);
+    append_log(m_val_p);  append_log(g_valbuf);
+    append_log(m_vt_p);   int_to_str(g_numbuf, load16(pv + 16)); append_log(g_numbuf);
+    append_log(m_q_p);    int_to_str(g_numbuf, load16(pv + 12)); append_log(g_numbuf);
+    append_log(m_close);
+    return 0;
+}
+
+func gv_addcol(idx: i64, w: i64, txt: ptr) -> i64 {
+    memset(lvcol, 0, 64);
+    store32(lvcol + 0, 15);
+    store32(lvcol + 8, w);
+    store64(lvcol + 16, txt);
+    store32(lvcol + 28, idx);
+    SendMessageA(load64(g_grid), 4123, idx, lvcol);
+    return 0;
+}
+func gv_setcell(row: i64, col: i64, txt: ptr) -> i64 {
+    memset(lvitem, 0, 96);
+    store32(lvitem + 0, 1);
+    store32(lvitem + 4, row);
+    store32(lvitem + 8, col);
+    store64(lvitem + 24, txt);
+    if col == 0 { SendMessageA(load64(g_grid), 4103, 0, lvitem); }
+    else        { SendMessageA(load64(g_grid), 4142, row, lvitem); }
+    return 0;
+}
+
+func read_host() -> i64 {
+    GetWindowTextA(load64(g_hostHwnd), g_hostbuf, 128);
+    a2w(g_hostwide, g_hostbuf);
+    return 0;
+}
+
+# CoCreateInstanceEx(clsid, iid) honoring g_hostwide (blank=local, else remote DCOM); fills ppout
+func com_create(clsidp: ptr, iidp: ptr, ppout: ptr) -> i64 {
+    store64(ppout, 0);
+    store64(g_mqi + 0, iidp);   # MULTI_QI.pIID
+    store64(g_mqi + 8, 0);      # .pItf
+    store32(g_mqi + 16, 0);     # .hr
+    if load16(g_hostwide) == 0 {
+        hr = CoCreateInstanceEx(clsidp, 0, 7, 0, 1, g_mqi);            # CLSCTX_INPROC|HANDLER|LOCAL
+    } else {
+        memset(g_csi, 0, 32);
+        store64(g_csi + 8, g_hostwide);                                # COSERVERINFO.pwszName
+        hr = CoCreateInstanceEx(clsidp, 0, 16, g_csi, 1, g_mqi);       # CLSCTX_REMOTE_SERVER
+    }
+    if hr < 0 { return hr; }
+    qihr = nf_sext32(load32(g_mqi + 16));
+    if qihr < 0 { return qihr; }
+    store64(ppout, load64(g_mqi + 8));
+    return hr;
+}
+
+func enum_servers() -> i64 {
+    read_host();
+    SendMessageA(load64(g_list), 388, 0, 0);        # LB_RESETCONTENT
+    store64(g_srvcount, 0);
+    append_log(m_enum);
+    store64(pp_list, 0);
+    hr = com_create(clsidEnum, iidSrvList, pp_list);
+    if hr < 0 { loghr(m_enum_e, hr); return 0; }
+    pList = load64(pp_list);
+    if pList == 0 { append_log(m_enum_n); return 0; }
+    store64(pp_enum, 0);
+    hr = callp(vmeth(pList, 3), pList, 1, catidDA20, 0, 0, pp_enum);   # EnumClassesOfCategories
+    if hr < 0 { loghr(m_enum_e, hr); com_release(pList); return 0; }
+    pEnum = load64(pp_enum);
+    if pEnum == 0 { append_log(m_enum_n); com_release(pList); return 0; }
+    n = 0;
+    while 1 {
+        store32(g_fetch, 0);
+        callp(vmeth(pEnum, 3), pEnum, 1, g_clsbuf, g_fetch);          # IEnumGUID::Next
+        if load32(g_fetch) != 1 { break; }
+        store64(pp_progid, 0);
+        store64(pp_utype, 0);
+        callp(vmeth(pList, 4), pList, g_clsbuf, pp_progid, pp_utype); # GetClassDetails
+        wprog = load64(pp_progid);
+        if wprog != 0 {
+            memcpy(g_srvclsids + n * 16, g_clsbuf, 16);               # keep CLSID for connect
+            w2a(g_narrow, wprog);
+            SendMessageA(load64(g_list), 384, 0, g_narrow);           # LB_ADDSTRING
+            CoTaskMemFree(wprog);
+            n = n + 1;
+        }
+        wut = load64(pp_utype);
+        if wut != 0 { CoTaskMemFree(wut); }
+        if n >= 256 { break; }
+    }
+    com_release(pEnum);
+    com_release(pList);
+    store64(g_srvcount, n);
+    loghr(m_enum_d, n);
+    return 0;
+}
+
+func add_one_item(witem: ptr, idx: i64) -> i64 {
+    build_itemdef(witem, 0);
+    store64(pp_results, 0);
+    store64(pp_adderr, 0);
+    pim = load64(g_pitemmgt);
+    callp(vmeth(pim, 3), pim, 1, itemdef, pp_results, pp_adderr);
+    h = 0;
+    pres = load64(pp_results);
+    perr = load64(pp_adderr);
+    if pres != 0 { h = load32(pres); CoTaskMemFree(pres); }
+    if perr != 0 { CoTaskMemFree(perr); }
+    store32(g_taghnd + idx * 4, h);
+    return 0;
+}
+
+func remove_all_items() -> i64 {
+    c = load64(g_tagcount);
+    if c == 0 { return 0; }
+    pim = load64(g_pitemmgt);
+    if pim == 0 { return 0; }
+    store64(pp_rmerr, 0);
+    callp(vmeth(pim, 5), pim, c, g_taghnd, pp_rmerr);
+    prm = load64(pp_rmerr);
+    if prm != 0 { CoTaskMemFree(prm); }
+    return 0;
+}
+
+func stop_poll() -> i64 {
+    if load64(g_polling) == 0 { return 0; }
+    KillTimer(load64(g_hwnd), 1);
+    store64(g_polling, 0);
+    append_log(m_poll_off);
+    return 0;
+}
+
+func do_disconnect() -> i64 {
+    stop_poll();
+    remove_all_items();
+    SendMessageA(load64(g_grid), 4105, 0, 0);       # LVM_DELETEALLITEMS
+    store64(g_tagcount, 0);
+    psv = load64(g_pserver);
+    if psv != 0 {
+        h = load32(h_srvgrp);
+        if h != 0 { callp(vmeth(psv, 7), psv, h, 1); }
+    }
+    com_release(load64(g_psyncio));
+    com_release(load64(g_pitemmgt));
+    com_release(psv);
+    store64(g_psyncio, 0);
+    store64(g_pitemmgt, 0);
+    store64(g_pserver, 0);
+    store32(h_srvgrp, 0);
+    store64(g_conn, 0);
+    SetWindowTextA(load64(g_status), m_st_disc);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    append_log(m_disc_ok);
+    return 0;
+}
+
+func do_connect() -> i64 {
+    if load64(g_conn) != 0 { append_log(m_already); return 0; }
+    idx = SendMessageA(load64(g_list), 392, 0, 0);  # LB_GETCURSEL
+    if idx < 0 { append_log(m_nosel); return 0; }
+    if idx >= load64(g_srvcount) { append_log(m_nosel); return 0; }
+    SendMessageA(load64(g_list), 393, idx, g_selprog);   # LB_GETTEXT (for display)
+    append_log(m_conn_p); append_log(g_selprog); append_log(crlf);
+    read_host();
+    hr = com_create(g_srvclsids + idx * 16, iidServer, pp_server);    # stored CLSID + host
+    if hr < 0 { loghr(m_cci_e, hr); return 0; }
+    psv = load64(pp_server);
+    if psv == 0 { append_log(m_cci_n); return 0; }
+    store64(g_pserver, psv);
+    a2w(w_group, g_group);
+    store64(pp_itemmgt, 0);
+    store32(h_srvgrp, 0);
+    store32(d_revrate, 0);
+    hr = callp(vmeth(psv, 3), psv,
+               w_group, 1, 1000, 1, 0, 0, 0,
+               h_srvgrp, d_revrate, iidItemMgt, pp_itemmgt);
+    if hr < 0 { loghr(m_grp_e, hr); do_disconnect(); return 0; }
+    pim = load64(pp_itemmgt);
+    if pim == 0 { append_log(m_grp_n); do_disconnect(); return 0; }
+    store64(g_pitemmgt, pim);
+    store64(pp_syncio, 0);
+    hr = com_qi(pim, iidSyncIO, pp_syncio);
+    if hr < 0 { loghr(m_sio_e, hr); do_disconnect(); return 0; }
+    store64(g_psyncio, load64(pp_syncio));
+    store64(g_conn, 1);
+    e = str_copy(g_statbuf, m_st_conn);
+    str_copy(e, g_selprog);
+    SetWindowTextA(load64(g_status), g_statbuf);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    append_log(m_conn_ok);
+    return 0;
+}
+
+func do_read() -> i64 {
+    if load64(g_conn) == 0 { append_log(m_noconn); return 0; }
+    GetWindowTextA(load64(g_itemed), g_itembuf, 256);
+    append_log(m_read_p); append_log(g_itembuf); append_log(crlf);
+    a2w(w_item, g_itembuf);
+    build_itemdef(w_item, 0);
+    pim = load64(g_pitemmgt);
+    psi = load64(g_psyncio);
+    store64(pp_results, 0);
+    store64(pp_adderr, 0);
+    hr = callp(vmeth(pim, 3), pim, 1, itemdef, pp_results, pp_adderr);
+    if hr < 0 { loghr(m_add_e, hr); return 0; }
+    perr = load64(pp_adderr);
+    pres = load64(pp_results);
+    aerr = 0;
+    if perr != 0 { aerr = nf_sext32(load32(perr)); }
+    if aerr < 0 {
+        loghr(m_item_e, aerr);
+        if pres != 0 { CoTaskMemFree(pres); }
+        if perr != 0 { CoTaskMemFree(perr); }
+        return 0;
+    }
+    hitem = 0;
+    if pres != 0 { hitem = load32(pres); }
+    store32(srv_h, hitem);
+    if pres != 0 { CoTaskMemFree(pres); }
+    if perr != 0 { CoTaskMemFree(perr); }
+    store64(pp_values, 0);
+    store64(pp_readerr, 0);
+    hr = callp(vmeth(psi, 3), psi, 2, 1, srv_h, pp_values, pp_readerr);
+    if hr < 0 { loghr(m_read_e, hr); }
+    pvals = load64(pp_values);
+    prerr = load64(pp_readerr);
+    if pvals != 0 { log_value(pvals); }
+    if pvals != 0 { CoTaskMemFree(pvals); }
+    if prerr != 0 { CoTaskMemFree(prerr); }
+    store64(pp_rmerr, 0);
+    callp(vmeth(pim, 5), pim, 1, srv_h, pp_rmerr);
+    prm = load64(pp_rmerr);
+    if prm != 0 { CoTaskMemFree(prm); }
+    return 0;
+}
+
+func do_browse() -> i64 {
+    if load64(g_conn) == 0 { append_log(m_noconn); return 0; }
+    stop_poll();
+    remove_all_items();
+    SendMessageA(load64(g_grid), 4105, 0, 0);
+    store64(g_tagcount, 0);
+    append_log(m_browse);
+    store64(pp_browse, 0);
+    hr = com_qi(load64(g_pserver), iidBrowse, pp_browse);
+    if hr < 0 { loghr(m_brws_e, hr); return 0; }
+    pBr = load64(pp_browse);
+    if pBr == 0 { append_log(m_brws_n); return 0; }
+    store64(pp_enumstr, 0);
+    hr = callp(vmeth(pBr, 5), pBr, 3, w_filter, 0, 0, pp_enumstr);   # BrowseOPCItemIDs(OPC_FLAT)
+    if hr < 0 { loghr(m_brws_e, hr); com_release(pBr); return 0; }
+    pES = load64(pp_enumstr);
+    if pES == 0 { append_log(m_brws_n); com_release(pBr); return 0; }
+    n = 0;
+    while 1 {
+        store32(g_fetch, 0);
+        store64(pp_str, 0);
+        callp(vmeth(pES, 3), pES, 1, pp_str, g_fetch);              # IEnumString::Next
+        if load32(g_fetch) != 1 { break; }
+        wname = load64(pp_str);
+        if wname != 0 {
+            w2a(g_narrow, wname);
+            gv_setcell(n, 0, g_narrow);
+            gv_setcell(n, 1, v_dash);
+            gv_setcell(n, 2, v_dash);
+            gv_setcell(n, 3, v_dash);
+            add_one_item(wname, n);
+            CoTaskMemFree(wname);
+            n = n + 1;
+        }
+        if n >= 256 { break; }
+    }
+    com_release(pES);
+    com_release(pBr);
+    store64(g_tagcount, n);
+    loghr(m_brws_d, n);
+    return 0;
+}
+
+func poll_all() -> i64 {
+    if load64(g_conn) == 0 { return 0; }
+    c = load64(g_tagcount);
+    if c == 0 { return 0; }
+    psi = load64(g_psyncio);
+    store64(pp_values, 0);
+    store64(pp_readerr, 0);
+    callp(vmeth(psi, 3), psi, 2, c, g_taghnd, pp_values, pp_readerr);
+    pv = load64(pp_values);
+    pe = load64(pp_readerr);
+    if pv != 0 {
+        i = 0;
+        while i < c {
+            ps = pv + i * 40;
+            fmt_value(ps, g_valbuf);
+            type_name(load16(ps + 16), g_typebuf);
+            qual_name(load16(ps + 12), g_qualbuf);
+            gv_setcell(i, 1, g_valbuf);
+            gv_setcell(i, 2, g_typebuf);
+            gv_setcell(i, 3, g_qualbuf);
+            i = i + 1;
+        }
+    }
+    if pv != 0 { CoTaskMemFree(pv); }
+    if pe != 0 { CoTaskMemFree(pe); }
+    return 0;
+}
+
+func start_poll() -> i64 {
+    if load64(g_conn) == 0 { append_log(m_noconn); return 0; }
+    if load64(g_tagcount) == 0 { append_log(m_nobrws); return 0; }
+    GetWindowTextA(load64(g_polled), g_numbuf, 16);
+    ms = str_to_int(g_numbuf);
+    if ms < 100 { ms = 100; }
+    if ms > 60000 { ms = 60000; }
+    SetTimer(load64(g_hwnd), 1, ms, 0);
+    store64(g_polling, 1);
+    loghr(m_poll_on, ms);
+    poll_all();
+    return 0;
+}
+
+func GridWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 78 { # WM_NOTIFY
+        lpnm = lParam;
+        code = load32(lpnm + 16);
+        
+        # Log all notifications from SysHeader32
+        hHeader = SendMessageA(hwnd, 4127, 0, 0); # LVM_GETHEADER
+        hwndFrom = load64(lpnm + 0);
+        if hwndFrom == hHeader {
+            append_log("[gridproc] Header notify, code = ");
+            int_to_str(g_numbuf, code);
+            append_log(g_numbuf);
+            append_log(crlf);
+        }
+        
+        if code == 0 - 12 { # NM_CUSTOMDRAW
+            if hwndFrom == hHeader {
+                dwDrawStage = load32(lpnm + 24);
+                append_log("[gridproc] Header NM_CUSTOMDRAW, stage = ");
+                int_to_str(g_numbuf, dwDrawStage);
+                append_log(g_numbuf);
+                append_log(crlf);
+                
+                if dwDrawStage == 1 { # CDDS_PREPAINT
+                    return 32; # CDRF_NOTIFYITEMDRAW
+                }
+                if dwDrawStage == 0x00010001 { # CDDS_ITEMPREPAINT
+                    hdc = load64(lpnm + 32);
+                    left = load32(lpnm + 40);
+                    top = load32(lpnm + 44);
+                    right = load32(lpnm + 48);
+                    bottom = load32(lpnm + 52);
+                    colIndex = load64(lpnm + 56);
+                    
+                    # Fill background with COLOR_BG_PANEL
+                    FillRect(hdc, lpnm + 40, load64(g_brush_panel));
+                    
+                    # Draw column text
+                    SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+                    SetBkMode(hdc, 1);
+                    oldFont = SelectObject(hdc, load64(g_font_normal));
+                    
+                    if colIndex == 0 { TextOutA(hdc, left + 8, top + 4, col_item, 7); }
+                    if colIndex == 1 { TextOutA(hdc, left + 8, top + 4, col_val, 5); }
+                    if colIndex == 2 { TextOutA(hdc, left + 8, top + 4, col_type, 4); }
+                    if colIndex == 3 { TextOutA(hdc, left + 8, top + 4, col_qual, 7); }
+                    
+                    SelectObject(hdc, oldFont);
+                    
+                    # Draw borders and separators
+                    oldPen = SelectObject(hdc, load64(g_pen_border));
+                    MoveToEx(hdc, left, bottom - 1, 0); LineTo(hdc, right, bottom - 1);
+                    MoveToEx(hdc, right - 1, top, 0); LineTo(hdc, right - 1, bottom);
+                    SelectObject(hdc, oldPen);
+                    
+                    return 4; # CDRF_SKIPDEFAULT
+                }
+            }
+        }
+    }
+    return CallWindowProcA(load64(g_oldGridProc), hwnd, msg, wParam, lParam);
+}
+
+func create_controls(hwnd: i64) -> i64 {
+    hinst = load64(g_hinst);
+    f_norm = load64(g_font_normal);
+    f_hdr = load64(g_font_header);
+
+    # Custom Minimize & Close title bar buttons
+    hmin = CreateWindowExA(0, cls_btn, "-", 0x5000000B, 832, 8, 26, 26, hwnd, 5002, hinst, 0);
+    SendMessageA(hmin, 48, f_norm, 1);
+    
+    hcls = CreateWindowExA(0, cls_btn, "X", 0x5000000B, 866, 8, 26, 26, hwnd, 5003, hinst, 0);
+    SendMessageA(hcls, 48, f_norm, 1);
+
+    h1 = CreateWindowExA(0, cls_stat, lbl_srv, 1342177280, 12, 48, 500, 18, hwnd, 0, hinst, 0);
+    SendMessageA(h1, 48, f_hdr, 1);
+
+    lst = CreateWindowExA(0, cls_list, gui_empty, 1344208897, 12, 70, 360, 116, hwnd, 2001, hinst, 0);
+    store64(g_list, lst);
+    SendMessageA(lst, 48, f_norm, 1);
+
+    h2 = CreateWindowExA(0, cls_btn, btn_refr, 1342177291, 385, 70, 120, 26, hwnd, 2002, hinst, 0);
+    SendMessageA(h2, 48, f_norm, 1);
+
+    h3 = CreateWindowExA(0, cls_btn, btn_conn, 1342177291, 385, 102, 120, 26, hwnd, 2003, hinst, 0);
+    SendMessageA(h3, 48, f_norm, 1);
+
+    h4 = CreateWindowExA(0, cls_btn, btn_disc, 1342177291, 385, 134, 120, 26, hwnd, 2004, hinst, 0);
+    SendMessageA(h4, 48, f_norm, 1);
+
+    h5 = CreateWindowExA(0, cls_btn, btn_brws, 1342177291, 385, 166, 120, 26, hwnd, 2008, hinst, 0);
+    SendMessageA(h5, 48, f_norm, 1);
+
+    # remote DCOM host/port (to the right of the buttons)
+    h6 = CreateWindowExA(0, cls_stat, lbl_host, 1342177280, 525, 74, 360, 16, hwnd, 0, hinst, 0);
+    SendMessageA(h6, 48, f_hdr, 1);
+
+    hh = CreateWindowExA(0, cls_edit, gui_empty, 1342177408, 525, 94, 350, 22, hwnd, 2014, hinst, 0);
+    store64(g_hostHwnd, hh);
+    SendMessageA(hh, 48, f_norm, 1);
+
+    h7 = CreateWindowExA(0, cls_stat, lbl_dcom, 1342177280, 525, 126, 360, 16, hwnd, 0, hinst, 0);
+    SendMessageA(h7, 48, f_hdr, 1);
+
+    sts = CreateWindowExA(0, cls_stat, m_st_disc, 1342177280, 12, 192, 870, 18, hwnd, 0, hinst, 0);
+    store64(g_status, sts);
+    SendMessageA(sts, 48, f_hdr, 1);
+
+    h8 = CreateWindowExA(0, cls_stat, lbl_item, 1342177280, 12, 220, 55, 20, hwnd, 0, hinst, 0);
+    SendMessageA(h8, 48, f_hdr, 1);
+
+    ie = CreateWindowExA(0, cls_edit, def_item, 1342177408, 70, 218, 240, 24, hwnd, 2005, hinst, 0);
+    store64(g_itemed, ie);
+    SendMessageA(ie, 48, f_norm, 1);
+
+    h9 = CreateWindowExA(0, cls_btn, btn_read, 1342177291, 318, 217, 70, 26, hwnd, 2006, hinst, 0);
+    SendMessageA(h9, 48, f_norm, 1);
+
+    h10 = CreateWindowExA(0, cls_stat, lbl_poll, 1342177280, 410, 220, 55, 20, hwnd, 0, hinst, 0);
+    SendMessageA(h10, 48, f_hdr, 1);
+
+    pe2 = CreateWindowExA(0, cls_edit, def_poll, 1342177408, 468, 218, 60, 24, hwnd, 2011, hinst, 0);
+    store64(g_polled, pe2);
+    SendMessageA(pe2, 48, f_norm, 1);
+
+    h11 = CreateWindowExA(0, cls_btn, btn_pon,  1342177291, 535, 217, 95, 26, hwnd, 2012, hinst, 0);
+    SendMessageA(h11, 48, f_norm, 1);
+
+    h12 = CreateWindowExA(0, cls_btn, btn_poff, 1342177291, 635, 217, 95, 26, hwnd, 2013, hinst, 0);
+    SendMessageA(h12, 48, f_norm, 1);
+
+    grid = CreateWindowExA(0, cls_lv, gui_empty, 1342177281, 12, 252, 870, 380, hwnd, 2010, hinst, 0);
+    store64(g_grid, grid);
+    SendMessageA(grid, 48, f_norm, 1);
+    
+    # Subclass the ListView control to intercept header notifications
+    oldProc = SetWindowLongPtrA(grid, 0 - 4, &GridWndProc);
+    store64(g_oldGridProc, oldProc);
+    
+    append_log("[subclass] oldProc = ");
+    int_to_str(g_numbuf, oldProc);
+    append_log(g_numbuf);
+    append_log(crlf);
+
+    SendMessageA(grid, 4150, 0, 32); # LVS_EX_FULLROWSELECT (disable default gridlines)
+    SendMessageA(grid, 4097, 0, COLOR_BG_CARD); # LVM_SETBKCOLOR
+    SendMessageA(grid, 4132, 0, COLOR_TEXT_PRIMARY); # LVM_SETTEXTCOLOR
+    SendMessageA(grid, 4134, 0, COLOR_BG_CARD); # LVM_SETTEXTBKCOLOR
+    
+    # Disable visual styles on ListView header so it honors custom colors
+    hHeader = SendMessageA(grid, 4127, 0, 0); # LVM_GETHEADER
+    SetWindowTheme(hHeader, w_empty, w_empty);
+    
+    # Initialize w_space to L" " and disable visual borders on all listbox/edit controls
+    store16(w_space + 0, 32);
+    store16(w_space + 2, 0);
+    SetWindowTheme(lst, w_space, w_space);
+    SetWindowTheme(hh, w_space, w_space);
+    SetWindowTheme(ie, w_space, w_space);
+    SetWindowTheme(pe2, w_space, w_space);
+    SetWindowTheme(lg, w_space, w_space);
+
+    gv_addcol(0, 320, col_item);
+    gv_addcol(1, 170, col_val);
+    gv_addcol(2, 90,  col_type);
+    gv_addcol(3, 110, col_qual);
+
+    h13 = CreateWindowExA(0, cls_stat, lbl_log, 1342177280, 12, 638, 60, 16, hwnd, 0, hinst, 0);
+    SendMessageA(h13, 48, f_hdr, 1);
+
+    lg = CreateWindowExA(0, cls_edit, gui_empty, 1344211140, 12, 656, 870, 54, hwnd, 2007, hinst, 0);
+    store64(g_log, lg);
+    SendMessageA(lg, 48, f_norm, 1);
+    return 0;
+}
+
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 {
+        create_controls(hwnd);
+        enum_servers();
+        return 0;
+    }
+    if msg == 273 {
+        id = band(wParam, 65535);
+        if id == 5002 { # Minimize
+            ShowWindow(hwnd, 6); # SW_MINIMIZE
+            return 0;
+        }
+        if id == 5003 { # Close
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if id == 2002 { enum_servers(); }
+        if id == 2003 { do_connect(); }
+        if id == 2004 { do_disconnect(); }
+        if id == 2006 { do_read(); }
+        if id == 2008 { do_browse(); }
+        if id == 2012 { start_poll(); }
+        if id == 2013 { stop_poll(); }
+        return 0;
+    }
+    if msg == 275 { poll_all(); return 0; }
+    
+    if msg == 132 { # WM_NCHITTEST (0x0084)
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lParam, 65535);
+        my = shr(lParam, 16);
+        cx = mx - wl;
+        cy = my - wt;
+        
+        if cy < 42 {
+            if cx >= 832 {
+                if cx < 858 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; } # HTCLIENT
+                    }
+                }
+            }
+            if cx >= 866 {
+                if cx < 892 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; } # HTCLIENT
+                    }
+                }
+            }
+            return 2; # HTCAPTION
+        }
+        return 1; # HTCLIENT
+    }
+
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        r = load32(g_rect + 8);
+        b = load32(g_rect + 12);
+        
+        # 1. Title bar background: t=0, l=0, r=width, b=42
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, r);
+        store32(g_rect + 12, 42);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+        
+        # 2. Main Area: t=42, l=0, r=width, b=height
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 42);
+        store32(g_rect + 8, r);
+        store32(g_rect + 12, b);
+        FillRect(hdc, g_rect, load64(g_brush_deep));
+        
+        # 3. Neon divider line at y=41
+        old_pen = SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 0, 41, 0);
+        LineTo(hdc, r, 41);
+        
+        # 4. Draw Title Bar Text
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_NEON_BLUE);
+        SelectObject(hdc, load64(g_font_header));
+        TextOutA(hdc, 15, 12, "ANCL OPC DA EXPLORER", 20);
+        
+        SetTextColor(hdc, COLOR_TEXT_DIM);
+        SelectObject(hdc, load64(g_font_normal));
+        TextOutA(hdc, 215, 14, "| Client", 8);
+        
+        # 5. Draw Dynamic Connection Status
+        if load64(g_conn) == 1 {
+            SetTextColor(hdc, COLOR_GREEN);
+            TextOutA(hdc, 290, 12, "* CONNECTED", 11);
+        } else {
+            SetTextColor(hdc, COLOR_RED);
+            TextOutA(hdc, 290, 12, "* DISCONNECTED", 14);
+        }
+        
+        # 6. Outer border and unified control borders
+        SelectObject(hdc, load64(g_pen_border));
+        SelectObject(hdc, GetStockObject(5)); # NULL_BRUSH
+        Rectangle(hdc, 0, 0, r, b);
+        
+        # Draw unified borders matching buttons style
+        Rectangle(hdc, 11, 69, 373, 187);      # Server Listbox border
+        Rectangle(hdc, 524, 93, 876, 117);    # Host Edit border
+        Rectangle(hdc, 69, 217, 311, 243);      # Item Edit border
+        Rectangle(hdc, 467, 217, 529, 243);     # Poll Edit border
+        Rectangle(hdc, 11, 251, 883, 633);      # Grid ListView border
+        Rectangle(hdc, 11, 655, 883, 711);      # Log Edit border
+        
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 78 { # WM_NOTIFY (0x004E)
+        lpnm = lParam;
+        code = load32(lpnm + 16);
+        if code == 0 - 12 { # NM_CUSTOMDRAW (0xFFFFFFF4)
+            hwndFrom = load64(lpnm + 0);
+            gGrid = load64(g_grid);
+            if gGrid != 0 {
+                # Header custom drawing is now handled via subclassing in GridWndProc
+                if hwndFrom == gGrid {
+                    dwDrawStage = load32(lpnm + 24);
+                    if dwDrawStage == 1 { # CDDS_PREPAINT
+                        return 32; # CDRF_NOTIFYITEMDRAW
+                    }
+                    if dwDrawStage == 0x00010001 { # CDDS_ITEMPREPAINT
+                        uState = load32(lpnm + 64);
+                        isSelected = band(uState, 1); # CDIS_SELECTED
+                        if isSelected != 0 {
+                            store32(lpnm + 80, COLOR_TEXT_BRIGHT); # clrText
+                            store32(lpnm + 84, COLOR_BG_HOVER); # clrTextBk
+                        } else {
+                            store32(lpnm + 80, COLOR_TEXT_PRIMARY); # clrText
+                            store32(lpnm + 84, COLOR_BG_CARD); # clrTextBk
+                        }
+                        return 18; # CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT
+                    }
+                    if dwDrawStage == 0x00010002 { # CDDS_ITEMPOSTPAINT
+                        hdc = load64(lpnm + 32);
+                        left = load32(lpnm + 40);
+                        top = load32(lpnm + 44);
+                        right = load32(lpnm + 48);
+                        bottom = load32(lpnm + 52);
+                        
+                        uState = load32(lpnm + 64);
+                        isSelected = band(uState, 1); # CDIS_SELECTED
+                        
+                        if isSelected != 0 {
+                            oldPen = SelectObject(hdc, load64(g_pen_neon));
+                        } else {
+                            oldPen = SelectObject(hdc, load64(g_pen_border));
+                        }
+                        
+                        # Draw horizontal bottom line of row
+                        MoveToEx(hdc, left, bottom - 1, 0);
+                        LineTo(hdc, right, bottom - 1);
+                        
+                        # Draw vertical column borders dynamically
+                        w0 = SendMessageA(gGrid, 4125, 0, 0); # LVM_GETCOLUMNWIDTH
+                        w1 = SendMessageA(gGrid, 4125, 1, 0);
+                        w2 = SendMessageA(gGrid, 4125, 2, 0);
+                        
+                        x1 = left + w0;
+                        MoveToEx(hdc, x1, top, 0); LineTo(hdc, x1, bottom);
+                        
+                        x2 = x1 + w1;
+                        MoveToEx(hdc, x2, top, 0); LineTo(hdc, x2, bottom);
+                        
+                        x3 = x2 + w2;
+                        MoveToEx(hdc, x3, top, 0); LineTo(hdc, x3, bottom);
+                        
+                        # If selected, also draw left, right, and top edges to frame the row like a button
+                        if isSelected != 0 {
+                            MoveToEx(hdc, left, top, 0); LineTo(hdc, right, top);
+                            MoveToEx(hdc, left, top, 0); LineTo(hdc, left, bottom);
+                            MoveToEx(hdc, right - 1, top, 0); LineTo(hdc, right - 1, bottom);
+                        }
+                        
+                        SelectObject(hdc, oldPen);
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    
+    if msg == 43 { # WM_DRAWITEM (0x002B)
+        lpDrawItem = lParam;
+        ctlType = load32(lpDrawItem + 0);
+        if ctlType == 4 { # ODT_BUTTON
+            hwndItem = load64(lpDrawItem + 24);
+            hdc = load64(lpDrawItem + 32);
+            left = load32(lpDrawItem + 40);
+            top = load32(lpDrawItem + 44);
+            right = load32(lpDrawItem + 48);
+            bottom = load32(lpDrawItem + 52);
+            itemState = load32(lpDrawItem + 16);
+            isPressed = band(itemState, 1); # ODS_SELECTED (0x0001)
+            isFocused = band(itemState, 16); # ODS_FOCUS (0x0010)
+            
+            if isPressed != 0 {
+                oldPen = SelectObject(hdc, load64(g_pen_neon));
+                oldBrush = SelectObject(hdc, load64(g_brush_input));
+                SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+            } else {
+                if isFocused != 0 {
+                    oldPen = SelectObject(hdc, load64(g_pen_neon));
+                    oldBrush = SelectObject(hdc, load64(g_brush_hover));
+                    SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+                } else {
+                    oldPen = SelectObject(hdc, load64(g_pen_border));
+                    oldBrush = SelectObject(hdc, load64(g_brush_card));
+                    SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+                }
+            }
+            RoundRect(hdc, left, top, right, bottom, 8, 8);
+            
+            GetWindowTextA(hwndItem, g_btn_txt, 64);
+            SetBkMode(hdc, 1);
+            
+            oldFont = SelectObject(hdc, load64(g_font_normal));
+            
+            if isPressed != 0 {
+                store32(lpDrawItem + 40, left + 1);
+                store32(lpDrawItem + 44, top + 1);
+            }
+            DrawTextA(hdc, g_btn_txt, 0 - 1, lpDrawItem + 40, 37); # DT_CENTER | DT_VCENTER | DT_SINGLELINE
+            if isPressed != 0 {
+                store32(lpDrawItem + 40, left);
+                store32(lpDrawItem + 44, top);
+            }
+            
+            SelectObject(hdc, oldFont);
+            SelectObject(hdc, oldPen);
+            SelectObject(hdc, oldBrush);
+            return 1;
+        }
+    }
+    
+    # Subclass Dark Mode Control painting overrides (NexusEdge SCADA style)
+    if msg == 312 { # WM_CTLCOLORSTATIC (0x0138)
+        hdcStatic = wParam;
+        SetBkMode(hdcStatic, 1);
+        if lParam == load64(g_status) {
+            if load64(g_conn) == 1 {
+                SetTextColor(hdcStatic, COLOR_GREEN);
+            } else {
+                SetTextColor(hdcStatic, COLOR_RED);
+            }
+        } else {
+            SetTextColor(hdcStatic, COLOR_TEXT_PRIMARY);
+        }
+        return load64(g_brush_deep);
+    }
+    if msg == 307 { # WM_CTLCOLOREDIT (0x0133)
+        hdcEdit = wParam;
+        SetBkMode(hdcEdit, 1);
+        SetTextColor(hdcEdit, COLOR_TEXT_BRIGHT);
+        return load64(g_brush_input);
+    }
+    if msg == 308 { # WM_CTLCOLORLISTBOX (0x0134)
+        hdcLB = wParam;
+        SetBkMode(hdcLB, 1);
+        SetTextColor(hdcLB, COLOR_TEXT_PRIMARY);
+        return load64(g_brush_input);
+    }
+    
+    if msg == 2 {
+        do_disconnect();
+        CoUninitialize();
+        DeleteObject(load64(g_brush_deep));
+        DeleteObject(load64(g_brush_panel));
+        DeleteObject(load64(g_brush_card));
+        DeleteObject(load64(g_brush_input));
+        DeleteObject(load64(g_brush_hover));
+        DeleteObject(load64(g_pen_border));
+        DeleteObject(load64(g_pen_blue));
+        DeleteObject(load64(g_pen_neon));
+        DeleteObject(load64(g_font_normal));
+        DeleteObject(load64(g_font_header));
+        PostQuitMessage(0);
+        return 0;
+    }
+    r = DefWindowProcA(hwnd, msg, wParam, lParam);
+    return r;
+}
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+    init_iids();
+    store32(g_icc + 0, 8);
+    store32(g_icc + 4, 1);
+    InitCommonControlsEx(g_icc);
+    CoInitializeEx(0, 2);
+
+    store64(g_brush_deep,   CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel,  CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,   CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input,  CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover,  CreateSolidBrush(COLOR_BG_HOVER));
+
+    store64(g_pen_border,   CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_blue,     CreatePen(0, 1, COLOR_BLUE));
+    store64(g_pen_neon,     CreatePen(0, 1, COLOR_NEON_BLUE));
+
+    store64(g_font_normal,  CreateFontA(14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"));
+    store64(g_font_header,  CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, "Segoe UI"));
+
+    store32(g_wndcls + 0,  80);
+    store32(g_wndcls + 4,  3);
+    store64(g_wndcls + 8,  &WndProc);
+    store32(g_wndcls + 16, 0);
+    store32(g_wndcls + 20, 0);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 32, 0);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_brush_deep));
+    store64(g_wndcls + 56, 0);
+    store64(g_wndcls + 64, clsname);
+    store64(g_wndcls + 72, 0);
+    RegisterClassExA(g_wndcls);
+
+    hwnd = CreateWindowExA(0, clsname, title, 0x90000000, 80, 60, 900, 720, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

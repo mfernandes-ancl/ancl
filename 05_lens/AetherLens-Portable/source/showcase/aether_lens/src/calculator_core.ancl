@@ -1,0 +1,174 @@
+# =====================================================================
+# calculator_core.ancl - deterministic offline arithmetic for Lens.
+# Supports decimals, unary +/- , parentheses, +, -, *, and /.
+# =====================================================================
+
+@DATA
+lct_ptr: buf = 8;
+lct_error: buf = 8;
+lct_tmp: buf = 80;
+
+@CODE
+func lct_skip_ws() -> i64 {
+    p = load64(lct_ptr);
+    while 1 {
+        c = load8(p);
+        if c == 32 { p = p + 1; continue; }
+        if c == 9 { p = p + 1; continue; }
+        if c == 10 { p = p + 1; continue; }
+        if c == 13 { p = p + 1; continue; }
+        break;
+    }
+    store64(lct_ptr, p);
+    return p;
+}
+
+func lct_parse_number() -> f64 {
+    p = lct_skip_ws();
+    val = 0.0;
+    digits = 0;
+    while load8(p) >= 48 {
+        if load8(p) > 57 { break; }
+        val = val * 10.0 + itof(load8(p) - 48);
+        p = p + 1;
+        digits = digits + 1;
+    }
+    if load8(p) == 46 {
+        p = p + 1;
+        divisor = 10.0;
+        while load8(p) >= 48 {
+            if load8(p) > 57 { break; }
+            val = val + itof(load8(p) - 48) / divisor;
+            divisor = divisor * 10.0;
+            p = p + 1;
+            digits = digits + 1;
+        }
+    }
+    if digits == 0 { store64(lct_error, 1); }
+    store64(lct_ptr, p);
+    return val;
+}
+
+func lct_parse_primary() -> f64 {
+    p = lct_skip_ws();
+    c = load8(p);
+    if c == 43 { store64(lct_ptr, p + 1); return lct_parse_primary(); }
+    if c == 45 { store64(lct_ptr, p + 1); return 0.0 - lct_parse_primary(); }
+    if c == 40 {
+        store64(lct_ptr, p + 1);
+        v = lct_parse_expr();
+        p = lct_skip_ws();
+        if load8(p) != 41 { store64(lct_error, 1); return 0.0; }
+        store64(lct_ptr, p + 1);
+        return v;
+    }
+    if c == 46 { return lct_parse_number(); }
+    if c >= 48 { if c <= 57 { return lct_parse_number(); } }
+    store64(lct_error, 1);
+    return 0.0;
+}
+
+func lct_parse_term() -> f64 {
+    v = lct_parse_primary();
+    while load64(lct_error) == 0 {
+        p = lct_skip_ws();
+        op = load8(p);
+        if op != 42 { if op != 47 { break; } }
+        store64(lct_ptr, p + 1);
+        rhs = lct_parse_primary();
+        if op == 42 { v = v * rhs; }
+        else {
+            if rhs == 0.0 { store64(lct_error, 2); return 0.0; }
+            v = v / rhs;
+        }
+    }
+    return v;
+}
+
+func lct_parse_expr() -> f64 {
+    v = lct_parse_term();
+    while load64(lct_error) == 0 {
+        p = lct_skip_ws();
+        op = load8(p);
+        if op != 43 { if op != 45 { break; } }
+        store64(lct_ptr, p + 1);
+        rhs = lct_parse_term();
+        if op == 43 { v = v + rhs; } else { v = v - rhs; }
+    }
+    return v;
+}
+
+func lct_eval(src: i64, error_out: i64) -> f64 {
+    store64(lct_ptr, src);
+    store64(lct_error, 0);
+    if load8(lct_skip_ws()) == 0 { store64(lct_error, 1); store64(error_out, 1); return 0.0; }
+    v = lct_parse_expr();
+    p = lct_skip_ws();
+    if load8(p) != 0 { store64(lct_error, 1); }
+    store64(error_out, load64(lct_error));
+    return v;
+}
+
+func lct_digit(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return c - 48; } }
+    if c >= 65 { if c <= 70 { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0 - 1;
+}
+
+# Parse one non-negative 63-bit integer in decimal, 0x hex, or 0b binary.
+func lct_parse_uint(src: i64, value_out: i64) -> i64 {
+    p = src;
+    while load8(p) == 32 { p = p + 1; }
+    while load8(p) == 9 { p = p + 1; }
+    base = 10;
+    if load8(p) == 48 {
+        c = load8(p + 1);
+        if c == 120 { base = 16; p = p + 2; }
+        else if c == 88 { base = 16; p = p + 2; }
+        else if c == 98 { base = 2; p = p + 2; }
+        else if c == 66 { base = 2; p = p + 2; }
+    }
+    v = 0;
+    digits = 0;
+    while 1 {
+        c = load8(p);
+        if c == 95 { p = p + 1; continue; }
+        d = lct_digit(c);
+        if d < 0 { break; }
+        if d >= base { return 0; }
+        if v > (9223372036854775807 - d) / base { return 0; }
+        v = v * base + d;
+        digits = digits + 1;
+        p = p + 1;
+    }
+    while load8(p) == 32 { p = p + 1; }
+    while load8(p) == 9 { p = p + 1; }
+    if digits == 0 { return 0; }
+    if load8(p) != 0 { return 0; }
+    store64(value_out, v);
+    return 1;
+}
+
+func lct_format_base(v: i64, base: i64, dst: i64, prefix: i64) -> i64 {
+    p = dst;
+    if prefix == 16 { store8(p, 48); store8(p + 1, 120); p = p + 2; }
+    if prefix == 2 { store8(p, 48); store8(p + 1, 98); p = p + 2; }
+    if v == 0 { store8(p, 48); store8(p + 1, 0); return 1; }
+    n = 0;
+    while v > 0 {
+        d = v % base;
+        if d < 10 { store8(lct_tmp + n, 48 + d); }
+        else { store8(lct_tmp + n, 55 + d); }
+        v = v / base;
+        n = n + 1;
+    }
+    i = 0;
+    while i < n { store8(p + i, load8(lct_tmp + n - 1 - i)); i = i + 1; }
+    store8(p + n, 0);
+    return 1;
+}
+
+func lct_format_dec(v: i64, dst: i64) -> i64 { return lct_format_base(v, 10, dst, 0); }
+func lct_format_hex(v: i64, dst: i64) -> i64 { return lct_format_base(v, 16, dst, 16); }
+func lct_format_bin(v: i64, dst: i64) -> i64 { return lct_format_base(v, 2, dst, 2); }

@@ -1,0 +1,300 @@
+# ============================================================================
+#  opc_client.ancl  -  Native OPC DA (Data Access) test client, written in ANCL.
+#  Phase 6.11. 100% CRT-free PE32+; imports kernel32 (intrinsics) + ole32 (COM).
+#
+#  OPC DA is a COM/DCOM technology: a client CoCreateInstance's an OPC server,
+#  then drives it through interface VTABLES (IOPCServer / IOPCItemMgt /
+#  IOPCSyncIO). Every method call is an INDIRECT call through a runtime
+#  pointer, which ANCL gained in Phase 6.11 via the `callp` primitive
+#  (see compiler/anclc.cpp) and the helpers in core_lib/win32_com.ancl.
+#
+#  Flow:  CoInitializeEx
+#         -> CLSIDFromProgID(ProgID)            (resolve the server's CLSID)
+#         -> CoCreateInstance(IOPCServer)       (launch/attach the server)
+#         -> IOPCServer::AddGroup(... IID_IOPCItemMgt ...)  (group + item mgr)
+#         -> IOPCItemMgt::AddItems(item)        (register the tag)
+#         -> QueryInterface(IOPCSyncIO)         (sync read interface)
+#         -> IOPCSyncIO::Read(DEVICE, item)     (read the value)
+#         -> print value -> Release chain -> CoUninitialize
+#
+#  Every stage reports its HRESULT; on a machine with no OPC DA server (or no
+#  64-bit OPC proxy/stub) it fails cleanly at the first impossible stage and
+#  says exactly where -- it never crashes.
+#
+#  CONFIG: set g_progid / g_itemid below to match your installed server.
+#  Defaults target the de-facto-standard Matrikon OPC Simulation server and
+#  its integer tag "Random.Int4" (VT_I4, so the value prints as a plain int).
+#
+#  NOTE on layout: the directive's example used `//` comments and bare import
+#  names; ANCL comments are `#` and the shared libs live in core_lib/, so the
+#  imports are path-qualified. Structure is the mandated imports -> @DATA ->
+#  @CODE with NO executable code in @DATA.
+# ============================================================================
+
+# ============================================================================
+# 1. TOP-LEVEL IMPORTS
+# ============================================================================
+import "../../core_lib/win32_api.ancl";
+import "../../core_lib/win32_com.ancl";
+
+# ============================================================================
+# 2. GLOBAL SYSTEM MEMORY SEGMENT
+# ============================================================================
+@DATA
+
+# ---- user-facing strings ---------------------------------------------------
+b_hdr:   str = "=== ANCL OPC DA test client (Phase 6.11, native COM) ===";
+b_cfg:   str = "config: ProgID / item = ";
+b_slash: str = " / ";
+b_init:  str = "[1] CoInitializeEx hr = ";
+b_clsid: str = "[2] CLSIDFromProgID hr = ";
+b_cci:   str = "[3] CoCreateInstance(IOPCServer) hr = ";
+b_srv:   str = "    IOPCServer* = ";
+b_grp:   str = "[4] AddGroup hr = ";
+b_gi:    str = "    IOPCItemMgt* = ";
+b_add:   str = "[5] AddItems hr = ";
+b_aerr:  str = "    item[0] add error = ";
+b_hsrv:  str = "    server item handle = ";
+b_qsio:  str = "[6] QueryInterface(IOPCSyncIO) hr = ";
+b_read:  str = "[7] Read hr = ";
+b_rerr:  str = "    item[0] read error = ";
+b_vt:    str = "    value VARTYPE = ";
+b_val:   str = "    >>> VALUE = ";
+b_vnoti: str = "    (value type is not VT_I4; raw 32-bit bits = ";
+b_ok:    str = "=== OK: read a live value from the OPC DA server ===";
+b_eprog: str = "    -> ProgID not registered (is the OPC server installed?).";
+b_ecci:  str = "    -> server not creatable (not registered / DCOM / bitness).";
+b_egrp:  str = "    -> AddGroup failed (server up, but no 64-bit OPC proxy/stub?).";
+b_eadd:  str = "    -> AddItems failed (does the server expose that item id?).";
+b_eread: str = "    -> Read failed.";
+b_done:  str = "=== done (COM released, CoUninitialize called) ===";
+nl:      str = "\n";
+
+# ---- CONFIG (defaults; override at runtime: opc_client.exe [ProgID] [ItemID]) --
+#   Servers seen on this PC: "opcserversim.Instance.1" (32-bit OPC Server Simulator),
+#   "OPC.OpcTestServer_x64" (64-bit OPC Foundation sample), "Kepware.KEPServerEX.V6",
+#   "OPC.OpcTestServer_x86". For a Matrikon box use "Matrikon.OPC.Simulation.1".
+g_progid: str = "opcserversim.Instance.1";
+g_group:  str = "AnclGrp";
+g_itemid: str = "Random.Int4";
+
+# ---- widened (UTF-16LE) copies + command-line override buffers -------------
+w_progid: buf = 512;
+w_group:  buf = 64;
+w_itemid: buf = 1024;
+w_empty:  buf = 8;     # zeroed -> empty wide string L"" for szAccessPath
+a_progid: buf = 256;   # argv[1] override (ASCII); empty if not supplied
+a_itemid: buf = 512;   # argv[2] override (ASCII); empty if not supplied
+
+# ---- GUID blobs (16 bytes each), filled at runtime via store64 halves ------
+clsid:      buf = 16;  # resolved server CLSID
+iidItemMgt: buf = 16;  # IID_IOPCItemMgt {39C13A54-011E-11D0-9675-0020AFD8ADB3}
+iidSyncIO:  buf = 16;  # IID_IOPCSyncIO  {39C13A52-011E-11D0-9675-0020AFD8ADB3}
+iidServer:  buf = 16;  # IID_IOPCServer  {39C13A4D-011E-11D0-9675-0020AFD8ADB3}
+
+# ---- OPCITEMDEF (x64 layout, 48 bytes) for AddItems ------------------------
+itemdef:    buf = 48;
+
+# ---- out-parameter cells (COM fills these) ---------------------------------
+pp_server:  buf = 8;   # IOPCServer*
+pp_itemmgt: buf = 8;   # IOPCItemMgt*   (from AddGroup ppUnk)
+pp_syncio:  buf = 8;   # IOPCSyncIO*    (from QueryInterface)
+h_srvgroup: buf = 8;   # OPCHANDLE      server group handle
+d_revrate:  buf = 8;   # DWORD          revised update rate
+pp_results: buf = 8;   # OPCITEMRESULT* array (server-allocated)
+pp_adderr:  buf = 8;   # HRESULT*       array (server-allocated)
+pp_values:  buf = 8;   # OPCITEMSTATE*  array (server-allocated)
+pp_readerr: buf = 8;   # HRESULT*       array (server-allocated)
+srv_handles:buf = 8;   # OPCHANDLE[1]   input array for Read
+
+# ============================================================================
+# 3. EXECUTABLE LOGIC SEGMENT
+# ============================================================================
+@CODE
+
+# Fill the three fixed OPC interface IIDs (little-endian store64 halves).
+func init_iids() -> i64 {
+    # IID_IOPCServer  {39C13A4D-011E-11D0-9675-0020AFD8ADB3}
+    store64(iidServer + 0, 0x11D0011E39C13A4D);
+    store64(iidServer + 8, 0xB3ADD8AF20007596);
+    # IID_IOPCItemMgt {39C13A54-011E-11D0-9675-0020AFD8ADB3}
+    store64(iidItemMgt + 0, 0x11D0011E39C13A54);
+    store64(iidItemMgt + 8, 0xB3ADD8AF20007596);
+    # IID_IOPCSyncIO  {39C13A52-011E-11D0-9675-0020AFD8ADB3}
+    store64(iidSyncIO + 0, 0x11D0011E39C13A52);
+    store64(iidSyncIO + 8, 0xB3ADD8AF20007596);
+    return 0;
+}
+
+# Build the 48-byte OPCITEMDEF for one item (szItemID, active, VT_I4 requested).
+func build_itemdef(wItem: ptr) -> i64 {
+    store64(itemdef + 0,  w_empty);   # szAccessPath = L""
+    store64(itemdef + 8,  wItem);     # szItemID
+    store32(itemdef + 16, 1);         # bActive = TRUE
+    store32(itemdef + 20, 1);         # hClient = 1
+    store32(itemdef + 24, 0);         # dwBlobSize = 0
+    store64(itemdef + 32, 0);         # pBlob = NULL
+    store16(itemdef + 40, 3);         # vtRequestedDataType = VT_I4 (=3)
+    store16(itemdef + 42, 0);         # wReserved
+    return 0;
+}
+
+# Parse one whitespace-delimited (optionally "quoted") token from `p` into `dst`
+# (NUL-terminated; pass dst=0 to skip a token without copying). Returns the
+# pointer just past the token, for chaining across GetCommandLineA().
+func parse_token(p: ptr, dst: ptr) -> ptr {
+    while load8(p) == 32 { p = p + 1; }    # skip leading spaces
+    i = 0;
+    q = 0;
+    if load8(p) == 34 { q = 1; p = p + 1; }    # opening double-quote
+    while 1 {
+        c = load8(p);
+        if c == 0 { break; }
+        if q == 1 {
+            if c == 34 { p = p + 1; break; }    # closing quote ends token
+        } else {
+            if c == 32 { break; }               # space ends token
+        }
+        if dst != 0 { store8(dst + i, c); }
+        i = i + 1;
+        p = p + 1;
+    }
+    if dst != 0 { store8(dst + i, 0); }
+    return p;
+}
+
+func main() -> i32 {
+    syscall 1, b_hdr, nl;
+
+    # resolve ProgID / item from the command line (opc_client.exe [ProgID] [ItemID]); else defaults
+    cl = GetCommandLineA();
+    cl = parse_token(cl, 0);          # skip argv[0] (the exe path)
+    cl = parse_token(cl, a_progid);   # argv[1] -> ProgID override
+    cl = parse_token(cl, a_itemid);   # argv[2] -> item-ID override
+    src_progid = g_progid;
+    if load8(a_progid) != 0 { src_progid = a_progid; }
+    src_itemid = g_itemid;
+    if load8(a_itemid) != 0 { src_itemid = a_itemid; }
+
+    syscall 1, b_cfg;                 # runtime strings -> puts_cstr (NOT syscall 1, ptr)
+    puts_cstr(src_progid);
+    syscall 1, b_slash;
+    puts_cstr(src_itemid);
+    syscall 1, nl;
+
+    init_iids();
+    a2w(w_progid, src_progid);
+    a2w(w_group,  g_group);
+    a2w(w_itemid, src_itemid);
+
+    # [1] Initialize COM (multithreaded apartment; sync reads need no pump).
+    hr = CoInitializeEx(0, 0);
+    syscall 1, b_init, hr, nl;
+
+    # [2] Resolve the server's CLSID from its ProgID.
+    hr = CLSIDFromProgID(w_progid, clsid);
+    syscall 1, b_clsid, hr, nl;
+    if hr < 0 { syscall 1, b_eprog, nl; CoUninitialize(); return 1; }
+
+    # [3] Create the OPC server object (out-of-proc local server).
+    store64(pp_server, 0);
+    hr = CoCreateInstance(clsid, 0, 4, iidServer, pp_server);   # CLSCTX_LOCAL_SERVER=4
+    syscall 1, b_cci, hr, nl;
+    pServer = load64(pp_server);
+    if hr < 0 { syscall 1, b_ecci, nl; CoUninitialize(); return 1; }
+    if pServer == 0 { syscall 1, b_ecci, nl; CoUninitialize(); return 1; }
+    syscall 1, b_srv, pServer, nl;
+
+    # [4] AddGroup, asking directly for the IOPCItemMgt interface via riid/ppUnk.
+    #     IOPCServer::AddGroup = vtbl[3]; 11 params after `this`.
+    store64(pp_itemmgt, 0);
+    store32(h_srvgroup, 0);
+    store32(d_revrate, 0);
+    hr = callp(vmeth(pServer, 3), pServer,
+               w_group,        # szName
+               1,              # bActive = TRUE
+               1000,           # dwRequestedUpdateRate (ms)
+               1,              # hClientGroup
+               0,              # pTimeBias = NULL
+               0,              # pPercentDeadband = NULL
+               0,              # dwLCID
+               h_srvgroup,     # [out] phServerGroup
+               d_revrate,      # [out] pRevisedUpdateRate
+               iidItemMgt,     # riid = IID_IOPCItemMgt
+               pp_itemmgt);    # [out] ppUnk
+    syscall 1, b_grp, hr, nl;
+    if hr < 0 { syscall 1, b_egrp, nl; com_release(pServer); CoUninitialize(); return 1; }
+    pItemMgt = load64(pp_itemmgt);
+    syscall 1, b_gi, pItemMgt, nl;
+    if pItemMgt == 0 { syscall 1, b_egrp, nl; com_release(pServer); CoUninitialize(); return 1; }
+
+    # [5] AddItems: register the one tag. IOPCItemMgt::AddItems = vtbl[3]; 4 params.
+    build_itemdef(w_itemid);
+    store64(pp_results, 0);
+    store64(pp_adderr, 0);
+    hr = callp(vmeth(pItemMgt, 3), pItemMgt,
+               1,              # dwCount
+               itemdef,        # pItemArray
+               pp_results,     # [out] ppAddResults
+               pp_adderr);     # [out] ppErrors
+    syscall 1, b_add, hr, nl;
+    if hr < 0 { syscall 1, b_eadd, nl; com_release(pItemMgt); com_release(pServer); CoUninitialize(); return 1; }
+    # per-item add error + the server handle we need for Read
+    pAddErr  = load64(pp_adderr);
+    pResults = load64(pp_results);
+    if pAddErr != 0  { syscall 1, b_aerr, load32(pAddErr + 0), nl; }
+    hSrvItem = 0;
+    if pResults != 0 { hSrvItem = load32(pResults + 0); }   # OPCITEMRESULT.hServer @0
+    syscall 1, b_hsrv, hSrvItem, nl;
+    store32(srv_handles + 0, hSrvItem);
+    # release server-allocated AddItems out-arrays
+    if pResults != 0 { CoTaskMemFree(pResults); }
+    if pAddErr  != 0 { CoTaskMemFree(pAddErr); }
+
+    # [6] Get the synchronous-IO interface on the same group object.
+    store64(pp_syncio, 0);
+    hr = com_qi(pItemMgt, iidSyncIO, pp_syncio);
+    syscall 1, b_qsio, hr, nl;
+    pSyncIO = load64(pp_syncio);
+    if hr < 0 { com_release(pItemMgt); com_release(pServer); CoUninitialize(); return 1; }
+    if pSyncIO == 0 { com_release(pItemMgt); com_release(pServer); CoUninitialize(); return 1; }
+
+    # [7] Read the value from device. IOPCSyncIO::Read = vtbl[3]; 5 params.
+    store64(pp_values, 0);
+    store64(pp_readerr, 0);
+    hr = callp(vmeth(pSyncIO, 3), pSyncIO,
+               2,              # OPCDATASOURCE: OPC_DS_DEVICE = 2
+               1,              # dwCount
+               srv_handles,    # phServer (OPCHANDLE[1])
+               pp_values,      # [out] ppItemValues (OPCITEMSTATE*)
+               pp_readerr);    # [out] ppErrors (HRESULT*)
+    syscall 1, b_read, hr, nl;
+    if hr < 0 { syscall 1, b_eread, nl; com_release(pSyncIO); com_release(pItemMgt); com_release(pServer); CoUninitialize(); return 1; }
+
+    pReadErr = load64(pp_readerr);
+    pValues  = load64(pp_values);
+    if pReadErr != 0 { syscall 1, b_rerr, load32(pReadErr + 0), nl; }
+    if pValues != 0 {
+        # OPCITEMSTATE (x64): vDataValue VARIANT @16; vt @ +0 of variant, data @ +8.
+        vt = load16(pValues + 16);
+        syscall 1, b_vt, vt, nl;
+        if vt == 3 {                                   # VT_I4 -> a plain int32 at +24
+            syscall 1, b_val, load32(pValues + 24), nl;
+            syscall 1, b_ok, nl;
+        } else {
+            syscall 1, b_vnoti, load32(pValues + 24), nl;
+        }
+    }
+    # release server-allocated Read out-arrays
+    if pValues  != 0 { CoTaskMemFree(pValues); }
+    if pReadErr != 0 { CoTaskMemFree(pReadErr); }
+
+    # ---- cleanup: remove the group, release interfaces, shut COM down -------
+    callp(vmeth(pServer, 7), pServer, load32(h_srvgroup), 1);   # IOPCServer::RemoveGroup(h, bForce)
+    com_release(pSyncIO);
+    com_release(pItemMgt);
+    com_release(pServer);
+    CoUninitialize();
+    syscall 1, b_done, nl;
+    return 0;
+}

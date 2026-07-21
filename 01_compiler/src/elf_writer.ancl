@@ -1,0 +1,397 @@
+# =====================================================================
+#  elf_writer.ancl  -  static x86-64 ELF writer for anclc2  (thread C / M5 5b)
+#
+#  Emits a static Linux ELF (ET_EXEC, statically linked) from the same
+#  emitted code + data + fixups the PE writer consumes. A direct port of
+#  the bootstrap C++ ELFWriter::write. Reuses pe_writer's image buffer
+#  (g_pe_img) + helpers (pe_put_le / pe_align / pe_memcpy_to_img) and the
+#  output file write (CreateFileA / WriteFile / CloseHandle).
+#
+#  Key tricks (mirroring the bootstrap):
+#   - vaddr = LOAD_BASE + file_offset  -> page congruence is automatic.
+#   - p_filesz = 0 for the R|W .data segment (loader zero-fills from
+#     p_memsz); file ends at data_off, so the compiler's own multi-MB .data
+#     costs ZERO file bytes (and never overflows the 4 MB g_pe_img).
+#  Only emitted under --target=linux (main.ancl gates the call); dead in PE.
+# =====================================================================
+import "codegen.ancl";
+import "pe_writer.ancl";
+
+@DATA
+elf_err_kind3: str = "[elf] internal: Windows import fixup under --target=linux\n";
+elf_err_open:  str = "[elf] cannot open output file\n";
+elfd_interp:   str = "/lib64/ld-linux-x86-64.so.2";   # PT_INTERP for --target=linux-dyn
+
+@CODE
+
+func elf_write(path: i64) -> i64 {
+    LOAD_BASE = 4194304;    # 0x400000
+    PAGE      = 4096;
+    headers   = 176;        # Ehdr(64) + 2 * Phdr(56)
+
+    # ---- string table (.rdata): record each string's offset within rdata ----
+    nstrs = load64(g_str_count);
+    elf_stroff = alloc((nstrs + 1) * 8);
+    rdata_size = 0;
+    i = 0;
+    while i < nstrs {
+        store64(elf_stroff + i * 8, rdata_size);
+        rdata_size = rdata_size + load64(g_str_len + i * 8) + 1;
+        i = i + 1;
+    }
+    if rdata_size == 0 { rdata_size = 1; }
+
+    code_size = load64(g_code_len);
+    data_size = load64(g_cg_data_size);
+
+    # ---- file/vaddr layout (contiguous; vaddr = LOAD_BASE + file offset) ----
+    text_off  = headers;
+    rdata_off = text_off + code_size;
+    seg1_end  = rdata_off + rdata_size;          # end of the R|X segment
+    data_off  = pe_align(seg1_end, PAGE);        # R|W segment on a fresh page
+    file_size = data_off;                        # p_filesz=0 for .data -> no .data bytes in the file
+    entry     = LOAD_BASE + text_off + load64(g_labels + load64(L_start) * 8);
+
+    # ---- resolve code fixups (kinds 0/1/2; kind 3 = error) into g_code ----
+    nfix = load64(g_fixup_count);
+    i = 0;
+    while i < nfix {
+        fpos  = load64(g_fixup_pos  + i * 8);
+        fkind = load64(g_fixup_kind + i * 8);
+        ftgt  = load64(g_fixup_tgt  + i * 8);
+        disp  = 0;
+        if fkind == 0 { disp = load64(g_labels + ftgt * 8) - (fpos + 4); }                              # rel32 -> label
+        if fkind == 1 { disp = (rdata_off + load64(elf_stroff + ftgt * 8)) - (text_off + fpos + 4); }   # rip -> rdata string
+        if fkind == 2 { disp = (data_off + ftgt) - (text_off + fpos + 4); }                             # rip -> .data offset
+        if fkind == 3 { syscall 1, elf_err_kind3; ExitProcess(1); }                                     # Windows import -> error
+        store8(g_code + fpos + 0, band(disp,        255));
+        store8(g_code + fpos + 1, band(shr(disp,  8), 255));
+        store8(g_code + fpos + 2, band(shr(disp, 16), 255));
+        store8(g_code + fpos + 3, band(shr(disp, 24), 255));
+        i = i + 1;
+    }
+
+    # ---- assemble the image into g_pe_img (already zero-initialised .data) ----
+    # Elf64_Ehdr
+    store8(g_pe_img + 0, 127); store8(g_pe_img + 1, 69); store8(g_pe_img + 2, 76); store8(g_pe_img + 3, 70);  # 0x7F 'E' 'L' 'F'
+    store8(g_pe_img + 4, 2);   # EI_CLASS = ELFCLASS64
+    store8(g_pe_img + 5, 1);   # EI_DATA  = ELFDATA2LSB
+    store8(g_pe_img + 6, 1);   # EI_VERSION = EV_CURRENT
+    pe_put_le(16, 2,  2);      # e_type = ET_EXEC
+    pe_put_le(18, 62, 2);      # e_machine = EM_X86_64
+    pe_put_le(20, 1,  4);      # e_version
+    pe_put_le(24, entry, 8);   # e_entry (absolute vaddr)
+    pe_put_le(32, 64, 8);      # e_phoff
+    pe_put_le(52, 64, 2);      # e_ehsize
+    pe_put_le(54, 56, 2);      # e_phentsize
+    pe_put_le(56, 2,  2);      # e_phnum
+
+    # Phdr[0] : PT_LOAD R|X  (headers + .text + .rdata)
+    pe_put_le(64,  1, 4);              # p_type = PT_LOAD
+    pe_put_le(68,  5, 4);              # p_flags = R|X
+    pe_put_le(80,  LOAD_BASE, 8);      # p_vaddr
+    pe_put_le(88,  LOAD_BASE, 8);      # p_paddr
+    pe_put_le(96,  seg1_end, 8);       # p_filesz
+    pe_put_le(104, seg1_end, 8);       # p_memsz
+    pe_put_le(112, PAGE, 8);           # p_align
+    # p_offset (72..79) = 0 (zero-init)
+
+    # Phdr[1] : PT_LOAD R|W  (.data, zero-filled by the loader; NO file bytes)
+    pe_put_le(120, 1, 4);                    # p_type = PT_LOAD
+    pe_put_le(124, 6, 4);                    # p_flags = R|W
+    pe_put_le(128, data_off, 8);             # p_offset
+    pe_put_le(136, LOAD_BASE + data_off, 8); # p_vaddr
+    pe_put_le(144, LOAD_BASE + data_off, 8); # p_paddr
+    pe_put_le(160, data_size, 8);            # p_memsz   (p_filesz at 152..159 = 0, zero-init)
+    pe_put_le(168, PAGE, 8);                 # p_align
+
+    # segment contents
+    pe_memcpy_to_img(text_off, g_code, code_size);
+    i = 0;
+    while i < nstrs {
+        soff = load64(g_str_off + i * 8);
+        slen = load64(g_str_len + i * 8);
+        dst  = rdata_off + load64(elf_stroff + i * 8);
+        j = 0;
+        while j <= slen {
+            store8(g_pe_img + dst + j, load8(g_strings + soff + j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    store64(g_pe_img_size, file_size);
+
+    # ---- write the file (GENERIC_WRITE, CREATE_ALWAYS) ----
+    h = CreateFileA(path, 1073741824, 0, 0, 2, 128, 0);
+    if h == 0 - 1 { syscall 1, elf_err_open; return 0 - 1; }
+    WriteFile(h, g_pe_img, file_size, g_pe_nwritten, 0);
+    CloseHandle(h);
+    return 0;
+}
+
+# =====================================================================
+#  elf_write_dyn(path)  --  DYNAMIC x86-64 ELF writer  (--target=linux-dyn)
+#
+#  A direct port of the bootstrap C++ ELFWriterDyn. Emits a dynamically
+#  linked ET_EXEC (PT_INTERP=/lib64/ld-linux-x86-64.so.2, DT_NEEDED=libc.so.6)
+#  that resolves libc dl* symbols through .rela.plt R_X86_64_JUMP_SLOT under
+#  DF_BIND_NOW -- ld.so fills .got.plt at load, code calls `call [rip+GOT]`
+#  (fixup kind 4), like the PE writer's IAT. NO PLT stubs. Non-PIE, fixed
+#  LOAD_BASE=0x400000 so vaddr=LOAD_BASE+file_off (kind 1/2 fixups reuse the
+#  static-writer arithmetic). seg1 R|X = Ehdr+Phdrs+.interp+.hash+.dynsym+
+#  .dynstr+.rela.plt+.text+.rdata ; seg2 R|W = .dynamic+.got.plt+.data (bss).
+#  Only emitted under --target=linux-dyn; dead in PE and static ELF.
+# =====================================================================
+func elf_write_dyn(path: i64) -> i64 {
+    LOAD_BASE = 4194304;    # 0x400000
+    PAGE      = 4096;
+    headers   = 344;        # Ehdr(64) + 5 * Phdr(56)
+
+    D = load64(g_dynimp_count);
+
+    # ---- distinct sonames (dedup) -> one DT_NEEDED each ----
+    so_off_arr = alloc(128 * 8);
+    so_len_arr = alloc(128 * 8);
+    nso = 0;
+    di = 0;
+    while di < D {
+        foff = load64(g_dynimp_so    + di * 8);
+        flen = load64(g_dynimp_solen + di * 8);
+        seen = 0;
+        s = 0;
+        while s < nso {
+            if cg_pool_cmp(load64(so_off_arr + s*8), load64(so_len_arr + s*8), foff, flen) == 1 { seen = 1; }
+            s = s + 1;
+        }
+        if seen == 0 {
+            store64(so_off_arr + nso*8, foff);
+            store64(so_len_arr + nso*8, flen);
+            nso = nso + 1;
+        }
+        di = di + 1;
+    }
+
+    # ---- .dynstr offsets: \0 + sonames + dyn import fn names ----
+    dynstr_size = 1;                 # leading NUL
+    so_stroff = alloc(128 * 8);
+    s = 0;
+    while s < nso {
+        store64(so_stroff + s*8, dynstr_size);
+        dynstr_size = dynstr_size + load64(so_len_arr + s*8) + 1;
+        s = s + 1;
+    }
+    sym_stroff = alloc(128 * 8);
+    di = 0;
+    while di < D {
+        store64(sym_stroff + di*8, dynstr_size);
+        dynstr_size = dynstr_size + load64(g_dynimp_fnlen + di*8) + 1;
+        di = di + 1;
+    }
+    nsym = 1 + D;
+
+    # ---- .rdata (string literals) offsets, as in elf_write ----
+    nstrs = load64(g_str_count);
+    elf_stroff = alloc((nstrs + 1) * 8);
+    rdata_size = 0;
+    i = 0;
+    while i < nstrs {
+        store64(elf_stroff + i * 8, rdata_size);
+        rdata_size = rdata_size + load64(g_str_len + i * 8) + 1;
+        i = i + 1;
+    }
+    if rdata_size == 0 { rdata_size = 1; }
+
+    interp_sz = strlen(elfd_interp) + 1;
+    code_size = load64(g_code_len);
+    data_size = load64(g_cg_data_size);
+
+    # ---- seg1 (R|X) layout ----
+    interp_off  = headers;
+    hash_off    = pe_align(interp_off + interp_sz, 8);
+    hash_bytes  = (3 + nsym) * 4;               # nbucket + nchain + bucket[0] + chain[nsym]
+    dynsym_off  = pe_align(hash_off + hash_bytes, 8);
+    dynsym_bytes= nsym * 24;
+    dynstr_off  = dynsym_off + dynsym_bytes;
+    relaplt_off = pe_align(dynstr_off + dynstr_size, 8);
+    relaplt_bytes = D * 24;
+    text_off    = pe_align(relaplt_off + relaplt_bytes, 16);
+    rdata_off   = text_off + code_size;
+    seg1_end    = rdata_off + rdata_size;
+
+    # ---- seg2 (R|W): .dynamic + .got.plt (+ .data bss) ----
+    dyn_off      = pe_align(seg1_end, PAGE);
+    ndyn         = nso + 12;                     # NEEDED* + 11 fixed + DT_NULL
+    dynamic_off  = dyn_off;
+    dynamic_bytes= ndyn * 16;
+    gotplt_off   = pe_align(dynamic_off + dynamic_bytes, 8);
+    gotplt_bytes = (3 + D) * 8;
+    seg2_end     = gotplt_off + gotplt_bytes;
+    data_voff    = seg2_end;                     # .data base (bss) = right after .got.plt
+    seg2_filesz  = seg2_end - dyn_off;
+    seg2_memsz   = seg2_filesz + data_size;
+    file_size    = seg2_end;
+
+    entry = LOAD_BASE + text_off + load64(g_labels + load64(L_start) * 8);
+
+    # ---- resolve code fixups (kinds 0/1/2 as in elf_write; kind 4 -> .got.plt slot) ----
+    nfix = load64(g_fixup_count);
+    i = 0;
+    while i < nfix {
+        fpos  = load64(g_fixup_pos  + i * 8);
+        fkind = load64(g_fixup_kind + i * 8);
+        ftgt  = load64(g_fixup_tgt  + i * 8);
+        disp  = 0;
+        if fkind == 0 { disp = load64(g_labels + ftgt * 8) - (fpos + 4); }
+        if fkind == 1 { disp = (rdata_off + load64(elf_stroff + ftgt * 8)) - (text_off + fpos + 4); }
+        if fkind == 2 { disp = (data_voff + ftgt) - (text_off + fpos + 4); }
+        if fkind == 4 { disp = (gotplt_off + (3 + ftgt) * 8) - (text_off + fpos + 4); }
+        if fkind == 3 { syscall 1, elf_err_kind3; ExitProcess(1); }
+        store8(g_code + fpos + 0, band(disp,        255));
+        store8(g_code + fpos + 1, band(shr(disp,  8), 255));
+        store8(g_code + fpos + 2, band(shr(disp, 16), 255));
+        store8(g_code + fpos + 3, band(shr(disp, 24), 255));
+        i = i + 1;
+    }
+
+    # ---- assemble the image into g_pe_img (zero-initialised) ----
+    # Elf64_Ehdr
+    store8(g_pe_img + 0, 127); store8(g_pe_img + 1, 69); store8(g_pe_img + 2, 76); store8(g_pe_img + 3, 70);  # 0x7F 'E' 'L' 'F'
+    store8(g_pe_img + 4, 2);   # ELFCLASS64
+    store8(g_pe_img + 5, 1);   # ELFDATA2LSB
+    store8(g_pe_img + 6, 1);   # EV_CURRENT
+    pe_put_le(16, 2,  2);      # e_type = ET_EXEC
+    pe_put_le(18, 62, 2);      # e_machine = EM_X86_64
+    pe_put_le(20, 1,  4);      # e_version
+    pe_put_le(24, entry, 8);   # e_entry
+    pe_put_le(32, 64, 8);      # e_phoff
+    pe_put_le(52, 64, 2);      # e_ehsize
+    pe_put_le(54, 56, 2);      # e_phentsize
+    pe_put_le(56, 5,  2);      # e_phnum = NPH
+
+    # Phdr[0] PT_PHDR
+    pe_put_le(64,  6, 4); pe_put_le(68,  4, 4);
+    pe_put_le(72,  64, 8); pe_put_le(80, LOAD_BASE + 64, 8); pe_put_le(88, LOAD_BASE + 64, 8);
+    pe_put_le(96,  280, 8); pe_put_le(104, 280, 8); pe_put_le(112, 8, 8);
+    # Phdr[1] PT_INTERP
+    pe_put_le(120, 3, 4); pe_put_le(124, 4, 4);
+    pe_put_le(128, interp_off, 8); pe_put_le(136, LOAD_BASE + interp_off, 8); pe_put_le(144, LOAD_BASE + interp_off, 8);
+    pe_put_le(152, interp_sz, 8); pe_put_le(160, interp_sz, 8); pe_put_le(168, 1, 8);
+    # Phdr[2] PT_LOAD R|X (seg1)
+    pe_put_le(176, 1, 4); pe_put_le(180, 5, 4);
+    pe_put_le(184, 0, 8); pe_put_le(192, LOAD_BASE, 8); pe_put_le(200, LOAD_BASE, 8);
+    pe_put_le(208, seg1_end, 8); pe_put_le(216, seg1_end, 8); pe_put_le(224, PAGE, 8);
+    # Phdr[3] PT_LOAD R|W (seg2 = .dynamic + .got.plt + .data bss)
+    pe_put_le(232, 1, 4); pe_put_le(236, 6, 4);
+    pe_put_le(240, dyn_off, 8); pe_put_le(248, LOAD_BASE + dyn_off, 8); pe_put_le(256, LOAD_BASE + dyn_off, 8);
+    pe_put_le(264, seg2_filesz, 8); pe_put_le(272, seg2_memsz, 8); pe_put_le(280, PAGE, 8);
+    # Phdr[4] PT_DYNAMIC
+    pe_put_le(288, 2, 4); pe_put_le(292, 6, 4);
+    pe_put_le(296, dynamic_off, 8); pe_put_le(304, LOAD_BASE + dynamic_off, 8); pe_put_le(312, LOAD_BASE + dynamic_off, 8);
+    pe_put_le(320, dynamic_bytes, 8); pe_put_le(328, dynamic_bytes, 8); pe_put_le(336, 8, 8);
+
+    # .interp
+    k = 0;
+    while k < interp_sz - 1 { store8(g_pe_img + interp_off + k, load8(elfd_interp + k)); k = k + 1; }
+
+    # .hash (SysV; nbucket=1)
+    pe_put_le(hash_off + 0, 1, 4);         # nbucket
+    pe_put_le(hash_off + 4, nsym, 4);      # nchain
+    bkt = 0;
+    if nsym > 1 { bkt = 1; }
+    pe_put_le(hash_off + 8, bkt, 4);       # bucket[0]
+    ci = 0;
+    while ci < nsym {                       # chain[]: 1..nsym-2 -> next; ends -> 0; chain[0]=0
+        cv = 0;
+        if ci != 0 { if ci != nsym - 1 { cv = ci + 1; } }
+        pe_put_le(hash_off + 12 + ci*4, cv, 4);
+        ci = ci + 1;
+    }
+
+    # .dynsym (sym[0] = null; sym[1+k] = UNDEF GLOBAL FUNC)
+    di = 0;
+    while di < D {
+        symb = dynsym_off + (1 + di) * 24;
+        pe_put_le(symb + 0, load64(sym_stroff + di*8), 4);   # st_name
+        store8(g_pe_img + symb + 4, 18);                     # st_info = (STB_GLOBAL<<4)|STT_FUNC
+        di = di + 1;
+    }
+
+    # .dynstr (leading NUL already 0)
+    s = 0;
+    while s < nso {
+        base = dynstr_off + load64(so_stroff + s*8);
+        soff = load64(so_off_arr + s*8);
+        slen = load64(so_len_arr + s*8);
+        k = 0;
+        while k < slen { store8(g_pe_img + base + k, load8(g_str_pool + soff + k)); k = k + 1; }
+        s = s + 1;
+    }
+    di = 0;
+    while di < D {
+        base = dynstr_off + load64(sym_stroff + di*8);
+        foff = load64(g_dynimp_fn    + di*8);
+        flen = load64(g_dynimp_fnlen + di*8);
+        k = 0;
+        while k < flen { store8(g_pe_img + base + k, load8(g_str_pool + foff + k)); k = k + 1; }
+        di = di + 1;
+    }
+
+    # .rela.plt (Elf64_Rela: r_offset, r_info, r_addend)
+    di = 0;
+    while di < D {
+        rr = relaplt_off + di * 24;
+        pe_put_le(rr + 0, LOAD_BASE + gotplt_off + (3 + di) * 8, 8);   # r_offset -> GOT slot
+        pe_put_le(rr + 8, (1 + di) * 4294967296 + 7, 8);              # (symidx<<32)|R_X86_64_JUMP_SLOT
+        di = di + 1;
+    }
+
+    # .text + .rdata
+    pe_memcpy_to_img(text_off, g_code, code_size);
+    i = 0;
+    while i < nstrs {
+        soff2 = load64(g_str_off + i * 8);
+        slen2 = load64(g_str_len + i * 8);
+        dst   = rdata_off + load64(elf_stroff + i * 8);
+        j = 0;
+        while j <= slen2 { store8(g_pe_img + dst + j, load8(g_strings + soff2 + j)); j = j + 1; }
+        i = i + 1;
+    }
+
+    # .dynamic
+    dyi = 0;
+    s = 0;
+    while s < nso {
+        de = dynamic_off + dyi * 16;
+        pe_put_le(de + 0, 1, 8);                         # DT_NEEDED
+        pe_put_le(de + 8, load64(so_stroff + s*8), 8);
+        dyi = dyi + 1;
+        s = s + 1;
+    }
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 4,  8); pe_put_le(de+8, LOAD_BASE + hash_off, 8);    dyi = dyi + 1;   # DT_HASH
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 5,  8); pe_put_le(de+8, LOAD_BASE + dynstr_off, 8);  dyi = dyi + 1;   # DT_STRTAB
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 6,  8); pe_put_le(de+8, LOAD_BASE + dynsym_off, 8);  dyi = dyi + 1;   # DT_SYMTAB
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 10, 8); pe_put_le(de+8, dynstr_size, 8);             dyi = dyi + 1;   # DT_STRSZ
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 11, 8); pe_put_le(de+8, 24, 8);                      dyi = dyi + 1;   # DT_SYMENT
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 3,  8); pe_put_le(de+8, LOAD_BASE + gotplt_off, 8);  dyi = dyi + 1;   # DT_PLTGOT
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 2,  8); pe_put_le(de+8, relaplt_bytes, 8);           dyi = dyi + 1;   # DT_PLTRELSZ
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 20, 8); pe_put_le(de+8, 7, 8);                       dyi = dyi + 1;   # DT_PLTREL = RELA
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 23, 8); pe_put_le(de+8, LOAD_BASE + relaplt_off, 8); dyi = dyi + 1;   # DT_JMPREL
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 24, 8); pe_put_le(de+8, 0, 8);                       dyi = dyi + 1;   # DT_BIND_NOW
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 30, 8); pe_put_le(de+8, 8, 8);                       dyi = dyi + 1;   # DT_FLAGS = DF_BIND_NOW
+    de = dynamic_off + dyi*16; pe_put_le(de+0, 0,  8); pe_put_le(de+8, 0, 8);                       dyi = dyi + 1;   # DT_NULL
+
+    # .got.plt : GOT[0] = &_DYNAMIC (reserved); GOT[1..2] and the D slots stay 0 (ld.so fills)
+    pe_put_le(gotplt_off + 0, LOAD_BASE + dynamic_off, 8);
+
+    store64(g_pe_img_size, file_size);
+
+    free(so_off_arr); free(so_len_arr); free(so_stroff); free(sym_stroff); free(elf_stroff);
+
+    # ---- write the file (GENERIC_WRITE, CREATE_ALWAYS) ----
+    h = CreateFileA(path, 1073741824, 0, 0, 2, 128, 0);
+    if h == 0 - 1 { syscall 1, elf_err_open; return 0 - 1; }
+    WriteFile(h, g_pe_img, file_size, g_pe_nwritten, 0);
+    CloseHandle(h);
+    return 0;
+}

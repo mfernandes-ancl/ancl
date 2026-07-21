@@ -1,0 +1,989 @@
+# =====================================================================
+#  bloch_visualizer_3d.ancl  -  3D Qubit Bloch Sphere Visualizer
+#
+#  Open-Source Systems Mathematics Showcase (Project Aether-Bloch)
+#  100% CRT-free, native 3D software-rasterized qubit state display.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" StretchDIBits;
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+clsname:      str = "AETHERBLOCHWND";
+title:        str = "ANCL Project Aether-Bloch: 3D Qubit Bloch Sphere Visualizer";
+font_name:    str = "Consolas";
+btn_class:    str = "BUTTON";
+
+# Qubit State (alpha = a_r + a_i * i, beta = b_r + b_i * i)
+g_q_a_r: buf = 8;
+g_q_a_i: buf = 8;
+g_q_b_r: buf = 8;
+g_q_b_i: buf = 8;
+
+# Needle positions (scaled by 65536)
+g_needle_target_x: buf = 8;
+g_needle_target_y: buf = 8;
+g_needle_target_z: buf = 8;
+
+g_needle_curr_x: buf = 8;
+g_needle_curr_y: buf = 8;
+g_needle_curr_z: buf = 8;
+
+g_needle_start_x: buf = 8;
+g_needle_start_y: buf = 8;
+g_needle_start_z: buf = 8;
+
+g_anim_frames: buf = 8;
+
+# 3D Rotations
+g_angleY: buf = 8;
+
+# Spherical coordinate angles (indices 0 to 1023)
+g_theta: buf = 8;
+g_phi:   buf = 8;
+
+# Trig tables (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# Viewport buffers
+# Framebuffer: 320x240 pixels * 4 bytes/pixel = 307200 bytes
+g_framebuffer: buf = 307200;
+# Z-buffer: 320x240 pixels * 4 bytes/pixel = 307200 bytes
+g_zbuffer: buf = 307200;
+# BITMAPINFO structure (48 bytes)
+g_bitmapinfo: buf = 48;
+
+# Mesh database
+# Vertices: 148 * 24 bytes (3 coords * 8) = 3552 bytes
+g_vertices: buf = 3552;
+# Normals: 148 * 24 bytes = 3552 bytes
+g_normals: buf = 3552;
+# Projected coordinates: 148 * 48 bytes (6 values * 8) = 7104 bytes
+g_projected: buf = 7104;
+# Triangles: 260 * 24 bytes (3 indices * 8) = 6240 bytes
+g_triangles: buf = 6240;
+# Colors: 260 * 8 bytes = 2080 bytes
+g_triangle_colors: buf = 2080;
+
+g_num_vertices: buf = 8;
+g_num_triangles: buf = 8;
+
+# Complex multiplication product buffer
+g_temp_prod: buf = 16;
+
+# String buffers
+g_txt_buf: buf = 256;
+g_num_buf: buf = 32;
+
+# Standard Win32 variables
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Math & String Utilities
+# ---------------------------------------------------------------------
+
+func strcpy(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i, c);
+        if c == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strcat(dst: i64, src: i64) -> i64 {
+    p = dst;
+    while load8(p) != 0 {
+        p = p + 1;
+    }
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(p + i, c);
+        if c == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strlen(s: i64) -> i64 {
+    i = 0;
+    while load8(s + i) != 0 {
+        i = i + 1;
+    }
+    return i;
+}
+
+func itoa(val: i64, buf: i64) -> i64 {
+    if val == 0 {
+        store8(buf, 48); # '0'
+        store8(buf + 1, 0);
+        return 1;
+    }
+    negative = 0;
+    temp = val;
+    if temp < 0 {
+        negative = 1;
+        temp = 0 - temp;
+    }
+    p = buf;
+    if negative == 1 {
+        store8(p, 45); # '-'
+        p = p + 1;
+    }
+    start_digits = p;
+    while temp > 0 {
+        digit = temp % 10;
+        store8(p, 48 + digit); # '0' + digit
+        p = p + 1;
+        temp = temp / 10;
+    }
+    store8(p, 0);
+    end_digits = p - 1;
+    while start_digits < end_digits {
+        c1 = load8(start_digits);
+        c2 = load8(end_digits);
+        store8(start_digits, c2);
+        store8(end_digits, c1);
+        start_digits = start_digits + 1;
+        end_digits = end_digits - 1;
+    }
+    return p - buf;
+}
+
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+func get_sin(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_sin + idx * 8);
+}
+
+func get_cos(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_cos + idx * 8);
+}
+
+# ---------------------------------------------------------------------
+# Radix Complex Math
+# ---------------------------------------------------------------------
+
+func c_add(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    store64(out, r1 + r2);
+    store64(out + 8, i1 + i2);
+    return 0;
+}
+
+func c_sub(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    store64(out, r1 - r2);
+    store64(out + 8, i1 - i2);
+    return 0;
+}
+
+func c_mul(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    r = (r1 * r2 - i1 * i2) / 65536;
+    i = (r1 * i2 + i1 * r2) / 65536;
+    store64(out, r);
+    store64(out + 8, i);
+    return 0;
+}
+
+func c_mag_sq(r: i64, im: i64) -> i64 {
+    return (r * r + im * im) / 65536;
+}
+
+# ---------------------------------------------------------------------
+# Qubit Gate Operations & Bloch Sphere Mapping
+# ---------------------------------------------------------------------
+
+func reset_q_state() -> i64 {
+    store64(g_q_a_r, 65536);
+    store64(g_q_a_i, 0);
+    store64(g_q_b_r, 0);
+    store64(g_q_b_i, 0);
+    return 0;
+}
+
+func apply_hadamard() -> i64 {
+    inv_s = 46341; # 1/sqrt(2) * 65536
+    ar = load64(g_q_a_r);
+    ai = load64(g_q_a_i);
+    br = load64(g_q_b_r);
+    bi = load64(g_q_b_i);
+    
+    store64(g_q_a_r, ((ar + br) * inv_s) / 65536);
+    store64(g_q_a_i, ((ai + bi) * inv_s) / 65536);
+    store64(g_q_b_r, ((ar - br) * inv_s) / 65536);
+    store64(g_q_b_i, ((ai - bi) * inv_s) / 65536);
+    return 0;
+}
+
+func apply_paulix() -> i64 {
+    ar = load64(g_q_a_r);
+    ai = load64(g_q_a_i);
+    br = load64(g_q_b_r);
+    bi = load64(g_q_b_i);
+    
+    store64(g_q_a_r, br);
+    store64(g_q_a_i, bi);
+    store64(g_q_b_r, ar);
+    store64(g_q_b_i, ai);
+    return 0;
+}
+
+func apply_pauliy() -> i64 {
+    ar = load64(g_q_a_r);
+    ai = load64(g_q_a_i);
+    br = load64(g_q_b_r);
+    bi = load64(g_q_b_i);
+    
+    # alpha' = -i*beta = bi - br*i
+    # beta' = i*alpha = -ai + ar*i
+    store64(g_q_a_r, bi);
+    store64(g_q_a_i, 0 - br);
+    store64(g_q_b_r, 0 - ai);
+    store64(g_q_b_i, ar);
+    return 0;
+}
+
+func apply_pauliz() -> i64 {
+    br = load64(g_q_b_r);
+    bi = load64(g_q_b_i);
+    
+    store64(g_q_b_r, 0 - br);
+    store64(g_q_b_i, 0 - bi);
+    return 0;
+}
+
+func update_target_coordinates() -> i64 {
+    ar = load64(g_q_a_r);
+    ai = load64(g_q_a_i);
+    br = load64(g_q_b_r);
+    bi = load64(g_q_b_i);
+    
+    # 1. Compute direct Cartesian projection (unnormalized helper coords)
+    c_mul(ar, 0 - ai, br, bi, g_temp_prod);
+    prod_r = load64(g_temp_prod);
+    prod_i = load64(g_temp_prod + 8);
+    
+    xu = prod_r * 2;
+    yu = prod_i * 2;
+    zu = c_mag_sq(ar, ai) - c_mag_sq(br, bi);
+    
+    # 2. Extract theta: Find index in [0, 512] that minimizes |cos(idx) - zu|
+    best_theta_idx = 0;
+    min_diff_theta = 0x7FFFFFFF;
+    
+    idx = 0;
+    while idx <= 512 {
+        cos_val = load64(g_cos + idx * 8);
+        diff = cos_val - zu;
+        if diff < 0 { diff = 0 - diff; }
+        if diff < min_diff_theta {
+            min_diff_theta = diff;
+            best_theta_idx = idx;
+        }
+        idx = idx + 1;
+    }
+    store64(g_theta, best_theta_idx);
+    
+    # 3. Extract phi: Find index in [0, 1023] that maximizes (xu * cos(idx) + yu * sin(idx))
+    best_phi_idx = 0;
+    max_dot = 0 - 0x7FFFFFFF;
+    
+    idx = 0;
+    while idx < 1024 {
+        c_val = load64(g_cos + idx * 8);
+        s_val = load64(g_sin + idx * 8);
+        dot = (xu * c_val + yu * s_val) / 65536;
+        if dot > max_dot {
+            max_dot = dot;
+            best_phi_idx = idx;
+        }
+        idx = idx + 1;
+    }
+    store64(g_phi, best_phi_idx);
+    
+    # 4. Compute definitive 3D spatial vector coordinates using theta and phi:
+    # X = sin(theta) * cos(phi)
+    # Y = sin(theta) * sin(phi)
+    # Z = cos(theta)
+    sin_theta = get_sin(best_theta_idx);
+    cos_theta = get_cos(best_theta_idx);
+    sin_phi = get_sin(best_phi_idx);
+    cos_phi = get_cos(best_phi_idx);
+    
+    x = (sin_theta * cos_phi) / 65536;
+    y = (sin_theta * sin_phi) / 65536;
+    z = cos_theta;
+    
+    store64(g_needle_target_x, x);
+    store64(g_needle_target_y, y);
+    store64(g_needle_target_z, z);
+    return 0;
+}
+
+func trigger_transition() -> i64 {
+    store64(g_needle_start_x, load64(g_needle_curr_x));
+    store64(g_needle_start_y, load64(g_needle_curr_y));
+    store64(g_needle_start_z, load64(g_needle_curr_z));
+    
+    update_target_coordinates();
+    store64(g_anim_frames, 10);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Mesh Storage & Generators
+# ---------------------------------------------------------------------
+
+func set_vertex(idx: i64, x: i64, y: i64, z: i64, nx: i64, ny: i64, nz: i64) -> i64 {
+    store64(g_vertices + idx * 24, x);
+    store64(g_vertices + idx * 24 + 8, y);
+    store64(g_vertices + idx * 24 + 16, z);
+    
+    store64(g_normals + idx * 24, nx);
+    store64(g_normals + idx * 24 + 8, ny);
+    store64(g_normals + idx * 24 + 16, nz);
+    return 0;
+}
+
+func set_triangle(idx: i64, v0: i64, v1: i64, v2: i64, color_type: i64) -> i64 {
+    store64(g_triangles + idx * 24, v0);
+    store64(g_triangles + idx * 24 + 8, v1);
+    store64(g_triangles + idx * 24 + 16, v2);
+    store64(g_triangle_colors + idx * 8, color_type);
+    return 0;
+}
+
+func init_sphere_mesh() -> i64 {
+    r_val = 80;
+    
+    # 1. Generate vertices (9 rings * 16 sectors = 144 vertices)
+    r = 0;
+    while r <= 8 {
+        u = (r * 512) / 8;
+        sin_u = get_sin(u);
+        cos_u = get_cos(u);
+        
+        s = 0;
+        while s < 16 {
+            v = (s * 1024) / 16;
+            sin_v = get_sin(v);
+            cos_v = get_cos(v);
+            
+            vx = (r_val * sin_u) / 65536;
+            vx = (vx * cos_v) / 65536;
+            
+            vy = (r_val * sin_u) / 65536;
+            vy = (vy * sin_v) / 65536;
+            
+            vz = (r_val * cos_u) / 65536;
+            
+            nx = (sin_u * cos_v) / 65536;
+            ny = (sin_u * sin_v) / 65536;
+            nz = cos_u;
+            
+            v_idx = r * 16 + s;
+            set_vertex(v_idx, vx, vy, vz, nx, ny, nz);
+            
+            s = s + 1;
+        }
+        r = r + 1;
+    }
+    
+    # 2. Generate triangles (8 ring sectors * 16 sectors * 2 = 256 triangles)
+    t_idx = 0;
+    r = 0;
+    while r < 8 {
+        s = 0;
+        while s < 16 {
+            s_next = s + 1;
+            if s_next == 16 { s_next = 0; }
+            
+            v0 = r * 16 + s;
+            v1 = r * 16 + s_next;
+            v2 = (r + 1) * 16 + s;
+            v3 = (r + 1) * 16 + s_next;
+            
+            set_triangle(t_idx, v0, v1, v2, 1);
+            t_idx = t_idx + 1;
+            
+            set_triangle(t_idx, v1, v3, v2, 1);
+            t_idx = t_idx + 1;
+            
+            s = s + 1;
+        }
+        r = r + 1;
+    }
+    
+    store64(g_num_vertices, 144);
+    store64(g_num_triangles, 256);
+    return 0;
+}
+
+func update_needle_mesh() -> i64 {
+    curr_x = load64(g_needle_curr_x);
+    curr_y = load64(g_needle_curr_y);
+    curr_z = load64(g_needle_curr_z);
+    
+    tx = (80 * curr_x) / 65536;
+    ty = (80 * curr_y) / 65536;
+    tz = (80 * curr_z) / 65536;
+    
+    # Base triangle vertices (around origin)
+    set_vertex(144, 0 - 4, 0, 0 - 4, 0, 0, 65536);
+    set_vertex(145, 4, 0, 0 - 4, 0, 0, 65536);
+    set_vertex(146, 0, 0, 4, 0, 0, 65536);
+    
+    # Needle tip vertex
+    set_vertex(147, tx, ty, tz, curr_x, curr_y, curr_z);
+    
+    # Needle triangles at indices 256..259
+    set_triangle(256, 144, 145, 147, 2);
+    set_triangle(257, 145, 146, 147, 2);
+    set_triangle(258, 146, 144, 147, 2);
+    set_triangle(259, 144, 146, 145, 2);
+    
+    store64(g_num_vertices, 148);
+    store64(g_num_triangles, 260);
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Software Gouraud Scanline Rasterizer
+# ---------------------------------------------------------------------
+
+func draw_triangle(v0: i64, v1: i64, v2: i64, color_type: i64) -> i64 {
+    addr0 = g_projected + v0 * 48;
+    x0 = load64(addr0 + 0);
+    y0 = load64(addr0 + 8);
+    z0 = load64(addr0 + 16);
+    s0 = load64(addr0 + 24);
+    
+    addr1 = g_projected + v1 * 48;
+    x1 = load64(addr1 + 0);
+    y1 = load64(addr1 + 8);
+    z1 = load64(addr1 + 16);
+    s1 = load64(addr1 + 24);
+    
+    addr2 = g_projected + v2 * 48;
+    x2 = load64(addr2 + 0);
+    y2 = load64(addr2 + 8);
+    z2 = load64(addr2 + 16);
+    s2 = load64(addr2 + 24);
+    
+    if color_type == 1 { # Silver/Chrome skin
+        r0 = (140 * s0) / 255; g0 = (160 * s0) / 255; b0 = (200 * s0) / 255;
+        r1 = (140 * s1) / 255; g1 = (160 * s1) / 255; b1 = (200 * s1) / 255;
+        r2 = (140 * s2) / 255; g2 = (160 * s2) / 255; b2 = (200 * s2) / 255;
+    } else { # Orange/Amber Needle
+        r0 = (255 * s0) / 255; g0 = (120 * s0) / 255; b0 = 0;
+        r1 = (255 * s1) / 255; g1 = (120 * s1) / 255; b1 = 0;
+        r2 = (255 * s2) / 255; g2 = (120 * s2) / 255; b2 = 0;
+    }
+    
+    # Sort vertices by Y: y0 <= y1 <= y2
+    if y0 > y1 {
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+        t = z0; z0 = z1; z1 = t;
+        t = r0; r0 = r1; r1 = t;
+        t = g0; g0 = g1; g1 = t;
+        t = b0; b0 = b1; b1 = t;
+    }
+    if y0 > y2 {
+        t = x0; x0 = x2; x2 = t;
+        t = y0; y0 = y2; y2 = t;
+        t = z0; z0 = z2; z2 = t;
+        t = r0; r0 = r2; r2 = t;
+        t = g0; g0 = g2; g2 = t;
+        t = b0; b0 = b2; b2 = t;
+    }
+    if y1 > y2 {
+        t = x1; x1 = x2; x2 = t;
+        t = y1; y1 = y2; y2 = t;
+        t = z1; z1 = z2; z2 = t;
+        t = r1; r1 = r2; r2 = t;
+        t = g1; g1 = g2; g2 = t;
+        t = b1; b1 = b2; b2 = t;
+    }
+    
+    dy_total = y2 - y0;
+    if dy_total == 0 { return 0; }
+    
+    y = y0;
+    while y <= y2 {
+        if y >= 0 && y < 240 {
+            f02 = ((y - y0) * 65536) / dy_total;
+            x_02 = x0 + ((x2 - x0) * f02) / 65536;
+            z_02 = z0 + ((z2 - z0) * f02) / 65536;
+            r_02 = r0 + ((r2 - r0) * f02) / 65536;
+            g_02 = g0 + ((g2 - g0) * f02) / 65536;
+            b_02 = b0 + ((b2 - b0) * f02) / 65536;
+            
+            if y < y1 {
+                dy_short = y1 - y0;
+                if dy_short > 0 {
+                    f_short = ((y - y0) * 65536) / dy_short;
+                    x_short = x0 + ((x1 - x0) * f_short) / 65536;
+                    z_short = z0 + ((z1 - z0) * f_short) / 65536;
+                    r_short = r0 + ((r1 - r0) * f_short) / 65536;
+                    g_short = g0 + ((g1 - g0) * f_short) / 65536;
+                    b_short = b0 + ((b1 - b0) * f_short) / 65536;
+                } else {
+                    x_short = x0; z_short = z0; r_short = r0; g_short = g0; b_short = b0;
+                }
+            } else {
+                dy_short = y2 - y1;
+                if dy_short > 0 {
+                    f_short = ((y - y1) * 65536) / dy_short;
+                    x_short = x1 + ((x2 - x1) * f_short) / 65536;
+                    z_short = z1 + ((z2 - z1) * f_short) / 65536;
+                    r_short = r1 + ((r2 - r1) * f_short) / 65536;
+                    g_short = g1 + ((g2 - g1) * f_short) / 65536;
+                    b_short = b1 + ((b2 - b1) * f_short) / 65536;
+                } else {
+                    x_short = x1; z_short = z1; r_short = r1; g_short = g1; b_short = b1;
+                }
+            }
+            
+            x_l = x_02; z_l = z_02; r_l = r_02; g_l = g_02; b_l = b_02;
+            x_r = x_short; z_r = z_short; r_r = r_short; g_r = g_short; b_r = b_short;
+            if x_l > x_r {
+                t = x_l; x_l = x_r; x_r = t;
+                t = z_l; z_l = z_r; z_r = t;
+                t = r_l; r_l = r_r; r_r = t;
+                t = g_l; g_l = g_r; g_r = t;
+                t = b_l; b_l = b_r; b_r = t;
+            }
+            
+            x_start = x_l;
+            x_end = x_r;
+            if x_start < 0 { x_start = 0; }
+            if x_end > 319 { x_end = 319; }
+            
+            dx_line = x_r - x_l;
+            if dx_line > 0 {
+                x_idx = x_start;
+                while x_idx <= x_end {
+                    f_line = ((x_idx - x_l) * 65536) / dx_line;
+                    z_pixel = z_l + ((z_r - z_l) * f_line) / 65536;
+                    
+                    offset = y * 320 + x_idx;
+                    z_buffered = load32(g_zbuffer + offset * 4);
+                    
+                    if z_pixel < z_buffered {
+                        r_pixel = r_l + ((r_r - r_l) * f_line) / 65536;
+                        g_pixel = g_l + ((g_r - g_l) * f_line) / 65536;
+                        b_pixel = b_l + ((b_r - b_l) * f_line) / 65536;
+                        
+                        if r_pixel < 0 { r_pixel = 0; }
+                        if r_pixel > 255 { r_pixel = 255; }
+                        if g_pixel < 0 { g_pixel = 0; }
+                        if g_pixel > 255 { g_pixel = 255; }
+                        if b_pixel < 0 { b_pixel = 0; }
+                        if b_pixel > 255 { b_pixel = 255; }
+                        
+                        pixel_color = shl(r_pixel, 16) + shl(g_pixel, 8) + b_pixel;
+                        
+                        store32(g_framebuffer + offset * 4, pixel_color);
+                        store32(g_zbuffer + offset * 4, z_pixel);
+                    }
+                    x_idx = x_idx + 1;
+                }
+            }
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Projection & Lighting Pass
+# ---------------------------------------------------------------------
+
+func project_and_shade_vertices() -> i64 {
+    ax = 128; # Fixed isometric tilt around X
+    ay = load64(g_angleY);
+    
+    cosX = get_cos(ax);
+    sinX = get_sin(ax);
+    
+    cosY = get_cos(ay);
+    sinY = get_sin(ay);
+    
+    # Directional Light: normalized (Lx=23918, Ly=38269, Lz=-47836)
+    lx = 23918;
+    ly = 38269;
+    lz = 0 - 47836;
+    
+    num_v = load64(g_num_vertices);
+    i = 0;
+    while i < num_v {
+        vx = load64(g_vertices + i * 24);
+        vy = load64(g_vertices + i * 24 + 8);
+        vz = load64(g_vertices + i * 24 + 16);
+        
+        # Rotate coordinates around Y axis
+        x1 = (vx * cosY + vz * sinY) / 65536;
+        z1 = (0 - vx * sinY + vz * cosY) / 65536;
+        
+        # Rotate coordinates around X axis
+        rx = x1;
+        ry = (vy * cosX - z1 * sinX) / 65536;
+        rz = (vy * sinX + z1 * cosX) / 65536;
+        
+        # Rotate normal vector around Y axis
+        nx = load64(g_normals + i * 24);
+        ny = load64(g_normals + i * 24 + 8);
+        nz = load64(g_normals + i * 24 + 16);
+        
+        nx1 = (nx * cosY + nz * sinY) / 65536;
+        nz1 = (0 - nx * sinY + nz * cosY) / 65536;
+        
+        # Rotate normal vector around X axis
+        rnx = nx1;
+        rny = (ny * cosX - nz1 * sinX) / 65536;
+        rnz = (ny * sinX + nz1 * cosX) / 65536;
+        
+        # Compute Lambertian directional lighting dot intensity
+        dot = (rnx * lx + rny * ly + rnz * lz) / 65536;
+        if dot < 0 { dot = 0; }
+        
+        # Ambient (50) + Diffuse (205)
+        shade = 50 + (dot * 205) / 65536;
+        if shade > 255 { shade = 255; }
+        
+        # Perspective projection (Zoom=240, distance offset=180)
+        denom = rz + 180;
+        if denom < 1 { denom = 1; }
+        
+        projX = 160 + (rx * 240) / denom;
+        projY = 120 + (ry * 240) / denom;
+        
+        addr = g_projected + i * 48;
+        store64(addr + 0, projX);
+        store64(addr + 8, projY);
+        store64(addr + 16, rz);
+        store64(addr + 24, shade);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+func render_scene() -> i64 {
+    # Clear framebuffer (dark navy) and Z-buffer (max depth)
+    i = 0;
+    while i < 76800 {
+        store32(g_framebuffer + i * 4, 0x000B0B0F);
+        store32(g_zbuffer + i * 4, 0x7FFFFFFF);
+        i = i + 1;
+    }
+    
+    project_and_shade_vertices();
+    
+    # Rasterize triangles
+    num_t = load64(g_num_triangles);
+    t_idx = 0;
+    while t_idx < num_t {
+        v0 = load64(g_triangles + t_idx * 24);
+        v1 = load64(g_triangles + t_idx * 24 + 8);
+        v2 = load64(g_triangles + t_idx * 24 + 16);
+        color_type = load64(g_triangle_colors + t_idx * 8);
+        
+        draw_triangle(v0, v1, v2, color_type);
+        t_idx = t_idx + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 WndProc & Message Loop
+# ---------------------------------------------------------------------
+
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        CreateWindowExA(0, btn_class, "H", 1342242816, 380, 445, 45, 30, hwnd, 101, hinst, 0);
+        CreateWindowExA(0, btn_class, "X", 1342242816, 430, 445, 45, 30, hwnd, 102, hinst, 0);
+        CreateWindowExA(0, btn_class, "Y", 1342242816, 480, 445, 45, 30, hwnd, 103, hinst, 0);
+        CreateWindowExA(0, btn_class, "Z", 1342242816, 530, 445, 45, 30, hwnd, 104, hinst, 0);
+        CreateWindowExA(0, btn_class, "RESET", 1342242816, 580, 445, 50, 30, hwnd, 105, hinst, 0);
+        
+        SetTimer(hwnd, 1, 30, 0);
+        return 0;
+    }
+    
+    if msg == 273 { # WM_COMMAND
+        cmdId = band(wParam, 65535);
+        if cmdId == 101 {
+            apply_hadamard();
+            trigger_transition();
+        }
+        if cmdId == 102 {
+            apply_paulix();
+            trigger_transition();
+        }
+        if cmdId == 103 {
+            apply_pauliy();
+            trigger_transition();
+        }
+        if cmdId == 104 {
+            apply_pauliz();
+            trigger_transition();
+        }
+        if cmdId == 105 {
+            reset_q_state();
+            trigger_transition();
+        }
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Auto-rotate Bloch sphere
+        ay = load64(g_angleY);
+        ay = band(ay + 2, 1023);
+        store64(g_angleY, ay);
+        
+        # Smooth interpolation update
+        frames = load64(g_anim_frames);
+        if frames > 0 {
+            frames = frames - 1;
+            store64(g_anim_frames, frames);
+            
+            t = 10 - frames;
+            sx = load64(g_needle_start_x);
+            sy = load64(g_needle_start_y);
+            sz = load64(g_needle_start_z);
+            tx = load64(g_needle_target_x);
+            ty = load64(g_needle_target_y);
+            tz = load64(g_needle_target_z);
+            
+            store64(g_needle_curr_x, sx + ((tx - sx) * t) / 10);
+            store64(g_needle_curr_y, sy + ((ty - sy) * t) / 10);
+            store64(g_needle_curr_z, sz + ((tz - sz) * t) / 10);
+        }
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Render 3D Scene
+        update_needle_mesh();
+        render_scene();
+        
+        # Blit framebuffer to client DC (Y=0 to Y=h-80)
+        StretchDIBits(hdc, 0, 0, w, h - 80, 0, 0, 320, 240, g_framebuffer, g_bitmapinfo, 0, 0x00CC0020);
+        
+        # Paint bottom control panel bar
+        hBrushPanel = CreateSolidBrush(0x001B1B15);
+        oldBrush = SelectObject(hdc, hBrushPanel);
+        hPenPanel = CreatePen(0, 1, 0x0033332D);
+        oldPen = SelectObject(hdc, hPenPanel);
+        Rectangle(hdc, 0, h - 80, w, h);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(hPenPanel);
+        DeleteObject(hBrushPanel);
+        
+        # Monospace Text Overlay
+        hFont = CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, font_name);
+        oldFont = SelectObject(hdc, hFont);
+        SetBkMode(hdc, 1);
+        
+        SetTextColor(hdc, 0x0000FF95); # Mint Green
+        strcpy(g_txt_buf, "AETHER-BLOCH // 3D BLOCH SPHERE QUBIT VISUALIZER");
+        TextOutA(hdc, 15, 10, g_txt_buf, strlen(g_txt_buf));
+        
+        SetTextColor(hdc, 0x0000FFFF); # Cyber Cyan
+        
+        # Compute probabilities
+        ar = load64(g_q_a_r);
+        ai = load64(g_q_a_i);
+        br = load64(g_q_b_r);
+        bi = load64(g_q_b_i);
+        
+        prob0 = c_mag_sq(ar, ai);
+        prob1 = c_mag_sq(br, bi);
+        
+        pct0 = (prob0 * 100) / 65536;
+        pct1 = (prob1 * 100) / 65536;
+        
+        # Print state equation
+        strcpy(g_txt_buf, "State vector: |psi> = (");
+        itoa(ar, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        if ai >= 0 {
+            strcat(g_txt_buf, " + ");
+        } else {
+            strcat(g_txt_buf, " - ");
+        }
+        abs_ai = ai;
+        if abs_ai < 0 { abs_ai = 0 - abs_ai; }
+        itoa(abs_ai, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, "i)|0> + (");
+        itoa(br, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        if bi >= 0 {
+            strcat(g_txt_buf, " + ");
+        } else {
+            strcat(g_txt_buf, " - ");
+        }
+        abs_bi = bi;
+        if abs_bi < 0 { abs_bi = 0 - abs_bi; }
+        itoa(abs_bi, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, "i)|1>");
+        TextOutA(hdc, 15, h - 70, g_txt_buf, strlen(g_txt_buf));
+        
+        # Print probabilities
+        strcpy(g_txt_buf, "P(|0>): ");
+        itoa(pct0, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, "%  |  P(|1>): ");
+        itoa(pct1, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, "%");
+        TextOutA(hdc, 15, h - 50, g_txt_buf, strlen(g_txt_buf));
+        
+        # Print Bloch vector coords
+        cx = load64(g_needle_curr_x);
+        cy = load64(g_needle_curr_y);
+        cz = load64(g_needle_curr_z);
+        
+        strcpy(g_txt_buf, "Bloch Vector: [X: ");
+        itoa(cx, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, ", Y: ");
+        itoa(cy, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, ", Z: ");
+        itoa(cz, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, "]");
+        TextOutA(hdc, 15, h - 30, g_txt_buf, strlen(g_txt_buf));
+        
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Execution Entry Point
+# ---------------------------------------------------------------------
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize Trigonometry Tables & Mesh Data
+    init_lut();
+    init_sphere_mesh();
+    
+    # Initialize Qubit State Vector
+    reset_q_state();
+    update_target_coordinates();
+    
+    # Set current needle position to target immediately at boot
+    store64(g_needle_curr_x, load64(g_needle_target_x));
+    store64(g_needle_curr_y, load64(g_needle_target_y));
+    store64(g_needle_curr_z, load64(g_needle_target_z));
+    store64(g_anim_frames, 0);
+    
+    # Initialize BITMAPINFO (48 bytes) for 320x240 Top-Down DIB
+    store32(g_bitmapinfo + 0, 40);
+    store32(g_bitmapinfo + 4, 320);
+    store32(g_bitmapinfo + 8, 0 - 240);
+    store16(g_bitmapinfo + 12, 1);
+    store16(g_bitmapinfo + 14, 32);
+    store32(g_bitmapinfo + 16, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F));
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA (width 650, height 520)
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 100, 100, 650, 520, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Windows FFI Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

@@ -1,0 +1,226 @@
+# =====================================================================
+#  lens_json.ancl - tiny JSON/string helpers for Aether Lens.
+# =====================================================================
+
+@DATA
+lj_b64tab: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+@CODE
+func lj_sapp(dst: i64, d: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst + d, 0); return d; }
+        store8(dst + d, c);
+        i = i + 1;
+        d = d + 1;
+    }
+    return d;
+}
+
+func lj_find_after(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0 - 1; }
+        j = 0;
+        matched = 1;
+        while matched == 1 {
+            nc = load8(ndl + j);
+            if nc == 0 { return i + j; }
+            if load8(hay + i + j) != nc { matched = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+func lj_find_after_from(hay: i64, from: i64, ndl: i64) -> i64 {
+    p = lj_find_after(hay + from, ndl);
+    if p < 0 { return p; }
+    return from + p;
+}
+
+func lj_contains(hay: i64, ndl: i64) -> i64 {
+    if lj_find_after(hay, ndl) >= 0 { return 1; }
+    return 0;
+}
+
+func lj_match_at(hay: i64, pos: i64, ndl: i64) -> i64 {
+    j = 0;
+    while 1 {
+        c = load8(ndl + j);
+        if c == 0 { return 1; }
+        if load8(hay + pos + j) != c { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+func lj_json_esc(dst: i64, d0: i64, src: i64) -> i64 {
+    d = d0;
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst + d, 0); return d; }
+        if c == 34 {
+            store8(dst + d, 92);
+            store8(dst + d + 1, 34);
+            d = d + 2;
+        } else if c == 92 {
+            store8(dst + d, 92);
+            store8(dst + d + 1, 92);
+            d = d + 2;
+        } else if c == 10 {
+            store8(dst + d, 92);
+            store8(dst + d + 1, 110);
+            d = d + 2;
+        } else if c == 13 {
+            store8(dst + d, 92);
+            store8(dst + d + 1, 114);
+            d = d + 2;
+        } else if c == 9 {
+            store8(dst + d, 92);
+            store8(dst + d + 1, 116);
+            d = d + 2;
+        } else {
+            store8(dst + d, c);
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    return d;
+}
+
+func lj_hexdig(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return c - 48; } }
+    if c >= 65 { if c <= 70 { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0;
+}
+
+func lj_emitu(dst: i64, j: i64, cp: i64) -> i64 {
+    if cp < 128 {
+        store8(dst + j, cp);
+        return j + 1;
+    }
+    if cp < 2048 {
+        store8(dst + j, bor(192, shr(cp, 6)));
+        store8(dst + j + 1, bor(128, band(cp, 63)));
+        return j + 2;
+    }
+    store8(dst + j, bor(224, shr(cp, 12)));
+    store8(dst + j + 1, bor(128, band(shr(cp, 6), 63)));
+    store8(dst + j + 2, bor(128, band(cp, 63)));
+    return j + 3;
+}
+
+func lj_json_unesc(src: i64, s: i64, dst: i64, cap: i64) -> i64 {
+    i = s;
+    j = 0;
+    lim = cap - 1;
+    while j < lim {
+        c = load8(src + i);
+        if c == 0 { break; }
+        if c == 34 { break; }
+        if c == 92 {
+            d = load8(src + i + 1);
+            if d == 110 {
+                store8(dst + j, 10);
+                j = j + 1;
+                i = i + 2;
+            } else if d == 116 {
+                store8(dst + j, 9);
+                j = j + 1;
+                i = i + 2;
+            } else if d == 114 {
+                store8(dst + j, 13);
+                j = j + 1;
+                i = i + 2;
+            } else if d == 117 {
+                cp = shl(lj_hexdig(load8(src + i + 2)), 12) + shl(lj_hexdig(load8(src + i + 3)), 8) + shl(lj_hexdig(load8(src + i + 4)), 4) + lj_hexdig(load8(src + i + 5));
+                j = lj_emitu(dst, j, cp);
+                i = i + 6;
+            } else {
+                store8(dst + j, d);
+                j = j + 1;
+                i = i + 2;
+            }
+        } else {
+            store8(dst + j, c);
+            j = j + 1;
+            i = i + 1;
+        }
+    }
+    store8(dst + j, 0);
+    return j;
+}
+
+func lj_extract_string_after(src: i64, ndl: i64, dst: i64, cap: i64) -> i64 {
+    p = lj_find_after(src, ndl);
+    if p < 0 { store8(dst, 0); return 0; }
+    return lj_json_unesc(src, p, dst, cap);
+}
+
+func lj_parse_uint(src: i64) -> i64 {
+    i = 0;
+    v = 0;
+    while 1 {
+        c = load8(src + i);
+        if c < 48 { return v; }
+        if c > 57 { return v; }
+        v = v * 10 + c - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+func lj_copy_until(dst: i64, src: i64, stop: i64, cap: i64) -> i64 {
+    i = 0;
+    lim = cap - 1;
+    while i < lim {
+        c = load8(src + i);
+        if c == 0 { break; }
+        if c == stop { break; }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    store8(dst + i, 0);
+    return i;
+}
+
+func lj_b64_encode(src: i64, srclen: i64, dst: i64) -> i64 {
+    i = 0;
+    o = 0;
+    while i + 3 <= srclen {
+        b0 = load8(src + i);
+        b1 = load8(src + i + 1);
+        b2 = load8(src + i + 2);
+        store8(dst + o, load8(lj_b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(lj_b64tab + bor(shl(band(b0, 3), 4), shr(b1, 4))));
+        store8(dst + o + 2, load8(lj_b64tab + bor(shl(band(b1, 15), 2), shr(b2, 6))));
+        store8(dst + o + 3, load8(lj_b64tab + band(b2, 63)));
+        i = i + 3;
+        o = o + 4;
+    }
+    rem = srclen - i;
+    if rem == 1 {
+        b0 = load8(src + i);
+        store8(dst + o, load8(lj_b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(lj_b64tab + shl(band(b0, 3), 4)));
+        store8(dst + o + 2, 61);
+        store8(dst + o + 3, 61);
+        o = o + 4;
+    }
+    if rem == 2 {
+        b0 = load8(src + i);
+        b1 = load8(src + i + 1);
+        store8(dst + o, load8(lj_b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(lj_b64tab + bor(shl(band(b0, 3), 4), shr(b1, 4))));
+        store8(dst + o + 2, load8(lj_b64tab + shl(band(b1, 15), 2)));
+        store8(dst + o + 3, 61);
+        o = o + 4;
+    }
+    store8(dst + o, 0);
+    return o;
+}

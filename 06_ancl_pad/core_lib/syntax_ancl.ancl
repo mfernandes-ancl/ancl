@@ -1,0 +1,675 @@
+# =====================================================================
+#  syntax_ancl.ancl - ANCL syntax tokenizer and palette.
+#
+#  Pure byte-level lexer. syn_ancl_next(src,pos) returns token length and
+#  writes the token kind into syn_ancl_tok_kind.
+#
+#  Kinds: 0 default, 1 tag/directive/timestamp, 2 keyword/error,
+#         3 type/warning, 4 builtin/protocol, 5 string/comment/text.
+# =====================================================================
+
+@DATA
+syn_ancl_kw: str = " func if else loop while break continue return syscall struct import extern ";
+syn_ancl_ty: str = " i8 i16 i32 i64 f32 f64 ptr str u32 u64 HWND ";
+syn_ancl_bi: str = " load8 load16 load32 load64 store8 store16 store32 store64 shl shr band bor bxor strlen strcmp memcpy memset str_copy str_to_int puts_cstr int_to_str alloc free read_int read_char callp sizeof SendMessageA CreateWindowExA DefWindowProcA GetMessageA DispatchMessageA TranslateMessage PostQuitMessage CreateFileA ReadFile WriteFile CloseHandle LoadLibraryA GetModuleHandleA ";
+syn_py_kw:   str = " and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield ";
+syn_py_ty:   str = " bool bytes complex dict float frozenset int list object set str tuple None True False ";
+syn_py_bi:   str = " abs all any bin chr dir enumerate filter format hex input isinstance len map max min open ord print range repr reversed round sorted sum super type zip self ";
+syn_cs_kw:   str = " abstract as async await base break case catch checked class const continue default delegate do else enum event explicit extern false finally fixed for foreach get goto if implicit in interface internal is lock namespace new null operator out override params private protected public readonly ref return sealed set sizeof stackalloc static struct switch this throw true try typeof unchecked unsafe using virtual void volatile while var value ";
+syn_cs_ty:   str = " bool byte char decimal double dynamic float int long object sbyte short string uint ulong ushort nint nuint ";
+syn_cs_bi:   str = " Console WriteLine Write ReadLine Task List Dictionary IEnumerable IEnumerator Math DateTime TimeSpan StringBuilder Exception ";
+syn_sql_kw:  str = " select from where join inner left right full outer on as distinct group by order having limit offset union all insert into values update set delete create alter drop table view index trigger primary key foreign references constraint unique check default null not and or case when then else end exists in is like between asc desc with recursive returning begin commit rollback transaction pragma attach detach vacuum explain ";
+syn_sql_ty:  str = " integer int bigint smallint real float double numeric decimal text varchar char blob boolean bool date datetime timestamp ";
+syn_sql_bi:  str = " count sum avg min max coalesce ifnull nullif length lower upper substr round cast julianday strftime random changes last_insert_rowid ";
+syn_ps_kw:   str = " begin break catch class continue data define do dynamicparam else elseif end exit filter finally for foreach from function if in param process return switch throw trap try until using var while workflow ";
+syn_ps_bi:   str = " write-host write-output write-error write-warning get-item get-childitem get-content set-content add-content copy-item move-item remove-item new-item test-path select-object where-object foreach-object sort-object group-object measure-object get-process start-process stop-process invoke-webrequest invoke-restmethod convertfrom-json convertto-json import-csv export-csv out-file format-table format-list ";
+syn_log_err: str = " error err fail failed fatal exception timeout denied invalid offline disconnected refused abort aborted fault alarm critical illegal ";
+syn_log_warn:str = " warn warning retry stale degraded slow partial drop dropped suspect unknown busy nak reject rejected ";
+syn_log_ok:  str = " info debug trace ok success pass passed connected online started stopped sent recv receive received rx tx publish subscribe connect disconnect ";
+syn_log_proto:str = " modbus modbus/tcp modbus-rtu rtu mqtt dnp3 bacnet bacnet/ip s7 s7comm snap7 opc opcda opcua iec104 iec60870 iec61850 mms goose sv fins omron eip ethernet/ip cip sql sqlite tcp udp http https serial com plc ";
+syn_log_field:str = " unit slave station node dst src tid transaction protocol length mbap pdu adu crc address addr quantity qty count value values register registers coil coils input inputs holding discrete area memory command cmd response rsp request req function func fc fn mrc src-code endcode end-code status object group variation index point class qualifier invoke invokeid invoke-id invoke_id service apdu npdu cot ca ioa asdu dna da1 da2 sna sa1 sid gateway client server rack slot db dbw dbd byte bit ";
+syn_log_op:  str = " read write read-coils read-discrete read-holding read-inputs write-single-coil write-single-register write-multiple-coils write-multiple-registers fc01 fc02 fc03 fc04 fc05 fc06 fc15 fc16 f01 f02 f03 f04 f05 f06 f15 f16 0101 0102 0103 0104 memory-area-read memory-area-write memory-area-fill run stop start open close identify who-is i-am readproperty writeproperty select operate direct-operate confirm poll ";
+syn_ancl_word: buf = 256;
+syn_ancl_tok_kind: buf = 8;
+
+SYN_ANCL_DEFAULT: i64 = 0;
+SYN_ANCL_TAG:     i64 = 1;
+SYN_ANCL_KEYWORD: i64 = 2;
+SYN_ANCL_TYPE:    i64 = 3;
+SYN_ANCL_BUILTIN: i64 = 4;
+SYN_ANCL_TEXT:    i64 = 5;
+
+SYN_MODE_AUTO:    i64 = 0;
+SYN_MODE_ANCL:    i64 = 1;
+SYN_MODE_PYTHON:  i64 = 2;
+SYN_MODE_CSHARP:  i64 = 3;
+SYN_MODE_LOG:     i64 = 4;
+SYN_MODE_TEXT:    i64 = 5;
+SYN_MODE_JSON:    i64 = 6;
+SYN_MODE_XML:     i64 = 7;
+SYN_MODE_SQL:     i64 = 8;
+SYN_MODE_MARKDOWN:i64 = 9;
+SYN_MODE_INI:     i64 = 10;
+SYN_MODE_POWERSHELL:i64 = 11;
+SYN_MODE_HTML:    i64 = 12;
+
+@CODE
+
+func syn_ancl_lower_ascii(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func syn_ancl_is_alpha(c: i64) -> i64 {
+    if c == 95 { return 1; }
+    if c >= 65 { if c <= 90 { return 1; } }
+    if c >= 97 { if c <= 122 { return 1; } }
+    return 0;
+}
+
+func syn_ancl_is_digit(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return 1; } }
+    return 0;
+}
+
+func syn_ancl_is_alnum(c: i64) -> i64 {
+    if syn_ancl_is_alpha(c) == 1 { return 1; }
+    if syn_ancl_is_digit(c) == 1 { return 1; }
+    return 0;
+}
+
+func syn_ancl_is_word_extra(c: i64) -> i64 {
+    if syn_ancl_is_alnum(c) == 1 { return 1; }
+    return 0;
+}
+
+func syn_ancl_is_ws(c: i64) -> i64 {
+    if c == 32 { return 1; }
+    if c == 9 { return 1; }
+    if c == 13 { return 1; }
+    if c == 10 { return 1; }
+    return 0;
+}
+
+func syn_ancl_prepare_word(src: i64, pos: i64, len: i64, fold: i64) -> i64 {
+    if len > 240 { len = 240; }
+    store8(syn_ancl_word, 32);
+    k = 0;
+    while k < len {
+        c = load8(src + pos + k);
+        if fold != 0 { c = syn_ancl_lower_ascii(c); }
+        store8(syn_ancl_word + 1 + k, c);
+        k = k + 1;
+    }
+    store8(syn_ancl_word + 1 + len, 32);
+    store8(syn_ancl_word + 2 + len, 0);
+    return len;
+}
+
+func syn_ancl_contains(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0; }
+        j = 0;
+        matched = 1;
+        while matched == 1 {
+            cn = load8(ndl + j);
+            if cn == 0 { return 1; }
+            if load8(hay + i + j) != cn { matched = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func syn_ancl_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 0);
+    if syn_ancl_contains(syn_ancl_kw, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_ancl_ty, syn_ancl_word) == 1 { return SYN_ANCL_TYPE; }
+    if syn_ancl_contains(syn_ancl_bi, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_py_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 0);
+    if syn_ancl_contains(syn_py_kw, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_py_ty, syn_ancl_word) == 1 { return SYN_ANCL_TYPE; }
+    if syn_ancl_contains(syn_py_bi, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_cs_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 0);
+    if syn_ancl_contains(syn_cs_kw, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_cs_ty, syn_ancl_word) == 1 { return SYN_ANCL_TYPE; }
+    if syn_ancl_contains(syn_cs_bi, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    c = load8(src + pos); if c >= 65 { if c <= 90 { return SYN_ANCL_TYPE; } }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_sql_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 1);
+    if syn_ancl_contains(syn_sql_kw, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_sql_ty, syn_ancl_word) == 1 { return SYN_ANCL_TYPE; }
+    if syn_ancl_contains(syn_sql_bi, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_ps_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 1);
+    if syn_ancl_contains(syn_ps_kw, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_ps_bi, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_log_classify(src: i64, pos: i64, len: i64) -> i64 {
+    syn_ancl_prepare_word(src, pos, len, 1);
+    if syn_ancl_contains(syn_log_err, syn_ancl_word) == 1 { return SYN_ANCL_KEYWORD; }
+    if syn_ancl_contains(syn_log_warn, syn_ancl_word) == 1 { return SYN_ANCL_TYPE; }
+    if syn_ancl_contains(syn_log_op, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    if syn_ancl_contains(syn_log_proto, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    if syn_ancl_contains(syn_log_field, syn_ancl_word) == 1 { return SYN_ANCL_TAG; }
+    if syn_ancl_contains(syn_log_ok, syn_ancl_word) == 1 { return SYN_ANCL_BUILTIN; }
+    return SYN_ANCL_DEFAULT;
+}
+
+func syn_log_hex_digit(c: i64) -> i64 {
+    if syn_ancl_is_digit(c) == 1 { return 1; }
+    if c >= 65 { if c <= 70 { return 1; } }
+    if c >= 97 { if c <= 102 { return 1; } }
+    return 0;
+}
+
+func syn_to_eol(src: i64, pos: i64, kind: i64) -> i64 {
+    n = 0;
+    while 1 {
+        d = load8(src + pos + n);
+        if d == 0 { break; }
+        if d == 10 { break; }
+        if d == 13 { break; }
+        n = n + 1;
+    }
+    store64(syn_ancl_tok_kind, kind);
+    return n;
+}
+
+func syn_read_ws(src: i64, pos: i64) -> i64 {
+    n = 0;
+    while syn_ancl_is_ws(load8(src + pos + n)) == 1 { n = n + 1; }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return n;
+}
+
+func syn_read_quoted(src: i64, pos: i64, quote: i64) -> i64 {
+    n = 1;
+    while 1 {
+        d = load8(src + pos + n);
+        if d == 0 { break; }
+        if d == quote { n = n + 1; break; }
+        if d == 92 {
+            if load8(src + pos + n + 1) == 0 { n = n + 1; } else { n = n + 2; }
+        } else {
+            n = n + 1;
+        }
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_TEXT);
+    return n;
+}
+
+func syn_read_py_quoted(src: i64, pos: i64, quote: i64) -> i64 {
+    if load8(src + pos + 1) == quote {
+        if load8(src + pos + 2) == quote {
+            n = 3;
+            while 1 {
+                d = load8(src + pos + n);
+                if d == 0 { break; }
+                if d == quote {
+                    if load8(src + pos + n + 1) == quote {
+                        if load8(src + pos + n + 2) == quote {
+                            n = n + 3;
+                            break;
+                        }
+                    }
+                }
+                if d == 92 {
+                    if load8(src + pos + n + 1) == 0 { n = n + 1; } else { n = n + 2; }
+                } else {
+                    n = n + 1;
+                }
+            }
+            store64(syn_ancl_tok_kind, SYN_ANCL_TEXT);
+            return n;
+        }
+    }
+    return syn_read_quoted(src, pos, quote);
+}
+
+func syn_read_cs_verbatim(src: i64, pos: i64) -> i64 {
+    n = 2;
+    while 1 {
+        d = load8(src + pos + n);
+        if d == 0 { break; }
+        if d == 34 {
+            if load8(src + pos + n + 1) == 34 {
+                n = n + 2;
+            } else {
+                n = n + 1;
+                break;
+            }
+        } else {
+            n = n + 1;
+        }
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_TEXT);
+    return n;
+}
+
+func syn_read_prefixed(src: i64, pos: i64, prefix: i64, quote: i64, py: i64) -> i64 {
+    if py != 0 { n = syn_read_py_quoted(src, pos + prefix, quote); }
+    else { n = syn_read_quoted(src, pos + prefix, quote); }
+    store64(syn_ancl_tok_kind, SYN_ANCL_TEXT); return prefix + n;
+}
+
+func syn_ancl_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos);
+    if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+
+    if syn_ancl_is_ws(c) == 1 {
+        return syn_read_ws(src, pos);
+    }
+
+    if c == 35 {
+        return syn_to_eol(src, pos, SYN_ANCL_TEXT);
+    }
+
+    if c == 34 {
+        return syn_read_quoted(src, pos, 34);
+    }
+
+    if c == 64 {
+        n = 1;
+        while syn_ancl_is_alpha(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TAG);
+        return n;
+    }
+
+    if syn_ancl_is_digit(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+        return n;
+    }
+
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, syn_ancl_classify(src, pos, n));
+        return n;
+    }
+
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return 1;
+}
+
+func syn_py_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos);
+    if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); }
+    if c == 34 { return syn_read_py_quoted(src, pos, 34); }
+    if c == 39 { return syn_read_py_quoted(src, pos, 39); }
+    if c == 102 || c == 70 || c == 114 || c == 82 || c == 98 || c == 66 || c == 117 || c == 85 {
+        q = load8(src + pos + 1); if q == 34 || q == 39 { return syn_read_prefixed(src, pos, 1, q, 1); }
+        p2 = load8(src + pos + 1);
+        if p2 == 102 || p2 == 70 || p2 == 114 || p2 == 82 || p2 == 98 || p2 == 66 {
+            q = load8(src + pos + 2); if q == 34 || q == 39 { return syn_read_prefixed(src, pos, 2, q, 1); }
+        }
+    }
+
+    if c == 64 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 || load8(src + pos + n) == 46 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TAG);
+        return n;
+    }
+
+    if syn_ancl_is_digit(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+        return n;
+    }
+
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, syn_py_classify(src, pos, n));
+        return n;
+    }
+
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return 1;
+}
+
+func syn_cs_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos);
+    if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+
+    if c == 47 {
+        if load8(src + pos + 1) == 47 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); }
+        if load8(src + pos + 1) == 42 {
+            n = 2;
+            while 1 {
+                d = load8(src + pos + n);
+                if d == 0 { break; }
+                if d == 42 {
+                    if load8(src + pos + n + 1) == 47 {
+                        n = n + 2;
+                        break;
+                    }
+                }
+                n = n + 1;
+            }
+            store64(syn_ancl_tok_kind, SYN_ANCL_TEXT);
+            return n;
+        }
+    }
+
+    if c == 36 {
+        if load8(src + pos + 1) == 34 { return syn_read_prefixed(src, pos, 1, 34, 0); }
+        if load8(src + pos + 1) == 64 { if load8(src + pos + 2) == 34 { n = syn_read_cs_verbatim(src, pos + 1); store64(syn_ancl_tok_kind, SYN_ANCL_TEXT); return n + 1; } }
+    }
+    if c == 64 { if load8(src + pos + 1) == 36 { if load8(src + pos + 2) == 34 { return syn_read_prefixed(src, pos, 2, 34, 0); } } }
+    if c == 34 { return syn_read_quoted(src, pos, 34); }
+    if c == 39 { return syn_read_quoted(src, pos, 39); }
+    if c == 64 {
+        if load8(src + pos + 1) == 34 { return syn_read_cs_verbatim(src, pos); }
+    }
+    if c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TAG); }
+    if c == 91 {
+        n = 1; while load8(src + pos + n) != 0 { d = load8(src + pos + n); n = n + 1; if d == 93 { break; } }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n;
+    }
+
+    if syn_ancl_is_digit(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+        return n;
+    }
+
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1;
+        while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, syn_cs_classify(src, pos, n));
+        return n;
+    }
+
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return 1;
+}
+
+func syn_log_is_word(c: i64) -> i64 {
+    if syn_ancl_is_alnum(c) == 1 { return 1; }
+    if c == 95 { return 1; }
+    if c == 45 { return 1; }
+    if c == 47 { return 1; }
+    if c == 46 { return 1; }
+    return 0;
+}
+
+func syn_log_is_time(c: i64) -> i64 {
+    if syn_ancl_is_digit(c) == 1 { return 1; }
+    if c == 45 { return 1; }
+    if c == 46 { return 1; }
+    if c == 47 { return 1; }
+    if c == 58 { return 1; }
+    if c == 84 { return 1; }
+    if c == 90 { return 1; }
+    if c == 116 { return 1; }
+    if c == 122 { return 1; }
+    if c == 43 { return 1; }
+    return 0;
+}
+
+func syn_log_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos);
+    if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); }
+    if c == 34 { return syn_read_quoted(src, pos, 34); }
+    if c == 39 { return syn_read_quoted(src, pos, 39); }
+
+    if c == 36 {
+        n = 1;
+        while syn_log_hex_digit(load8(src + pos + n)) == 1 { n = n + 1; }
+        if n > 1 { store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+    }
+
+    if c == 91 {
+        n = 1;
+        while 1 {
+            d = load8(src + pos + n);
+            if d == 0 { break; }
+            n = n + 1;
+            if d == 93 { break; }
+        }
+        if n > 2 {
+            k = syn_log_classify(src, pos + 1, n - 2);
+            if k == SYN_ANCL_DEFAULT { k = SYN_ANCL_TAG; }
+            store64(syn_ancl_tok_kind, k);
+            return n;
+        }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TAG);
+        return n;
+    }
+
+    if syn_ancl_is_digit(c) == 1 {
+        if c == 48 {
+            nx = load8(src + pos + 1);
+            if nx == 120 {
+                n = 2;
+                while syn_log_hex_digit(load8(src + pos + n)) == 1 { n = n + 1; }
+                if n > 2 { store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+            }
+            if nx == 88 {
+                n = 2;
+                while syn_log_hex_digit(load8(src + pos + n)) == 1 { n = n + 1; }
+                if n > 2 { store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+            }
+        }
+        n = 0;
+        marked = 0;
+        while syn_log_is_time(load8(src + pos + n)) == 1 {
+            d = load8(src + pos + n);
+            if d == 45 { marked = 1; }
+            if d == 47 { marked = 1; }
+            if d == 58 { marked = 1; }
+            if d == 84 { marked = 1; }
+            if d == 116 { marked = 1; }
+            n = n + 1;
+        }
+        if marked != 0 {
+            if n >= 5 { store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+        }
+        k = syn_log_classify(src, pos, n);
+        if k != SYN_ANCL_DEFAULT { store64(syn_ancl_tok_kind, k); return n; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+        if n <= 0 { return 1; }
+        return n;
+    }
+
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1;
+        while syn_log_is_word(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, syn_log_classify(src, pos, n));
+        return n;
+    }
+
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return 1;
+}
+
+func syn_json_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 34 {
+        n = syn_read_quoted(src, pos, 34); q = pos + n;
+        while syn_ancl_is_ws(load8(src + q)) == 1 { q = q + 1; }
+        if load8(src + q) == 58 { store64(syn_ancl_tok_kind, SYN_ANCL_TAG); }
+        return n;
+    }
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1; while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_KEYWORD); return n;
+    }
+    if c == 123 || c == 125 || c == 91 || c == 93 { store64(syn_ancl_tok_kind, SYN_ANCL_BUILTIN); return 1; }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_xml_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if c == 60 {
+        if load8(src + pos + 1) == 33 { if load8(src + pos + 2) == 45 { if load8(src + pos + 3) == 45 {
+            n = 4; while load8(src + pos + n) != 0 { if load8(src + pos + n) == 45 { if load8(src + pos + n + 1) == 45 { if load8(src + pos + n + 2) == 62 { n = n + 3; break; } } } n = n + 1; }
+            store64(syn_ancl_tok_kind, SYN_ANCL_TEXT); return n;
+        } } }
+        n = 1; quote = 0;
+        while load8(src + pos + n) != 0 {
+            d = load8(src + pos + n);
+            if quote != 0 { if d == quote { quote = 0; } }
+            else { if d == 34 || d == 39 { quote = d; } else { if d == 62 { n = n + 1; break; } } }
+            n = n + 1;
+        }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n;
+    }
+    if c == 38 { n = 1; while load8(src + pos + n) != 0 { d = load8(src + pos + n); n = n + 1; if d == 59 { break; } } store64(syn_ancl_tok_kind, SYN_ANCL_BUILTIN); return n; }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_sql_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 45 { if load8(src + pos + 1) == 45 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); } }
+    if c == 47 { if load8(src + pos + 1) == 42 {
+        n = 2; while load8(src + pos + n) != 0 { if load8(src + pos + n) == 42 { if load8(src + pos + n + 1) == 47 { n = n + 2; break; } } n = n + 1; }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TEXT); return n;
+    } }
+    if c == 39 || c == 34 || c == 96 { return syn_read_quoted(src, pos, c); }
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1; while syn_ancl_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(syn_ancl_tok_kind, syn_sql_classify(src, pos, n)); return n;
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_markdown_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    line_start = 0; if pos == 0 { line_start = 1; } else { p = pos - 1; while p >= 0 { d = load8(src + p); if d == 10 || d == 13 { line_start = 1; break; } if d != 32 && d != 9 { break; } p = p - 1; } }
+    if line_start != 0 {
+        if c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TAG); }
+        if c == 62 { return syn_to_eol(src, pos, SYN_ANCL_TYPE); }
+        if c == 45 || c == 42 || c == 43 { if load8(src + pos + 1) == 32 || load8(src + pos + 1) == 9 { store64(syn_ancl_tok_kind, SYN_ANCL_BUILTIN); return 1; } }
+    }
+    if c == 92 { if load8(src + pos + 1) != 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 2; } }
+    if c == 96 {
+        n = 1; if load8(src + pos + 1) == 96 { if load8(src + pos + 2) == 96 { return syn_to_eol(src, pos, SYN_ANCL_BUILTIN); } }
+        while load8(src + pos + n) != 0 { d = load8(src + pos + n); n = n + 1; if d == 96 { break; } }
+        store64(syn_ancl_tok_kind, SYN_ANCL_TEXT); return n;
+    }
+    if c == 91 { n = 1; while load8(src + pos + n) != 0 { d = load8(src + pos + n); n = n + 1; if d == 41 { break; } } store64(syn_ancl_tok_kind, SYN_ANCL_BUILTIN); return n; }
+    if c == 42 || c == 95 {
+        marks = 1; if load8(src + pos + 1) == c { marks = 2; }
+        n = marks; found = 0;
+        while load8(src + pos + n) != 0 {
+            d = load8(src + pos + n); if d == 10 || d == 13 { break; }
+            if d == c { if marks == 1 || load8(src + pos + n + 1) == c { n = n + marks; found = 1; break; } }
+            n = n + 1;
+        }
+        if found != 0 { store64(syn_ancl_tok_kind, SYN_ANCL_KEYWORD); return n; }
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_ini_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 59 || c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); }
+    if c == 91 { n = 1; while load8(src + pos + n) != 0 { d = load8(src + pos + n); n = n + 1; if d == 93 { break; } } store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+    if c == 34 || c == 39 { return syn_read_quoted(src, pos, c); }
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1; while syn_ancl_is_alnum(load8(src + pos + n)) == 1 || load8(src + pos + n) == 45 || load8(src + pos + n) == 46 { n = n + 1; }
+        q = pos + n; while load8(src + q) == 32 || load8(src + q) == 9 { q = q + 1; }
+        if load8(src + q) == 61 || load8(src + q) == 58 { store64(syn_ancl_tok_kind, SYN_ANCL_KEYWORD); } else { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); }
+        return n;
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_powershell_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos); if c == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    if syn_ancl_is_ws(c) == 1 { return syn_read_ws(src, pos); }
+    if c == 35 { return syn_to_eol(src, pos, SYN_ANCL_TEXT); }
+    if c == 34 || c == 39 { return syn_read_quoted(src, pos, c); }
+    if c == 36 { n = 1; while syn_ancl_is_alnum(load8(src + pos + n)) == 1 || load8(src + pos + n) == 58 { n = n + 1; } store64(syn_ancl_tok_kind, SYN_ANCL_TAG); return n; }
+    if syn_ancl_is_alpha(c) == 1 {
+        n = 1; while syn_ancl_is_alnum(load8(src + pos + n)) == 1 || load8(src + pos + n) == 45 { n = n + 1; }
+        k = syn_ps_classify(src, pos, n); if k == SYN_ANCL_DEFAULT { i = 0; while i < n { if load8(src + pos + i) == 45 { k = SYN_ANCL_BUILTIN; } i = i + 1; } }
+        store64(syn_ancl_tok_kind, k); return n;
+    }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 1;
+}
+
+func syn_text_next(src: i64, pos: i64) -> i64 {
+    if load8(src + pos) == 0 { store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT); return 0; }
+    n = 0;
+    while n < 128 {
+        d = load8(src + pos + n);
+        if d == 0 { break; }
+        n = n + 1;
+        if d == 10 { break; }
+        if d == 13 { break; }
+    }
+    if n <= 0 { n = 1; }
+    store64(syn_ancl_tok_kind, SYN_ANCL_DEFAULT);
+    return n;
+}
+
+func syn_mode_next(mode: i64, src: i64, pos: i64) -> i64 {
+    if mode == SYN_MODE_ANCL { return syn_ancl_next(src, pos); }
+    if mode == SYN_MODE_PYTHON { return syn_py_next(src, pos); }
+    if mode == SYN_MODE_CSHARP { return syn_cs_next(src, pos); }
+    if mode == SYN_MODE_LOG { return syn_log_next(src, pos); }
+    if mode == SYN_MODE_JSON { return syn_json_next(src, pos); }
+    if mode == SYN_MODE_XML { return syn_xml_next(src, pos); }
+    if mode == SYN_MODE_SQL { return syn_sql_next(src, pos); }
+    if mode == SYN_MODE_MARKDOWN { return syn_markdown_next(src, pos); }
+    if mode == SYN_MODE_INI { return syn_ini_next(src, pos); }
+    if mode == SYN_MODE_POWERSHELL { return syn_powershell_next(src, pos); }
+    if mode == SYN_MODE_HTML { return syn_xml_next(src, pos); }
+    return syn_text_next(src, pos);
+}
+
+func syn_mode_color(mode: i64, kind: i64) -> i64 {
+    return syn_ancl_color(kind);
+}
+
+func syn_ancl_color(kind: i64) -> i64 {
+    if kind == SYN_ANCL_TAG { return 0x000060B4; }
+    if kind == SYN_ANCL_KEYWORD { return 0x00AA0000; }
+    if kind == SYN_ANCL_TYPE { return 0x00AF912B; }
+    if kind == SYN_ANCL_BUILTIN { return 0x00A64679; }
+    if kind == SYN_ANCL_TEXT { return 0x00008000; }
+    return 0x001E1E1E;
+}
+
+func syn_ancl_color_dark(kind: i64) -> i64 {
+    if kind == SYN_ANCL_TAG { return 0x0024BFFB; }
+    if kind == SYN_ANCL_KEYWORD { return 0x00FFFF29; }
+    if kind == SYN_ANCL_TYPE { return 0x00C0A06C; }
+    if kind == SYN_ANCL_BUILTIN { return 0x00EA92C7; }
+    if kind == SYN_ANCL_TEXT { return 0x0070B070; }
+    return 0x00C8C8C8;
+}

@@ -1,0 +1,828 @@
+# Project Cosmic-Vector - A Native 3D Rail-Shooter in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+
+# FFI Declarations
+extern "user32.dll" GetAsyncKeyState -> i32;
+extern "kernel32.dll" QueryPerformanceCounter -> i32;
+extern "kernel32.dll" QueryPerformanceFrequency -> i32;
+extern "kernel32.dll" Beep -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "user32.dll" PeekMessageA -> i32;
+
+@DATA
+class_name: str = "CosmicVector";
+window_title: str = "Cosmic-Vector 3D - ANCL Arcade Showcase";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+
+# Brushes, Pens, and Fonts
+bg_brush: buf = 8;
+green_pen: buf = 8;
+magenta_pen: buf = 8;
+cyan_pen: buf = 8;
+white_pen: buf = 8;
+title_font: buf = 8;
+hud_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+cell_rect: buf = 16;
+hud_str: buf = 64;
+
+# Timing variables
+qpc_freq: buf = 8;
+qpc_last: buf = 8;
+qpc_curr: buf = 8;
+rand_seed: buf = 8;
+
+# Game state
+game_state: buf = 8; # 0 = Menu, 1 = Playing, 2 = Game Over
+score: buf = 8;
+lives: buf = 8;
+player_x: buf = 8; # 3D x relative to center (-300 to +300)
+player_y: buf = 8; # 3D y relative to center (-200 to +200)
+player_roll: buf = 8; # dynamic banking/roll factor (-24 to 24)
+player_hit_cooldown: buf = 8;
+laser_cooldown: buf = 8;
+
+# Player 3D Interceptor Mesh relative coordinates
+p_nose_x: buf = 8; p_nose_y: buf = 8; p_nose_z: buf = 8;
+p_lwing_x: buf = 8; p_lwing_y: buf = 8; p_lwing_z: buf = 8;
+p_rwing_x: buf = 8; p_rwing_y: buf = 8; p_rwing_z: buf = 8;
+p_thru_x: buf = 8; p_thru_y: buf = 8; p_thru_z: buf = 8;
+p_cano_x: buf = 8; p_cano_y: buf = 8; p_cano_z: buf = 8;
+
+# Projected Screen coordinates for Player Interceptor vertices
+p_scr_nose: buf = 16;
+p_scr_lwing: buf = 16;
+p_scr_rwing: buf = 16;
+p_scr_thru: buf = 16;
+p_scr_cano: buf = 16;
+
+# Object pools
+star_x: buf = 800; # 100 stars * 8 bytes
+star_y: buf = 800; # 100 stars * 8 bytes
+star_z: buf = 800; # 100 stars * 8 bytes
+
+enemy_x: buf = 80; # 10 enemies * 8 bytes
+enemy_y: buf = 80; # 10 enemies * 8 bytes
+enemy_z: buf = 80; # 10 enemies * 8 bytes
+enemy_state: buf = 80; # 10 * 8 (0 = inactive, 1 = active, 2-15 = exploding animation frames)
+
+laser_x: buf = 160; # 20 lasers * 8 bytes
+laser_y: buf = 160; # 20 lasers * 8 bytes
+laser_z: buf = 160; # 20 lasers * 8 bytes
+laser_state: buf = 160; # 20 lasers * 8 (0 = inactive, 1 = active)
+
+@CODE
+
+# --- Helper Functions ---
+func draw_rect(hdc: ptr, x1: i32, y1: i32, x2: i32, y2: i32, brush: ptr) -> i64 {
+    store32(cell_rect + 0, x1);
+    store32(cell_rect + 4, y1);
+    store32(cell_rect + 8, x2);
+    store32(cell_rect + 12, y2);
+    FillRect(hdc, cell_rect, brush);
+    return 0;
+}
+
+func draw_text_num(hdc: ptr, x: i32, y: i32, prefix: ptr, val: i64) -> i64 {
+    str_len = strlen(prefix);
+    memset(hud_str, 0, 64);
+    memcpy(hud_str, prefix, str_len);
+    nf_u64dec(val, hud_str + str_len);
+    TextOutA(hdc, x, y, hud_str, strlen(hud_str));
+    return 0;
+}
+
+func get_rand(max: i64) -> i64 {
+    seed = load64(rand_seed);
+    seed = seed * 2862933555777941757 + 3037000493;
+    store64(rand_seed, seed);
+    val = band(shr(seed, 32), 0x7FFFFFFF) % max;
+    return val;
+}
+
+func get_rand_range(min_val: i64, max_val: i64) -> i64 {
+    diff = max_val - min_val;
+    if diff <= 0 { return min_val; }
+    return min_val + get_rand(diff + 1);
+}
+
+func project_vertex(px: i64, py: i64, vx: i64, vy: i64, vz: i64, sin_val: i64, cos_val: i64, ctr_x: i64, ctr_y: i64, out_x: ptr, out_y: ptr) -> i64 {
+    # 1. Roll rotation on local (vx, vy)
+    rx = (vx * cos_val - vy * sin_val) / 100;
+    ry = (vx * sin_val + vy * cos_val) / 100;
+    
+    # 2. Add player 3D position (px, py, 50)
+    abs_x = px + rx;
+    abs_y = py + ry;
+    abs_z = 50 + vz;
+    
+    # Clamp Z to prevent division by zero
+    if abs_z <= 0 { abs_z = 1; }
+    
+    # 3. Project to 2D screen space
+    scr_x = (abs_x * 300) / abs_z + ctr_x;
+    scr_y = (abs_y * 300) / abs_z + ctr_y;
+    
+    store64(out_x, scr_x);
+    store64(out_y, scr_y);
+    return 0;
+}
+
+func game_start() -> i64 {
+    store64(score, 0);
+    store64(lives, 3);
+    store64(player_x, 0);
+    store64(player_y, 50);
+    store64(player_roll, 0);
+    store64(player_hit_cooldown, 0);
+    store64(laser_cooldown, 0);
+    
+    # Initialize 3D Interceptor Mesh
+    # Nose (0, 0, -20)
+    store64(p_nose_x, 0);
+    store64(p_nose_y, 0);
+    store64(p_nose_z, 0 - 20);
+    
+    # Left Wing (-30, 10, 20)
+    store64(p_lwing_x, 0 - 30);
+    store64(p_lwing_y, 10);
+    store64(p_lwing_z, 20);
+    
+    # Right Wing (30, 10, 20)
+    store64(p_rwing_x, 30);
+    store64(p_rwing_y, 10);
+    store64(p_rwing_z, 20);
+    
+    # Thruster (0, 5, 20)
+    store64(p_thru_x, 0);
+    store64(p_thru_y, 5);
+    store64(p_thru_z, 20);
+    
+    # Canopy (0, -10, 10)
+    store64(p_cano_x, 0);
+    store64(p_cano_y, 0 - 10);
+    store64(p_cano_z, 10);
+    
+    # Initialize starfield
+    i = 0;
+    while i < 100 {
+        store64(star_x + i * 8, get_rand_range(0 - 800, 800));
+        store64(star_y + i * 8, get_rand_range(0 - 600, 600));
+        store64(star_z + i * 8, get_rand_range(10, 1000));
+        i = i + 1;
+    }
+    
+    # Initialize enemy pool (deactivate all)
+    i = 0;
+    while i < 10 {
+        store64(enemy_state + i * 8, 0);
+        i = i + 1;
+    }
+    
+    # Initialize laser pool (deactivate all)
+    i = 0;
+    while i < 20 {
+        store64(laser_state + i * 8, 0);
+        i = i + 1;
+    }
+    
+    store64(game_state, 1); # Playing
+    return 0;
+}
+
+func handle_input() -> i64 {
+    state = load64(game_state);
+    if state != 1 {
+        # Menu or Game Over
+        # Press Space or Enter to play
+        if GetAsyncKeyState(32) != 0 { game_start(); return 0; }
+        if GetAsyncKeyState(13) != 0 { game_start(); return 0; }
+        return 0;
+    }
+    
+    # Moving ship
+    px = load64(player_x);
+    py = load64(player_y);
+    roll = load64(player_roll);
+    
+    # Left (Arrow Left / A)
+    moved_horiz = 0;
+    if GetAsyncKeyState(37) != 0 { px = px - 8; roll = roll - 3; moved_horiz = 1; }
+    else if GetAsyncKeyState(65) != 0 { px = px - 8; roll = roll - 3; moved_horiz = 1; }
+    
+    # Right (Arrow Right / D)
+    if GetAsyncKeyState(39) != 0 { px = px + 8; roll = roll + 3; moved_horiz = 1; }
+    else if GetAsyncKeyState(68) != 0 { px = px + 8; roll = roll + 3; moved_horiz = 1; }
+    
+    # Center Return (interpolate back to 0)
+    if moved_horiz == 0 {
+        if roll > 0 { roll = roll - 2; if roll < 0 { roll = 0; } }
+        else if roll < 0 { roll = roll + 2; if roll > 0 { roll = 0; } }
+    }
+    
+    # Clamp roll bounds
+    if roll < 0 - 24 { roll = 0 - 24; }
+    if roll > 24 { roll = 24; }
+    store64(player_roll, roll);
+    
+    # Up (Arrow Up / W)
+    if GetAsyncKeyState(38) != 0 { py = py - 7; }
+    else if GetAsyncKeyState(87) != 0 { py = py - 7; }
+    
+    # Down (Arrow Down / S)
+    if GetAsyncKeyState(40) != 0 { py = py + 7; }
+    else if GetAsyncKeyState(83) != 0 { py = py + 7; }
+    
+    # Clamp ship position bounds
+    if px < 0 - 300 { px = 0 - 300; }
+    if px > 300 { px = 300; }
+    if py < 0 - 200 { py = 0 - 200; }
+    if py > 200 { py = 200; }
+    
+    store64(player_x, px);
+    store64(player_y, py);
+    
+    # Lasers firing
+    cooldown = load64(laser_cooldown);
+    if cooldown > 0 {
+        store64(laser_cooldown, cooldown - 1);
+    } else {
+        if GetAsyncKeyState(32) != 0 { # Space
+            # Find an inactive laser slot
+            i = 0;
+            while i < 20 {
+                if load64(laser_state + i * 8) == 0 {
+                    store64(laser_state + i * 8, 1);
+                    store64(laser_x + i * 8, px);
+                    store64(laser_y + i * 8, py);
+                    store64(laser_z + i * 8, 60); # slightly in front of ship
+                    store64(laser_cooldown, 7); # fire rate cooldown (115ms at 60Hz)
+                    Beep(1000, 30); # high pitch laser chirp
+                    break;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    
+    # Invulnerability flashing cooldown
+    hit_cd = load64(player_hit_cooldown);
+    if hit_cd > 0 {
+        store64(player_hit_cooldown, hit_cd - 1);
+    }
+    return 0;
+}
+
+func game_update() -> i64 {
+    if load64(game_state) != 1 { return 0; }
+    
+    # 1. Update starfield
+    i = 0;
+    while i < 100 {
+        z = load64(star_z + i * 8) - 18;
+        if z <= 10 {
+            store64(star_x + i * 8, get_rand_range(0 - 800, 800));
+            store64(star_y + i * 8, get_rand_range(0 - 600, 600));
+            z = 1000;
+        }
+        store64(star_z + i * 8, z);
+        i = i + 1;
+    }
+    
+    # 2. Update active lasers
+    i = 0;
+    while i < 20 {
+        if load64(laser_state + i * 8) == 1 {
+            lz = load64(laser_z + i * 8) + 28;
+            if lz >= 1000 {
+                store64(laser_state + i * 8, 0); # deactivate
+            } else {
+                store64(laser_z + i * 8, lz);
+                
+                # Check collision with active enemies
+                lx = load64(laser_x + i * 8);
+                ly = load64(laser_y + i * 8);
+                
+                j = 0;
+                while j < 10 {
+                    if load64(enemy_state + j * 8) == 1 {
+                        ez = load64(enemy_z + j * 8);
+                        dz = ez - lz;
+                        if dz < 0 { dz = 0 - dz; }
+                        
+                        if dz < 35 {
+                            ex = load64(enemy_x + j * 8);
+                            ey = load64(enemy_y + j * 8);
+                            dx = ex - lx;
+                            if dx < 0 { dx = 0 - dx; }
+                            dy = ey - ly;
+                            if dy < 0 { dy = 0 - dy; }
+                            
+                            # 3D Bounding Box collision check
+                            if dx < 30 {
+                                if dy < 30 {
+                                    # Enemy hit! Trigger explosion state (2)
+                                    store64(enemy_state + j * 8, 2);
+                                    store64(laser_state + i * 8, 0); # deactivate laser
+                                    store64(score, load64(score) + 100);
+                                    Beep(600, 60); # explosion beep
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    # 3. Update enemies
+    i = 0;
+    while i < 10 {
+        estate = load64(enemy_state + i * 8);
+        if estate == 1 {
+            # Active enemy - fly toward player
+            ez = load64(enemy_z + i * 8) - 10;
+            ex = load64(enemy_x + i * 8);
+            ey = load64(enemy_y + i * 8);
+            
+            # Subtle homing/drift to track player ship coordinates
+            px = load64(player_x);
+            py = load64(player_y);
+            if ex < px { ex = ex + 1; }
+            if ex > px { ex = ex - 1; }
+            if ey < py { ey = ey + 1; }
+            if ey > py { ey = ey - 1; }
+            
+            store64(enemy_x + i * 8, ex);
+            store64(enemy_y + i * 8, ey);
+            
+            if ez <= 50 {
+                # Collision check with player ship at Z = 50
+                dx = ex - px;
+                if dx < 0 { dx = 0 - dx; }
+                dy = ey - py;
+                if dy < 0 { dy = 0 - dy; }
+                
+                if dx < 35 {
+                    if dy < 35 {
+                        # Player ship hit!
+                        if load64(player_hit_cooldown) == 0 {
+                            hp = load64(lives) - 1;
+                            store64(lives, hp);
+                            store64(player_hit_cooldown, 60); # 1 second flash invulnerable
+                            Beep(220, 250); # player hit alarm
+                            if hp <= 0 {
+                                store64(game_state, 2); # Game Over
+                            }
+                        }
+                    }
+                }
+                # Deactivate enemy once past screen
+                store64(enemy_state + i * 8, 0);
+            } else {
+                store64(enemy_z + i * 8, ez);
+            }
+        }
+        
+        if estate >= 2 {
+            # Exploding state animation incrementor
+            estate = estate + 1;
+            if estate > 12 {
+                # Finished explosion animation (10 frames)
+                store64(enemy_state + i * 8, 0); # deactivate
+            } else {
+                store64(enemy_state + i * 8, estate);
+            }
+        }
+        i = i + 1;
+    }
+    
+    # 4. Spawner: Randomly release new enemies
+    active_count = 0;
+    i = 0;
+    while i < 10 {
+        if load64(enemy_state + i * 8) != 0 {
+            active_count = active_count + 1;
+        }
+        i = i + 1;
+    }
+    
+    if active_count < 6 {
+        # Random spawn chance per frame
+        if get_rand(35) == 9 {
+            i = 0;
+            while i < 10 {
+                if load64(enemy_state + i * 8) == 0 {
+                    store64(enemy_state + i * 8, 1);
+                    store64(enemy_x + i * 8, get_rand_range(0 - 250, 250));
+                    store64(enemy_y + i * 8, get_rand_range(0 - 150, 150));
+                    store64(enemy_z + i * 8, 1000); # spawn at deep horizon
+                    break;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+func paint_scene(hdc: ptr) -> i64 {
+    GetClientRect(load64(hwnd), client_rect);
+    w = load32(client_rect + 8);
+    h = load32(client_rect + 12);
+    
+    # Paint backdrop black
+    draw_rect(hdc, 0, 0, w, h, load64(bg_brush));
+    
+    ctr_x = w / 2;
+    ctr_y = h / 2;
+    
+    state = load64(game_state);
+    
+    if state == 0 {
+        # Menu Screen
+        SetBkMode(hdc, 1);
+        old_font = SelectObject(hdc, load64(title_font));
+        
+        SetTextColor(hdc, 0x00FF00FF); # Neon Magenta
+        TextOutA(hdc, ctr_x - 140, ctr_y - 80, "COSMIC-VECTOR 3D", 16);
+        
+        SelectObject(hdc, load64(hud_font));
+        
+        # Flashing play prompt
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0x0000FF00); # Neon Green
+            TextOutA(hdc, ctr_x - 90, ctr_y + 10, "PRESS SPACE TO START", 20);
+        }
+        
+        SetTextColor(hdc, 0x00FFFF00); # Electric Cyan
+        TextOutA(hdc, ctr_x - 130, ctr_y + 80, "Arrows / WASD: Move Space: Fire", 31);
+        TextOutA(hdc, ctr_x - 120, ctr_y + 110, "Pure ANCL Native 3D Rail Shooter", 32);
+        
+        SelectObject(hdc, old_font);
+        return 0;
+    }
+    
+    # 1. Draw Starfield (Background)
+    old_pen = SelectObject(hdc, load64(white_pen));
+    i = 0;
+    while i < 100 {
+        sx = load64(star_x + i * 8);
+        sy = load64(star_y + i * 8);
+        sz = load64(star_z + i * 8);
+        
+        z_safe = sz;
+        if z_safe <= 0 { z_safe = 1; }
+        
+        scr_x = (sx * 300) / z_safe + ctr_x;
+        scr_y = (sy * 300) / z_safe + ctr_y;
+        
+        if scr_x >= 0 {
+            if scr_x < w {
+                if scr_y >= 0 {
+                    if scr_y < h {
+                        MoveToEx(hdc, scr_x, scr_y, 0);
+                        LineTo(hdc, scr_x + 1, scr_y);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    # 2. Draw active lasers
+    SelectObject(hdc, load64(green_pen));
+    i = 0;
+    while i < 20 {
+        if load64(laser_state + i * 8) == 1 {
+            lx = load64(laser_x + i * 8);
+            ly = load64(laser_y + i * 8);
+            lz = load64(laser_z + i * 8);
+            
+            # Start coordinate (close segment)
+            z_s = lz;
+            if z_s <= 0 { z_s = 1; }
+            xs = (lx * 300) / z_s + ctr_x;
+            ys = (ly * 300) / z_s + ctr_y;
+            
+            # End coordinate (far segment)
+            z_e = lz + 40;
+            xe = (lx * 300) / z_e + ctr_x;
+            ye = (ly * 300) / z_e + ctr_y;
+            
+            # Draw forward projection vector line
+            MoveToEx(hdc, xs, ys, 0);
+            LineTo(hdc, xe, ye);
+        }
+        i = i + 1;
+    }
+    
+    # 3. Draw active and exploding enemies
+    i = 0;
+    while i < 10 {
+        estate = load64(enemy_state + i * 8);
+        if estate == 1 {
+            SelectObject(hdc, load64(magenta_pen));
+            
+            # Active enemy - Draw wireframe pyramid
+            ex = load64(enemy_x + i * 8);
+            ey = load64(enemy_y + i * 8);
+            ez = load64(enemy_z + i * 8);
+            
+            ez_safe = ez;
+            if ez_safe <= 0 { ez_safe = 1; }
+            
+            # Project wireframe starfighter corners
+            # Nose
+            nz = ez_safe - 22;
+            if nz <= 0 { nz = 1; }
+            nx = (ex * 300) / nz + ctr_x;
+            ny = (ey * 300) / nz + ctr_y;
+            
+            # Rear coordinates
+            rz = ez_safe + 15;
+            lx = ((ex - 22) * 300) / rz + ctr_x;
+            ly = (ey * 300) / rz + ctr_y;
+            rx = ((ex + 22) * 300) / rz + ctr_x;
+            ry = (ey * 300) / rz + ctr_y;
+            tx = (ex * 300) / rz + ctr_x;
+            ty = ((ey - 16) * 300) / rz + ctr_y;
+            bx = (ex * 300) / rz + ctr_x;
+            by = ((ey + 16) * 300) / rz + ctr_y;
+            
+            # Draw Wireframe Connections
+            MoveToEx(hdc, nx, ny, 0); LineTo(hdc, lx, ly);
+            MoveToEx(hdc, nx, ny, 0); LineTo(hdc, rx, ry);
+            MoveToEx(hdc, nx, ny, 0); LineTo(hdc, tx, ty);
+            MoveToEx(hdc, nx, ny, 0); LineTo(hdc, bx, by);
+            
+            MoveToEx(hdc, lx, ly, 0); LineTo(hdc, tx, ty);
+            MoveToEx(hdc, tx, ty, 0); LineTo(hdc, rx, ry);
+            MoveToEx(hdc, rx, ry, 0); LineTo(hdc, bx, by);
+            MoveToEx(hdc, bx, by, 0); LineTo(hdc, lx, ly);
+        }
+        
+        if estate >= 2 {
+            SelectObject(hdc, load64(green_pen)); # green explosion particles
+            ex = load64(enemy_x + i * 8);
+            ey = load64(enemy_y + i * 8);
+            ez = load64(enemy_z + i * 8);
+            
+            ez_safe = ez;
+            if ez_safe <= 0 { ez_safe = 1; }
+            
+            xc = (ex * 300) / ez_safe + ctr_x;
+            yc = (ey * 300) / ez_safe + ctr_y;
+            
+            # Radiating vector sparks
+            spark_len = estate * 3;
+            spr_pr = (spark_len * 300) / ez_safe;
+            if spr_pr < 2 { spr_pr = 2; }
+            
+            MoveToEx(hdc, xc - spr_pr, yc, 0); LineTo(hdc, xc + spr_pr, yc);
+            MoveToEx(hdc, xc, yc - spr_pr, 0); LineTo(hdc, xc, yc + spr_pr);
+            
+            diag = spr_pr * 7 / 10;
+            MoveToEx(hdc, xc - diag, yc - diag, 0); LineTo(hdc, xc + diag, yc + diag);
+            MoveToEx(hdc, xc - diag, yc + diag, 0); LineTo(hdc, xc + diag, yc - diag);
+        }
+        i = i + 1;
+    }
+    
+    # 4. Draw Player Ship
+    if state == 1 {
+        # Check flashing frames during hit cooldown
+        hit_cd = load64(player_hit_cooldown);
+        flash = band(hit_cd, 4);
+        if flash == 0 {
+            SelectObject(hdc, load64(cyan_pen));
+            px = load64(player_x);
+            py = load64(player_y);
+            
+            # Sin/Cos approximation for current roll angle
+            r_val = load64(player_roll);
+            sin_val = r_val;
+            cos_val = 100 - (r_val * r_val / 200);
+            
+            # Project all 5 vertices of the 3D Vector Interceptor
+            project_vertex(px, py, load64(p_nose_x), load64(p_nose_y), load64(p_nose_z), sin_val, cos_val, ctr_x, ctr_y, p_scr_nose + 0, p_scr_nose + 8);
+            project_vertex(px, py, load64(p_lwing_x), load64(p_lwing_y), load64(p_lwing_z), sin_val, cos_val, ctr_x, ctr_y, p_scr_lwing + 0, p_scr_lwing + 8);
+            project_vertex(px, py, load64(p_rwing_x), load64(p_rwing_y), load64(p_rwing_z), sin_val, cos_val, ctr_x, ctr_y, p_scr_rwing + 0, p_scr_rwing + 8);
+            project_vertex(px, py, load64(p_thru_x), load64(p_thru_y), load64(p_thru_z), sin_val, cos_val, ctr_x, ctr_y, p_scr_thru + 0, p_scr_thru + 8);
+            project_vertex(px, py, load64(p_cano_x), load64(p_cano_y), load64(p_cano_z), sin_val, cos_val, ctr_x, ctr_y, p_scr_cano + 0, p_scr_cano + 8);
+            
+            # Load projected screen points for fast GDI drawing
+            ns_x = load64(p_scr_nose + 0); ns_y = load64(p_scr_nose + 8);
+            lw_x = load64(p_scr_lwing + 0); lw_y = load64(p_scr_lwing + 8);
+            rw_x = load64(p_scr_rwing + 0); rw_y = load64(p_scr_rwing + 8);
+            th_x = load64(p_scr_thru + 0); th_y = load64(p_scr_thru + 8);
+            ca_x = load64(p_scr_cano + 0); ca_y = load64(p_scr_cano + 8);
+            
+            # Draw 3D wireframe connections
+            # Nose apex to wingtips, canopy, and thruster
+            MoveToEx(hdc, ns_x, ns_y, 0); LineTo(hdc, lw_x, lw_y);
+            MoveToEx(hdc, ns_x, ns_y, 0); LineTo(hdc, rw_x, rw_y);
+            MoveToEx(hdc, ns_x, ns_y, 0); LineTo(hdc, ca_x, ca_y);
+            MoveToEx(hdc, ns_x, ns_y, 0); LineTo(hdc, th_x, th_y);
+            
+            # Aft Thruster base links
+            MoveToEx(hdc, lw_x, lw_y, 0); LineTo(hdc, th_x, th_y);
+            MoveToEx(hdc, rw_x, rw_y, 0); LineTo(hdc, th_x, th_y);
+            
+            # Canopy structure links
+            MoveToEx(hdc, lw_x, lw_y, 0); LineTo(hdc, ca_x, ca_y);
+            MoveToEx(hdc, rw_x, rw_y, 0); LineTo(hdc, ca_x, ca_y);
+            MoveToEx(hdc, ca_x, ca_y, 0); LineTo(hdc, th_x, th_y);
+        }
+    }
+    
+    SelectObject(hdc, old_pen);
+    
+    # 5. Draw HUD Texts
+    SetBkMode(hdc, 1);
+    old_font = SelectObject(hdc, load64(hud_font));
+    
+    if state == 1 {
+        # Playing HUD panel
+        SetTextColor(hdc, 0x0000FF00); # Neon Green
+        draw_text_num(hdc, 20, 20, "SCORE: ", load64(score));
+        
+        SetTextColor(hdc, 0x00FFFF00); # Electric Cyan
+        draw_text_num(hdc, w - 140, 20, "LIVES: ", load64(lives));
+    }
+    
+    if state == 2 {
+        # Game Over Screen
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x000000FF); # Bright Red
+        TextOutA(hdc, ctr_x - 90, ctr_y - 80, "GAME OVER", 9);
+        
+        SelectObject(hdc, load64(hud_font));
+        SetTextColor(hdc, 0x00CCCCCC); # Light Gray
+        draw_text_num(hdc, ctr_x - 70, ctr_y - 10, "FINAL SCORE: ", load64(score));
+        
+        # Flashing prompt
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0x0000FF00); # Neon Green
+            TextOutA(hdc, ctr_x - 110, ctr_y + 50, "PRESS ENTER TO RESTART", 22);
+        }
+    }
+    
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        
+        GetClientRect(hwnd_val, client_rect);
+        w = load32(client_rect + 8);
+        h = load32(client_rect + 12);
+        
+        # Double Buffering: allocate compatible back-buffer
+        hdc_mem = CreateCompatibleDC(hdc);
+        hbm_mem = CreateCompatibleBitmap(hdc, w, h);
+        old_bm = SelectObject(hdc_mem, hbm_mem);
+        
+        # Render scene on memory DC
+        paint_scene(hdc_mem);
+        
+        # Blit back-buffer to screen
+        BitBlt(hdc, 0, 0, w, h, hdc_mem, 0, 0, 0x00CC0020);
+        
+        # Cleanup compatible GDI
+        SelectObject(hdc_mem, old_bm);
+        DeleteObject(hbm_mem);
+        DeleteDC(hdc_mem);
+        
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize GDI solid brush and pens
+    store64(bg_brush, CreateSolidBrush(0x00000000));     # Pure Black
+    store64(green_pen, CreatePen(0, 2, 0x0000FF00));     # Neon Green BGR
+    store64(magenta_pen, CreatePen(0, 2, 0x00FF00FF));   # Neon Magenta BGR
+    store64(cyan_pen, CreatePen(0, 2, 0x00FFFF00));      # Electric Cyan BGR
+    store64(white_pen, CreatePen(0, 1, 0x00FFFFFF));     # White pen
+    
+    # Fonts
+    store64(title_font, CreateFontA(32, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(hud_font, CreateFontA(20, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    
+    # Seed RNG
+    store64(rand_seed, GetTickCount());
+    
+    # Set initial game state to Menu (0)
+    store64(game_state, 0);
+    
+    # Initialize WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3); # CS_HREDRAW | CS_VREDRAW
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+    
+    # CreateWindowExA
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 200, 100, 800, 600, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    
+    if hwnd_val == 0 {
+        return 1;
+    }
+    
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    
+    # 60 FPS Framerate Lock Setup
+    QueryPerformanceFrequency(qpc_freq);
+    freq = load64(qpc_freq);
+    target_ticks = freq / 60;
+    
+    QueryPerformanceCounter(qpc_last);
+    
+    while 1 {
+        # Feed entropy continuously
+        store64(rand_seed, load64(rand_seed) * 2862933555777941757 + GetTickCount() + 13);
+        
+        # Check window messages
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; } # WM_QUIT
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            # Precise 60 FPS update tick
+            QueryPerformanceCounter(qpc_curr);
+            curr = load64(qpc_curr);
+            last = load64(qpc_last);
+            
+            if curr - last >= target_ticks {
+                store64(qpc_last, curr);
+                
+                # Update input & physics
+                handle_input();
+                game_update();
+                
+                # Request redraw
+                InvalidateRect(hwnd_val, 0, 0);
+            } else {
+                Sleep(1); # yield CPU
+            }
+        }
+    }
+    
+    # Clean GDI
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(green_pen));
+    DeleteObject(load64(magenta_pen));
+    DeleteObject(load64(cyan_pen));
+    DeleteObject(load64(white_pen));
+    DeleteObject(load64(title_font));
+    DeleteObject(load64(hud_font));
+    
+    return 0;
+}

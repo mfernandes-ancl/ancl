@@ -1,0 +1,16 @@
+# =====================================================================
+#  console_app.ancl  -  Aether Studio "New > Console App" boilerplate.
+#
+#  A minimal, self-contained, CRT-free native console program.
+#  Build it from the IDE with Ctrl+B, or:  anclc console_app.ancl app.exe
+# =====================================================================
+@DATA
+banner: str = "Hello from a brand-new ANCL console app!\n";
+note:   str = "Native x86-64 PE32+  -  no VM, no interpreter, no CRT.\n";
+
+@CODE
+func main() -> i32 {
+    syscall 1, banner;
+    syscall 1, note;
+    return 0;
+}

@@ -1,0 +1,35 @@
+struct Point { x: i32; y: i32; tag: i64; }
+struct Pkt   { id: i16; flags: i8; data: i8[61]; crc: i32; }
+
+@DATA
+storage: buf = 64;
+mSz:  str = "sizeof(Point)=";
+mPx:  str = "  Point.x off=";
+mPy:  str = "  Point.y off=";
+mPt:  str = "  Point.tag off=";
+mPk:  str = "sizeof(Pkt)=";
+mArr: str = "sizeof(i32[10])=";
+mx:   str = "x=";
+my:   str = " y=";
+mt:   str = " tag=";
+nl:   str = "\n";
+
+@CODE
+func main() -> i32 {
+    syscall 1, mSz, sizeof(Point), nl;        # 16
+    syscall 1, mPx, Point.x, nl;              # 0
+    syscall 1, mPy, Point.y, nl;              # 4
+    syscall 1, mPt, Point.tag, nl;            # 8
+    syscall 1, mPk, sizeof(Pkt), nl;          # 72
+    syscall 1, mArr, sizeof(i32[10]), nl;     # 40
+
+    # use a buffer as struct storage, write/read fields
+    p = storage;
+    store32(p + Point.x, 100);
+    store32(p + Point.y, 200);
+    store64(p + Point.tag, 99999);
+    syscall 1, mx, load32(p + Point.x);
+    syscall 1, my, load32(p + Point.y);
+    syscall 1, mt, load64(p + Point.tag), nl;  # x=100 y=200 tag=99999
+    return 0;
+}

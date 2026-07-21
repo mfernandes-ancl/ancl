@@ -1,0 +1,1295 @@
+# ============================================================================
+#  dnp3_tester.ancl  -  ANCL Native DNP3 Master Station Tester (GUI)
+#
+#  A native Win32 dark-themed DNP3 Master Station client, written in ANCL.
+#  NexusEdge themed with GlowButtons, live point ListView grid, hex traffic log.
+#  100% CRT-free PE32+, GUI subsystem.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+import "dnp3_client.ancl";
+
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "gdi32.dll" RoundRect;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "dwmapi.dll" DwmSetWindowAttribute -> i32;
+extern "user32.dll" TrackMouseEvent;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" MessageBoxA -> i32;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "ANCLDNP3TESTER";
+title:      str = "ANCL DNP3 Master Station Tester";
+title_draw: str = "ANCL DNP3 MASTER STATION TESTER";
+st_conn_ind: str = "* CONNECTED";
+st_disc_ind: str = "* DISCONNECTED";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom window classes ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+
+# ---- Labels ----
+lbl_host:   str = "Host:";
+lbl_port:   str = "Port:";
+lbl_maddr:  str = "Master:";
+lbl_oaddr:  str = "Outstation:";
+lbl_log:    str = "Traffic Log:";
+lbl_status: str = "Status: Disconnected";
+lbl_idx:    str = "Index:";
+lbl_ctrl:   str = "Ctrl:";
+lbl_grp:    str = "Grp:";
+lbl_var:    str = "Var:";
+
+# ---- ListView columns ----
+cls_lv:     str = "SysListView32";
+col_idx:    str = "Index";
+col_group:  str = "Group";
+col_var:    str = "Variation";
+col_value:  str = "Value";
+col_flags:  str = "Flags";
+col_status: str = "Status";
+
+# ---- Buttons ----
+btn_conn:   str = "Connect";
+btn_disc:   str = "Disconnect";
+btn_poll:   str = "Integrity Poll";
+btn_event:  str = "Event Poll";
+btn_read:   str = "Read";
+btn_dop:    str = "Direct Op";
+btn_cold:   str = "Cold Restart";
+btn_warm:   str = "Warm Restart";
+btn_reset:  str = "Link Reset";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_min:    str = "-";
+btn_close:  str = "X";
+btn_auto:   str = "Auto Poll";
+btn_stop:   str = "Stop Poll";
+
+# ---- Defaults ----
+def_host:   str = "127.0.0.1";
+def_port:   str = "20000";
+def_maddr:  str = "3";
+def_oaddr:  str = "1";
+def_idx:    str = "0";
+def_ctrl:   str = "3";
+def_grp:    str = "1";
+def_var:    str = "2";
+
+# ---- Log Messages ----
+crlf:       str = "\r\n";
+g_logpath:  str = "dnp3_tester_log.txt";
+m_save_ok:  str = "[DNP3 Tester] Log saved to dnp3_tester_log.txt\r\n";
+m_save_err: str = "[DNP3 Tester] Log save failed.\r\n";
+
+# ---- Global handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_host_ed:  buf = 8;
+g_port_ed:  buf = 8;
+g_maddr_ed: buf = 8;
+g_oaddr_ed: buf = 8;
+g_idx_ed:   buf = 8;
+g_ctrl_ed:  buf = 8;
+g_grp_ed:   buf = 8;
+g_var_ed:   buf = 8;
+g_btn_conn: buf = 8;
+g_btn_disc: buf = 8;
+g_btn_auto: buf = 8;
+g_log:      buf = 8;
+g_status:   buf = 8;
+g_font:     buf = 8;
+g_listview: buf = 8;
+g_auto_poll: buf = 8;
+
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+
+# ---- Protocol Buffers ----
+g_numbuf:   buf = 32;
+g_hostbuf:  buf = 256;
+g_portbuf:  buf = 32;
+g_logbuf:   buf = 1024;
+g_savebuf:  buf = 4096;
+g_hexbuf:   buf = 8192;
+
+# ---- GDI setup ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+g_lv_brush:  buf = 8;
+
+COL_BG:      i64 = 0x140A08;
+COL_PANEL:   i64 = 0x050303;
+COL_TEXT:    i64 = 0xAB9687;
+COL_ACCENT:  i64 = 0x40D080; # DNP3 green accent (teal-green in BGR)
+
+# Dark theme overrides (DNP3 Teal-Green accents)
+COLOR_BG_DEEP:     i64 = 0x0A0706;
+COLOR_BG_PANEL:    i64 = 0x100C0A;
+COLOR_BG_CARD:     i64 = 0x181210;
+COLOR_BG_INPUT:    i64 = 0x080605;
+COLOR_BG_HOVER:    i64 = 0x221A16;
+COLOR_BORDER:      i64 = 0x2A201C;
+COLOR_TEXT_PRIMARY:i64 = 0xDFD5CF;
+COLOR_TEXT_MUTED:  i64 = 0x7A6A66;
+
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_temp_text:    buf = 256;
+w_empty:        buf = 8;
+
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40;
+thm_dm_cfd_w:   buf = 40;
+g_allowdark:    buf = 8;
+
+g_lvcol:       buf = 64;
+g_lvitem:      buf = 96;
+g_search_idx:  buf = 64;
+g_search_grp:  buf = 64;
+
+# Width & Height
+WIN_W: i64 = 1150;
+WIN_H: i64 = 620;
+
+hexd:  str = "0123456789ABCDEF";
+
+# ---- Control IDs ----
+ID_BTN_CONN:    i64 = 101;
+ID_BTN_DISC:    i64 = 102;
+ID_BTN_POLL:    i64 = 103;
+ID_BTN_EVENT:   i64 = 104;
+ID_BTN_READ:    i64 = 105;
+ID_BTN_DOP:     i64 = 106;
+ID_BTN_COLD:    i64 = 107;
+ID_BTN_WARM:    i64 = 108;
+ID_BTN_RESET:   i64 = 109;
+ID_BTN_CLEAR:   i64 = 110;
+ID_BTN_SAVE:    i64 = 111;
+ID_BTN_MIN:     i64 = 112;
+ID_BTN_CLOSE:   i64 = 113;
+ID_BTN_AUTO:    i64 = 114;
+ID_TIMER_POLL:  i64 = 1;
+
+@CODE
+
+# ============================================================================
+# HELPER UTILITIES
+# ============================================================================
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    SendMessageA(hwnd_log, 177, len, len);
+    SendMessageA(hwnd_log, 194, 0, text);
+    return 0;
+}
+
+func str_equal(s1: i64, s2: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c1 = load8(s1 + i);
+        c2 = load8(s2 + i);
+        if c1 != c2 { return 0; }
+        if c1 == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func format_nibble(n: i64) -> i64 {
+    if n >= 10 { return 55 + n; }
+    return 48 + n;
+}
+
+func byte_to_hex(v: i64, dst: i64) -> i64 {
+    store8(dst, format_nibble(band(shr(v, 4), 15)));
+    store8(dst + 1, format_nibble(band(v, 15)));
+    store8(dst + 2, 0);
+    return 0;
+}
+
+func log_hex_traffic(prefix: i64, buf_ptr: i64, len: i64) -> i64 {
+    log_append(prefix);
+    i = 0;
+    while i < len {
+        val = load8(buf_ptr + i);
+        byte_to_hex(val, g_numbuf);
+        log_append(g_numbuf);
+        log_append(" ");
+        i = i + 1;
+    }
+    log_append("[");
+    int_to_str(g_numbuf, len);
+    log_append(g_numbuf);
+    log_append(" bytes]\r\n");
+    return 0;
+}
+
+# ============================================================================
+# LISTVIEW GRID HELPERS
+# ============================================================================
+
+# Find an existing row by matching Index (col 0) + Group (col 1).
+# Returns row index if found, or -1 if not found.
+func find_row_by_index_group(idx_str: i64, grp_str: i64) -> i64 {
+    hlv = load64(g_listview);
+    count = SendMessageA(hlv, 4100, 0, 0);
+
+    i = 0;
+    while i < count {
+        # Read col 0 (Index)
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, g_search_idx);
+        store32(g_lvitem + 32, 64);
+        SendMessageA(hlv, 4141, i, g_lvitem);
+
+        # Read col 1 (Group)
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, g_search_grp);
+        store32(g_lvitem + 32, 64);
+        SendMessageA(hlv, 4141, i, g_lvitem);
+
+        if str_equal(g_search_idx, idx_str) != 0 {
+            if str_equal(g_search_grp, grp_str) != 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Update an existing row or insert a new one if the point doesn't exist yet.
+func update_or_insert_point(idx_str: i64, grp_str: i64, var_str: i64, val_str: i64, flags_str: i64, status_str: i64) -> i64 {
+    hlv = load64(g_listview);
+    row = find_row_by_index_group(idx_str, grp_str);
+
+    if row == 0 - 1 {
+        # New point: insert
+        count = SendMessageA(hlv, 4100, 0, 0);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, count);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, idx_str);
+        SendMessageA(hlv, 4103, 0, g_lvitem);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, grp_str);
+        SendMessageA(hlv, 4142, count, g_lvitem);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 2);
+        store64(g_lvitem + 24, var_str);
+        SendMessageA(hlv, 4142, count, g_lvitem);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, val_str);
+        SendMessageA(hlv, 4142, count, g_lvitem);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 4);
+        store64(g_lvitem + 24, flags_str);
+        SendMessageA(hlv, 4142, count, g_lvitem);
+
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 5);
+        store64(g_lvitem + 24, status_str);
+        SendMessageA(hlv, 4142, count, g_lvitem);
+    } else {
+        # Existing point: update value, flags, status in-place
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, row);
+
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, val_str);
+        SendMessageA(hlv, 4142, row, g_lvitem);
+
+        store32(g_lvitem + 8, 4);
+        store64(g_lvitem + 24, flags_str);
+        SendMessageA(hlv, 4142, row, g_lvitem);
+
+        store32(g_lvitem + 8, 5);
+        store64(g_lvitem + 24, status_str);
+        SendMessageA(hlv, 4142, row, g_lvitem);
+    }
+    return 0;
+}
+
+# ============================================================================
+# DNP3 RESPONSE PARSER (populates ListView from response)
+# ============================================================================
+
+func parse_dnp3_response() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n <= 0 {
+        log_append(dnp3_m_timeout);
+        return 0;
+    }
+
+    # Log raw hex
+    log_hex_traffic(dnp3_m_rx, dnp3_rx_buf, n);
+
+    # Validate header
+    valid = dnp3_validate_header();
+    if valid != 0 {
+        log_append(dnp3_m_hdr_ok);
+    } else {
+        log_append(dnp3_m_hdr_bad);
+        return 0;
+    }
+
+    # Parse response function code
+    fc = dnp3_get_resp_fc();
+    log_append(dnp3_m_resp_ok);
+    log_append("FC=");
+    int_to_str(g_numbuf, fc);
+    log_append(g_numbuf);
+    log_append(crlf);
+
+    # Parse IIN
+    iin = dnp3_get_iin();
+    log_append(dnp3_m_iin);
+    log_append("0x");
+    byte_to_hex(band(iin, 0xFF), g_numbuf);
+    log_append(g_numbuf);
+    log_append(" 0x");
+    byte_to_hex(band(shr(iin, 8), 0xFF), g_numbuf);
+    log_append(g_numbuf);
+    log_append(crlf);
+
+    # Parse object headers (starting at offset 13 in the raw frame)
+    # Frame: [0-1]=magic, [2]=len, [3]=ctrl, [4-5]=dst, [6-7]=src,
+    #         [8]=transport, [9]=appctrl, [10]=FC, [11-12]=IIN
+    # Object data begins at offset 13
+    if n > 13 {
+        log_append(dnp3_m_obj);
+        offset = 13;
+        obj_count = 0;
+        while offset + 3 <= n {
+            grp = load8(dnp3_rx_buf + offset);
+            var = load8(dnp3_rx_buf + offset + 1);
+            qual = load8(dnp3_rx_buf + offset + 2);
+
+            log_append("G");
+            int_to_str(g_numbuf, grp);
+            log_append(g_numbuf);
+            log_append("V");
+            int_to_str(g_numbuf, var);
+            log_append(g_numbuf);
+            log_append(" Q=0x");
+            byte_to_hex(qual, g_numbuf);
+            log_append(g_numbuf);
+            log_append(" ");
+
+            # Qualifier decoding for item count
+            qual_code = band(qual, 0x0F);
+            count = 0;
+
+            if qual_code == 0x07 {
+                # 1-byte count
+                if offset + 3 < n {
+                    count = load8(dnp3_rx_buf + offset + 3);
+                    offset = offset + 4;
+                } else { break; }
+            } else if qual_code == 0x08 {
+                # 2-byte count
+                if offset + 4 < n {
+                    count = load16(dnp3_rx_buf + offset + 3);
+                    offset = offset + 5;
+                } else { break; }
+            } else if qual_code == 0x00 {
+                # 1-byte start/stop range
+                if offset + 4 < n {
+                    start_idx = load8(dnp3_rx_buf + offset + 3);
+                    stop_idx = load8(dnp3_rx_buf + offset + 4);
+                    count = stop_idx - start_idx + 1;
+                    offset = offset + 5;
+                } else { break; }
+            } else if qual_code == 0x01 {
+                # 2-byte start/stop range
+                if offset + 6 < n {
+                    start_idx = load16(dnp3_rx_buf + offset + 3);
+                    stop_idx = load16(dnp3_rx_buf + offset + 5);
+                    count = stop_idx - start_idx + 1;
+                    offset = offset + 7;
+                } else { break; }
+            } else if qual_code == 0x06 {
+                # All objects, no range
+                count = 0;
+                offset = offset + 3;
+            } else {
+                # Unknown qualifier, skip remaining
+                break;
+            }
+
+            # Parse individual data points into the ListView
+            item_idx = 0;
+            while item_idx < count {
+                if offset >= n { break; }
+
+                # Determine value size based on group/variation
+                val_size = 1; # default
+                val = 0;
+                flags = 0;
+
+                # Binary Input (Group 1, Var 2): 1 byte (flags+value)
+                if grp == 1 {
+                    if var == 2 {
+                        val_size = 1;
+                        b = load8(dnp3_rx_buf + offset);
+                        val = shr(band(b, 0x80), 7);
+                        flags = band(b, 0x7F);
+                    }
+                }
+                # Binary Output (Group 10, Var 2): 1 byte
+                if grp == 10 {
+                    if var == 2 {
+                        val_size = 1;
+                        b = load8(dnp3_rx_buf + offset);
+                        val = shr(band(b, 0x80), 7);
+                        flags = band(b, 0x7F);
+                    }
+                }
+                # Counter (Group 20, Var 1): 5 bytes (1 flag + 4 value)
+                if grp == 20 {
+                    if var == 1 {
+                        val_size = 5;
+                        flags = load8(dnp3_rx_buf + offset);
+                        val = load32(dnp3_rx_buf + offset + 1);
+                    }
+                }
+                # Analog Input (Group 30, Var 1): 5 bytes (1 flag + 4 value)
+                if grp == 30 {
+                    if var == 1 {
+                        val_size = 5;
+                        flags = load8(dnp3_rx_buf + offset);
+                        val = load32(dnp3_rx_buf + offset + 1);
+                    }
+                }
+                # Analog Output Status (Group 40, Var 1): 5 bytes
+                if grp == 40 {
+                    if var == 1 {
+                        val_size = 5;
+                        flags = load8(dnp3_rx_buf + offset);
+                        val = load32(dnp3_rx_buf + offset + 1);
+                    }
+                }
+
+                # Format strings into g_logbuf slots (zero first to avoid residue)
+                memset(g_logbuf, 0, 500);
+                int_to_str(g_numbuf, obj_count);
+                str_copy(g_logbuf, g_numbuf);
+
+                int_to_str(g_numbuf, grp);
+                str_copy(g_logbuf + 100, g_numbuf);
+
+                int_to_str(g_numbuf, var);
+                str_copy(g_logbuf + 200, g_numbuf);
+
+                int_to_str(g_numbuf, val);
+                str_copy(g_logbuf + 300, g_numbuf);
+
+                int_to_str(g_numbuf, flags);
+                str_copy(g_logbuf + 400, g_numbuf);
+
+                # Mark command echo objects (Group 12) with "CMD OK" status
+                if grp == 12 {
+                    update_or_insert_point(g_logbuf, g_logbuf + 100, g_logbuf + 200, g_logbuf + 300, g_logbuf + 400, "CMD OK");
+                } else {
+                    update_or_insert_point(g_logbuf, g_logbuf + 100, g_logbuf + 200, g_logbuf + 300, g_logbuf + 400, "OK");
+                }
+
+                offset = offset + val_size;
+                item_idx = item_idx + 1;
+                obj_count = obj_count + 1;
+            }
+        }
+        log_append(crlf);
+    }
+
+    return 1;
+}
+
+# ============================================================================
+# GUI OPERATIONS
+# ============================================================================
+
+# Auto-send Application Confirm if the response has CON bit set,
+# or Unsolicited Confirm if UNS bit is set.
+func dnp3_auto_confirm() -> i64 {
+    if dnp3_is_unsolicited() != 0 {
+        seq = band(load8(dnp3_rx_buf + 9), 0x0F);
+        dnp3_send_unsol_confirm(seq);
+        log_append(dnp3_m_unsol_conf);
+        return 1;
+    }
+    con_seq = dnp3_check_con_bit();
+    if con_seq != 0 - 1 {
+        dnp3_send_app_confirm(con_seq);
+        log_append(dnp3_m_confirm);
+        return 1;
+    }
+    return 0;
+}
+
+func do_connect() -> i64 {
+    if dnp3_is_connected() != 0 { return 0; }
+
+    GetWindowTextA(load64(g_host_ed), g_hostbuf, 256);
+    GetWindowTextA(load64(g_port_ed), g_portbuf, 32);
+    port = str_to_int(g_portbuf);
+    if port < 1 { port = 20000; }
+
+    # Get master/outstation addresses
+    GetWindowTextA(load64(g_maddr_ed), g_numbuf, 32);
+    maddr = str_to_int(g_numbuf);
+    if maddr < 1 { maddr = 3; }
+    GetWindowTextA(load64(g_oaddr_ed), g_numbuf, 32);
+    oaddr = str_to_int(g_numbuf);
+    if oaddr < 0 { oaddr = 1; }
+
+    dnp3_init(maddr, oaddr);
+
+    log_append("[DNP3 Tester] Connecting to ");
+    log_append(g_hostbuf);
+    log_append(":");
+    log_append(g_portbuf);
+    log_append("...\r\n");
+
+    rc = dnp3_connect(g_hostbuf, port);
+    if rc == 0 {
+        log_append(dnp3_m_conn_err);
+        return 0;
+    }
+
+    log_append(dnp3_m_conn_ok);
+
+    # Perform link-layer reset handshake (required by some outstations)
+    log_append("[DNP3 Tester] Performing Link Reset handshake...\r\n");
+    dnp3_ensure_link_ready();
+    log_append("[DNP3 Tester] Link layer ready.\r\n");
+
+    SetWindowTextA(load64(g_status), "Status: Connected");
+    SetWindowTextA(load64(g_btn_conn), "Connected");
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 1;
+}
+
+func do_disconnect() -> i64 {
+    if dnp3_is_connected() == 0 { return 0; }
+
+    dnp3_disconnect();
+    log_append(dnp3_m_disc);
+    SetWindowTextA(load64(g_status), "Status: Disconnected");
+    SetWindowTextA(load64(g_btn_conn), "Connect");
+
+    store64(g_auto_poll, 0);
+    SetWindowTextA(load64(g_btn_auto), btn_auto);
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func do_integrity_poll() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    dnp3_drain();
+    frame_len = dnp3_send_integrity_poll();
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_poll);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_event_poll() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    dnp3_drain();
+    frame_len = dnp3_send_event_poll();
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_class123);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_read_request() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    GetWindowTextA(load64(g_grp_ed), g_numbuf, 32);
+    grp = str_to_int(g_numbuf);
+    GetWindowTextA(load64(g_var_ed), g_numbuf, 32);
+    var = str_to_int(g_numbuf);
+
+    dnp3_drain();
+    frame_len = dnp3_send_read(grp, var);
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_read);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_direct_operate() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    GetWindowTextA(load64(g_idx_ed), g_numbuf, 32);
+    idx = str_to_int(g_numbuf);
+    GetWindowTextA(load64(g_ctrl_ed), g_numbuf, 32);
+    ctrl = str_to_int(g_numbuf);
+
+    dnp3_drain();
+    frame_len = dnp3_send_direct_operate(idx, ctrl);
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_dop);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_cold_restart() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    dnp3_drain();
+    frame_len = dnp3_send_restart(0);
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_cold);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_warm_restart() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    dnp3_drain();
+    frame_len = dnp3_send_restart(1);
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_warm);
+    dnp3_recv_full_response();
+    parse_dnp3_response();
+    dnp3_auto_confirm();
+    return 0;
+}
+
+func do_link_reset() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+    dnp3_drain();
+    frame_len = dnp3_send_link_reset();
+    log_hex_traffic(dnp3_m_tx, dnp3_tx_frame, frame_len);
+    log_append(dnp3_m_reset);
+    dnp3_recv_response();
+    parse_dnp3_response();
+    return 0;
+}
+
+func handle_poll_toggle() -> i64 {
+    if dnp3_is_connected() == 0 {
+        log_append("[DNP3 Tester] Error: Not connected.\r\n");
+        return 0;
+    }
+
+    state = load64(g_auto_poll);
+    if state == 0 {
+        store64(g_auto_poll, 1);
+        SetWindowTextA(load64(g_btn_auto), btn_stop);
+        log_append("[DNP3 Tester] Auto polling started (2s interval).\r\n");
+        SetTimer(load64(g_hwnd), ID_TIMER_POLL, 2000, 0);
+        do_integrity_poll();
+    } else {
+        store64(g_auto_poll, 0);
+        SetWindowTextA(load64(g_btn_auto), btn_auto);
+        log_append("[DNP3 Tester] Auto polling stopped.\r\n");
+        KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+    }
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    # Clear ListView
+    hlv = load64(g_listview);
+    if hlv != 0 { SendMessageA(hlv, 4105, 0, 0); }
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+
+    len = GetWindowTextA(hwnd_log, g_savebuf, 4096);
+    if len <= 0 { return 0; }
+
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 {
+        log_append(m_save_err);
+        return 0;
+    }
+
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE OVERRIDES & GDI SUBCLASSING
+# ============================================================================
+
+func register_wide_string(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while load8(src + i) != 0 {
+        store16(dst + i * 2, load8(src + i));
+        i = i + 1;
+    }
+    store16(dst + i * 2, 0);
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    register_wide_string(thm_dm_exp_w, "DarkMode_Explorer");
+    register_wide_string(thm_dm_cfd_w, "CFD");
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+# ============================================================================
+# CUSTOM GLOWBUTTON WINDOW PROCEDURE
+# ============================================================================
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+    if msg == 512 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            SetWindowLongA(hwnd, 0 - 21, bor(pressed, 1));
+            InvalidateRect(hwnd, 0, 1);
+
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        SetWindowLongA(hwnd, 0 - 21, bor(hover, 2));
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 514 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+
+        brush = load64(g_brush_card);
+        if pressed == 2 { brush = load64(g_brush_deep); }
+        else if hover == 1 { brush = load64(g_brush_hover); }
+
+        old_brush = SelectObject(hdc, brush);
+
+        pen = load64(g_pen_border);
+        if pressed == 2 { pen = load64(g_pen_neon); }
+        else if hover == 1 { pen = load64(g_pen_neon); }
+
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, 0, 0, w, h, 6, 6);
+
+        if hover == 1 {
+            SelectObject(hdc, load64(g_pen_neon));
+            RoundRect(hdc, 1, 1, w - 1, h - 1, 6, 6);
+        }
+
+        SetBkMode(hdc, 1);
+        tc = COLOR_TEXT_PRIMARY;
+        if hover == 1 { tc = COL_ACCENT; }
+        else if pressed == 2 { tc = COL_ACCENT; }
+        SetTextColor(hdc, tc);
+
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 256);
+
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, w);
+        store32(g_rect + 12, h);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func register_class(wndcls_ptr: i64, name: i64, wndproc_addr: i64, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    memset(wndcls_ptr, 0, 80);
+    store32(wndcls_ptr + 0, 80);
+    store32(wndcls_ptr + 4, 3);
+    store64(wndcls_ptr + 8, wndproc_addr);
+    store64(wndcls_ptr + 24, hinst);
+    store64(wndcls_ptr + 40, cursor);
+    store64(wndcls_ptr + 48, brush);
+    store64(wndcls_ptr + 64, name);
+    return RegisterClassExA(wndcls_ptr);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+
+        gfont = CreateFontA(14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face_mono);
+        store64(g_font, gfont);
+
+        # Title bar min/close buttons
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 1090, 6, 24, 24, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1118, 6, 24, 24, hwnd, ID_BTN_CLOSE, hinst, 0);
+
+        # ---- Row 1: Connection setup (Y=50) ----
+        CreateWindowExA(0, cls_stat, lbl_host, 0x50000000, 12, 54, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_host, 0x50000080, 47, 52, 95, 24, hwnd, 0, hinst, 0);
+        store64(g_host_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 150, 54, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50000080, 185, 52, 55, 24, hwnd, 0, hinst, 0);
+        store64(g_port_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_maddr, 0x50000000, 250, 54, 50, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_maddr, 0x50000080, 300, 52, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_maddr_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_oaddr, 0x50000000, 345, 54, 72, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_oaddr, 0x50000080, 418, 52, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_oaddr_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        h = CreateWindowExA(0, cls_glow_btn, btn_conn, 0x50000000, 465, 50, 85, 28, hwnd, ID_BTN_CONN, hinst, 0);
+        store64(g_btn_conn, h);
+
+        h = CreateWindowExA(0, cls_glow_btn, btn_disc, 0x50000000, 560, 50, 85, 28, hwnd, ID_BTN_DISC, hinst, 0);
+        store64(g_btn_disc, h);
+
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 660, 54, 200, 20, hwnd, 0, hinst, 0);
+        store64(g_status, h); SendMessageA(h, 48, gfont, 1);
+
+        # ---- Row 2: Protocol Actions (Y=86) ----
+        CreateWindowExA(0, cls_glow_btn, btn_poll, 0x50000000, 12, 86, 100, 28, hwnd, ID_BTN_POLL, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_event, 0x50000000, 120, 86, 85, 28, hwnd, ID_BTN_EVENT, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_reset, 0x50000000, 213, 86, 85, 28, hwnd, ID_BTN_RESET, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_cold, 0x50000000, 306, 86, 95, 28, hwnd, ID_BTN_COLD, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_warm, 0x50000000, 409, 86, 100, 28, hwnd, ID_BTN_WARM, hinst, 0);
+        h = CreateWindowExA(0, cls_glow_btn, btn_auto, 0x50000000, 517, 86, 85, 28, hwnd, ID_BTN_AUTO, hinst, 0);
+        store64(g_btn_auto, h);
+
+        # ---- Row 3: Read/Operate controls (Y=122) ----
+        CreateWindowExA(0, cls_stat, lbl_grp, 0x50000000, 12, 126, 30, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_grp, 0x50000080, 42, 124, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_grp_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_var, 0x50000000, 85, 126, 30, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_var, 0x50000080, 115, 124, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_var_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_read, 0x50000000, 160, 122, 65, 28, hwnd, ID_BTN_READ, hinst, 0);
+
+        CreateWindowExA(0, cls_stat, lbl_idx, 0x50000000, 240, 126, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_idx, 0x50000080, 280, 124, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_idx_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_ctrl, 0x50000000, 323, 126, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_ctrl, 0x50000080, 358, 124, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_ctrl_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_dop, 0x50000000, 403, 122, 80, 28, hwnd, ID_BTN_DOP, hinst, 0);
+
+        # ---- Traffic Log (left side, Y=160) ----
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 12, 155, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50200044, 12, 172, 520, 390, hwnd, 0, hinst, 0);
+        store64(g_log, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 390, 570, 60, 26, hwnd, ID_BTN_CLEAR, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 460, 570, 60, 26, hwnd, ID_BTN_SAVE, hinst, 0);
+
+        # ---- ListView Grid (right side, Y=172) ----
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 550, 172, 580, 390, hwnd, 0, hinst, 0);
+        store64(g_listview, h); SendMessageA(h, 48, gfont, 1);
+        SendMessageA(h, 4150, 0x20, 0x20);
+
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);
+        dark_scroll(h);
+
+        # Columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+
+        store32(g_lvcol + 8, 60); store64(g_lvcol + 16, col_idx);
+        SendMessageA(h, 4123, 0, g_lvcol);
+
+        store32(g_lvcol + 8, 70); store64(g_lvcol + 16, col_group); store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+
+        store32(g_lvcol + 8, 80); store64(g_lvcol + 16, col_var); store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+
+        store32(g_lvcol + 8, 120); store64(g_lvcol + 16, col_value); store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+
+        store32(g_lvcol + 8, 80); store64(g_lvcol + 16, col_flags); store32(g_lvcol + 24, 4);
+        SendMessageA(h, 4123, 4, g_lvcol);
+
+        store32(g_lvcol + 8, 120); store64(g_lvcol + 16, col_status); store32(g_lvcol + 24, 5);
+        SendMessageA(h, 4123, 5, g_lvcol);
+
+        return 0;
+    }
+
+    if msg == 2 { # WM_DESTROY
+        do_disconnect();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    if msg == 15 { # WM_PAINT
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+
+        GetClientRect(hwnd, g_rect);
+        FillRect(hdc, g_rect, load64(g_bg_brush));
+
+        # Title bar background (y=[0, 36))
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, WIN_W);
+        store32(g_rect + 12, 36);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+
+        SelectObject(hdc, load64(g_font_header));
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+
+        store32(g_rect + 0, 12);
+        store32(g_rect + 4, 12);
+        store32(g_rect + 8, 600);
+        store32(g_rect + 12, 35);
+        DrawTextA(hdc, title_draw, 0 - 1, g_rect, 0);
+
+        # Connection indicator
+        indicator = st_disc_ind;
+        if dnp3_is_connected() != 0 {
+            indicator = st_conn_ind;
+            SetTextColor(hdc, COL_ACCENT);
+        } else {
+            SetTextColor(hdc, 0x555555);
+        }
+
+        store32(g_rect + 0, 380);
+        store32(g_rect + 8, 600);
+        DrawTextA(hdc, indicator, 0 - 1, g_rect, 0);
+
+        # Accent line under title bar
+        SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 12, 36, 0);
+        LineTo(hdc, WIN_W - 12, 36);
+
+        # Custom flat headers for ListView
+        old_pen = SelectObject(hdc, load64(g_pen_border));
+        old_brush = SelectObject(hdc, load64(g_edit_brush));
+        old_font = SelectObject(hdc, load64(g_font));
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+
+        # Column headers above ListView
+        store32(g_rect + 0, 550); store32(g_rect + 4, 155); store32(g_rect + 8, 610); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 550, 155, 610, 172);
+
+        store32(g_rect + 0, 610); store32(g_rect + 4, 155); store32(g_rect + 8, 680); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 610, 155, 680, 172);
+
+        store32(g_rect + 0, 680); store32(g_rect + 4, 155); store32(g_rect + 8, 760); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 680, 155, 760, 172);
+
+        store32(g_rect + 0, 760); store32(g_rect + 4, 155); store32(g_rect + 8, 880); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 760, 155, 880, 172);
+
+        store32(g_rect + 0, 880); store32(g_rect + 4, 155); store32(g_rect + 8, 960); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 880, 155, 960, 172);
+
+        store32(g_rect + 0, 960); store32(g_rect + 4, 155); store32(g_rect + 8, 1130); store32(g_rect + 12, 172);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 960, 155, 1130, 172);
+
+        # Header text
+        TextOutA(hdc, 558, 157, col_idx, 5);
+        TextOutA(hdc, 618, 157, col_group, 5);
+        TextOutA(hdc, 688, 157, col_var, 9);
+        TextOutA(hdc, 768, 157, col_value, 5);
+        TextOutA(hdc, 888, 157, col_flags, 5);
+        TextOutA(hdc, 968, 157, col_status, 6);
+
+        SelectObject(hdc, old_font);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 307 { # WM_CTLCOLOREDIT
+        hdc = wp;
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkColor(hdc, COLOR_BG_INPUT);
+        return load64(g_brush_input);
+    }
+
+    if msg == 312 { # WM_CTLCOLORSTATIC
+        hdc = wp;
+        SetTextColor(hdc, COL_TEXT);
+        SetBkColor(hdc, COL_BG);
+        return load64(g_bg_brush);
+    }
+
+    if msg == 273 { # WM_COMMAND
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_CONN  { do_connect(); }
+        if cmd_id == ID_BTN_DISC  { do_disconnect(); }
+        if cmd_id == ID_BTN_POLL  { do_integrity_poll(); }
+        if cmd_id == ID_BTN_EVENT { do_event_poll(); }
+        if cmd_id == ID_BTN_READ  { do_read_request(); }
+        if cmd_id == ID_BTN_DOP   { do_direct_operate(); }
+        if cmd_id == ID_BTN_COLD  { do_cold_restart(); }
+        if cmd_id == ID_BTN_WARM  { do_warm_restart(); }
+        if cmd_id == ID_BTN_RESET { do_link_reset(); }
+        if cmd_id == ID_BTN_CLEAR { do_clear_log(); }
+        if cmd_id == ID_BTN_SAVE  { do_save_log(); }
+        if cmd_id == ID_BTN_AUTO  { handle_poll_toggle(); }
+        if cmd_id == ID_BTN_MIN   { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        return 0;
+    }
+
+    if msg == 275 { # WM_TIMER
+        if wp == ID_TIMER_POLL {
+            # Check for unsolicited responses first
+            unsol = dnp3_check_unsolicited();
+            if unsol == 1 {
+                # Unsolicited data received and confirmed, parse it
+                log_append(dnp3_m_unsol);
+                parse_dnp3_response();
+            } else if unsol == 2 {
+                # Non-unsolicited data arrived (late response), parse it
+                parse_dnp3_response();
+                dnp3_auto_confirm();
+            }
+            # Then do the scheduled integrity poll
+            do_integrity_poll();
+        }
+        return 0;
+    }
+
+    if msg == 132 { # WM_NCHITTEST (draggable title bar)
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        if mx >= 32768 { mx = mx - 65536; }
+        my = band(shr(lp, 16), 65535);
+        if my >= 32768 { my = my - 65536; }
+        cx = mx - wl;
+        cy = my - wt;
+
+        if cy < 36 {
+            if cx >= 1090 {
+                if cx < 1114 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            if cx >= 1118 {
+                if cx < 1142 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            return 2; # HTCAPTION
+        }
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    store64(g_auto_poll, 0);
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    enable_dark_mode();
+
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COL_ACCENT));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COL_ACCENT));
+
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+
+    res = register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+    if res == 0 {
+        MessageBoxA(0, "RegisterClassExA failed for GlowButton!", "Error", 16);
+    }
+
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+
+    hwnd = CreateWindowExA(0, clsname, title, 0x92000000, 80, 80, WIN_W, WIN_H, 0, 0, hinst, 0);
+    if hwnd == 0 {
+        MessageBoxA(0, "CreateWindowExA failed!", "Error", 16);
+    }
+    store64(g_hwnd, hwnd);
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

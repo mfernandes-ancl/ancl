@@ -1,0 +1,401 @@
+# Neon Speech & Synth - A Native Win32 COM Application in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "win32_com.ancl";
+import "numfmt.ancl";
+
+extern "kernel32.dll" Beep -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+class_name: str = "NeonSpeech";
+window_title: str = "Neon Speech & Synth - ANCL Native Showcase";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+hwnd_edit: buf = 8;
+hwnd_btn: buf = 8;
+
+# Brushes, Pens, and Fonts
+bg_brush: buf = 8;
+hud_brush: buf = 8;
+edit_bg_brush: buf = 8;
+border_brush: buf = 8;
+neon_pen: buf = 8;
+title_font: buf = 8;
+hud_font: buf = 8;
+ctrl_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+cell_rect: buf = 16;
+text_buf: buf = 512;
+status_buf: buf = 64;
+
+# COM Variables and GUIDs
+clsid_spvoice: buf = 16;
+iid_ispvoice: buf = 16;
+pVoice_buf: buf = 8;
+wide_str_buf: buf = 1024;
+voice_obj: buf = 8;
+
+# Wave state
+wave_phase: buf = 8;
+sine_table: buf = 128; # 16 values * 8 bytes
+vis_rect: buf = 16;
+
+@CODE
+
+# --- Helper Functions ---
+func draw_rect(hdc: ptr, x1: i32, y1: i32, x2: i32, y2: i32, brush: ptr) -> i64 {
+    store32(cell_rect + 0, x1);
+    store32(cell_rect + 4, y1);
+    store32(cell_rect + 8, x2);
+    store32(cell_rect + 12, y2);
+    FillRect(hdc, cell_rect, brush);
+    return 0;
+}
+
+func init_sine_table() -> i64 {
+    # Pre-calculated 16-point sine wave scaled to -100 to 100
+    store64(sine_table + 0, 0);
+    store64(sine_table + 8, 38);
+    store64(sine_table + 16, 70);
+    store64(sine_table + 24, 92);
+    store64(sine_table + 32, 100);
+    store64(sine_table + 40, 92);
+    store64(sine_table + 48, 70);
+    store64(sine_table + 56, 38);
+    store64(sine_table + 64, 0);
+    store64(sine_table + 72, 0 - 38);
+    store64(sine_table + 80, 0 - 70);
+    store64(sine_table + 88, 0 - 92);
+    store64(sine_table + 96, 0 - 100);
+    store64(sine_table + 104, 0 - 92);
+    store64(sine_table + 112, 0 - 70);
+    store64(sine_table + 120, 0 - 38);
+    return 0;
+}
+
+func init_guids() -> i64 {
+    # CLSID_SpVoice: {96749377-3391-11D2-9EE3-00C04F797396}
+    store32(clsid_spvoice, 0x96749377);
+    store16(clsid_spvoice + 4, 0x3391);
+    store16(clsid_spvoice + 6, 0x11D2);
+    store8(clsid_spvoice + 8, 0x9E);
+    store8(clsid_spvoice + 9, 0xE3);
+    store8(clsid_spvoice + 10, 0x00);
+    store8(clsid_spvoice + 11, 0xC0);
+    store8(clsid_spvoice + 12, 0x4F);
+    store8(clsid_spvoice + 13, 0x79);
+    store8(clsid_spvoice + 14, 0x73);
+    store8(clsid_spvoice + 15, 0x96);
+
+    # IID_ISpVoice: {6C44DF74-72B9-4992-A1EC-EF996E0422D4}
+    store32(iid_ispvoice, 0x6C44DF74);
+    store16(iid_ispvoice + 4, 0x72B9);
+    store16(iid_ispvoice + 6, 0x4992);
+    store8(iid_ispvoice + 8, 0xA1);
+    store8(iid_ispvoice + 9, 0xEC);
+    store8(iid_ispvoice + 10, 0xEF);
+    store8(iid_ispvoice + 11, 0x99);
+    store8(iid_ispvoice + 12, 0x6E);
+    store8(iid_ispvoice + 13, 0x04);
+    store8(iid_ispvoice + 14, 0x22);
+    store8(iid_ispvoice + 15, 0xD4);
+    return 0;
+}
+
+func speak_text(ascii_text: ptr) -> i64 {
+    v_obj = load64(voice_obj);
+    if v_obj == 0 { return 0 - 1; }
+
+    # Convert ASCII to wide string
+    a2w(wide_str_buf, ascii_text);
+
+    # Invoke Speak asynchronously (vtable index 20, SPF_ASYNC = 1)
+    callp(vmeth(v_obj, 20), v_obj, wide_str_buf, 1, 0);
+    return 0;
+}
+
+func get_speech_modulation() -> i64 {
+    v_obj = load64(voice_obj);
+    if v_obj == 0 { return 0; }
+
+    # GetStatus (vtable slot 22)
+    # HRESULT GetStatus(SPVOICESTATUS *pStatus, LPWSTR *ppszLastBookmark)
+    memset(status_buf, 0, 64);
+    hr = callp(vmeth(v_obj, 22), v_obj, status_buf, 0);
+    if hr < 0 { return 0; }
+
+    # dwRunningState is offset 12 (4th field). SPRS_IS_SPEAKING = 2
+    state = load32(status_buf + 12);
+    if state != 2 {
+        return 0;
+    }
+
+    # PhonemeId (offset 36, 16-bit) and VisemeId (offset 40, 32-bit)
+    v1 = load16(status_buf + 36);
+    v2 = load32(status_buf + 40);
+    seed = v1 + v2;
+    if seed == 0 {
+        return 1; # Return baseline active if both are zero
+    }
+    return seed;
+}
+
+func trigger_synth_sound() -> i64 {
+    Beep(523, 80);   # C5
+    Beep(659, 80);   # E5
+    Beep(784, 80);   # G5
+    Beep(1046, 120); # C6
+    return 0;
+}
+
+func paint_window(hdc: ptr) -> i64 {
+    GetClientRect(load64(hwnd), client_rect);
+    width = load32(client_rect + 8);
+    height = load32(client_rect + 12);
+
+    # Paint background panels
+    draw_rect(hdc, 0, 0, width, height, load64(bg_brush));
+    draw_rect(hdc, 0, 0, width, 55, load64(hud_brush));
+
+    SetBkMode(hdc, 1);
+
+    # Header Title - Neon Purple
+    old_font = SelectObject(hdc, load64(title_font));
+    SetTextColor(hdc, 0xFF00FF); # Magenta
+    TextOutA(hdc, 30, 15, "NEON SPEECH & SYNTH", 19);
+
+    # Render Visualizer Container
+    draw_rect(hdc, 28, 178, 472, 242, load64(border_brush));
+    draw_rect(hdc, 30, 180, 470, 240, load64(edit_bg_brush));
+
+    # Draw oscilloscope line
+    old_pen = SelectObject(hdc, load64(neon_pen));
+    
+    seed = get_speech_modulation();
+    if seed > 0 {
+        # Modulated wave based on phonetic seed
+        # Amplitude ranges from 8 to 24 pixels
+        amp = 8 + (seed % 3) * 8;
+        # Wavelength divisor ranges from 6 to 15 pixels
+        freq_div = 6 + (seed % 4) * 3;
+        
+        x = 30;
+        while x <= 470 {
+            # Map index in sine table
+            phase = (x - 30) / freq_div + load64(wave_phase);
+            idx = band(phase, 15);
+            sine_val = nf_sext8(load64(sine_table + idx * 8));
+            
+            y_offset = (sine_val * amp) / 100;
+            y = 210 + y_offset;
+            
+            if x == 30 {
+                MoveToEx(hdc, x, y, 0);
+            } else {
+                LineTo(hdc, x, y);
+            }
+            x = x + 5;
+        }
+    } else {
+        # Flat baseline
+        MoveToEx(hdc, 30, 210, 0);
+        LineTo(hdc, 470, 210);
+    }
+    
+    SelectObject(hdc, old_pen);
+
+    # Subtitle - Neon Cyan
+    SelectObject(hdc, load64(hud_font));
+    SetTextColor(hdc, 0xFFFF00); # Cyan
+    TextOutA(hdc, 30, 250, "ANCL Native COM (SAPI) & Dynamic Oscilloscope Visualizer", 56);
+
+    # Footer - Dimmed Gray
+    SetTextColor(hdc, 0x888888);
+    TextOutA(hdc, 30, 275, "Type text above and click SPEAK to watch the visualizer respond dynamically.", 76);
+
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        # Create Edit control
+        edit_wnd = CreateWindowExA(0x00000200, "EDIT", "This is amazing! SAPI is speaking asynchronously while ANCL renders a live neon oscilloscope!", 0x50800044, 30, 70, 440, 95, hwnd_val, 100, hinst, 0);
+        store64(hwnd_edit, edit_wnd);
+        SendMessageA(edit_wnd, 0x0030, load64(ctrl_font), 1);
+
+        # Create Button control
+        btn_wnd = CreateWindowExA(0, "BUTTON", "SPEAK", 0x50000001, 180, 310, 140, 40, hwnd_val, 1001, hinst, 0);
+        store64(hwnd_btn, btn_wnd);
+        SendMessageA(btn_wnd, 0x0030, load64(ctrl_font), 1);
+
+        # 60 FPS animation timer
+        SetTimer(hwnd_val, 1, 16, 0);
+        return 0;
+    }
+
+    if msg == 275 { # WM_TIMER
+        # Progress wave phase
+        store64(wave_phase, load64(wave_phase) + 1);
+        # Redraw visualizer rect only to avoid flickering edit controls
+        InvalidateRect(hwnd_val, vis_rect, 0);
+        return 0;
+    }
+
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        
+        GetClientRect(hwnd_val, client_rect);
+        width = load32(client_rect + 8);
+        height = load32(client_rect + 12);
+        
+        # Double buffering: allocate back-buffer
+        hdc_mem = CreateCompatibleDC(hdc);
+        hbm_mem = CreateCompatibleBitmap(hdc, width, height);
+        old_bm = SelectObject(hdc_mem, hbm_mem);
+        
+        # Paint everything onto the memory back-buffer
+        paint_window(hdc_mem);
+        
+        # Blit the finished memory back-buffer to the screen in one frame (SRCCOPY = 0x00CC0020)
+        BitBlt(hdc, 0, 0, width, height, hdc_mem, 0, 0, 0x00CC0020);
+        
+        # Clean up resources
+        SelectObject(hdc_mem, old_bm);
+        DeleteObject(hbm_mem);
+        DeleteDC(hdc_mem);
+        
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+
+    if msg == 307 { # WM_CTLCOLOREDIT
+        hdc = wParam;
+        SetTextColor(hdc, 0x00FF00); # Neon green text
+        SetBkColor(hdc, 0x121212);   # Dark background
+        return load64(edit_bg_brush);
+    }
+
+    if msg == 273 { # WM_COMMAND
+        ctrl_id = band(wParam, 65535);
+        if ctrl_id == 1001 {
+            memset(text_buf, 0, 512);
+            GetWindowTextA(load64(hwnd_edit), text_buf, 512);
+            
+            trigger_synth_sound();
+            speak_text(text_buf);
+            return 0;
+        }
+        return 0;
+    }
+
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd_val, 1);
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+
+    # Initialize GDI Resources
+    store64(bg_brush, CreateSolidBrush(0x1E1E1E));
+    store64(hud_brush, CreateSolidBrush(0x252525));
+    store64(edit_bg_brush, CreateSolidBrush(0x121212));
+    store64(border_brush, CreateSolidBrush(0x333333));
+    store64(neon_pen, CreatePen(0, 2, 0x00FF00)); # Neon Green Pen
+
+    # Fonts
+    store64(title_font, CreateFontA(24, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(hud_font, CreateFontA(14, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(ctrl_font, CreateFontA(16, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+
+    # Initialize wave state and COM structures
+    store64(wave_phase, 0);
+    init_sine_table();
+    init_guids();
+
+    # Setup visualizer RECT bounds (left, top, right, bottom)
+    store32(vis_rect + 0, 26);
+    store32(vis_rect + 4, 176);
+    store32(vis_rect + 8, 474);
+    store32(vis_rect + 12, 244);
+
+    # COM Global Initialization
+    CoInitializeEx(0, 2); # COINIT_APARTMENTTHREADED
+    hr = CoCreateInstance(clsid_spvoice, 0, 1, iid_ispvoice, pVoice_buf);
+    if hr >= 0 {
+        store64(voice_obj, load64(pVoice_buf));
+    } else {
+        store64(voice_obj, 0);
+    }
+
+    # Initialize WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3);
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+
+    # CreateWindowExA
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 300, 200, 520, 400, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+
+    if hwnd_val == 0 {
+        return 1;
+    }
+
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+
+    while GetMessageA(msg_buf, 0, 0, 0) > 0 {
+        TranslateMessage(msg_buf);
+        DispatchMessageA(msg_buf);
+    }
+
+    # Clean COM
+    v_obj = load64(voice_obj);
+    if v_obj != 0 {
+        com_release(v_obj);
+    }
+    CoUninitialize();
+
+    # Clean GDI
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(hud_brush));
+    DeleteObject(load64(edit_bg_brush));
+    DeleteObject(load64(border_brush));
+    DeleteObject(load64(neon_pen));
+    DeleteObject(load64(title_font));
+    DeleteObject(load64(hud_font));
+    DeleteObject(load64(ctrl_font));
+
+    return 0;
+}

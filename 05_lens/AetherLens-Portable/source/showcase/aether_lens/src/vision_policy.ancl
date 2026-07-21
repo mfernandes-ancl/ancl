@@ -1,0 +1,40 @@
+# Pure Aether Engine vision routing policy.
+# The Engine contract currently exposes native PNG vision on gemma4:e4b.
+
+@CODE
+func lvp_lower(c: i64) -> i64 {
+    if c >= 65 { if c <= 90 { return c + 32; } }
+    return c;
+}
+
+func lvp_equal_ci(a: i64, b: i64) -> i64 {
+    i = 0;
+    while 1 {
+        ca = lvp_lower(load8(a + i));
+        cb = lvp_lower(load8(b + i));
+        if ca != cb { return 0; }
+        if ca == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func lvp_aether_model_has_vision(model: i64) -> i64 {
+    return lvp_equal_ci(model, "gemma4:e4b");
+}
+
+func lvp_aether_mime_supported(mime: i64) -> i64 {
+    return lvp_equal_ci(mime, "image/png");
+}
+
+# Route values: 0 = no image, 1 = direct, 2 = helper,
+# 3 = unsupported image format, 4 = no available/switchable helper.
+func lvp_aether_route(has_image: i64, model: i64, mime: i64, helper_mode: i64, helper_installed: i64, local_switchable: i64) -> i64 {
+    if has_image == 0 { return 0; }
+    if lvp_aether_mime_supported(mime) == 0 { return 3; }
+    if lvp_aether_model_has_vision(model) == 1 { return 1; }
+    if helper_mode == 3 { return 4; }
+    if helper_installed == 0 { return 4; }
+    if local_switchable == 0 { return 4; }
+    return 2;
+}

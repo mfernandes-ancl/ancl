@@ -1,0 +1,1768 @@
+# ============================================================================
+#  fins_client.ancl  -  ANCL Native Omron FINS/TCP Client/Tester
+#
+#  A native Win32 dark-mode GUI Omron FINS/TCP client, written in ANCL.
+#  NexusEdge themed with GlowButtons, live polling ListView grid, read/write.
+#
+#  Features:
+#   - Connect to any Omron FINS TCP slave (host:port)
+#   - Negotiate Client / Server node addresses automatically
+#   - Read memory areas: DM (0x82), HR (0xB2), CIO (0xB0), AR (0xB3), EM (0x90)
+#   - Write single Word to any memory area (DM/HR/CIO/AR/EM)
+#   - Live polling with configurable interval
+#   - Dark NexusEdge theme with GlowButton custom controls and Orange accents
+#   - SysListView32 grid with real-time register values
+#
+#  100% CRT-free PE32+, GUI subsystem.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+
+extern "ws2_32.dll" connect;
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "user32.dll" PostMessageA;
+extern "user32.dll" PeekMessageA -> i32;
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+extern "comctl32.dll" InitCommonControlsEx;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll" RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "ANCLFINSCLIENT";
+title:      str = "ANCL Omron FINS TCP Tester";
+title_draw: str = "ANCL OMRON FINS TCP TESTER";
+st_conn_ind: str = "* CONNECTED";
+st_disc_ind: str = "* DISCONNECTED";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+cls_list:   str = "LISTBOX";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom window classes ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+cls_panel:    str = "ANCL_PANEL";
+
+# ---- Labels ----
+lbl_host:   str = "Host:";
+lbl_port:   str = "Port:";
+lbl_cnode:  str = "C Node:";
+lbl_snode:  str = "S Node:";
+lbl_log:    str = "Log:";
+lbl_status: str = "Status: Disconnected";
+lbl_area:   str = "Area:";
+lbl_start:  str = "Start Addr:";
+lbl_qty:    str = "Qty:";
+lbl_wrval:  str = "Val:";
+lbl_wraddr: str = "Addr:";
+lbl_interval: str = "Interval ms:";
+
+# ---- Combobox class ----
+cls_combo:  str = "COMBOBOX";
+
+# ---- Area dropdown items ----
+area_item_dm:  str = "DM - Data Memory (0x82)";
+area_item_hr:  str = "HR - Holding Area (0xB2)";
+area_item_cio: str = "CIO - Core I/O Area (0xB0)";
+area_item_ar:  str = "AR - Auxiliary Area (0xB3)";
+area_item_em:  str = "EM - Extended Memory (0x90)";
+
+area_dm:  str = "DM";
+area_hr:  str = "HR";
+area_cio: str = "CIO";
+area_ar:  str = "AR";
+area_em:  str = "EM";
+
+# ---- Format/Addr/Endian dropdown items ----
+fmt_dec:    str = "Decimal";
+fmt_hex:    str = "Hex";
+addr_0:     str = "0-based";
+addr_1:     str = "1-based";
+end_big:    str = "Big";
+end_lit:    str = "Little";
+lbl_fmt:    str = "Fmt:";
+lbl_adr:    str = "Addr:";
+lbl_end:    str = "End:";
+
+# ---- Buttons ----
+btn_conn:   str = "Connect";
+btn_disc:   str = "Disconnect";
+btn_read:   str = "Read";
+btn_poll:   str = "Start Poll";
+btn_stop:   str = "Stop Poll";
+btn_write:  str = "Write";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_min:    str = "-";
+btn_close:  str = "X";
+
+# ---- ListView columns ----
+cls_lv:     str = "SysListView32";
+col_area:   str = "Area";
+col_addr:   str = "Address";
+col_val:    str = "Value";
+col_hex:    str = "Hex";
+
+# ---- Defaults ----
+def_host:   str = "127.0.0.1";
+def_port:   str = "9600";
+def_node_auto: str = "0";
+def_start:  str = "0";
+def_qty:    str = "10";
+def_interval: str = "1000";
+
+# ---- Log messages ----
+crlf:       str = "\r\n";
+m_conn:     str = "[fins] connecting to ";
+m_colon:    str = ":";
+m_dots:     str = "...\r\n";
+m_conn_ok:  str = "[fins] connected!\r\n";
+m_conn_err: str = "[fins] connect() failed or rejected.\r\n";
+m_disc:     str = "[fins] disconnected.\r\n";
+m_wsa_err:  str = "[fins] WSAStartup failed.\r\n";
+m_send_err: str = "[fins] send failed.\r\n";
+m_recv_err: str = "[fins] recv failed or connection lost.\r\n";
+m_read_ok:  str = "[fins] read OK: ";
+m_read_n:   str = " words\r\n";
+m_write_ok: str = "[fins] write OK: register ";
+m_write_eq: str = " = ";
+m_write_err:str = "[fins] write failed.\r\n";
+m_poll_on:  str = "[fins] polling started (interval = ";
+m_poll_on2: str = "ms).\r\n";
+m_poll_off: str = "[fins] polling stopped.\r\n";
+m_poll_err: str = "[fins] connection lost - poll stopped.\r\n";
+m_exc:      str = "[fins] error response: MRES=0x";
+m_exc2:     str = " SRES=0x";
+m_st_conn:  str = "Status: Connected to ";
+m_st_disc:  str = "Status: Disconnected";
+m_bytes:    str = " bytes\r\n";
+m_sp:       str = " ";
+
+# ---- GUI handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_host_ed:  buf = 8;      # host edit control
+g_port_ed:  buf = 8;      # port edit control
+g_cnode_ed: buf = 8;      # client node address override/display
+g_snode_ed: buf = 8;      # server node address override/display
+g_start_ed: buf = 8;      # start register edit
+g_qty_ed:   buf = 8;      # quantity edit
+g_area_combo: buf = 8;    # memory area combobox
+g_log:      buf = 8;      # log multiline edit
+g_status:   buf = 8;      # status label
+g_font:     buf = 8;      # Consolas font
+g_listview: buf = 8;      # ListView HWND
+g_interval_ed: buf = 8;   # interval edit HWND
+g_write_reg_ed: buf = 8;  # write register edit
+g_write_val_ed: buf = 8;  # write value edit
+g_fmt_combo:    buf = 8;  # format combo
+g_addr_combo:   buf = 8;  # addr mode combo
+g_end_combo:    buf = 8;  # endian combo
+
+# ---- Win32 structs ----
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+
+# ---- Winsock ----
+g_wsa:      buf = 512;
+g_addr:     buf = 16;
+g_sock:     buf = 8;      # active TCP socket (0 = disconnected)
+
+# ---- FINS buffers ----
+g_txbuf:    buf = 1024;   # outgoing request
+g_rxbuf:    buf = 1024;   # incoming response
+
+# ---- Scratch buffers ----
+g_hostbuf:  buf = 256;
+g_portbuf:  buf = 32;
+g_cnodebuf: buf = 16;
+g_snodebuf: buf = 16;
+g_startbuf: buf = 16;
+g_qtybuf:   buf = 16;
+g_numbuf:   buf = 32;
+g_hexbuf:   buf = 32;
+g_logbuf:   buf = 512;
+g_statbuf:  buf = 256;
+g_intbuf:   buf = 16;
+g_wrbuf:    buf = 32;
+g_wrregbuf: buf = 32;
+g_savebuf:  buf = 2048;
+g_logpath:  str = "fins_log.txt";
+m_save_ok:  str = "[fins] log saved.\r\n";
+m_save_err: str = "[fins] save failed.\r\n";
+
+# ---- State ----
+g_sid:         buf = 8;      # service ID counter
+g_client_node: buf = 8;      # negotiated client node
+g_server_node: buf = 8;      # negotiated server node
+g_polling:     buf = 8;      # 1 = polling active
+g_icc:         buf = 8;      # INITCOMMONCONTROLSEX
+g_lvcol:       buf = 64;     # LVCOLUMNA struct
+g_lvitem:      buf = 96;     # LVITEMA struct
+g_lv_txtbuf:   buf = 256;    # text buffer for ListView items
+g_dwm_val:     buf = 8;      # DWM attribute value
+
+# ---- GDI: NexusEdge brushes/pens ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+g_lv_brush:  buf = 8;
+
+# NexusEdge color palette (BGR format for Win32)
+# Styled with Omron FINS Orange accent
+COL_BG:      i64 = 0x1C1008;
+COL_PANEL:   i64 = 0x060402;
+COL_TEXT:    i64 = 0xAB9687;
+COL_ACCENT:  i64 = 0x3C92FB; # Omron Orange BGR (#FB923C)
+COL_DIM:     i64 = 0x808080;
+COL_GREEN:   i64 = 0x53D339;
+COL_RED:     i64 = 0x703AF5;
+
+# NexusEdge extended palette
+COLOR_BG_DEEP:     i64 = 0x1C1008;
+COLOR_BG_PANEL:    i64 = 0x060402;
+COLOR_BG_CARD:     i64 = 0x180D05;
+COLOR_BG_INPUT:    i64 = 0x080604;
+COLOR_BG_HOVER:    i64 = 0x301F0D;
+COLOR_TEXT_PRIMARY:i64 = 0xAB9687;
+COLOR_TEXT_BRIGHT: i64 = 0xFFFFFF;
+COLOR_NEON_ORANGE: i64 = 0x3C92FB;
+COLOR_BORDER:      i64 = 0x7C6543;
+
+# GDI objects
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_wndclass_pnl: buf = 80;
+g_temp_text:    buf = 256;
+w_empty:        buf = 8;
+g_combo_ps:     buf = 72;
+g_combo_rect:   buf = 16;
+g_old_combo_proc: buf = 8;
+g_pen_arrow:    buf = 8;
+
+# ---- Dark mode (native dark scrollbars) ----
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40;    # L"DarkMode_Explorer" (wide)
+thm_dm_exp_a:   str = "DarkMode_Explorer";
+thm_dm_cfd_w:   buf = 40;    # L"DarkMode_CFD" (wide)
+thm_dm_cfd_a:   str = "DarkMode_CFD";
+g_allowdark:    buf = 8;      # AllowDarkModeForWindow fn ptr
+
+# ---- GUI geometry ----
+WIN_W:      i64 = 900;
+WIN_H:      i64 = 580;
+
+# ---- Control IDs ----
+ID_HOST_EDIT:       i64 = 100;
+ID_PORT_EDIT:       i64 = 101;
+ID_CNODE_EDIT:      i64 = 102;
+ID_SNODE_EDIT:      i64 = 103;
+ID_BTN_CONN:        i64 = 104;
+ID_BTN_DISC:        i64 = 105;
+ID_AREA_COMBO:      i64 = 106;
+ID_START_EDIT:      i64 = 107;
+ID_QTY_EDIT:        i64 = 108;
+ID_BTN_READ:        i64 = 109;
+ID_LOG:             i64 = 110;
+ID_STATUS:          i64 = 111;
+ID_LISTVIEW:        i64 = 112;
+ID_BTN_POLL:        i64 = 113;
+ID_BTN_STOP:        i64 = 114;
+ID_INTERVAL_EDIT:   i64 = 115;
+ID_WRITE_REG_EDIT:  i64 = 116;
+ID_WRITE_VAL_EDIT:  i64 = 117;
+ID_BTN_WRITE:       i64 = 118;
+ID_BTN_CLEAR:       i64 = 119;
+ID_BTN_MIN:         i64 = 120;
+ID_BTN_CLOSE:       i64 = 121;
+ID_FMT_COMBO:       i64 = 122;
+ID_ADDR_COMBO:      i64 = 123;
+ID_END_COMBO:       i64 = 124;
+ID_BTN_SAVE:        i64 = 125;
+ID_TIMER_POLL:      i64 = 1;
+
+@CODE
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    SendMessageA(hwnd_log, 177, len, len);
+    SendMessageA(hwnd_log, 194, 0, text);
+    return 0;
+}
+
+func to_hex2(val: i64) -> i64 {
+    nib1 = band(shr(val, 4), 15);
+    ch1 = 48 + nib1;
+    if nib1 >= 10 { ch1 = 55 + nib1; }
+    store8(g_hexbuf + 0, ch1);
+
+    nib2 = band(val, 15);
+    ch2 = 48 + nib2;
+    if nib2 >= 10 { ch2 = 55 + nib2; }
+    store8(g_hexbuf + 1, ch2);
+
+    store8(g_hexbuf + 2, 0);
+    return g_hexbuf;
+}
+
+func to_hex4(val: i64) -> i64 {
+    i = 3;
+    while i >= 0 {
+        nib = band(val, 15);
+        ch = 48 + nib;
+        if nib >= 10 { ch = 55 + nib; }
+        store8(g_hexbuf + i, ch);
+        val = shr(val, 4);
+        i = i - 1;
+    }
+    store8(g_hexbuf + 4, 0);
+    return g_hexbuf;
+}
+
+func log_num(prefix: i64, val: i64) -> i64 {
+    log_append(prefix);
+    int_to_str(g_numbuf, val);
+    log_append(g_numbuf);
+    log_append(crlf);
+    return 0;
+}
+
+# ============================================================================
+# FINS TCP PROTOCOL
+# ============================================================================
+
+func get_area_code(sel: i64) -> i64 {
+    if sel == 0 { return 0x82; }  # DM
+    if sel == 1 { return 0xB2; }  # HR
+    if sel == 2 { return 0xB0; }  # CIO
+    if sel == 3 { return 0xB3; }  # AR
+    if sel == 4 { return 0x90; }  # EM Bank 0
+    return 0x82;
+}
+
+func get_area_name(sel: i64) -> i64 {
+    if sel == 0 { return area_dm; }
+    if sel == 1 { return area_hr; }
+    if sel == 2 { return area_cio; }
+    if sel == 3 { return area_ar; }
+    if sel == 4 { return area_em; }
+    return area_dm;
+}
+
+# FINS Memory Area Read (MRC 01, SRC 01)
+# Returns number of words read (0 on failure)
+func fins_read_memory(area_code: i64, start_addr: i64, qty: i64) -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    # Increment Service ID (SID)
+    sid = load64(g_sid);
+    sid = band(sid + 1, 0xFF);
+    store64(g_sid, sid);
+
+    cnode = load64(g_client_node);
+    snode = load64(g_server_node);
+
+    # FINS command frame size: 18 bytes
+    # TCP header length field: remainder = 8 (FINS TCP command + error) + 18 (FINS frame) = 26 bytes
+
+    # FINS TCP Header: 'F', 'I', 'N', 'S'
+    store8(g_txbuf + 0, 70);
+    store8(g_txbuf + 1, 73);
+    store8(g_txbuf + 2, 78);
+    store8(g_txbuf + 3, 83);
+    # Length: 26
+    store8(g_txbuf + 4, 0);
+    store8(g_txbuf + 5, 0);
+    store8(g_txbuf + 6, 0);
+    store8(g_txbuf + 7, 26);
+    # Command: 2 (Send Frame)
+    store8(g_txbuf + 8, 0);
+    store8(g_txbuf + 9, 0);
+    store8(g_txbuf + 10, 0);
+    store8(g_txbuf + 11, 2);
+    # Error: 0
+    store8(g_txbuf + 12, 0);
+    store8(g_txbuf + 13, 0);
+    store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 0);
+
+    # FINS Frame payload
+    store8(g_txbuf + 16, 0x80);  # ICF (command, response expected)
+    store8(g_txbuf + 17, 0x00);  # RSV
+    store8(g_txbuf + 18, 0x02);  # GCT
+    store8(g_txbuf + 19, 0x00);  # DNA (Destination Network Address)
+    store8(g_txbuf + 20, band(snode, 0xFF));  # DA1 (Destination Node Address)
+    store8(g_txbuf + 21, 0x00);  # DA2 (Destination Unit Address)
+    store8(g_txbuf + 22, 0x00);  # SNA (Source Network Address)
+    store8(g_txbuf + 23, band(cnode, 0xFF));  # SA1 (Source Node Address)
+    store8(g_txbuf + 24, 0x00);  # SA2 (Source Unit Address)
+    store8(g_txbuf + 25, sid);               # SID (Service ID)
+    store8(g_txbuf + 26, 0x01);  # MRC (Main Request Code)
+    store8(g_txbuf + 27, 0x01);  # SRC (Sub Request Code)
+
+    store8(g_txbuf + 28, band(area_code, 0xFF));  # Memory Area Code
+    store8(g_txbuf + 29, band(shr(start_addr, 8), 0xFF)); # Word Address high
+    store8(g_txbuf + 30, band(start_addr, 0xFF));        # Word Address low
+    store8(g_txbuf + 31, 0x00);                          # Bit Address = 0
+    store8(g_txbuf + 32, band(shr(qty, 8), 0xFF));        # Qty high
+    store8(g_txbuf + 33, band(qty, 0xFF));                # Qty low
+
+    # Send request (34 bytes)
+    n = send(sock, g_txbuf, 34, 0);
+    if n < 34 {
+        log_append("[fins] Send failed.\r\n");
+        return 0;
+    }
+
+    # Receive response
+    n = recv(sock, g_rxbuf, 512, 0);
+    if n < 30 {
+        log_append("[fins] Recv failed or incomplete.\r\n");
+        return 0;
+    }
+
+    # Check FINS TCP header command code = 2
+    if load8(g_rxbuf + 11) != 2 {
+        log_append("[fins] Invalid response command type.\r\n");
+        return 0;
+    }
+
+    # FINS Response Frame status codes MRES and SRES are at 28 and 29
+    mres = load8(g_rxbuf + 28);
+    sres = load8(g_rxbuf + 29);
+    if mres != 0 {
+        log_append(m_exc);
+        to_hex2(mres);
+        log_append(g_hexbuf);
+        log_append(m_exc2);
+        to_hex2(sres);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        return 0;
+    }
+    if sres != 0 {
+        log_append(m_exc);
+        to_hex2(mres);
+        log_append(g_hexbuf);
+        log_append(m_exc2);
+        to_hex2(sres);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        return 0;
+    }
+
+    # Successful! Calculate how many words returned
+    # Length field is at 4..7 (big-endian)
+    len_remainder = load8(g_rxbuf + 7) + shl(load8(g_rxbuf + 6), 8) + shl(load8(g_rxbuf + 5), 16) + shl(load8(g_rxbuf + 4), 24);
+    # Remainder length is FINS TCP Command (4) + Error (4) + FINS Frame
+    # So FINS Frame size is len_remainder - 8.
+    # Data is starting from offset 14 in FINS Frame, which is byte 30 of entire response.
+    # Data length is FINS Frame size - 14 = len_remainder - 22.
+    # Number of words is data_len / 2.
+    data_len = len_remainder - 22;
+    word_count = shr(data_len, 1);
+    return word_count;
+}
+
+# FINS Memory Area Write (MRC 01, SRC 02)
+# Returns 1 on success, 0 on failure
+func fins_write_memory(area_code: i64, write_addr: i64, value: i64) -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    # Increment Service ID (SID)
+    sid = load64(g_sid);
+    sid = band(sid + 1, 0xFF);
+    store64(g_sid, sid);
+
+    cnode = load64(g_client_node);
+    snode = load64(g_server_node);
+
+    # FINS write command frame size: 20 bytes
+    # TCP header length field: remainder = 8 + 20 = 28 bytes
+
+    # FINS TCP Header: 'F', 'I', 'N', 'S'
+    store8(g_txbuf + 0, 70);
+    store8(g_txbuf + 1, 73);
+    store8(g_txbuf + 2, 78);
+    store8(g_txbuf + 3, 83);
+    # Length: 28
+    store8(g_txbuf + 4, 0);
+    store8(g_txbuf + 5, 0);
+    store8(g_txbuf + 6, 0);
+    store8(g_txbuf + 7, 28);
+    # Command: 2 (Send Frame)
+    store8(g_txbuf + 8, 0);
+    store8(g_txbuf + 9, 0);
+    store8(g_txbuf + 10, 0);
+    store8(g_txbuf + 11, 2);
+    # Error: 0
+    store8(g_txbuf + 12, 0);
+    store8(g_txbuf + 13, 0);
+    store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 0);
+
+    # FINS Frame payload
+    store8(g_txbuf + 16, 0x80);  # ICF
+    store8(g_txbuf + 17, 0x00);  # RSV
+    store8(g_txbuf + 18, 0x02);  # GCT
+    store8(g_txbuf + 19, 0x00);  # DNA
+    store8(g_txbuf + 20, band(snode, 0xFF));  # DA1
+    store8(g_txbuf + 21, 0x00);  # DA2
+    store8(g_txbuf + 22, 0x00);  # SNA
+    store8(g_txbuf + 23, band(cnode, 0xFF));  # SA1
+    store8(g_txbuf + 24, 0x00);  # SA2
+    store8(g_txbuf + 25, sid);               # SID
+    store8(g_txbuf + 26, 0x01);  # MRC
+    store8(g_txbuf + 27, 0x02);  # SRC (Write Memory)
+
+    store8(g_txbuf + 28, band(area_code, 0xFF));  # Memory Area Code
+    store8(g_txbuf + 29, band(shr(write_addr, 8), 0xFF)); # Word Address high
+    store8(g_txbuf + 30, band(write_addr, 0xFF));        # Word Address low
+    store8(g_txbuf + 31, 0x00);                          # Bit Address = 0
+    store8(g_txbuf + 32, 0x00);                          # Qty high (write 1 word)
+    store8(g_txbuf + 33, 0x01);                          # Qty low
+    store8(g_txbuf + 34, band(shr(value, 8), 0xFF));      # Value high
+    store8(g_txbuf + 35, band(value, 0xFF));              # Value low
+
+    # Send request (36 bytes)
+    n = send(sock, g_txbuf, 36, 0);
+    if n < 36 {
+        log_append("[fins] Send failed.\r\n");
+        return 0;
+    }
+
+    # Receive response
+    n = recv(sock, g_rxbuf, 512, 0);
+    if n < 30 {
+        log_append("[fins] Recv failed or incomplete.\r\n");
+        return 0;
+    }
+
+    if load8(g_rxbuf + 11) != 2 {
+        log_append("[fins] Invalid response command type.\r\n");
+        return 0;
+    }
+
+    mres = load8(g_rxbuf + 28);
+    sres = load8(g_rxbuf + 29);
+    if mres != 0 {
+        log_append(m_exc);
+        to_hex2(mres);
+        log_append(g_hexbuf);
+        log_append(m_exc2);
+        to_hex2(sres);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        return 0;
+    }
+    if sres != 0 {
+        log_append(m_exc);
+        to_hex2(mres);
+        log_append(g_hexbuf);
+        log_append(m_exc2);
+        to_hex2(sres);
+        log_append(g_hexbuf);
+        log_append(crlf);
+        return 0;
+    }
+
+    return 1;
+}
+
+# ============================================================================
+# GUI ACTIONS
+# ============================================================================
+
+func do_connect() -> i64 {
+    # Already connected?
+    sock = load64(g_sock);
+    if sock != 0 { return 0; }
+
+    # Get host
+    GetWindowTextA(load64(g_host_ed), g_hostbuf, 256);
+    # Get port
+    GetWindowTextA(load64(g_port_ed), g_portbuf, 32);
+    port = str_to_int(g_portbuf);
+    if port < 1 { port = 9600; }
+    if port > 65535 { port = 9600; }
+
+    # Log
+    log_append(m_conn);
+    log_append(g_hostbuf);
+    log_append(m_colon);
+    log_append(g_portbuf);
+    log_append(m_dots);
+
+    # Resolve host
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);          # AF_INET
+    pp = htons(port);
+    store16(g_addr + 2, pp);
+
+    # Parse IP from g_hostbuf (dotted decimal)
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = g_hostbuf;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 {  # '.'
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10;
+            octet = octet + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+
+    # Create socket
+    s = socket(2, 1, 6);    # AF_INET, SOCK_STREAM, TCP
+    if s == 0 - 1 {
+        log_append(m_conn_err);
+        return 0;
+    }
+
+    # Connect
+    rc = connect(s, g_addr, 16);
+    if rc != 0 {
+        closesocket(s);
+        log_append(m_conn_err);
+        return 0;
+    }
+
+    # Send FINS connection request (negotiate node addresses)
+    # Header: 'F', 'I', 'N', 'S'
+    store8(g_txbuf + 0, 70);
+    store8(g_txbuf + 1, 73);
+    store8(g_txbuf + 2, 78);
+    store8(g_txbuf + 3, 83);
+    # Length: 12
+    store8(g_txbuf + 4, 0);
+    store8(g_txbuf + 5, 0);
+    store8(g_txbuf + 6, 0);
+    store8(g_txbuf + 7, 12);
+    # Command: 0
+    store8(g_txbuf + 8, 0);
+    store8(g_txbuf + 9, 0);
+    store8(g_txbuf + 10, 0);
+    store8(g_txbuf + 11, 0);
+    # Error code: 0
+    store8(g_txbuf + 12, 0);
+    store8(g_txbuf + 13, 0);
+    store8(g_txbuf + 14, 0);
+    store8(g_txbuf + 15, 0);
+    # Client node: read from Edit or default 0 (auto-assign)
+    GetWindowTextA(load64(g_cnode_ed), g_cnodebuf, 16);
+    cn = str_to_int(g_cnodebuf);
+    store8(g_txbuf + 16, 0);
+    store8(g_txbuf + 17, 0);
+    store8(g_txbuf + 18, 0);
+    store8(g_txbuf + 19, band(cn, 0xFF));
+
+    n = send(s, g_txbuf, 20, 0);
+    if n < 20 {
+        closesocket(s);
+        log_append(m_send_err);
+        return 0;
+    }
+
+    # Receive connection response
+    n = recv(s, g_rxbuf, 512, 0);
+    if n < 24 {
+        closesocket(s);
+        log_append(m_recv_err);
+        return 0;
+    }
+
+    magic_ok = 0;
+    if load8(g_rxbuf + 0) == 70 {
+        if load8(g_rxbuf + 1) == 73 {
+            if load8(g_rxbuf + 2) == 78 {
+                if load8(g_rxbuf + 3) == 83 {
+                    magic_ok = 1;
+                }
+            }
+        }
+    }
+    if magic_ok == 0 {
+        closesocket(s);
+        log_append("[fins] Invalid response magic.\r\n");
+        return 0;
+    }
+
+    if load8(g_rxbuf + 11) != 1 {
+        closesocket(s);
+        log_append("[fins] Unexpected connection response command.\r\n");
+        return 0;
+    }
+
+    err_code = load8(g_rxbuf + 15);
+    if err_code != 0 {
+        closesocket(s);
+        log_append("[fins] Connection rejected by PLC. Error code: ");
+        int_to_str(g_numbuf, err_code);
+        log_append(g_numbuf);
+        log_append(crlf);
+        return 0;
+    }
+
+    # Extract negotiated client and server node addresses
+    client_node = load8(g_rxbuf + 19);
+    server_node = load8(g_rxbuf + 23);
+    store64(g_client_node, client_node);
+    store64(g_server_node, server_node);
+
+    # Update node edits so user is aware
+    int_to_str(g_cnodebuf, client_node);
+    SetWindowTextA(load64(g_cnode_ed), g_cnodebuf);
+    int_to_str(g_snodebuf, server_node);
+    SetWindowTextA(load64(g_snode_ed), g_snodebuf);
+
+    store64(g_sock, s);
+    log_append(m_conn_ok);
+
+    # Update status bar text
+    e = str_copy(g_statbuf, m_st_conn);
+    e = str_copy(e, g_hostbuf);
+    e = str_copy(e, m_colon);
+    str_copy(e, g_portbuf);
+    SetWindowTextA(load64(g_status), g_statbuf);
+
+    # Repaint to update connection indicator dot
+    InvalidateRect(load64(g_hwnd), 0, 1);
+
+    return 0;
+}
+
+func do_disconnect() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    # Stop polling if active
+    poll = load64(g_polling);
+    if poll != 0 {
+        KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+        store64(g_polling, 0);
+    }
+
+    closesocket(sock);
+    store64(g_sock, 0);
+    log_append(m_disc);
+    SetWindowTextA(load64(g_status), m_st_disc);
+
+    # Repaint to update connection indicator dot
+    InvalidateRect(load64(g_hwnd), 0, 1);
+
+    return 0;
+}
+
+func do_read() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    # Get parameters
+    area_idx = SendMessageA(load64(g_area_combo), 327, 0, 0);
+    area_code = get_area_code(area_idx);
+
+    GetWindowTextA(load64(g_start_ed), g_startbuf, 16);
+    start_addr = str_to_int(g_startbuf);
+
+    GetWindowTextA(load64(g_qty_ed), g_qtybuf, 16);
+    qty = str_to_int(g_qtybuf);
+    if qty < 1 { qty = 1; }
+    if qty > 250 { qty = 250; }
+
+    # Perform read
+    n = fins_read_memory(area_code, start_addr, qty);
+    if n == 0 { return 0; }
+
+    # Log success
+    log_append(m_read_ok);
+    int_to_str(g_numbuf, n);
+    log_append(g_numbuf);
+    log_append(m_read_n);
+
+    # Populate ListView
+    update_listview(start_addr, n);
+    return 0;
+}
+
+func update_listview(start_addr: i64, count: i64) -> i64 {
+    hlv = load64(g_listview);
+    SendMessageA(hlv, 4105, 0, 0);    # LVM_DELETEALLITEMS
+
+    # Read display settings once before loop
+    fmt = SendMessageA(load64(g_fmt_combo), 327, 0, 0);
+    addr_mode = SendMessageA(load64(g_addr_combo), 327, 0, 0);
+    endian = SendMessageA(load64(g_end_combo), 327, 0, 0);
+    area_idx = SendMessageA(load64(g_area_combo), 327, 0, 0);
+    area_name = get_area_name(area_idx);
+
+    i = 0;
+    while i < count {
+        data_off = 30 + i + i;
+        hi_byte = load8(g_rxbuf + data_off);
+        lo_byte = load8(g_rxbuf + data_off + 1);
+        val = shl(hi_byte, 8) + lo_byte;
+        if endian == 1 { val = shl(lo_byte, 8) + hi_byte; }
+
+        # Col 0: Area name
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);       # mask = LVIF_TEXT
+        store32(g_lvitem + 4, i);       # iItem
+        store32(g_lvitem + 8, 0);       # iSubItem
+        store64(g_lvitem + 24, area_name);
+        SendMessageA(hlv, 4103, 0, g_lvitem); # LVM_INSERTITEMA
+
+        # Col 1: Address offset
+        disp_addr = start_addr + i;
+        if addr_mode == 1 { disp_addr = disp_addr + 1; }
+        int_to_str(g_lv_txtbuf, disp_addr);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, g_lv_txtbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem); # LVM_SETITEMA
+
+        # Col 2: Value (decimal or hex based on fmt combo)
+        if fmt == 1 {
+            to_hex4(val);
+            store8(g_lv_txtbuf + 0, 48);
+            store8(g_lv_txtbuf + 1, 120);
+            store8(g_lv_txtbuf + 2, load8(g_hexbuf + 0));
+            store8(g_lv_txtbuf + 3, load8(g_hexbuf + 1));
+            store8(g_lv_txtbuf + 4, load8(g_hexbuf + 2));
+            store8(g_lv_txtbuf + 5, load8(g_hexbuf + 3));
+            store8(g_lv_txtbuf + 6, 0);
+        } else {
+            int_to_str(g_lv_txtbuf, val);
+        }
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 2);
+        store64(g_lvitem + 24, g_lv_txtbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        # Col 3: Hex (always)
+        to_hex4(val);
+        store8(g_lv_txtbuf + 0, 48);
+        store8(g_lv_txtbuf + 1, 120);
+        store8(g_lv_txtbuf + 2, load8(g_hexbuf + 0));
+        store8(g_lv_txtbuf + 3, load8(g_hexbuf + 1));
+        store8(g_lv_txtbuf + 4, load8(g_hexbuf + 2));
+        store8(g_lv_txtbuf + 5, load8(g_hexbuf + 3));
+        store8(g_lv_txtbuf + 6, 0);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, g_lv_txtbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        i = i + 1;
+    }
+    return 0;
+}
+
+func do_write() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    # Get memory area
+    area_idx = SendMessageA(load64(g_area_combo), 327, 0, 0);
+    area_code = get_area_code(area_idx);
+
+    # Get address
+    GetWindowTextA(load64(g_write_reg_ed), g_wrregbuf, 32);
+    write_addr = str_to_int(g_wrregbuf);
+
+    # Get value
+    GetWindowTextA(load64(g_write_val_ed), g_wrbuf, 32);
+    value = str_to_int(g_wrbuf);
+    if value > 65535 { value = 65535; }
+
+    # Perform write
+    rc = fins_write_memory(area_code, write_addr, value);
+    if rc == 0 {
+        log_append(m_write_err);
+        return 0;
+    }
+
+    # Log success
+    log_append(m_write_ok);
+    log_append(get_area_name(area_idx));
+    log_append(" ");
+    int_to_str(g_numbuf, write_addr);
+    log_append(g_numbuf);
+    log_append(m_write_eq);
+    int_to_str(g_numbuf, value);
+    log_append(g_numbuf);
+    log_append(crlf);
+    return 0;
+}
+
+func do_start_poll() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+
+    poll = load64(g_polling);
+    if poll != 0 { return 0; }
+
+    # Get interval
+    GetWindowTextA(load64(g_interval_ed), g_intbuf, 16);
+    interval = str_to_int(g_intbuf);
+    if interval < 50 { interval = 50; }
+
+    store64(g_polling, 1);
+    SetTimer(load64(g_hwnd), ID_TIMER_POLL, interval, 0);
+
+    log_append(m_poll_on);
+    int_to_str(g_numbuf, interval);
+    log_append(g_numbuf);
+    log_append(m_poll_on2);
+    return 0;
+}
+
+func do_stop_poll() -> i64 {
+    poll = load64(g_polling);
+    if poll == 0 { return 0; }
+
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+    store64(g_polling, 0);
+    log_append(m_poll_off);
+    return 0;
+}
+
+func do_poll_tick() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 {
+        do_stop_poll();
+        log_append(m_poll_err);
+        return 0;
+    }
+
+    # Re-read with current parameters
+    area_idx = SendMessageA(load64(g_area_combo), 327, 0, 0);
+    area_code = get_area_code(area_idx);
+
+    GetWindowTextA(load64(g_start_ed), g_startbuf, 16);
+    start_addr = str_to_int(g_startbuf);
+
+    GetWindowTextA(load64(g_qty_ed), g_qtybuf, 16);
+    qty = str_to_int(g_qtybuf);
+    if qty < 1 { qty = 1; }
+    if qty > 250 { qty = 250; }
+
+    n = fins_read_memory(area_code, start_addr, qty);
+    if n == 0 {
+        do_stop_poll();
+        log_append(m_poll_err);
+        return 0;
+    }
+
+    update_listview(start_addr, n);
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    if len < 1 { return 0; }
+    if len > 2046 { len = 2046; }
+    SendMessageA(hwnd_log, 13, 2047, g_savebuf);
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 {
+        log_append(m_save_err);
+        return 0;
+    }
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE HELPERS
+# ============================================================================
+
+func a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i + i, c);
+        store8(dst + i + i + 1, 0);
+        if c == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    a2w(thm_dm_exp_w, thm_dm_exp_a);
+    a2w(thm_dm_cfd_w, thm_dm_cfd_a);
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+func dark_combo(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_cfd_w, 0);
+    SendMessageA(hwnd, 0x031A, 0, 0);
+    return 0;
+}
+
+# ============================================================================
+# WINDOW CLASS REGISTRATION HELPER
+# ============================================================================
+
+func register_class(wndclass: ptr, clsname_arg: str, wndproc_fn: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    store32(wndclass + 0,  80);
+    store32(wndclass + 4,  3);
+    store64(wndclass + 8,  wndproc_fn);
+    store32(wndclass + 16, 0);
+    store32(wndclass + 20, 0);
+    store64(wndclass + 24, hinst);
+    store64(wndclass + 32, 0);
+    store64(wndclass + 40, cursor);
+    store64(wndclass + 48, brush);
+    store64(wndclass + 56, 0);
+    store64(wndclass + 64, clsname_arg);
+    store64(wndclass + 72, 0);
+    return RegisterClassExA(wndclass);
+}
+
+# ============================================================================
+# GLOWBUTTON CONTROL (NexusEdge styled button with hover/press glow)
+# ============================================================================
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+
+    if msg == 512 { # WM_MOUSEMOVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            new_state = bor(pressed, 1);
+            SetWindowLongA(hwnd, 0 - 21, new_state);
+            InvalidateRect(hwnd, 0, 1);
+
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+
+    if msg == 675 { # WM_MOUSELEAVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 513 { # WM_LBUTTONDOWN
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        new_state = bor(hover, 2);
+        SetWindowLongA(hwnd, 0 - 21, new_state);
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 514 { # WM_LBUTTONUP
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        l = load32(g_rect + 0);
+        t = load32(g_rect + 4);
+        r = load32(g_rect + 8);
+        b = load32(g_rect + 12);
+
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+
+        br = load64(g_brush_card);
+        if pressed == 2 {
+            br = load64(g_brush_input);
+        } else if hover == 1 {
+            br = load64(g_brush_hover);
+        }
+        old_brush = SelectObject(hdc, br);
+
+        pen = load64(g_pen_border);
+        if pressed == 2 {
+            pen = load64(g_pen_neon);
+        } else if hover == 1 {
+            pen = load64(g_pen_neon);
+        }
+        old_pen = SelectObject(hdc, pen);
+
+        RoundRect(hdc, l, t, r, b, 8, 8);
+
+        if hover == 1 {
+            SelectObject(hdc, load64(g_pen_neon));
+            RoundRect(hdc, l + 1, t + 1, r - 1, b - 1, 8, 8);
+        }
+
+        SetBkMode(hdc, 1);
+        if hover == 1 {
+            SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        } else if pressed == 2 {
+            SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        } else {
+            SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        }
+
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 128);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ============================================================================
+# COMBOBOX SUBCLASS PROCEDURE (NexusEdge styled dropdowns)
+# ============================================================================
+
+func ComboBoxWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_combo_ps);
+        GetClientRect(hwnd, g_combo_rect);
+        l = load32(g_combo_rect + 0);
+        t = load32(g_combo_rect + 4);
+        r = load32(g_combo_rect + 8);
+        b = load32(g_combo_rect + 12);
+
+        # Background (COL_PANEL / g_edit_brush)
+        FillRect(hdc, g_combo_rect, load64(g_edit_brush));
+
+        # Flat border (COLOR_BORDER / g_pen_border)
+        old_brush = SelectObject(hdc, GetStockObject(5)); # NULL_BRUSH
+        SelectObject(hdc, load64(g_pen_border));
+        Rectangle(hdc, l, t, r, b);
+        SelectObject(hdc, old_brush);
+
+        # Draw selected text
+        old_font = SelectObject(hdc, load64(g_font));
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkMode(hdc, 1);
+
+        sel = SendMessageA(hwnd, 327, 0, 0); # CB_GETCURSEL = 327
+        if sel >= 0 {
+            SendMessageA(hwnd, 328, sel, g_temp_text); # CB_GETLBTEXT = 328
+            # Setup text rect (offset slightly from borders)
+            store32(g_combo_rect + 0, l + 6);
+            store32(g_combo_rect + 4, t + 2);
+            store32(g_combo_rect + 8, r - 24);
+            store32(g_combo_rect + 12, b - 2);
+            DrawTextA(hdc, g_temp_text, 0 - 1, g_combo_rect, 36); # 36 = DT_LEFT | DT_VCENTER | DT_SINGLELINE
+        }
+
+        # Draw custom scrollbar-style down arrow (centered vertically in the right 20px)
+        x_mid = r - 12;
+        y_mid = shr(t + b, 1);
+
+        old_pen = SelectObject(hdc, load64(g_pen_arrow));
+
+        # Line 1: width 9 at y_mid - 2
+        MoveToEx(hdc, x_mid - 4, y_mid - 2, 0); LineTo(hdc, x_mid + 5, y_mid - 2);
+        # Line 2: width 7 at y_mid - 1
+        MoveToEx(hdc, x_mid - 3, y_mid - 1, 0); LineTo(hdc, x_mid + 4, y_mid - 1);
+        # Line 3: width 5 at y_mid
+        MoveToEx(hdc, x_mid - 2, y_mid, 0); LineTo(hdc, x_mid + 3, y_mid);
+        # Line 4: width 3 at y_mid + 1
+        MoveToEx(hdc, x_mid - 1, y_mid + 1, 0); LineTo(hdc, x_mid + 2, y_mid + 1);
+        # Line 5: width 1 at y_mid + 2
+        MoveToEx(hdc, x_mid, y_mid + 2, 0); LineTo(hdc, x_mid + 1, y_mid + 2);
+
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_font);
+
+        EndPaint(hwnd, g_combo_ps);
+        return 0;
+    }
+
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+
+    if msg == 7 { # WM_SETFOCUS
+        res = CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, 0, 1);
+        return res;
+    }
+    if msg == 8 { # WM_KILLFOCUS
+        res = CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, 0, 1);
+        return res;
+    }
+
+    return CallWindowProcA(load64(g_old_combo_proc), hwnd, msg, wp, lp);
+}
+
+
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    # WM_CREATE
+    if msg == 1 {
+        store64(g_hwnd, hwnd);
+        hinst = load64(g_hinst);
+
+        # Create Consolas font
+        store64(g_font, CreateFontA(0 - 14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 49, face_mono));
+
+        # ---- Custom title bar buttons ----
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 840, 8, 26, 26, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 868, 8, 26, 26, hwnd, ID_BTN_CLOSE, hinst, 0);
+
+        # ---- Row 1: Connection controls (Y=52) ----
+        CreateWindowExA(0, cls_stat, lbl_host, 0x50000000, 12, 54, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_host, 0x50000080, 55, 52, 130, 24, hwnd, ID_HOST_EDIT, hinst, 0);
+        store64(g_host_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 195, 54, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50000080, 232, 52, 50, 24, hwnd, ID_PORT_EDIT, hinst, 0);
+        store64(g_port_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        # Connect / Disconnect Buttons
+        CreateWindowExA(0, cls_glow_btn, btn_conn, 0x50000000, 295, 50, 85, 28, hwnd, ID_BTN_CONN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_disc, 0x50000000, 385, 50, 95, 28, hwnd, ID_BTN_DISC, hinst, 0);
+
+        # Node display / overrides
+        CreateWindowExA(0, cls_stat, lbl_cnode, 0x50000000, 495, 54, 55, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_node_auto, 0x50000080, 555, 52, 30, 24, hwnd, ID_CNODE_EDIT, hinst, 0);
+        store64(g_cnode_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_snode, 0x50000000, 595, 54, 55, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_node_auto, 0x50000080, 655, 52, 30, 24, hwnd, ID_SNODE_EDIT, hinst, 0);
+        store64(g_snode_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        # ---- Row 2: Read controls (Y=86) ----
+        CreateWindowExA(0, cls_stat, lbl_area, 0x50000000, 12, 88, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_combo, gui_empty, 0x50200003, 50, 84, 175, 160, hwnd, ID_AREA_COMBO, hinst, 0);
+        store64(g_area_combo, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_combo(h);
+        old = SetWindowLongPtrA(h, 0 - 4, &ComboBoxWndProc);
+        store64(g_old_combo_proc, old);
+        # Populate Area items
+        SendMessageA(h, 323, 0, area_item_dm);
+        SendMessageA(h, 323, 0, area_item_hr);
+        SendMessageA(h, 323, 0, area_item_cio);
+        SendMessageA(h, 323, 0, area_item_ar);
+        SendMessageA(h, 323, 0, area_item_em);
+        SendMessageA(h, 334, 0, 0); # select DM first
+
+        CreateWindowExA(0, cls_stat, lbl_start, 0x50000000, 235, 88, 60, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_start, 0x50000080, 300, 86, 55, 24, hwnd, ID_START_EDIT, hinst, 0);
+        store64(g_start_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_qty, 0x50000000, 365, 88, 30, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_qty, 0x50000080, 400, 86, 45, 24, hwnd, ID_QTY_EDIT, hinst, 0);
+        store64(g_qty_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        # Read button
+        CreateWindowExA(0, cls_glow_btn, btn_read, 0x50000000, 455, 84, 60, 28, hwnd, ID_BTN_READ, hinst, 0);
+
+        # Format combo
+        CreateWindowExA(0, cls_stat, lbl_fmt, 0x50000000, 525, 88, 30, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_combo, gui_empty, 0x50200003, 560, 84, 80, 100, hwnd, ID_FMT_COMBO, hinst, 0);
+        store64(g_fmt_combo, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_combo(h);
+        SetWindowLongPtrA(h, 0 - 4, &ComboBoxWndProc);
+        SendMessageA(h, 323, 0, fmt_dec);
+        SendMessageA(h, 323, 0, fmt_hex);
+        SendMessageA(h, 334, 0, 0);
+
+        # Address mode combo
+        CreateWindowExA(0, cls_stat, lbl_adr, 0x50000000, 650, 88, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_combo, gui_empty, 0x50200003, 685, 84, 78, 100, hwnd, ID_ADDR_COMBO, hinst, 0);
+        store64(g_addr_combo, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_combo(h);
+        SetWindowLongPtrA(h, 0 - 4, &ComboBoxWndProc);
+        SendMessageA(h, 323, 0, addr_0);
+        SendMessageA(h, 323, 0, addr_1);
+        SendMessageA(h, 334, 0, 0);
+
+        # Endian combo
+        CreateWindowExA(0, cls_stat, lbl_end, 0x50000000, 775, 88, 30, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_combo, gui_empty, 0x50200003, 810, 84, 65, 100, hwnd, ID_END_COMBO, hinst, 0);
+        store64(g_end_combo, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_combo(h);
+        SetWindowLongPtrA(h, 0 - 4, &ComboBoxWndProc);
+        SendMessageA(h, 323, 0, end_big);
+        SendMessageA(h, 323, 0, end_lit);
+        SendMessageA(h, 334, 0, 0);
+
+        # ---- ListView (left side, below controls, Y=142) ----
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 12, 142, 440, 346, hwnd, ID_LISTVIEW, hinst, 0);
+        store64(g_listview, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        SendMessageA(h, 4150, 0x20, 0x20); # LVS_EX_FULLROWSELECT
+
+        # Dark theme colors for ListView
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);       # LVM_SETBKCOLOR
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);   # LVM_SETTEXTCOLOR
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);       # LVM_SETTEXTBKCOLOR
+        dark_scroll(h);
+
+        # Columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);       # LVCF_FMT|LVCF_WIDTH|LVCF_TEXT|LVCF_SUBITEM
+        store32(g_lvcol + 4, 0);
+        store32(g_lvcol + 8, 100);
+        store64(g_lvcol + 16, col_area);
+        SendMessageA(h, 4123, 0, g_lvcol);
+
+        store32(g_lvcol + 8, 80);
+        store64(g_lvcol + 16, col_addr);
+        store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+
+        store32(g_lvcol + 8, 120);
+        store64(g_lvcol + 16, col_val);
+        store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+
+        store32(g_lvcol + 8, 100);
+        store64(g_lvcol + 16, col_hex);
+        store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+
+        # ---- Right side: Poll controls (Y=118) ----
+        CreateWindowExA(0, cls_stat, lbl_interval, 0x50000000, 465, 120, 80, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_interval, 0x50000080, 550, 118, 60, 24, hwnd, ID_INTERVAL_EDIT, hinst, 0);
+        store64(g_interval_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        CreateWindowExA(0, cls_glow_btn, btn_poll, 0x50000000, 620, 116, 90, 28, hwnd, ID_BTN_POLL, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 718, 116, 80, 28, hwnd, ID_BTN_STOP, hinst, 0);
+
+        # ---- Right side: Write controls (Y=152) ----
+        CreateWindowExA(0, cls_stat, lbl_wraddr, 0x50000000, 465, 156, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_start, 0x50000080, 505, 154, 55, 24, hwnd, ID_WRITE_REG_EDIT, hinst, 0);
+        store64(g_write_reg_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_wrval, 0x50000000, 570, 156, 28, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50000080, 600, 154, 80, 24, hwnd, ID_WRITE_VAL_EDIT, hinst, 0);
+        store64(g_write_val_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_write, 0x50000000, 690, 152, 55, 28, hwnd, ID_BTN_WRITE, hinst, 0);
+
+        # ---- Right side: Log (Y=190) ----
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 465, 190, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50200044, 465, 210, 410, 250, hwnd, ID_LOG, hinst, 0);
+        store64(g_log, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        # ---- Clear / Save ----
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 760, 466, 55, 26, hwnd, ID_BTN_CLEAR, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 820, 466, 55, 26, hwnd, ID_BTN_SAVE, hinst, 0);
+
+        # ---- Status bar ----
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 12, 508, 870, 20, hwnd, ID_STATUS, hinst, 0);
+        store64(g_status, h);
+
+        return 0;
+    }
+
+    # WM_PAINT (custom title bar + orange neon accent)
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        r = load32(g_rect + 8);
+        b2 = load32(g_rect + 12);
+
+        # Title bar background
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, r);
+        store32(g_rect + 12, 42);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+
+        # Neon accent line below title bar
+        old_pen = SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 0, 42, 0);
+        LineTo(hdc, r, 42);
+        SelectObject(hdc, old_pen);
+
+        # Draw title in Orange
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_NEON_ORANGE);
+        SelectObject(hdc, load64(g_font_header));
+        TextOutA(hdc, 15, 12, title_draw, 26);
+
+        # Draw connection status dot next to title
+        sock = load64(g_sock);
+        if sock != 0 {
+            SetTextColor(hdc, COL_GREEN);
+            TextOutA(hdc, 305, 12, st_conn_ind, 11);
+        } else {
+            SetTextColor(hdc, COL_RED);
+            TextOutA(hdc, 305, 12, st_disc_ind, 14);
+        }
+
+        # Custom flat borders around the Edit controls (input fields)
+        old_brush = SelectObject(hdc, GetStockObject(5)); # 5 = NULL_BRUSH
+        SelectObject(hdc, load64(g_pen_border));
+
+        Rectangle(hdc, 54, 51, 185, 76);     # Host
+        Rectangle(hdc, 231, 51, 282, 76);    # Port
+        Rectangle(hdc, 554, 51, 585, 76);    # Client Node
+        Rectangle(hdc, 654, 51, 685, 76);    # Server Node
+        Rectangle(hdc, 299, 85, 355, 110);   # Start Addr
+        Rectangle(hdc, 399, 85, 445, 110);   # Qty
+        Rectangle(hdc, 549, 117, 610, 142);  # Interval ms
+        Rectangle(hdc, 504, 153, 560, 178);  # Write Addr
+        Rectangle(hdc, 599, 153, 680, 178);  # Write Val
+        Rectangle(hdc, 464, 209, 875, 460);  # Log multiline
+
+        # Custom flat headers for ListView (draw flat rectangles like input fields but not editable)
+        # Column 0: Area
+        store32(g_rect + 0, 12);
+        store32(g_rect + 4, 118);
+        store32(g_rect + 8, 112);
+        store32(g_rect + 12, 142);
+        FillRect(hdc, g_rect, load64(g_edit_brush));
+        Rectangle(hdc, 12, 118, 112, 142);
+
+        # Column 1: Address
+        store32(g_rect + 0, 112);
+        store32(g_rect + 4, 118);
+        store32(g_rect + 8, 192);
+        store32(g_rect + 12, 142);
+        FillRect(hdc, g_rect, load64(g_edit_brush));
+        Rectangle(hdc, 112, 118, 192, 142);
+
+        # Column 2: Value
+        store32(g_rect + 0, 192);
+        store32(g_rect + 4, 118);
+        store32(g_rect + 8, 312);
+        store32(g_rect + 12, 142);
+        FillRect(hdc, g_rect, load64(g_edit_brush));
+        Rectangle(hdc, 192, 118, 312, 142);
+
+        # Column 3: Hex
+        store32(g_rect + 0, 312);
+        store32(g_rect + 4, 118);
+        store32(g_rect + 8, 412);
+        store32(g_rect + 12, 142);
+        FillRect(hdc, g_rect, load64(g_edit_brush));
+        Rectangle(hdc, 312, 118, 412, 142);
+
+        # Right spacer
+        store32(g_rect + 0, 412);
+        store32(g_rect + 4, 118);
+        store32(g_rect + 8, 452);
+        store32(g_rect + 12, 142);
+        FillRect(hdc, g_rect, load64(g_edit_brush));
+        Rectangle(hdc, 412, 118, 452, 142);
+
+        # Draw header text
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        old_font = SelectObject(hdc, load64(g_font));
+        TextOutA(hdc, 20, 122, col_area, 4);
+        TextOutA(hdc, 120, 122, col_addr, 7);
+        TextOutA(hdc, 200, 122, col_val, 5);
+        TextOutA(hdc, 320, 122, col_hex, 3);
+        SelectObject(hdc, old_font);
+
+        SelectObject(hdc, old_brush);
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    # WM_COMMAND (button clicks)
+    if msg == 273 {
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_MIN   { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        if cmd_id == ID_BTN_CONN  { do_connect(); }
+        if cmd_id == ID_BTN_DISC  { do_disconnect(); }
+        if cmd_id == ID_BTN_READ  { do_read(); }
+        if cmd_id == ID_BTN_POLL  { do_start_poll(); }
+        if cmd_id == ID_BTN_STOP  { do_stop_poll(); }
+        if cmd_id == ID_BTN_WRITE { do_write(); }
+        if cmd_id == ID_BTN_CLEAR { do_clear_log(); }
+        if cmd_id == ID_BTN_SAVE  { do_save_log(); }
+        return 0;
+    }
+
+    # WM_NOTIFY
+    if msg == 78 {
+        code = load32(lp + 16);
+        # NM_CUSTOMDRAW = -12
+        if code == 0 - 12 {
+            draw_stage = load32(lp + 24);
+            if draw_stage == 1 { return 32; }         # CDDS_PREPAINT -> CDRF_NOTIFYITEMDRAW
+            if draw_stage == 65537 {                   # CDDS_ITEMPREPAINT
+                hdc2 = load64(lp + 32);
+                SetTextColor(hdc2, COLOR_TEXT_PRIMARY);
+                SetBkColor(hdc2, COLOR_BG_CARD);
+                return 2;   # CDRF_NEWFONT
+            }
+        }
+        return 0;
+    }
+
+    # WM_TIMER (polling)
+    if msg == 275 {
+        if band(wp, 0xFFFF) == ID_TIMER_POLL { do_poll_tick(); }
+        return 0;
+    }
+
+    # WM_CTLCOLORSTATIC (dark labels)
+    if msg == 312 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_BG);
+        return load64(g_bg_brush);
+    }
+
+    # WM_CTLCOLOREDIT (dark edit backgrounds)
+    if msg == 307 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_PANEL);
+        return load64(g_edit_brush);
+    }
+
+    # WM_CTLCOLORLISTBOX (dark combobox dropdown)
+    if msg == 308 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_PANEL);
+        return load64(g_edit_brush);
+    }
+
+    # WM_NCHITTEST (draggable custom title bar)
+    if msg == 132 {
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        my = shr(lp, 16);
+        cx = mx - wl;
+        cy = my - wt;
+
+        # Title bar area (first 42 pixels)
+        if cy < 42 {
+            # Exclude minimize button area (840..866, 8..34)
+            if cx >= 840 {
+                if cx < 866 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; }
+                    }
+                }
+            }
+            # Exclude close button area (868..894, 8..34)
+            if cx >= 868 {
+                if cx < 894 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; }
+                    }
+                }
+            }
+            return 2;   # HTCAPTION - draggable
+        }
+        return 1;   # HTCLIENT
+    }
+
+    # WM_ERASEBKGND
+    if msg == 20 {
+        GetClientRect(hwnd, g_rect);
+        FillRect(wp, g_rect, load64(g_bg_brush));
+        return 1;
+    }
+
+    # WM_DESTROY
+    if msg == 2 {
+        do_disconnect();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    # Init Winsock
+    rc = WSAStartup(514, g_wsa);
+    if rc != 0 { return 1; }
+
+    store64(g_sock, 0);
+    store64(g_sid, 0);
+    store64(g_client_node, 0);
+    store64(g_server_node, 0);
+    store64(g_polling, 0);
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    # Enable dark mode
+    enable_dark_mode();
+
+    # Create NexusEdge brushes and pens
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_lv_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COLOR_NEON_ORANGE));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COLOR_NEON_ORANGE));
+    store64(g_pen_arrow,   CreatePen(0, 1, COLOR_TEXT_PRIMARY));
+
+    # Header font
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+
+    # Init common controls (ListView)
+    store32(g_icc + 0, 8);
+    store32(g_icc + 4, 1);
+    InitCommonControlsEx(g_icc);
+
+    # Register GlowButton custom class
+    register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+
+    # Register main window class
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+
+    # Create main window (WS_POPUP | WS_VISIBLE - custom title bar)
+    hwnd = CreateWindowExA(0, clsname, title, 0x90000000, 100, 100, WIN_W, WIN_H, 0, 0, hinst, 0);
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    # Message loop
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+
+    return 0;
+}

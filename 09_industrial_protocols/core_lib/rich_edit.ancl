@@ -1,0 +1,182 @@
+# =====================================================================
+#  rich_edit.ancl - RichEdit helpers for native ANCL document apps.
+# =====================================================================
+import "gui_v2.ancl";
+
+@DATA
+rich_cls:      str = "RichEdit20A";
+rich_msftedit: str = "Riched20.dll";
+rich_empty:    str = "";
+
+RICH_STYLE_DOC: i64 = 0x543011C4;
+SCF_SELECTION: i64 = 1;
+SCF_ALL:       i64 = 4;
+
+CFM_BOLD:      i64 = 1;
+CFM_ITALIC:    i64 = 2;
+CFM_UNDERLINE: i64 = 4;
+CFM_SIZE:      i64 = 0x80000000;
+CFM_COLOR:     i64 = 0x40000000;
+CFE_BOLD:      i64 = 1;
+CFE_ITALIC:    i64 = 2;
+CFE_UNDERLINE: i64 = 4;
+
+PFA_LEFT:   i64 = 1;
+PFA_RIGHT:  i64 = 2;
+PFA_CENTER: i64 = 3;
+PFM_ALIGNMENT: i64 = 8;
+
+@CODE
+
+func rich_init() -> i64 {
+    LoadLibraryA(rich_msftedit);
+    return 1;
+}
+
+func rich_create(parent: i64, hinst: i64, id: i64, x: i64, y: i64, w: i64, h: i64) -> ptr {
+    rich_init();
+    return CreateWindowExA(512, rich_cls, rich_empty, RICH_STYLE_DOC, x, y, w, h, parent, id, hinst, 0);
+}
+
+func rich_limit_text(hwnd: i64, n: i64) -> i64 {
+    return SendMessageA(hwnd, 0x435, 0, n); # EM_EXLIMITTEXT
+}
+
+func rich_set_bg(hwnd: i64, color: i64) -> i64 {
+    return SendMessageA(hwnd, 0x443, 0, color); # EM_SETBKGNDCOLOR
+}
+
+func rich_set_event_mask(hwnd: i64, mask: i64) -> i64 {
+    return SendMessageA(hwnd, 0x445, 0, mask); # EM_SETEVENTMASK
+}
+
+func rich_select_all(hwnd: i64) -> i64 {
+    SendMessageA(hwnd, 0xB1, 0, 0 - 1); # EM_SETSEL
+    return hwnd;
+}
+
+func rich_undo(hwnd: i64) -> i64 { return SendMessageA(hwnd, 0x0304, 0, 0); }
+func rich_redo(hwnd: i64) -> i64 { return SendMessageA(hwnd, 0x0454, 0, 0); }
+func rich_cut(hwnd: i64) -> i64 { return SendMessageA(hwnd, 0x0300, 0, 0); }
+func rich_copy(hwnd: i64) -> i64 { return SendMessageA(hwnd, 0x0301, 0, 0); }
+func rich_paste(hwnd: i64) -> i64 { return SendMessageA(hwnd, 0x0302, 0, 0); }
+
+func rich_cf_init(cf: ptr) -> ptr {
+    memset(cf, 0, 60);
+    store32(cf + 0, 60);
+    return cf;
+}
+
+func rich_cf_effect(cf: ptr, mask: i64, effects: i64) -> ptr {
+    rich_cf_init(cf);
+    store32(cf + 4, mask);
+    store32(cf + 8, effects);
+    return cf;
+}
+
+func rich_cf_size(cf: ptr, twips: i64) -> ptr {
+    rich_cf_init(cf);
+    store32(cf + 4, CFM_SIZE);
+    store32(cf + 12, twips);
+    return cf;
+}
+
+func rich_cf_color(cf: ptr, color: i64) -> ptr {
+    rich_cf_init(cf);
+    store32(cf + 4, CFM_COLOR);
+    store32(cf + 20, color);
+    return cf;
+}
+
+func rich_set_charformat(hwnd: i64, scope: i64, cf: ptr) -> i64 {
+    return SendMessageA(hwnd, 0x444, scope, cf); # EM_SETCHARFORMAT
+}
+
+func rich_get_charformat(hwnd: i64, scope: i64, cf: ptr) -> i64 {
+    rich_cf_init(cf);
+    return SendMessageA(hwnd, 0x43A, scope, cf); # EM_GETCHARFORMAT
+}
+
+func rich_toggle_effect(hwnd: i64, cf: ptr, mask: i64, effect: i64) -> i64 {
+    rich_get_charformat(hwnd, SCF_SELECTION, cf);
+    now = load32(cf + 8);
+    next = effect;
+    if band(now, effect) != 0 { next = 0; }
+    rich_cf_effect(cf, mask, next);
+    return rich_set_charformat(hwnd, SCF_SELECTION, cf);
+}
+
+func rich_set_size(hwnd: i64, cf: ptr, twips: i64) -> i64 {
+    rich_cf_size(cf, twips);
+    return rich_set_charformat(hwnd, SCF_SELECTION, cf);
+}
+
+func rich_set_color(hwnd: i64, cf: ptr, color: i64) -> i64 {
+    rich_cf_color(cf, color);
+    return rich_set_charformat(hwnd, SCF_SELECTION, cf);
+}
+
+func rich_pf_alignment(pf: ptr, align: i64) -> ptr {
+    memset(pf, 0, 188);
+    store32(pf + 0, 188);
+    store32(pf + 4, PFM_ALIGNMENT);
+    store16(pf + 24, align);
+    return pf;
+}
+
+func rich_set_alignment(hwnd: i64, pf: ptr, align: i64) -> i64 {
+    rich_pf_alignment(pf, align);
+    return SendMessageA(hwnd, 0x447, 0, pf); # EM_SETPARAFORMAT
+}
+
+func rich_get_sel(hwnd: i64, range: ptr) -> i64 {
+    return SendMessageA(hwnd, 0x434, 0, range); # EM_EXGETSEL
+}
+
+func rich_exset_sel(hwnd: i64, range: ptr) -> i64 {
+    return SendMessageA(hwnd, 0x437, 0, range); # EM_EXSETSEL
+}
+
+func rich_set_redraw(hwnd: i64, enabled: i64) -> i64 {
+    return SendMessageA(hwnd, 11, enabled, 0); # WM_SETREDRAW
+}
+
+func rich_get_text_length(hwnd: i64) -> i64 {
+    return SendMessageA(hwnd, 14, 0, 0); # WM_GETTEXTLENGTH
+}
+
+func rich_get_first_visible_line(hwnd: i64) -> i64 {
+    return SendMessageA(hwnd, 0xCE, 0, 0); # EM_GETFIRSTVISIBLELINE
+}
+
+func rich_line_count(hwnd: i64) -> i64 {
+    return SendMessageA(hwnd, 0xBA, 0, 0); # EM_GETLINECOUNT
+}
+
+func rich_line_from_char(hwnd: i64, ch: i64) -> i64 {
+    return SendMessageA(hwnd, 0x436, 0, ch); # EM_EXLINEFROMCHAR
+}
+
+func rich_line_index(hwnd: i64, line: i64) -> i64 {
+    return SendMessageA(hwnd, 0xBB, line, 0); # EM_LINEINDEX
+}
+
+func rich_pos_from_char(hwnd: i64, pt: ptr, ch: i64) -> i64 {
+    return SendMessageA(hwnd, 0xD6, pt, ch); # EM_POSFROMCHAR
+}
+
+func rich_get_scroll_pos(hwnd: i64, pt: ptr) -> i64 {
+    return SendMessageA(hwnd, 0x4DD, 0, pt); # EM_GETSCROLLPOS
+}
+
+func rich_set_scroll_pos(hwnd: i64, pt: ptr) -> i64 {
+    return SendMessageA(hwnd, 0x4DE, 0, pt); # EM_SETSCROLLPOS
+}
+
+func rich_set_modified(hwnd: i64, dirty: i64) -> i64 {
+    return SendMessageA(hwnd, 185, dirty, 0); # EM_SETMODIFY
+}
+
+func rich_get_modified(hwnd: i64) -> i64 {
+    return SendMessageA(hwnd, 184, 0, 0); # EM_GETMODIFY
+}

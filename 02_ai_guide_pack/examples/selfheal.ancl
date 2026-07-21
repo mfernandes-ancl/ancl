@@ -1,0 +1,10 @@
+# SC1 --fix regression: deliberately C-flavored ANCL.
+# `anclc --fix --write` must heal it to valid ANCL that compiles and returns 41.
+#   let/var declarators stripped; bool->i64; true->1; false->0; // -> #
+func main() -> i64 {
+    let a = 30;          // 'let' declarator + // comment
+    var b = 10;          // 'var' declarator
+    flag: bool = true;   // bool + true  -> i64 + 1
+    zero: i64 = false;   // false        -> 0
+    return a + b + flag + zero;   // 30 + 10 + 1 + 0 = 41
+}

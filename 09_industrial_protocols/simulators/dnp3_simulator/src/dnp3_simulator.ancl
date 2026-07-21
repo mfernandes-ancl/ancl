@@ -1,0 +1,1503 @@
+# ============================================================================
+#  dnp3_simulator.ancl  -  ANCL Native DNP3 Outstation Simulator
+#
+#  A native Win32 dark-themed DNP3 Outstation simulator, written in ANCL.
+#  NexusEdge themed with GlowButtons, virtual point database in ListView,
+#  accepts master connections on port 20000 and responds to:
+#   - Integrity Poll (Class 0 Read) with current point values
+#   - Event Poll (Class 1/2/3) with empty response
+#   - Direct Operate (CROB) toggling binary outputs
+#   - Cold/Warm Restart with IIN restart bit
+#   - Link Reset with link ACK
+#
+#  100% CRT-free PE32+, GUI subsystem.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "user32.dll" PostMessageA;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll" RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "user32.dll" MessageBoxA -> i32;
+
+# ---- Winsock imports ----
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+extern "ws2_32.dll" socket -> i64;
+extern "ws2_32.dll" bind -> i32;
+extern "ws2_32.dll" listen -> i32;
+extern "ws2_32.dll" accept -> i64;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" ioctlsocket -> i32;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "ANCLDNP3SIM";
+title:      str = "ANCL DNP3 Outstation Simulator";
+title_draw: str = "ANCL DNP3 OUTSTATION SIMULATOR";
+st_run_ind: str = "* RUNNING";
+st_stop_ind:str = "* STOPPED";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom window classes ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+
+# ---- Labels ----
+lbl_port:   str = "Port:";
+lbl_oaddr:  str = "Outstation Addr:";
+lbl_log:    str = "Traffic Log:";
+lbl_status: str = "Status: Stopped";
+lbl_reg:    str = "Point:";
+lbl_val:    str = "Value:";
+lbl_client: str = "Master: (none)";
+
+# ---- ListView columns ----
+cls_lv:     str = "SysListView32";
+col_idx:    str = "Index";
+col_name:   str = "Name";
+col_type:   str = "Type";
+col_value:  str = "Value";
+col_flags:  str = "Flags";
+col_group:  str = "Group";
+
+# ---- Point Names ----
+pn_bi0:     str = "BI_Breaker_Open";
+pn_bi1:     str = "BI_Breaker_Closed";
+pn_bi2:     str = "BI_OverCurrent";
+pn_bi3:     str = "BI_UnderVoltage";
+pn_bi4:     str = "BI_OverFreq";
+pn_bi5:     str = "BI_UnderFreq";
+pn_bi6:     str = "BI_Ground_Fault";
+pn_bi7:     str = "BI_Comm_Loss";
+pn_bo0:     str = "BO_Trip_Coil";
+pn_bo1:     str = "BO_Close_Coil";
+pn_bo2:     str = "BO_Block_Reclose";
+pn_bo3:     str = "BO_Reset_Lockout";
+pn_ai0:     str = "AI_Voltage_kV";
+pn_ai1:     str = "AI_Current_A";
+pn_ai2:     str = "AI_Power_kW";
+pn_ai3:     str = "AI_Frequency_mHz";
+pn_ct0:     str = "CT_Operations";
+pn_ct1:     str = "CT_Fault_Events";
+pn_ao0:     str = "AO_Setpoint";
+
+# ---- Buttons ----
+btn_start:  str = "Start";
+btn_stop:   str = "Stop";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_update: str = "Update";
+btn_random: str = "Randomize";
+btn_auto_rand: str = "Auto Rand";
+btn_stop_rand: str = "Stop Rand";
+btn_min:    str = "-";
+btn_close:  str = "X";
+
+# ---- Defaults ----
+def_port:   str = "20000";
+def_oaddr:  str = "1";
+def_idx:    str = "0";
+def_val:    str = "0";
+
+# ---- Log Messages ----
+crlf:       str = "\r\n";
+g_logpath:  str = "dnp3_sim_log.txt";
+m_start_try:str = "[DNP3 Sim] Starting outstation on port ";
+m_dots:     str = "...\r\n";
+m_start_ok: str = "[DNP3 Sim] Outstation started. Listening for masters.\r\n";
+m_start_err:str = "[DNP3 Sim] bind() failed. Port may be in use.\r\n";
+m_stop_msg: str = "[DNP3 Sim] Outstation stopped.\r\n";
+m_new_conn: str = "[DNP3 Sim] Master connected.\r\n";
+m_disc_conn:str = "[DNP3 Sim] Master disconnected.\r\n";
+m_rx:       str = "[DNP3 Sim] RX << ";
+m_tx:       str = "[DNP3 Sim] TX >> ";
+m_poll:     str = "[DNP3 Sim] Responding to Integrity Poll (Class 0 Read).\r\n";
+m_event:    str = "[DNP3 Sim] Responding to Event Poll (empty).\r\n";
+m_dop:      str = "[DNP3 Sim] Direct Operate received. Toggling output.\r\n";
+m_cold:     str = "[DNP3 Sim] Cold Restart requested. IIN restart bit set.\r\n";
+m_warm:     str = "[DNP3 Sim] Warm Restart requested. IIN restart bit set.\r\n";
+m_reset:    str = "[DNP3 Sim] Link Reset received. ACK sent.\r\n";
+m_unknown:  str = "[DNP3 Sim] Unknown request FC=";
+m_save_ok:  str = "[DNP3 Sim] Log saved.\r\n";
+m_save_err: str = "[DNP3 Sim] Log save failed.\r\n";
+
+# ---- Virtual Point Database ----
+# 8 Binary Inputs (Group 1, Var 2) + 4 Binary Outputs (Group 10, Var 2)
+# + 4 Analog Inputs (Group 30, Var 1) + 2 Counters (Group 20, Var 1)
+# + 1 Analog Output (Group 40, Var 1)
+# = 19 points total, stored in flat arrays
+PT_COUNT:   i64 = 19;
+pt_values:  buf = 256;   # 19 * 8 bytes (i64 each, with extra padding)
+pt_flags:   buf = 256;   # 19 * 8 bytes (quality flags each, with extra padding)
+
+# Point type codes: 1=BI, 10=BO, 30=AI, 20=Counter, 40=AO
+pt_groups:  buf = 256;   # group number for each point
+pt_vars:    buf = 256;   # variation for each point
+pt_names:   buf = 256;   # pointer to name string for each point
+
+# ---- GUI handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_port_ed:  buf = 8;
+g_oaddr_ed: buf = 8;
+g_idx_ed:   buf = 8;
+g_val_ed:   buf = 8;
+g_log:      buf = 8;
+g_status:   buf = 8;
+g_clients:  buf = 8;
+g_font:     buf = 8;
+g_listview: buf = 8;
+
+# ---- Win32 structs ----
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+
+# ---- Winsock state ----
+g_wsa:      buf = 512;
+g_listen_s: buf = 8;
+g_client_s: buf = 8;
+g_nonblock: buf = 8;
+g_addr:     buf = 16;
+g_running:  buf = 8;
+
+# ---- Protocol Buffers ----
+g_rxbuf:    buf = 2048;
+g_txbuf:    buf = 2048;
+g_numbuf:   buf = 32;
+g_portbuf:  buf = 32;
+g_logbuf:   buf = 1024;
+g_savebuf:  buf = 4096;
+g_hexbuf:   buf = 256;
+
+# ---- GDI setup ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+g_lv_brush:  buf = 8;
+
+COL_BG:      i64 = 0x140A08;
+COL_PANEL:   i64 = 0x050303;
+COL_TEXT:    i64 = 0xAB9687;
+COL_ACCENT:  i64 = 0x40D080; # Teal-green to match tester
+
+COLOR_BG_DEEP:     i64 = 0x0A0706;
+COLOR_BG_PANEL:    i64 = 0x100C0A;
+COLOR_BG_CARD:     i64 = 0x181210;
+COLOR_BG_INPUT:    i64 = 0x080605;
+COLOR_BG_HOVER:    i64 = 0x221A16;
+COLOR_BORDER:      i64 = 0x2A201C;
+COLOR_TEXT_PRIMARY:i64 = 0xDFD5CF;
+
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_temp_text:    buf = 256;
+
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40;
+g_allowdark:    buf = 8;
+
+g_lvcol:       buf = 64;
+g_lvitem:      buf = 96;
+
+WIN_W: i64 = 1050;
+WIN_H: i64 = 600;
+
+hexd:  str = "0123456789ABCDEF";
+
+# ---- Control IDs ----
+ID_BTN_START:   i64 = 101;
+ID_BTN_STOP:    i64 = 102;
+ID_BTN_CLEAR:   i64 = 103;
+ID_BTN_SAVE:    i64 = 104;
+ID_BTN_UPDATE:  i64 = 105;
+ID_BTN_RANDOM:  i64 = 106;
+ID_BTN_AUTORAND: i64 = 109;
+ID_BTN_MIN:     i64 = 107;
+ID_BTN_CLOSE:   i64 = 108;
+ID_TIMER_POLL:  i64 = 1;
+ID_TIMER_RAND:  i64 = 2;
+
+g_auto_rand:    buf = 8;
+g_btn_autorand: buf = 8;
+
+@CODE
+
+# ============================================================================
+# HELPER UTILITIES
+# ============================================================================
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    SendMessageA(hwnd_log, 177, len, len);
+    SendMessageA(hwnd_log, 194, 0, text);
+    return 0;
+}
+
+func format_nibble(n: i64) -> i64 {
+    if n >= 10 { return 55 + n; }
+    return 48 + n;
+}
+
+func byte_to_hex(v: i64, dst: i64) -> i64 {
+    store8(dst, format_nibble(band(shr(v, 4), 15)));
+    store8(dst + 1, format_nibble(band(v, 15)));
+    store8(dst + 2, 0);
+    return 0;
+}
+
+func log_hex_traffic(prefix: i64, buf_ptr: i64, len: i64) -> i64 {
+    log_append(prefix);
+    i = 0;
+    while i < len {
+        if i > 80 { log_append("..."); break; }
+        val = load8(buf_ptr + i);
+        byte_to_hex(val, g_numbuf);
+        log_append(g_numbuf);
+        log_append(" ");
+        i = i + 1;
+    }
+    log_append("[");
+    int_to_str(g_numbuf, len);
+    log_append(g_numbuf);
+    log_append(" bytes]\r\n");
+    return 0;
+}
+
+# ============================================================================
+# VIRTUAL POINT DATABASE
+# ============================================================================
+
+func init_point_database() -> i64 {
+    # 8 Binary Inputs: indices 0-7, Group 1, Var 2
+    i = 0;
+    while i < 8 {
+        store64(pt_values + i * 8, band(i, 1));  # alternating ON/OFF
+        store64(pt_flags + i * 8, 0x01);          # ONLINE flag
+        store64(pt_groups + i * 8, 1);
+        store64(pt_vars + i * 8, 2);
+        i = i + 1;
+    }
+    store64(pt_names + 0 * 8, pn_bi0);
+    store64(pt_names + 1 * 8, pn_bi1);
+    store64(pt_names + 2 * 8, pn_bi2);
+    store64(pt_names + 3 * 8, pn_bi3);
+    store64(pt_names + 4 * 8, pn_bi4);
+    store64(pt_names + 5 * 8, pn_bi5);
+    store64(pt_names + 6 * 8, pn_bi6);
+    store64(pt_names + 7 * 8, pn_bi7);
+
+    # 4 Binary Outputs: indices 8-11, Group 10, Var 2
+    i = 8;
+    while i < 12 {
+        store64(pt_values + i * 8, 0);
+        store64(pt_flags + i * 8, 0x01);
+        store64(pt_groups + i * 8, 10);
+        store64(pt_vars + i * 8, 2);
+        i = i + 1;
+    }
+    store64(pt_names + 8 * 8, pn_bo0);
+    store64(pt_names + 9 * 8, pn_bo1);
+    store64(pt_names + 10 * 8, pn_bo2);
+    store64(pt_names + 11 * 8, pn_bo3);
+
+    # 4 Analog Inputs: indices 12-15, Group 30, Var 1
+    store64(pt_values + 12 * 8, 1024);
+    store64(pt_values + 13 * 8, 2048);
+    store64(pt_values + 14 * 8, 512);
+    store64(pt_values + 15 * 8, 4096);
+    i = 12;
+    while i < 16 {
+        store64(pt_flags + i * 8, 0x01);
+        store64(pt_groups + i * 8, 30);
+        store64(pt_vars + i * 8, 1);
+        i = i + 1;
+    }
+    store64(pt_names + 12 * 8, pn_ai0);
+    store64(pt_names + 13 * 8, pn_ai1);
+    store64(pt_names + 14 * 8, pn_ai2);
+    store64(pt_names + 15 * 8, pn_ai3);
+
+    # 2 Counters: indices 16-17, Group 20, Var 1
+    store64(pt_values + 16 * 8, 100);
+    store64(pt_values + 17 * 8, 250);
+    store64(pt_flags + 16 * 8, 0x01);
+    store64(pt_flags + 17 * 8, 0x01);
+    store64(pt_groups + 16 * 8, 20);
+    store64(pt_groups + 17 * 8, 20);
+    store64(pt_vars + 16 * 8, 1);
+    store64(pt_vars + 17 * 8, 1);
+    store64(pt_names + 16 * 8, pn_ct0);
+    store64(pt_names + 17 * 8, pn_ct1);
+
+    # 1 Analog Output: index 18, Group 40, Var 1
+    store64(pt_values + 18 * 8, 0);
+    store64(pt_flags + 18 * 8, 0x01);
+    store64(pt_groups + 18 * 8, 40);
+    store64(pt_vars + 18 * 8, 1);
+    store64(pt_names + 18 * 8, pn_ao0);
+    return 0;
+}
+
+func refresh_listview() -> i64 {
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    SendMessageA(hlv, 4105, 0, 0); # LVM_DELETEALLITEMS
+
+    i = 0;
+    while i < PT_COUNT {
+        # Col 0: Index
+        int_to_str(g_numbuf, i);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, g_numbuf);
+        SendMessageA(hlv, 4103, 0, g_lvitem);
+
+        # Col 1: Name
+        name_ptr = load64(pt_names + i * 8);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, name_ptr);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        # Col 2: Type
+        grp = load64(pt_groups + i * 8);
+        type_str = "BI";
+        if grp == 10 { type_str = "BO"; }
+        if grp == 30 { type_str = "AI"; }
+        if grp == 20 { type_str = "Counter"; }
+        if grp == 40 { type_str = "AO"; }
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 2);
+        store64(g_lvitem + 24, type_str);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        # Col 3: Value
+        val = load64(pt_values + i * 8);
+        int_to_str(g_logbuf, val);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, g_logbuf);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        # Col 4: Flags
+        flags = load64(pt_flags + i * 8);
+        int_to_str(g_logbuf + 100, flags);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 4);
+        store64(g_lvitem + 24, g_logbuf + 100);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        # Col 5: Group
+        int_to_str(g_logbuf + 200, grp);
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 8, 5);
+        store64(g_lvitem + 24, g_logbuf + 200);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+
+        i = i + 1;
+    }
+    return 0;
+}
+
+func randomize_values() -> i64 {
+    # Simple pseudo-random: increment counters, toggle bits, vary analogs
+    i = 0;
+    while i < 8 {
+        v = load64(pt_values + i * 8);
+        store64(pt_values + i * 8, band(v + 1, 1));
+        i = i + 1;
+    }
+    # Analog: add small offset
+    i = 12;
+    while i < 16 {
+        v = load64(pt_values + i * 8);
+        v = v + 7 - band(i, 3) * 3;
+        if v > 10000 { v = 500; }
+        if v < 0 { v = 100; }
+        store64(pt_values + i * 8, v);
+        i = i + 1;
+    }
+    # Counters: increment
+    store64(pt_values + 16 * 8, load64(pt_values + 16 * 8) + 1);
+    store64(pt_values + 17 * 8, load64(pt_values + 17 * 8) + 3);
+    refresh_listview();
+    return 0;
+}
+
+# ============================================================================
+# DNP3 OUTSTATION RESPONSE BUILDER
+# ============================================================================
+
+# Build a DNP3 response frame in g_txbuf and return total length.
+# src_addr = outstation, dst_addr = master (from received frame)
+func build_response_header(dst_addr: i64, src_addr: i64, app_ctrl: i64, fc: i64, iin1: i64, iin2: i64) -> i64 {
+    # Data Link Layer
+    store8(g_txbuf + 0, 0x05);
+    store8(g_txbuf + 1, 0x64);
+    # Length placeholder at offset 2 (filled later)
+    # Control: DIR=0 (from outstation), PRM=0, FC=0 (ACK)
+    store8(g_txbuf + 3, 0x00);
+    # Destination (master)
+    store8(g_txbuf + 4, band(dst_addr, 0xFF));
+    store8(g_txbuf + 5, band(shr(dst_addr, 8), 0xFF));
+    # Source (outstation)
+    store8(g_txbuf + 6, band(src_addr, 0xFF));
+    store8(g_txbuf + 7, band(shr(src_addr, 8), 0xFF));
+    # Transport: FIR=1, FIN=1, SEQ=0
+    store8(g_txbuf + 8, 0xC0);
+    # Application Control
+    store8(g_txbuf + 9, app_ctrl);
+    # Function Code (Response = 0x81)
+    store8(g_txbuf + 10, fc);
+    # IIN bytes
+    store8(g_txbuf + 11, iin1);
+    store8(g_txbuf + 12, iin2);
+    # Object data starts at offset 13
+    return 13;
+}
+
+func finalize_frame(total_len: i64) -> i64 {
+    # Length field = total - 3 (magic 2 + length byte itself excluded)
+    # Actually: length = bytes after length byte through src addr + data
+    # In TCP variant: length = total - 3 (start bytes + length)
+    # Per spec: length counts from ctrl to end of user data in this block
+    data_after_len = total_len - 3;
+    store8(g_txbuf + 2, data_after_len);
+    return total_len;
+}
+
+# Build Class 0 (static data) response with all points
+func build_class0_response(dst_addr: i64, src_addr: i64, req_seq: i64) -> i64 {
+    app_ctrl = bor(0xC0, band(req_seq, 0x0F)); # FIR+FIN + echo SEQ
+    offset = build_response_header(dst_addr, src_addr, app_ctrl, 0x81, 0x00, 0x00);
+
+    # Binary Inputs: Group 1, Var 2, Qualifier 0x00 (start=0, stop=7)
+    store8(g_txbuf + offset, 1);      # Group
+    store8(g_txbuf + offset + 1, 2);  # Variation
+    store8(g_txbuf + offset + 2, 0x00); # Qualifier: 1-byte start/stop
+    store8(g_txbuf + offset + 3, 0);  # Start index
+    store8(g_txbuf + offset + 4, 7);  # Stop index
+    offset = offset + 5;
+    # 8 points, each 1 byte (flags | value_in_bit7)
+    i = 0;
+    while i < 8 {
+        val = load64(pt_values + i * 8);
+        flags = load64(pt_flags + i * 8);
+        store8(g_txbuf + offset, bor(band(flags, 0x7F), shl(band(val, 1), 7)));
+        offset = offset + 1;
+        i = i + 1;
+    }
+
+    # Binary Outputs: Group 10, Var 2, Qualifier 0x00 (start=0, stop=3)
+    store8(g_txbuf + offset, 10);
+    store8(g_txbuf + offset + 1, 2);
+    store8(g_txbuf + offset + 2, 0x00);
+    store8(g_txbuf + offset + 3, 0);
+    store8(g_txbuf + offset + 4, 3);
+    offset = offset + 5;
+    i = 8;
+    while i < 12 {
+        val = load64(pt_values + i * 8);
+        flags = load64(pt_flags + i * 8);
+        store8(g_txbuf + offset, bor(band(flags, 0x7F), shl(band(val, 1), 7)));
+        offset = offset + 1;
+        i = i + 1;
+    }
+
+    # Analog Inputs: Group 30, Var 1, Qualifier 0x00 (start=0, stop=3)
+    store8(g_txbuf + offset, 30);
+    store8(g_txbuf + offset + 1, 1);
+    store8(g_txbuf + offset + 2, 0x00);
+    store8(g_txbuf + offset + 3, 0);
+    store8(g_txbuf + offset + 4, 3);
+    offset = offset + 5;
+    # Each analog: 1 byte flags + 4 bytes value (32-bit signed)
+    i = 12;
+    while i < 16 {
+        flags = load64(pt_flags + i * 8);
+        val = load64(pt_values + i * 8);
+        store8(g_txbuf + offset, band(flags, 0xFF));
+        store32(g_txbuf + offset + 1, val);
+        offset = offset + 5;
+        i = i + 1;
+    }
+
+    # Counters: Group 20, Var 1, Qualifier 0x00 (start=0, stop=1)
+    store8(g_txbuf + offset, 20);
+    store8(g_txbuf + offset + 1, 1);
+    store8(g_txbuf + offset + 2, 0x00);
+    store8(g_txbuf + offset + 3, 0);
+    store8(g_txbuf + offset + 4, 1);
+    offset = offset + 5;
+    i = 16;
+    while i < 18 {
+        flags = load64(pt_flags + i * 8);
+        val = load64(pt_values + i * 8);
+        store8(g_txbuf + offset, band(flags, 0xFF));
+        store32(g_txbuf + offset + 1, val);
+        offset = offset + 5;
+        i = i + 1;
+    }
+
+    # Analog Outputs: Group 40, Var 1, Qualifier 0x00 (start=0, stop=0)
+    store8(g_txbuf + offset, 40);
+    store8(g_txbuf + offset + 1, 1);
+    store8(g_txbuf + offset + 2, 0x00);
+    store8(g_txbuf + offset + 3, 0);
+    store8(g_txbuf + offset + 4, 0);
+    offset = offset + 5;
+    # 1 point (Index 18): 1 byte flags + 4 bytes value (32-bit signed)
+    flags = load64(pt_flags + 18 * 8);
+    val = load64(pt_values + 18 * 8);
+    store8(g_txbuf + offset, band(flags, 0xFF));
+    store32(g_txbuf + offset + 1, val);
+    offset = offset + 5;
+
+    return finalize_frame(offset);
+}
+
+# Build empty event response (no events pending)
+func build_empty_response(dst_addr: i64, src_addr: i64, req_seq: i64) -> i64 {
+    app_ctrl = bor(0xC0, band(req_seq, 0x0F));
+    offset = build_response_header(dst_addr, src_addr, app_ctrl, 0x81, 0x00, 0x00);
+    return finalize_frame(offset);
+}
+
+# Build restart response (IIN restart bit set)
+func build_restart_response(dst_addr: i64, src_addr: i64, req_seq: i64) -> i64 {
+    app_ctrl = bor(0xC0, band(req_seq, 0x0F));
+    # IIN1 bit 7 = Device Restart
+    offset = build_response_header(dst_addr, src_addr, app_ctrl, 0x81, 0x80, 0x00);
+    return finalize_frame(offset);
+}
+
+# Build Direct Operate response (echo back the request with status=0)
+func build_dop_response(dst_addr: i64, src_addr: i64, req_seq: i64, crob_idx: i64, crob_ctrl: i64) -> i64 {
+    app_ctrl = bor(0xC0, band(req_seq, 0x0F));
+    offset = build_response_header(dst_addr, src_addr, app_ctrl, 0x81, 0x00, 0x00);
+    # Echo object: Group 12, Var 1, Qualifier 0x28, Count=1
+    store8(g_txbuf + offset, 12);
+    store8(g_txbuf + offset + 1, 1);
+    store8(g_txbuf + offset + 2, 0x28);
+    store8(g_txbuf + offset + 3, 1);
+    store8(g_txbuf + offset + 4, band(crob_idx, 0xFF));
+    store8(g_txbuf + offset + 5, crob_ctrl);
+    store8(g_txbuf + offset + 6, 1);    # count
+    store32(g_txbuf + offset + 7, 1000); # on_time
+    store32(g_txbuf + offset + 11, 1000);# off_time
+    store8(g_txbuf + offset + 15, 0);   # status = SUCCESS
+    offset = offset + 16;
+    return finalize_frame(offset);
+}
+
+# Build Direct Operate response for Analog Output (echo back the request with status=0)
+func build_dop_ao_response(dst_addr: i64, src_addr: i64, req_seq: i64, grp: i64, var: i64, ao_idx: i64, ao_val: i64) -> i64 {
+    app_ctrl = bor(0xC0, band(req_seq, 0x0F));
+    offset = build_response_header(dst_addr, src_addr, app_ctrl, 0x81, 0x00, 0x00);
+    # Echo object: Group 41, Var var, Qualifier 0x28, Count=1
+    store8(g_txbuf + offset, grp);
+    store8(g_txbuf + offset + 1, var);
+    store8(g_txbuf + offset + 2, 0x28);
+    store8(g_txbuf + offset + 3, 1);
+    store8(g_txbuf + offset + 4, band(ao_idx, 0xFF));
+    
+    if var == 1 {
+        # 32-bit value (4 bytes) + 1 status byte (0)
+        store32(g_txbuf + offset + 5, ao_val);
+        store8(g_txbuf + offset + 9, 0); # status success
+        offset = offset + 10;
+    } else {
+        # 16-bit value (2 bytes) + 1 status byte (0)
+        store16(g_txbuf + offset + 5, band(ao_val, 0xFFFF));
+        store8(g_txbuf + offset + 7, 0); # status success
+        offset = offset + 8;
+    }
+    return finalize_frame(offset);
+}
+
+# Build link-layer ACK (no transport/app)
+func build_link_ack(dst_addr: i64, src_addr: i64) -> i64 {
+    store8(g_txbuf + 0, 0x05);
+    store8(g_txbuf + 1, 0x64);
+    store8(g_txbuf + 2, 5); # length
+    store8(g_txbuf + 3, 0x00); # ctrl: DIR=0, PRM=0, FC=0 (ACK)
+    store8(g_txbuf + 4, band(dst_addr, 0xFF));
+    store8(g_txbuf + 5, band(shr(dst_addr, 8), 0xFF));
+    store8(g_txbuf + 6, band(src_addr, 0xFF));
+    store8(g_txbuf + 7, band(shr(src_addr, 8), 0xFF));
+    return 8;
+}
+
+# ============================================================================
+# REQUEST HANDLER (parses incoming master frames)
+# ============================================================================
+
+func handle_request(rx_len: i64) -> i64 {
+    if rx_len < 8 { return 0; }
+
+    # Validate DNP3 magic
+    if load8(g_rxbuf + 0) != 0x05 { return 0; }
+    if load8(g_rxbuf + 1) != 0x64 { return 0; }
+
+    log_hex_traffic(m_rx, g_rxbuf, rx_len);
+
+    ctrl = load8(g_rxbuf + 3);
+    dst_addr = load8(g_rxbuf + 4) + shl(load8(g_rxbuf + 5), 8);
+    src_addr = load8(g_rxbuf + 6) + shl(load8(g_rxbuf + 7), 8);
+
+    # Check if this is a link-only frame (length=5 means no user data)
+    frame_len = load8(g_rxbuf + 2);
+    if frame_len == 5 {
+        # Link layer only (e.g., Reset Link States FC=0)
+        log_append(m_reset);
+        resp_len = build_link_ack(src_addr, dst_addr);
+        send(load64(g_client_s), g_txbuf, resp_len, 0);
+        log_hex_traffic(m_tx, g_txbuf, resp_len);
+        return 1;
+    }
+
+    # Determine if frame includes CRC bytes.
+    # Without CRC: total = 3 (start+len) + frame_len => user data at offset 8
+    # With CRC: total = 10 (header+CRC) + data blocks with CRCs => user data at offset 10
+    # Detection: if rx_len > frame_len + 3, CRC is present
+    user_offset = 8;  # default: no CRC (TCP-only)
+    expected_no_crc = frame_len + 3;
+    if rx_len > expected_no_crc {
+        user_offset = 10; # skip header CRC at bytes 8-9
+    }
+
+    # Has transport + application layer
+    if rx_len < user_offset + 3 { return 0; }
+
+    # Strip CRC from data blocks: copy user data into a clean buffer
+    # For simplicity, extract user bytes by skipping every 2-byte CRC after 16-byte blocks
+    # User data length (from frame_len field): frame_len - 5 = transport + app bytes
+    user_data_len = frame_len - 5;
+    if user_data_len <= 0 { return 0; }
+
+    # If CRC present, we need to strip block CRCs from user data
+    # Each block: up to 16 data bytes + 2 CRC bytes
+    if user_offset == 10 {
+        # Extract user data from blocks, stripping CRCs
+        src_pos = 10; # first user byte after header CRC
+        dst_pos = 0;
+        remaining = user_data_len;
+        while remaining > 0 {
+            block_sz = 16;
+            if remaining < 16 { block_sz = remaining; }
+            # Copy block data
+            j = 0;
+            while j < block_sz {
+                if src_pos + j < rx_len {
+                    store8(g_logbuf + dst_pos + j, load8(g_rxbuf + src_pos + j));
+                }
+                j = j + 1;
+            }
+            dst_pos = dst_pos + block_sz;
+            src_pos = src_pos + block_sz + 2; # skip 2-byte CRC
+            remaining = remaining - block_sz;
+        }
+    } else {
+        # No CRC: user data starts directly at offset 8
+        j = 0;
+        while j < user_data_len {
+            store8(g_logbuf + j, load8(g_rxbuf + 8 + j));
+            j = j + 1;
+        }
+    }
+
+    # Now g_logbuf contains clean user data: [transport][app_ctrl][FC][objects...]
+    # Transport header at g_logbuf+0
+    # Application control at g_logbuf+1
+    # Function code at g_logbuf+2
+    app_ctrl = load8(g_logbuf + 1);
+    req_seq = band(app_ctrl, 0x0F);
+    fc = load8(g_logbuf + 2);
+
+    resp_len = 0;
+
+    # FC=0x01: READ
+    if fc == 0x01 {
+        # Check what's being read
+        if user_data_len >= 6 {
+            obj_grp = load8(g_logbuf + 3);
+            obj_var = load8(g_logbuf + 4);
+            # Class 0 = Group 60 Var 1
+            if obj_grp == 0x3C {
+                if obj_var == 1 {
+                    log_append(m_poll);
+                    resp_len = build_class0_response(src_addr, dst_addr, req_seq);
+                } else {
+                    # Class 1/2/3 event poll -> empty
+                    log_append(m_event);
+                    resp_len = build_empty_response(src_addr, dst_addr, req_seq);
+                }
+            } else {
+                # Generic read -> respond with Class 0 for now
+                log_append(m_poll);
+                resp_len = build_class0_response(src_addr, dst_addr, req_seq);
+            }
+        } else {
+            resp_len = build_empty_response(src_addr, dst_addr, req_seq);
+        }
+    }
+
+    # FC=0x05: Direct Operate
+    if fc == 0x05 {
+        log_append(m_dop);
+        grp = load8(g_logbuf + 3);
+        var = load8(g_logbuf + 4);
+        
+        if grp == 41 {
+            ao_idx = 0;
+            ao_val = 0;
+            if user_data_len >= 10 {
+                ao_idx = load8(g_logbuf + 7);
+                if var == 1 {
+                    ao_val = load32(g_logbuf + 8);
+                } else {
+                    ao_val = load16(g_logbuf + 8);
+                }
+            }
+            # Update corresponding Analog Output
+            ao_pt = 18 + ao_idx;
+            if ao_pt < 19 {
+                store64(pt_values + ao_pt * 8, ao_val);
+                refresh_listview();
+            }
+            resp_len = build_dop_ao_response(src_addr, dst_addr, req_seq, grp, var, ao_idx, ao_val);
+        } else {
+            crob_idx = 0;
+            crob_ctrl = 3;
+            if user_data_len >= 10 {
+                crob_idx = load8(g_logbuf + 7);
+                crob_ctrl = load8(g_logbuf + 8);
+            }
+            # Toggle the binary output point
+            bo_pt = 8 + crob_idx;
+            if bo_pt < 12 {
+                cur = load64(pt_values + bo_pt * 8);
+                store64(pt_values + bo_pt * 8, band(cur + 1, 1));
+                refresh_listview();
+            }
+            resp_len = build_dop_response(src_addr, dst_addr, req_seq, crob_idx, crob_ctrl);
+        }
+    }
+
+    # FC=0x06: Direct Operate No Ack
+    if fc == 0x06 {
+        log_append(m_dop);
+        grp = load8(g_logbuf + 3);
+        var = load8(g_logbuf + 4);
+        if grp == 41 {
+            if user_data_len >= 10 {
+                ao_idx = load8(g_logbuf + 7);
+                if var == 1 {
+                    ao_val = load32(g_logbuf + 8);
+                } else {
+                    ao_val = load16(g_logbuf + 8);
+                }
+                ao_pt = 18 + ao_idx;
+                if ao_pt < 19 {
+                    store64(pt_values + ao_pt * 8, ao_val);
+                    refresh_listview();
+                }
+            }
+        } else {
+            if user_data_len >= 10 {
+                crob_idx = load8(g_logbuf + 7);
+                bo_pt = 8 + crob_idx;
+                if bo_pt < 12 {
+                    cur = load64(pt_values + bo_pt * 8);
+                    store64(pt_values + bo_pt * 8, band(cur + 1, 1));
+                    refresh_listview();
+                }
+            }
+        }
+        return 1; # No response needed
+    }
+
+    # FC=0x0D: Cold Restart
+    if fc == 0x0D {
+        log_append(m_cold);
+        resp_len = build_restart_response(src_addr, dst_addr, req_seq);
+    }
+
+    # FC=0x0E: Warm Restart
+    if fc == 0x0E {
+        log_append(m_warm);
+        resp_len = build_restart_response(src_addr, dst_addr, req_seq);
+    }
+
+    # Unknown FC
+    if resp_len == 0 {
+        log_append(m_unknown);
+        int_to_str(g_numbuf, fc);
+        log_append(g_numbuf);
+        log_append(crlf);
+        resp_len = build_empty_response(src_addr, dst_addr, req_seq);
+    }
+
+    # Send response
+    if resp_len > 0 {
+        send(load64(g_client_s), g_txbuf, resp_len, 0);
+        log_hex_traffic(m_tx, g_txbuf, resp_len);
+    }
+
+    return 1;
+}
+
+# ============================================================================
+# SERVER START / STOP / POLL
+# ============================================================================
+
+func do_start() -> i64 {
+    if load64(g_running) != 0 { return 0; }
+
+    GetWindowTextA(load64(g_port_ed), g_portbuf, 32);
+    port = str_to_int(g_portbuf);
+    if port < 1 { port = 20000; }
+
+    log_append(m_start_try);
+    log_append(g_portbuf);
+    log_append(m_dots);
+
+    WSAStartup(0x0202, g_wsa);
+
+    s = socket(2, 1, 6);
+    if s == 0 - 1 {
+        log_append(m_start_err);
+        WSACleanup();
+        return 0;
+    }
+
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2); # AF_INET
+    store8(g_addr + 2, band(shr(port, 8), 0xFF));
+    store8(g_addr + 3, band(port, 0xFF));
+    store32(g_addr + 4, 0); # INADDR_ANY
+
+    rc = bind(s, g_addr, 16);
+    if rc != 0 {
+        log_append(m_start_err);
+        closesocket(s);
+        WSACleanup();
+        return 0;
+    }
+
+    listen(s, 1);
+
+    # Set non-blocking
+    store64(g_nonblock, 1);
+    ioctlsocket(s, 0x8004667E, g_nonblock);
+
+    store64(g_listen_s, s);
+    store64(g_client_s, 0);
+    store64(g_running, 1);
+
+    log_append(m_start_ok);
+    SetWindowTextA(load64(g_status), "Status: Running");
+    SetTimer(load64(g_hwnd), ID_TIMER_POLL, 50, 0);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 1;
+}
+
+func do_stop() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+
+    cs = load64(g_client_s);
+    if cs != 0 { closesocket(cs); store64(g_client_s, 0); }
+
+    ls = load64(g_listen_s);
+    if ls != 0 { closesocket(ls); store64(g_listen_s, 0); }
+
+    WSACleanup();
+    store64(g_running, 0);
+
+    log_append(m_stop_msg);
+    SetWindowTextA(load64(g_status), "Status: Stopped");
+    SetWindowTextA(load64(g_clients), "Master: (none)");
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func poll_network() -> i64 {
+    if load64(g_running) == 0 { return 0; }
+
+    ls = load64(g_listen_s);
+    cs = load64(g_client_s);
+
+    # Accept new connection if none active
+    if cs == 0 {
+        new_s = accept(ls, 0, 0);
+        if new_s != 0 {
+            if new_s != 0 - 1 {
+                store64(g_client_s, new_s);
+                # Set non-blocking
+                store64(g_nonblock, 1);
+                ioctlsocket(new_s, 0x8004667E, g_nonblock);
+                log_append(m_new_conn);
+                SetWindowTextA(load64(g_clients), "Master: CONNECTED");
+                InvalidateRect(load64(g_hwnd), 0, 1);
+            }
+        }
+    }
+
+    # Read from connected client
+    cs = load64(g_client_s);
+    if cs == 0 { return 0; }
+
+    n = recv(cs, g_rxbuf, 2048, 0);
+    if n > 0 {
+        handle_request(n);
+    } else if n == 0 {
+        # Graceful disconnect
+        closesocket(cs);
+        store64(g_client_s, 0);
+        log_append(m_disc_conn);
+        SetWindowTextA(load64(g_clients), "Master: (none)");
+        InvalidateRect(load64(g_hwnd), 0, 1);
+    }
+    # n < 0 with non-blocking = WSAEWOULDBLOCK (no data), just ignore
+
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = GetWindowTextA(hwnd_log, g_savebuf, 4096);
+    if len <= 0 { return 0; }
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 { log_append(m_save_err); return 0; }
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+func do_update_point() -> i64 {
+    GetWindowTextA(load64(g_idx_ed), g_numbuf, 32);
+    idx = str_to_int(g_numbuf);
+    if idx < 0 { idx = 0; }
+    if idx >= PT_COUNT { idx = PT_COUNT - 1; }
+
+    GetWindowTextA(load64(g_val_ed), g_numbuf, 32);
+    val = str_to_int(g_numbuf);
+
+    store64(pt_values + idx * 8, val);
+    refresh_listview();
+    log_append("[DNP3 Sim] Point ");
+    int_to_str(g_numbuf, idx);
+    log_append(g_numbuf);
+    log_append(" set to ");
+    int_to_str(g_numbuf, val);
+    log_append(g_numbuf);
+    log_append(".\r\n");
+    return 0;
+}
+
+func handle_auto_rand_toggle() -> i64 {
+    state = load64(g_auto_rand);
+    if state == 0 {
+        store64(g_auto_rand, 1);
+        SetWindowTextA(load64(g_btn_autorand), btn_stop_rand);
+        SetTimer(load64(g_hwnd), ID_TIMER_RAND, 1000, 0);
+        log_append("[DNP3 Sim] Auto-randomize started (1s interval).\r\n");
+    } else {
+        store64(g_auto_rand, 0);
+        SetWindowTextA(load64(g_btn_autorand), btn_auto_rand);
+        KillTimer(load64(g_hwnd), ID_TIMER_RAND);
+        log_append("[DNP3 Sim] Auto-randomize stopped.\r\n");
+    }
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE & GLOWBUTTON
+# ============================================================================
+
+func register_wide_string(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while load8(src + i) != 0 {
+        store16(dst + i * 2, load8(src + i));
+        i = i + 1;
+    }
+    store16(dst + i * 2, 0);
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    register_wide_string(thm_dm_exp_w, "DarkMode_Explorer");
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+    if msg == 512 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            SetWindowLongA(hwnd, 0 - 21, bor(pressed, 1));
+            InvalidateRect(hwnd, 0, 1);
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        SetWindowLongA(hwnd, 0 - 21, bor(hover, 2));
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+
+    if msg == 514 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+
+        brush = load64(g_brush_card);
+        if pressed == 2 { brush = load64(g_brush_deep); }
+        else if hover == 1 { brush = load64(g_brush_hover); }
+
+        old_brush = SelectObject(hdc, brush);
+        pen = load64(g_pen_border);
+        if pressed == 2 { pen = load64(g_pen_neon); }
+        else if hover == 1 { pen = load64(g_pen_neon); }
+
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, 0, 0, w, h, 6, 6);
+
+        if hover == 1 {
+            SelectObject(hdc, load64(g_pen_neon));
+            RoundRect(hdc, 1, 1, w - 1, h - 1, 6, 6);
+        }
+
+        SetBkMode(hdc, 1);
+        tc = COLOR_TEXT_PRIMARY;
+        if hover == 1 { tc = COL_ACCENT; }
+        else if pressed == 2 { tc = COL_ACCENT; }
+        SetTextColor(hdc, tc);
+
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 256);
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, w);
+        store32(g_rect + 12, h);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func register_class(wndcls_ptr: i64, name: i64, wndproc_addr: i64, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    memset(wndcls_ptr, 0, 80);
+    store32(wndcls_ptr + 0, 80);
+    store32(wndcls_ptr + 4, 3);
+    store64(wndcls_ptr + 8, wndproc_addr);
+    store64(wndcls_ptr + 24, hinst);
+    store64(wndcls_ptr + 40, cursor);
+    store64(wndcls_ptr + 48, brush);
+    store64(wndcls_ptr + 64, name);
+    return RegisterClassExA(wndcls_ptr);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        gfont = CreateFontA(14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face_mono);
+        store64(g_font, gfont);
+
+        # Title bar buttons
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 990, 6, 24, 24, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1018, 6, 24, 24, hwnd, ID_BTN_CLOSE, hinst, 0);
+
+        # ---- Row 1: Server setup (Y=50) ----
+        CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 12, 54, 35, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50000080, 47, 52, 60, 24, hwnd, 0, hinst, 0);
+        store64(g_port_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_oaddr, 0x50000000, 120, 54, 105, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_oaddr, 0x50000080, 225, 52, 35, 24, hwnd, 0, hinst, 0);
+        store64(g_oaddr_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_start, 0x50000000, 280, 50, 75, 28, hwnd, ID_BTN_START, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 365, 50, 65, 28, hwnd, ID_BTN_STOP, hinst, 0);
+
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 450, 54, 150, 20, hwnd, 0, hinst, 0);
+        store64(g_status, h); SendMessageA(h, 48, gfont, 1);
+
+        h = CreateWindowExA(0, cls_stat, lbl_client, 0x50000000, 620, 54, 200, 20, hwnd, 0, hinst, 0);
+        store64(g_clients, h); SendMessageA(h, 48, gfont, 1);
+
+        # ---- Row 2: Point edit (Y=86) ----
+        CreateWindowExA(0, cls_stat, lbl_reg, 0x50000000, 12, 90, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_idx, 0x50000080, 52, 88, 40, 24, hwnd, 0, hinst, 0);
+        store64(g_idx_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_stat, lbl_val, 0x50000000, 100, 90, 42, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_val, 0x50000080, 142, 88, 60, 24, hwnd, 0, hinst, 0);
+        store64(g_val_ed, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_update, 0x50000000, 212, 86, 70, 28, hwnd, ID_BTN_UPDATE, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_random, 0x50000000, 292, 86, 85, 28, hwnd, ID_BTN_RANDOM, hinst, 0);
+        h = CreateWindowExA(0, cls_glow_btn, btn_auto_rand, 0x50000000, 387, 86, 85, 28, hwnd, ID_BTN_AUTORAND, hinst, 0);
+        store64(g_btn_autorand, h);
+
+        # ---- Traffic Log (left, Y=120) ----
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 12, 118, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50200044, 12, 135, 480, 400, hwnd, 0, hinst, 0);
+        store64(g_log, h); SendMessageA(h, 48, gfont, 1); dark_scroll(h);
+
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 350, 545, 60, 26, hwnd, ID_BTN_CLEAR, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 420, 545, 60, 26, hwnd, ID_BTN_SAVE, hinst, 0);
+
+        # ---- ListView (right, Y=135) ----
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 510, 155, 520, 405, hwnd, 0, hinst, 0);
+        store64(g_listview, h); SendMessageA(h, 48, gfont, 1);
+        SendMessageA(h, 4150, 0x20, 0x20);
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);
+        dark_scroll(h);
+
+        # Columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+
+        store32(g_lvcol + 8, 45); store64(g_lvcol + 16, col_idx);
+        SendMessageA(h, 4123, 0, g_lvcol);
+
+        store32(g_lvcol + 8, 140); store64(g_lvcol + 16, col_name); store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+
+        store32(g_lvcol + 8, 65); store64(g_lvcol + 16, col_type); store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+
+        store32(g_lvcol + 8, 80); store64(g_lvcol + 16, col_value); store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+
+        store32(g_lvcol + 8, 55); store64(g_lvcol + 16, col_flags); store32(g_lvcol + 24, 4);
+        SendMessageA(h, 4123, 4, g_lvcol);
+
+        store32(g_lvcol + 8, 55); store64(g_lvcol + 16, col_group); store32(g_lvcol + 24, 5);
+        SendMessageA(h, 4123, 5, g_lvcol);
+
+        # Populate initial point data
+        refresh_listview();
+        return 0;
+    }
+
+    if msg == 2 { # WM_DESTROY
+        do_stop();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    if msg == 15 { # WM_PAINT
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+
+        GetClientRect(hwnd, g_rect);
+        FillRect(hdc, g_rect, load64(g_bg_brush));
+
+        # Title bar
+        store32(g_rect + 0, 0); store32(g_rect + 4, 0);
+        store32(g_rect + 8, WIN_W); store32(g_rect + 12, 36);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+
+        SelectObject(hdc, load64(g_font_header));
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+
+        store32(g_rect + 0, 12); store32(g_rect + 4, 12);
+        store32(g_rect + 8, 600); store32(g_rect + 12, 35);
+        DrawTextA(hdc, title_draw, 0 - 1, g_rect, 0);
+
+        # Running indicator
+        indicator = st_stop_ind;
+        if load64(g_running) != 0 {
+            indicator = st_run_ind;
+            SetTextColor(hdc, COL_ACCENT);
+        } else {
+            SetTextColor(hdc, 0x555555);
+        }
+        store32(g_rect + 0, 380); store32(g_rect + 8, 600);
+        DrawTextA(hdc, indicator, 0 - 1, g_rect, 0);
+
+        # Accent line
+        SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 12, 36, 0);
+        LineTo(hdc, WIN_W - 12, 36);
+
+        # Custom dark headers for ListView (Y=135 to Y=155)
+        old_pen = SelectObject(hdc, load64(g_pen_border));
+        old_brush = SelectObject(hdc, load64(g_edit_brush));
+        old_font = SelectObject(hdc, load64(g_font));
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+
+        # Col 0: Index (x=510, w=45)
+        store32(g_rect + 0, 510); store32(g_rect + 4, 135); store32(g_rect + 8, 555); store32(g_rect + 12, 155);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 510, 135, 555, 155);
+        # Col 1: Name (w=140)
+        store32(g_rect + 0, 555); store32(g_rect + 8, 695);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 555, 135, 695, 155);
+        # Col 2: Type (w=65)
+        store32(g_rect + 0, 695); store32(g_rect + 8, 760);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 695, 135, 760, 155);
+        # Col 3: Value (w=80)
+        store32(g_rect + 0, 760); store32(g_rect + 8, 840);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 760, 135, 840, 155);
+        # Col 4: Flags (w=55)
+        store32(g_rect + 0, 840); store32(g_rect + 8, 895);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 840, 135, 895, 155);
+        # Col 5: Group (w=55)
+        store32(g_rect + 0, 895); store32(g_rect + 8, 1030);
+        FillRect(hdc, g_rect, load64(g_edit_brush)); Rectangle(hdc, 895, 135, 1030, 155);
+
+        # Header text
+        TextOutA(hdc, 515, 139, col_idx, 5);
+        TextOutA(hdc, 600, 139, col_name, 4);
+        TextOutA(hdc, 705, 139, col_type, 4);
+        TextOutA(hdc, 775, 139, col_value, 5);
+        TextOutA(hdc, 848, 139, col_flags, 5);
+        TextOutA(hdc, 905, 139, col_group, 5);
+
+        SelectObject(hdc, old_font);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 307 { # WM_CTLCOLOREDIT
+        hdc = wp;
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SetBkColor(hdc, COLOR_BG_INPUT);
+        return load64(g_brush_input);
+    }
+
+    if msg == 312 { # WM_CTLCOLORSTATIC
+        hdc = wp;
+        SetTextColor(hdc, COL_TEXT);
+        SetBkColor(hdc, COL_BG);
+        return load64(g_bg_brush);
+    }
+
+    if msg == 273 { # WM_COMMAND
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_START  { do_start(); }
+        if cmd_id == ID_BTN_STOP   { do_stop(); }
+        if cmd_id == ID_BTN_CLEAR  { do_clear_log(); }
+        if cmd_id == ID_BTN_SAVE   { do_save_log(); }
+        if cmd_id == ID_BTN_UPDATE { do_update_point(); }
+        if cmd_id == ID_BTN_RANDOM { randomize_values(); }
+        if cmd_id == ID_BTN_AUTORAND { handle_auto_rand_toggle(); }
+        if cmd_id == ID_BTN_MIN    { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE  { DestroyWindow(hwnd); return 0; }
+        return 0;
+    }
+
+    if msg == 275 { # WM_TIMER
+        if wp == ID_TIMER_POLL { poll_network(); }
+        if wp == ID_TIMER_RAND { randomize_values(); }
+        return 0;
+    }
+
+    if msg == 132 { # WM_NCHITTEST (draggable title bar)
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        if mx >= 32768 { mx = mx - 65536; }
+        my = band(shr(lp, 16), 65535);
+        if my >= 32768 { my = my - 65536; }
+        cx = mx - wl;
+        cy = my - wt;
+
+        if cy < 36 {
+            if cx >= 990 {
+                if cx < 1014 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            if cx >= 1018 {
+                if cx < 1042 {
+                    if cy >= 6 { if cy < 30 { return 1; } }
+                }
+            }
+            return 2; # HTCAPTION
+        }
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    store64(g_running, 0);
+    store64(g_client_s, 0);
+    store64(g_listen_s, 0);
+    store64(g_auto_rand, 0);
+
+    init_point_database();
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    enable_dark_mode();
+
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep,  CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card,  CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon,  CreateSolidBrush(COL_ACCENT));
+    store64(g_pen_border,  CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon,    CreatePen(0, 2, COL_ACCENT));
+
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+
+    res = register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+    if res == 0 {
+        MessageBoxA(0, "RegisterClassExA failed for GlowButton!", "Error", 16);
+    }
+
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+
+    hwnd = CreateWindowExA(0, clsname, title, 0x92000000, 100, 100, WIN_W, WIN_H, 0, 0, hinst, 0);
+    if hwnd == 0 {
+        MessageBoxA(0, "CreateWindowExA failed!", "Error", 16);
+    }
+    store64(g_hwnd, hwnd);
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

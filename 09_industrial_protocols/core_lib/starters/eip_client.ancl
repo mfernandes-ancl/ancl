@@ -1,0 +1,76 @@
+# eip_client.ancl - EtherNet/IP (CIP) ListIdentity STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client: connects + reads the device identity (vendor / product /
+# serial / name). Edit the CONFIG block, COMPILE, RUN, then extend it (RegisterSession +
+# Read/Write Tag 0x4C/0x4D) - Ctrl+Space knows the idioms. Loaded by Aether Studio for
+# EtherNet/IP intent.
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" setsockopt;
+extern "kernel32.dll" Sleep;
+
+@DATA
+mInfo: str = "[eip] EtherNet/IP identity reader (ANCL starter)";
+mErr:  str = "[eip] connect failed - check IP / port / cable.";
+mNo:   str = "[eip] no / short reply.";
+mBad:  str = "[eip] unexpected reply (not a ListIdentity response).";
+mName: str = "[eip] product name: ";
+mVen:  str = "[eip] vendor id = ";
+mPc:   str = ", product code = ";
+mSer:  str = ", serial = ";
+nl:    str = "\r\n";
+# ==== CONFIG - edit these ====
+CFG_IP0:  i64 = 127;     # target IP, octet 1
+CFG_IP1:  i64 = 0;       #   octet 2
+CFG_IP2:  i64 = 0;       #   octet 3
+CFG_IP3:  i64 = 1;       #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT: i64 = 44818;   # EtherNet/IP port (standard 44818)
+# =============================
+g_wsa: buf = 512;
+g_addr: buf = 16;
+g_tmo: buf = 8;
+g_req: buf = 32;
+g_buf: buf = 600;
+g_name: buf = 64;
+
+@CODE
+func recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+func main() -> i32 {
+    syscall 1, mInfo, nl;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, htons(CFG_PORT));
+    store32(g_addr + 4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24));
+    store64(g_addr + 8, 0);
+    if connect(s, g_addr, 16) != 0 { syscall 1, mErr, nl; closesocket(s); return 1; }
+    store32(g_tmo, 3000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);
+    memset(g_req, 0, 24);
+    store8(g_req+0, 0x63);
+    if send(s, g_req, 24, 0) <= 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    if recv_n(s, g_buf, 24) < 0 { syscall 1, mNo, nl; closesocket(s); return 1; }
+    pl = load8(g_buf+2) + load8(g_buf+3) * 256;
+    if pl > 560 { pl = 560; }
+    if pl > 0 { if recv_n(s, g_buf + 24, pl) < 0 { syscall 1, mNo, nl; closesocket(s); return 1; } }
+    if load8(g_buf+0) != 0x63 { syscall 1, mBad, nl; closesocket(s); return 1; }
+    ic = load8(g_buf+24) + load8(g_buf+25) * 256;
+    if ic < 1 { syscall 1, mBad, nl; closesocket(s); return 1; }
+    ven = load8(g_buf+48) + load8(g_buf+49) * 256;
+    pc = load8(g_buf+52) + load8(g_buf+53) * 256;
+    ser = load8(g_buf+58) + load8(g_buf+59)*256 + load8(g_buf+60)*65536 + load8(g_buf+61)*16777216;
+    nn = load8(g_buf+62);
+    if nn > 60 { nn = 60; }
+    memcpy(g_name, g_buf + 63, nn);
+    store8(g_name + nn, 0);
+    syscall 1, mName; puts_cstr(g_name); syscall 1, nl;
+    syscall 1, mVen, ven, mPc, pc, mSer, ser, nl;
+    closesocket(s);
+    return 0;
+}

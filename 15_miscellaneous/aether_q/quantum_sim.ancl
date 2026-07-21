@@ -1,0 +1,684 @@
+# =====================================================================
+#  quantum_sim.ancl  -  2-Qubit Quantum Computing State Vector Simulator
+#
+#  Open-Source Systems Mathematics Showcase (Project Aether-Q)
+#  100% CRT-free, native fixed-point complex state engine with GDI
+#  probability histogram, dynamic ASCII circuit, and interactive control.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+clsname:      str = "AETHERQWND";
+title:        str = "ANCL Project Aether-Q: 2-Qubit Quantum Simulator";
+font_name:    str = "Consolas";
+
+# Button text labels
+btn_class:   str = "BUTTON";
+btn_h0:      str = "H0";
+btn_h1:      str = "H1";
+btn_x0:      str = "X0";
+btn_x1:      str = "X1";
+btn_cnot:    str = "CNOT";
+btn_reset:   str = "RESET";
+
+# State Vector (4 states * 2 components (real, imag) * 8 bytes = 64 bytes)
+# State indices mapping: 0 = |00>, 1 = |01>, 2 = |10>, 3 = |11>
+g_state: buf = 64;
+
+# History of applied gates (up to 12 gates * 8 bytes = 96 bytes)
+g_history: buf = 96;
+g_history_count: buf = 8;
+
+# Buffers for ASCII drawing
+g_line0: buf = 128;
+g_line1: buf = 128;
+
+# Temporary string buffers
+g_txt_buf: buf = 128;
+g_num_buf: buf = 32;
+
+# Gate Matrices
+g_mat_h:    buf = 64;
+g_mat_x:    buf = 64;
+g_mat_cnot: buf = 256;
+
+# Complex Number Engine Temporary Buffers
+g_temp_c0:   buf = 16;
+g_temp_c1:   buf = 16;
+g_temp_c2:   buf = 16;
+g_temp_c3:   buf = 16;
+g_temp_prod: buf = 16;
+
+# Standard Win32 variables
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Math & String Utilities
+# ---------------------------------------------------------------------
+
+func strcpy(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i, c);
+        if c == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strcat(dst: i64, src: i64) -> i64 {
+    p = dst;
+    while load8(p) != 0 {
+        p = p + 1;
+    }
+    
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(p + i, c);
+        if c == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strlen(s: i64) -> i64 {
+    i = 0;
+    while load8(s + i) != 0 {
+        i = i + 1;
+    }
+    return i;
+}
+
+func itoa(val: i64, buf: i64) -> i64 {
+    if val == 0 {
+        store8(buf, 48); # '0'
+        store8(buf + 1, 0);
+        return 1;
+    }
+    
+    negative = 0;
+    temp = val;
+    if temp < 0 {
+        negative = 1;
+        temp = 0 - temp;
+    }
+    
+    p = buf;
+    if negative == 1 {
+        store8(p, 45); # '-'
+        p = p + 1;
+    }
+    
+    start_digits = p;
+    while temp > 0 {
+        digit = temp % 10;
+        store8(p, 48 + digit); # '0' + digit
+        p = p + 1;
+        temp = temp / 10;
+    }
+    store8(p, 0); # Null terminator
+    
+    # Reverse digits
+    end_digits = p - 1;
+    while start_digits < end_digits {
+        c1 = load8(start_digits);
+        c2 = load8(end_digits);
+        store8(start_digits, c2);
+        store8(end_digits, c1);
+        start_digits = start_digits + 1;
+        end_digits = end_digits - 1;
+    }
+    
+    return p - buf;
+}
+
+# ---------------------------------------------------------------------
+# Radix Fixed-Point Complex Number Structure & Math Functions
+# Memory Layout:
+#   offset 0: real component (i64, scaled by 65536)
+#   offset 8: imag component (i64, scaled by 65536)
+# ---------------------------------------------------------------------
+
+func c_add(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    store64(out, r1 + r2);
+    store64(out + 8, i1 + i2);
+    return 0;
+}
+
+func c_sub(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    store64(out, r1 - r2);
+    store64(out + 8, i1 - i2);
+    return 0;
+}
+
+func c_mul(r1: i64, i1: i64, r2: i64, i2: i64, out: i64) -> i64 {
+    r = (r1 * r2 - i1 * i2) / 65536;
+    i = (r1 * i2 + i1 * r2) / 65536;
+    store64(out, r);
+    store64(out + 8, i);
+    return 0;
+}
+
+func c_mag_sq(r: i64, im: i64) -> i64 {
+    return (r * r + im * im) / 65536;
+}
+
+# ---------------------------------------------------------------------
+# Matrix Operator Definition & Initialization
+# ---------------------------------------------------------------------
+
+func store_matrix_element_2x2(mat: i64, row: i64, col: i64, r: i64, im: i64) -> i64 {
+    # Each row is 2 elements * 16 bytes = 32 bytes.
+    # Each column is 16 bytes.
+    offset = row * 32 + col * 16;
+    store64(mat + offset, r);
+    store64(mat + offset + 8, im);
+    return 0;
+}
+
+func store_matrix_element(mat: i64, row: i64, col: i64, r: i64, im: i64) -> i64 {
+    # Each row is 4 elements * 16 bytes = 64 bytes.
+    # Each column is 16 bytes.
+    offset = row * 64 + col * 16;
+    store64(mat + offset, r);
+    store64(mat + offset + 8, im);
+    return 0;
+}
+
+func init_matrices() -> i64 {
+    inv_s = 46341; # 1/sqrt(2) * 65536
+    
+    # H matrix (2x2 complex matrix)
+    store_matrix_element_2x2(g_mat_h, 0, 0, inv_s, 0);
+    store_matrix_element_2x2(g_mat_h, 0, 1, inv_s, 0);
+    store_matrix_element_2x2(g_mat_h, 1, 0, inv_s, 0);
+    store_matrix_element_2x2(g_mat_h, 1, 1, 0 - inv_s, 0);
+    
+    # X matrix (2x2 complex matrix)
+    store_matrix_element_2x2(g_mat_x, 0, 0, 0, 0);
+    store_matrix_element_2x2(g_mat_x, 0, 1, 65536, 0);
+    store_matrix_element_2x2(g_mat_x, 1, 0, 65536, 0);
+    store_matrix_element_2x2(g_mat_x, 1, 1, 0, 0);
+    
+    # CNOT matrix (4x4 complex matrix)
+    # Initialize all to 0 first
+    i = 0;
+    while i < 256 {
+        store8(g_mat_cnot + i, 0);
+        i = i + 1;
+    }
+    store_matrix_element(g_mat_cnot, 0, 0, 65536, 0);
+    store_matrix_element(g_mat_cnot, 1, 1, 65536, 0);
+    store_matrix_element(g_mat_cnot, 2, 3, 65536, 0);
+    store_matrix_element(g_mat_cnot, 3, 2, 65536, 0);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# High-Speed Matrix-Vector Multiplication Passes
+# ---------------------------------------------------------------------
+
+func apply_1qubit_gate(mat: i64, target_qubit: i64) -> i64 {
+    # Load 2x2 matrix elements
+    m00_r = load64(mat + 0);
+    m00_i = load64(mat + 8);
+    m01_r = load64(mat + 16);
+    m01_i = load64(mat + 24);
+    m10_r = load64(mat + 32);
+    m10_i = load64(mat + 40);
+    m11_r = load64(mat + 48);
+    m11_i = load64(mat + 56);
+    
+    # Determine state register indices to pair
+    idx0_a = 0;
+    idx1_a = 0;
+    idx0_b = 0;
+    idx1_b = 0;
+    
+    if target_qubit == 0 {
+        # Pair A: |00> and |10>
+        idx0_a = 0;
+        idx1_a = 2;
+        # Pair B: |01> and |11>
+        idx0_b = 1;
+        idx1_b = 3;
+    } else {
+        # Pair A: |00> and |01>
+        idx0_a = 0;
+        idx1_a = 1;
+        # Pair B: |10> and |11>
+        idx0_b = 2;
+        idx1_b = 3;
+    }
+    
+    # Process Pair A
+    r0 = load64(g_state + idx0_a * 16);
+    i0 = load64(g_state + idx0_a * 16 + 8);
+    r1 = load64(g_state + idx1_a * 16);
+    i1 = load64(g_state + idx1_a * 16 + 8);
+    
+    c_mul(m00_r, m00_i, r0, i0, g_temp_c0);
+    c_mul(m01_r, m01_i, r1, i1, g_temp_prod);
+    c_add(load64(g_temp_c0), load64(g_temp_c0 + 8), load64(g_temp_prod), load64(g_temp_prod + 8), g_temp_c0);
+    
+    c_mul(m10_r, m10_i, r0, i0, g_temp_c1);
+    c_mul(m11_r, m11_i, r1, i1, g_temp_prod);
+    c_add(load64(g_temp_c1), load64(g_temp_c1 + 8), load64(g_temp_prod), load64(g_temp_prod + 8), g_temp_c1);
+    
+    # Process Pair B
+    r2 = load64(g_state + idx0_b * 16);
+    i2 = load64(g_state + idx0_b * 16 + 8);
+    r3 = load64(g_state + idx1_b * 16);
+    i3 = load64(g_state + idx1_b * 16 + 8);
+    
+    c_mul(m00_r, m00_i, r2, i2, g_temp_c2);
+    c_mul(m01_r, m01_i, r3, i3, g_temp_prod);
+    c_add(load64(g_temp_c2), load64(g_temp_c2 + 8), load64(g_temp_prod), load64(g_temp_prod + 8), g_temp_c2);
+    
+    c_mul(m10_r, m10_i, r2, i2, g_temp_c3);
+    c_mul(m11_r, m11_i, r3, i3, g_temp_prod);
+    c_add(load64(g_temp_c3), load64(g_temp_c3 + 8), load64(g_temp_prod), load64(g_temp_prod + 8), g_temp_c3);
+    
+    # Store back to state register
+    store64(g_state + idx0_a * 16, load64(g_temp_c0));
+    store64(g_state + idx0_a * 16 + 8, load64(g_temp_c0 + 8));
+    store64(g_state + idx1_a * 16, load64(g_temp_c1));
+    store64(g_state + idx1_a * 16 + 8, load64(g_temp_c1 + 8));
+    
+    store64(g_state + idx0_b * 16, load64(g_temp_c2));
+    store64(g_state + idx0_b * 16 + 8, load64(g_temp_c2 + 8));
+    store64(g_state + idx1_b * 16, load64(g_temp_c3));
+    store64(g_state + idx1_b * 16 + 8, load64(g_temp_c3 + 8));
+    
+    return 0;
+}
+
+func apply_2qubit_gate(mat: i64) -> i64 {
+    # Compute new states into g_temp_c0, c1, c2, c3
+    i = 0;
+    while i < 4 {
+        acc_r = 0;
+        acc_i = 0;
+        
+        j = 0;
+        while j < 4 {
+            mat_offset = i * 64 + j * 16;
+            m_r = load64(mat + mat_offset);
+            m_i = load64(mat + mat_offset + 8);
+            
+            v_r = load64(g_state + j * 16);
+            v_i = load64(g_state + j * 16 + 8);
+            
+            c_mul(m_r, m_i, v_r, v_i, g_temp_prod);
+            prod_r = load64(g_temp_prod);
+            prod_i = load64(g_temp_prod + 8);
+            
+            acc_r = acc_r + prod_r;
+            acc_i = acc_i + prod_i;
+            
+            j = j + 1;
+        }
+        
+        out_ptr = 0;
+        if i == 0 { out_ptr = g_temp_c0; }
+        if i == 1 { out_ptr = g_temp_c1; }
+        if i == 2 { out_ptr = g_temp_c2; }
+        if i == 3 { out_ptr = g_temp_c3; }
+        
+        store64(out_ptr, acc_r);
+        store64(out_ptr + 8, acc_i);
+        
+        i = i + 1;
+    }
+    
+    # Stream back to state vector register
+    store64(g_state + 0, load64(g_temp_c0));
+    store64(g_state + 8, load64(g_temp_c0 + 8));
+    store64(g_state + 16, load64(g_temp_c1));
+    store64(g_state + 24, load64(g_temp_c1 + 8));
+    store64(g_state + 32, load64(g_temp_c2));
+    store64(g_state + 40, load64(g_temp_c2 + 8));
+    store64(g_state + 48, load64(g_temp_c3));
+    store64(g_state + 56, load64(g_temp_c3 + 8));
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Quantum State & Operators implementation
+# ---------------------------------------------------------------------
+
+func reset_state() -> i64 {
+    # Initialize state vector to pure |00> (real = 65536, imag = 0)
+    store64(g_state + 0, 65536);
+    store64(g_state + 8, 0);
+    
+    # Others are initialized to 0
+    store64(g_state + 16, 0);
+    store64(g_state + 24, 0);
+    store64(g_state + 32, 0);
+    store64(g_state + 40, 0);
+    store64(g_state + 48, 0);
+    store64(g_state + 56, 0);
+    return 0;
+}
+
+func apply_hadamard_q0() -> i64 {
+    apply_1qubit_gate(g_mat_h, 0);
+    return 0;
+}
+
+func apply_hadamard_q1() -> i64 {
+    apply_1qubit_gate(g_mat_h, 1);
+    return 0;
+}
+
+func apply_paulix_q0() -> i64 {
+    apply_1qubit_gate(g_mat_x, 0);
+    return 0;
+}
+
+func apply_paulix_q1() -> i64 {
+    apply_1qubit_gate(g_mat_x, 1);
+    return 0;
+}
+
+func apply_cnot() -> i64 {
+    apply_2qubit_gate(g_mat_cnot);
+    return 0;
+}
+
+func append_history(gate_type: i64) -> i64 {
+    count = load64(g_history_count);
+    if count < 12 {
+        store64(g_history + count * 8, gate_type);
+        store64(g_history_count, count + 1);
+    }
+    return 0;
+}
+
+func build_circuit_ascii() -> i64 {
+    store8(g_line0 + 0, 113); # 'q'
+    store8(g_line0 + 1, 91);  # '['
+    store8(g_line0 + 2, 48);  # '0'
+    store8(g_line0 + 3, 93);  # ']'
+    store8(g_line0 + 4, 32);  # ' '
+    store8(g_line0 + 5, 45);  # '-'
+    store8(g_line0 + 6, 45);  # '-'
+    store8(g_line0 + 7, 45);  # '-'
+    store8(g_line0 + 8, 0);
+    
+    store8(g_line1 + 0, 113); # 'q'
+    store8(g_line1 + 1, 91);  # '['
+    store8(g_line1 + 2, 49);  # '1'
+    store8(g_line1 + 3, 93);  # ']'
+    store8(g_line1 + 4, 32);  # ' '
+    store8(g_line1 + 5, 45);  # '-'
+    store8(g_line1 + 6, 45);  # '-'
+    store8(g_line1 + 7, 45);  # '-'
+    store8(g_line1 + 8, 0);
+    
+    count = load64(g_history_count);
+    i = 0;
+    while i < count {
+        gate = load64(g_history + i * 8);
+        if gate == 1 {
+            strcat(g_line0, "[ H ]---");
+            strcat(g_line1, "--------");
+        } else if gate == 2 {
+            strcat(g_line0, "--------");
+            strcat(g_line1, "[ H ]---");
+        } else if gate == 3 {
+            strcat(g_line0, "[ X ]---");
+            strcat(g_line1, "--------");
+        } else if gate == 4 {
+            strcat(g_line0, "--------");
+            strcat(g_line1, "[ X ]---");
+        } else if gate == 5 {
+            strcat(g_line0, "[ * ]---");
+            strcat(g_line1, "[ X ]---");
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 WndProc
+# ---------------------------------------------------------------------
+
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        CreateWindowExA(0, btn_class, btn_h0, 1342242816, 40, 370, 70, 30, hwnd, 101, hinst, 0);
+        CreateWindowExA(0, btn_class, btn_h1, 1342242816, 125, 370, 70, 30, hwnd, 102, hinst, 0);
+        CreateWindowExA(0, btn_class, btn_x0, 1342242816, 210, 370, 70, 30, hwnd, 103, hinst, 0);
+        CreateWindowExA(0, btn_class, btn_x1, 1342242816, 295, 370, 70, 30, hwnd, 104, hinst, 0);
+        CreateWindowExA(0, btn_class, btn_cnot, 1342242816, 380, 370, 70, 30, hwnd, 105, hinst, 0);
+        CreateWindowExA(0, btn_class, btn_reset, 1342242816, 465, 370, 80, 30, hwnd, 106, hinst, 0);
+        return 0;
+    }
+    
+    if msg == 273 { # WM_COMMAND
+        cmdId = band(wParam, 65535);
+        if cmdId == 101 {
+            apply_hadamard_q0();
+            append_history(1);
+        }
+        if cmdId == 102 {
+            apply_hadamard_q1();
+            append_history(2);
+        }
+        if cmdId == 103 {
+            apply_paulix_q0();
+            append_history(3);
+        }
+        if cmdId == 104 {
+            apply_paulix_q1();
+            append_history(4);
+        }
+        if cmdId == 105 {
+            apply_cnot();
+            append_history(5);
+        }
+        if cmdId == 106 {
+            reset_state();
+            store64(g_history_count, 0);
+        }
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Draw background header bar
+        hBrushHeader = CreateSolidBrush(0x001B1B15);
+        oldBrush = SelectObject(hdc, hBrushHeader);
+        hPenHeader = CreatePen(0, 1, 0x001B1B15);
+        oldPen = SelectObject(hdc, hPenHeader);
+        Rectangle(hdc, 0, 0, w, 35);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(hPenHeader);
+        DeleteObject(hBrushHeader);
+        
+        # Setup monospace font
+        hFont = CreateFontA(18, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, font_name);
+        oldFont = SelectObject(hdc, hFont);
+        
+        # Header title
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, 0x0000FF95); # Mint Green
+        strcpy(g_txt_buf, "AETHER-Q // 2-QUBIT QUANTUM COMPUTER SIMULATOR");
+        TextOutA(hdc, 15, 8, g_txt_buf, strlen(g_txt_buf));
+        
+        # Draw ASCII circuit diagram
+        build_circuit_ascii();
+        SetTextColor(hdc, 0x00E0E0E0); # Light Gray
+        TextOutA(hdc, 30, 60, g_line0, strlen(g_line0));
+        TextOutA(hdc, 30, 85, g_line1, strlen(g_line1));
+        
+        # Draw Probability Histogram Title
+        SetTextColor(hdc, 0x0000FFFF); # Cyber Cyan
+        strcpy(g_txt_buf, "MEASUREMENT PROBABILITY DISTRIBUTION:");
+        TextOutA(hdc, 30, 130, g_txt_buf, strlen(g_txt_buf));
+        
+        # Render the 4 state bars
+        i = 0;
+        while i < 4 {
+            r = load64(g_state + i * 16);
+            im = load64(g_state + i * 16 + 8);
+            
+            mag_sq = c_mag_sq(r, im);
+            pct = (mag_sq * 100) / 65536;
+            if pct < 0 { pct = 0; }
+            if pct > 100 { pct = 100; }
+            
+            # Prepare state label string
+            if i == 0 {
+                strcpy(g_txt_buf, "|00>: ");
+            } else if i == 1 {
+                strcpy(g_txt_buf, "|01>: ");
+            } else if i == 2 {
+                strcpy(g_txt_buf, "|10>: ");
+            } else {
+                strcpy(g_txt_buf, "|11>: ");
+            }
+            
+            # Convert percentage to string and append "%"
+            len = itoa(pct, g_num_buf);
+            strcat(g_txt_buf, g_num_buf);
+            strcat(g_txt_buf, "%");
+            
+            # Draw state label
+            SetTextColor(hdc, 0x00C0C0C0);
+            TextOutA(hdc, 40, 160 + i * 50, g_txt_buf, strlen(g_txt_buf));
+            
+            # Draw bar background (gray frame)
+            # Width is 300 pixels (X=140 to X=440)
+            hBrushBg = CreateSolidBrush(0x002D2D2D);
+            oldBrush2 = SelectObject(hdc, hBrushBg);
+            hPenBg = CreatePen(0, 1, 0x00444444);
+            oldPen2 = SelectObject(hdc, hPenBg);
+            Rectangle(hdc, 140, 160 + i * 50 + 2, 440, 160 + i * 50 + 18);
+            SelectObject(hdc, oldPen2);
+            SelectObject(hdc, oldBrush2);
+            DeleteObject(hPenBg);
+            DeleteObject(hBrushBg);
+            
+            # Draw colored probability bar
+            bar_w = (300 * pct) / 100;
+            if bar_w > 0 {
+                # Pick neon color
+                color = 0;
+                if i == 0 {
+                    color = 0x00FFFF00; # Cyan (BGR)
+                } else if i == 1 {
+                    color = 0x0000FF00; # Green (BGR)
+                } else if i == 2 {
+                    color = 0x0000A5FF; # Orange (BGR)
+                } else {
+                    color = 0x00FF00FF; # Magenta (BGR)
+                }
+                
+                hBrushBar = CreateSolidBrush(color);
+                oldBrush3 = SelectObject(hdc, hBrushBar);
+                hPenBar = CreatePen(0, 1, color);
+                oldPen3 = SelectObject(hdc, hPenBar);
+                Rectangle(hdc, 140, 160 + i * 50 + 2, 140 + bar_w, 160 + i * 50 + 18);
+                SelectObject(hdc, oldPen3);
+                SelectObject(hdc, oldBrush3);
+                DeleteObject(hPenBar);
+                DeleteObject(hBrushBar);
+            }
+            
+            i = i + 1;
+        }
+        
+        # Draw Technical Branding at bottom
+        SetTextColor(hdc, 0x0000FF95); # Mint Green
+        strcpy(g_txt_buf, "PROJECT AETHER-Q // COMPLEX MATRICES STATE ENGINE");
+        TextOutA(hdc, 30, 420, g_txt_buf, strlen(g_txt_buf));
+        
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Program Loop
+# ---------------------------------------------------------------------
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize quantum register and gate history
+    reset_state();
+    init_matrices();
+    store64(g_history_count, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F));
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 150, 150, 600, 500, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Windows FFI message pump loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

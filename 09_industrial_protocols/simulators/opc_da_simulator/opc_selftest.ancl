@@ -1,0 +1,493 @@
+# Direct-CLSID self-test for opc_da_server (no registry needed: connects to the
+# already-running server's CoRegisterClassObject'd class object). Drives the real
+# OPC interfaces exactly like opc_client.ancl, but binds by CLSID instead of ProgID.
+import "../../core_lib/win32_api.ancl";
+import "../../core_lib/win32_com.ancl";
+extern "kernel32.dll" Sleep;
+extern "user32.dll" SetTimer -> i64;
+extern "user32.dll" KillTimer;
+extern "user32.dll" GetMessageA -> i64;
+extern "user32.dll" TranslateMessage;
+extern "user32.dll" DispatchMessageA;
+
+@DATA
+b_cci:  str = "[3] CoCreateInstance(IOPCServer) hr = ";
+b_srv:  str = "    IOPCServer* = ";
+b_grp:  str = "[4] AddGroup hr = ";
+b_gi:   str = "    IOPCItemMgt* = ";
+b_add:  str = "[5] AddItems hr = ";
+b_hsrv: str = "    server item handle = ";
+b_qsio: str = "[6] QI(IOPCSyncIO) hr = ";
+b_read: str = "[7] Read hr = ";
+b_vt:   str = "    VARTYPE = ";
+b_val:  str = "    >>> VALUE = ";
+b_ok:   str = "=== OK: read a live value from the ANCL OPC DA server ===";
+b_fail: str = "    FAILED at this stage";
+nl:     str = "\n";
+
+s_group: str = "SelfGrp";
+s_item:  str = "Substation.Status";
+s_item2: str = "Substation.Frequency";
+s_item3: str = "Substation.Voltage";
+w_item2:   buf = 128;
+w_item3:   buf = 128;
+itemdefs3: buf = 144;
+srv_h3:    buf = 16;
+b_multi:   str = "[5b] AddItems(Frequency,Voltage) hr = ";
+b_rd3:     str = "[7b] Read all 3 tags (multi-item OPCITEMSTATE -- the path AETHER hit):";
+b_rdrow:   str = "     item ";
+b_rdvt:    str = " vt=";
+b_rdval:   str = " val32=";
+b_rdq:     str = " q=";
+b_rdok:    str = "=== OK: all 3 items nonzero vt + GOOD(192) quality ===";
+b_rdbad:   str = "    !!! an item has vt=0 or quality!=192 -- OPCITEMSTATE stride bug present";
+s_brk:     str = "Substation.Breaker";
+s_setp:    str = "Substation.Setpoint";
+w_brk:     buf = 128;
+w_setp:    buf = 128;
+wbuf:      buf = 48;
+srv_hw:    buf = 8;
+pp_writeerr: buf = 8;
+b_addw:    str = "[7c] AddItems(Breaker,Setpoint) hr = ";
+b_wr:      str = "     Write(Breaker=TRUE, Setpoint=250.0) hr = ";
+b_brkrb:   str = "     readback Breaker  vt=";
+b_setrb:   str = "     readback Setpoint vt=";
+b_eqv:     str = " val=";
+b_wrok:    str = "=== OK: client WRITES persisted (Breaker=TRUE, Setpoint=250.0) ===";
+b_wrbad:   str = "    !!! write did not persist or wrong type";
+
+clsid:      buf = 16;
+iidServer:  buf = 16;
+iidItemMgt: buf = 16;
+iidSyncIO:  buf = 16;
+w_group:    buf = 64;
+w_item:     buf = 128;
+w_empty:    buf = 8;
+itemdef:    buf = 48;
+pp_server:  buf = 8;
+pp_itemmgt: buf = 8;
+pp_syncio:  buf = 8;
+h_srvgroup: buf = 8;
+d_revrate:  buf = 8;
+pp_results: buf = 8;
+pp_adderr:  buf = 8;
+pp_values:  buf = 8;
+pp_readerr: buf = 8;
+srv_handles:buf = 8;
+iidBrowse:  buf = 16;
+iidEnumStr: buf = 16;
+pp_browse:  buf = 8;
+pp_enum:    buf = 8;
+pp_str:     buf = 8;
+org_buf:    buf = 8;
+fetched_buf:buf = 8;
+asciibuf:   buf = 256;
+pp_status:  buf = 8;
+b_gs:       str = "[3b] GetStatus hr = ";
+b_gss:      str = "     dwServerState = ";
+iidProps:   buf = 16;
+pp_props:   buf = 8;
+qa_count:   buf = 8;
+qa_ids:     buf = 8;
+qa_descs:   buf = 8;
+qa_vts:     buf = 8;
+b_prop:     str = "[10] QI(IOPCItemProperties) hr = ";
+b_qap:      str = "[11] QueryAvailableProperties hr = ";
+b_qcount:   str = "     prop count = ";
+b_propok:   str = "=== OK: item properties work ===";
+gp_ids:     buf = 16;
+pp_gpdata:  buf = 8;
+pp_gperr:   buf = 8;
+b_gip:      str = "[11b] GetItemProperties hr = ";
+b_gprow:    str = "     prop ";
+b_gpvt:     str = " : vt = ";
+b_gpdat:    str = "  data = ";
+b_gperr:    str = "  err = ";
+b_gpbad:    str = "    !!! EMPTY VARIANT (vt=0) -- bug present";
+b_gpok:     str = "=== OK: GetItemProperties returned populated VARIANTs ===";
+iidGroupSt: buf = 16;
+pp_groupst: buf = 8;
+gs_rate:    buf = 8;
+gs_active:  buf = 8;
+gs_name:    buf = 8;
+gs_bias:    buf = 8;
+gs_dead:    buf = 8;
+gs_lcid:    buf = 8;
+gs_hcli:    buf = 8;
+gs_hsrv2:   buf = 8;
+req_rate:   buf = 8;
+rev_rate2:  buf = 8;
+set_active: buf = 8;
+cli_handles:buf = 8;
+pp_valres:  buf = 8;
+pp_valerr:  buf = 8;
+pp_acterr:  buf = 8;
+pp_cherr:   buf = 8;
+b_mon:      str = "[11c] monitoring-setup methods (the path dOPC uses to go live):";
+b_val2:     str = "     ValidateItems hr = ";
+b_sch:      str = "     SetClientHandles hr = ";
+b_act:      str = "     SetActiveState(1) hr = ";
+b_getst:    str = "     GetState hr = ";
+b_getrate:  str = "       rate = ";
+b_getact:   str = "       active = ";
+b_setst:    str = "     SetState(rate=500,active=1) hr = ";
+b_monok:    str = "=== OK: all monitoring-setup methods returned S_OK ===";
+b_monbad:   str = "    !!! a monitoring method FAILED (E_NOTIMPL?) -- dOPC would error here";
+iidUnk:     buf = 16;
+iidCPC:     buf = 16;
+iidCP:      buf = 16;
+iidAsync:   buf = 16;
+iidDataCb:  buf = 16;
+cb_vt:      buf = 56;
+cb_obj:     buf = 16;
+pp_cpc:     buf = 8;
+pp_cp:      buf = 8;
+pp_async:   buf = 8;
+pp_cookie:  buf = 8;
+g_fired:    buf = 8;
+sta_msg:    buf = 48;
+b_sta:      str = "    (STA client: pumping messages ~3s for marshaled OnDataChange)";
+g_rxval:    buf = 8;
+b_sub:      str = "[12] subscription Advise hr = ";
+b_wait:     str = "     waiting ~1.5s for OnDataChange pushes...";
+b_fired:    str = "     OnDataChange fired count = ";
+b_rxval:    str = "     last received value = ";
+b_subok:    str = "=== OK: LIVE subscription updates received! ===";
+b_subno:    str = "    (no OnDataChange received)";
+b_brw:    str = "[8] QI(IOPCBrowseServerAddressSpace) hr = ";
+b_org:    str = "    namespace type (2=FLAT) = ";
+b_brz:    str = "[9] BrowseOPCItemIDs hr = ";
+b_item:   str = "    browsed item: ";
+b_bok:    str = "=== OK: browsed the server tags ===";
+
+@CODE
+func init_ids() -> i64 {
+    store64(clsid + 0, 0x6677445500112233); store64(clsid + 8, 0xFFEEDDCCBBAA9988);
+    store64(iidServer + 0,  0x11D0011E39C13A4D); store64(iidServer + 8,  0xB3ADD8AF20007596);
+    store64(iidItemMgt + 0, 0x11D0011E39C13A54); store64(iidItemMgt + 8, 0xB3ADD8AF20007596);
+    store64(iidSyncIO + 0,  0x11D0011E39C13A52); store64(iidSyncIO + 8,  0xB3ADD8AF20007596);
+    store64(iidBrowse + 0,  0x11D0011E39C13A4F); store64(iidBrowse + 8,  0xB3ADD8AF20007596);
+    store64(iidEnumStr + 0, 0x0000000000000101); store64(iidEnumStr + 8, 0x46000000000000C0);
+    store64(iidProps + 0,  0x11D0011E39C13A72); store64(iidProps + 8,  0xB3ADD8AF20007596);
+    store64(iidUnk + 0, 0x0000000000000000); store64(iidUnk + 8, 0x46000000000000C0);
+    store64(iidCPC + 0, 0x101ABAB4B196B284); store64(iidCPC + 8, 0x071D3400AA009CB6);
+    store64(iidCP + 0,  0x101ABAB4B196B286); store64(iidCP + 8,  0x071D3400AA009CB6);
+    store64(iidAsync + 0, 0x11D0011E39C13A71); store64(iidAsync + 8, 0xB3ADD8AF20007596);
+    store64(iidDataCb + 0, 0x11D0011E39C13A70); store64(iidDataCb + 8, 0xB3ADD8AF20007596);
+    store64(iidGroupSt + 0, 0x11D0011E39C13A50); store64(iidGroupSt + 8, 0xB3ADD8AF20007596);
+    return 0;
+}
+# ---- a minimal IOPCDataCallback the server will push OnDataChange to ----
+func cmpguid(a: ptr, b: ptr) -> i64 { if load64(a) != load64(b) { return 1; } if load64(a + 8) != load64(b + 8) { return 1; } return 0; }
+func cb_QI(this: ptr, riid: ptr, ppv: ptr) -> i64 {
+    if ppv == 0 { return 0x80004003; }
+    store64(ppv, 0);
+    if cmpguid(riid, iidUnk) == 0 { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    if cmpguid(riid, iidDataCb) == 0 { store64(ppv, this); store64(this + 8, load64(this + 8) + 1); return 0; }
+    return 0x80004002;
+}
+func cb_AddRef(this: ptr) -> i64 { store64(this + 8, load64(this + 8) + 1); return load64(this + 8); }
+func cb_Release(this: ptr) -> i64 { store64(this + 8, load64(this + 8) - 1); return load64(this + 8); }
+func cb_OnDataChange(this: ptr, transid: i64, hGroup: i64, hrMq: i64, hrMe: i64, count: i64, phClient: ptr, pvValues: ptr, pwQual: ptr, pftTime: ptr, pErrors: ptr) -> i64 {
+    store64(g_fired, load64(g_fired) + 1);
+    if count > 0 { store64(g_rxval, load32(pvValues + 8)); }   # first VARIANT's data (VT_I4 status)
+    return 0;
+}
+func cb_OnReadComplete(this: ptr, transid: i64, hGroup: i64, hrMq: i64, hrMe: i64, count: i64, phClient: ptr, pvValues: ptr, pwQual: ptr, pftTime: ptr, pErrors: ptr) -> i64 { return 0; }
+func cb_OnWriteComplete(this: ptr, transid: i64, hGroup: i64, hrMaster: i64, count: i64, phClient: ptr, pErrors: ptr) -> i64 { return 0; }
+func cb_OnCancelComplete(this: ptr, transid: i64, hGroup: i64) -> i64 { return 0; }
+
+func main() -> i32 {
+    init_ids();
+    store64(cb_vt + 0,  &cb_QI);
+    store64(cb_vt + 8,  &cb_AddRef);
+    store64(cb_vt + 16, &cb_Release);
+    store64(cb_vt + 24, &cb_OnDataChange);
+    store64(cb_vt + 32, &cb_OnReadComplete);
+    store64(cb_vt + 40, &cb_OnWriteComplete);
+    store64(cb_vt + 48, &cb_OnCancelComplete);
+    store64(cb_obj + 0, cb_vt); store64(cb_obj + 8, 1);
+    store64(g_fired, 0); store64(g_rxval, 0);
+    a2w(w_group, s_group);
+    a2w(w_item, s_item);
+    CoInitializeEx(0, 2);          # STA (apartment-threaded) -- mirrors dOPC Explorer exactly
+
+    store64(pp_server, 0);
+    hr = CoCreateInstance(clsid, 0, 4, iidServer, pp_server);   # CLSCTX_LOCAL_SERVER
+    syscall 1, b_cci, hr, nl;
+    pServer = load64(pp_server);
+    if pServer == 0 { syscall 1, b_fail, nl; CoUninitialize(); return 1; }
+    syscall 1, b_srv, pServer, nl;
+
+    # [3b] GetStatus (vtbl[6]) -- the path dOPC likely hits on connect
+    store64(pp_status, 0);
+    hr = callp(vmeth(pServer, 6), pServer, pp_status);
+    syscall 1, b_gs, hr, nl;
+    pStatus = load64(pp_status);
+    if pStatus != 0 {
+        syscall 1, b_gss, load32(pStatus + 24), nl;     # dwServerState (expect 1 = RUNNING)
+        CoTaskMemFree(pStatus);
+    }
+
+    store32(h_srvgroup, 0); store32(d_revrate, 0); store64(pp_itemmgt, 0);
+    hr = callp(vmeth(pServer, 3), pServer, w_group, 1, 1000, 1, 0, 0, 0, h_srvgroup, d_revrate, iidItemMgt, pp_itemmgt);
+    syscall 1, b_grp, hr, nl;
+    pItemMgt = load64(pp_itemmgt);
+    if pItemMgt == 0 { syscall 1, b_fail, nl; CoUninitialize(); return 1; }
+    syscall 1, b_gi, pItemMgt, nl;
+
+    store64(itemdef + 0, w_empty); store64(itemdef + 8, w_item);
+    store32(itemdef + 16, 1); store32(itemdef + 20, 1); store32(itemdef + 24, 0);
+    store64(itemdef + 32, 0); store16(itemdef + 40, 3); store16(itemdef + 42, 0);
+    store64(pp_results, 0); store64(pp_adderr, 0);
+    hr = callp(vmeth(pItemMgt, 3), pItemMgt, 1, itemdef, pp_results, pp_adderr);
+    syscall 1, b_add, hr, nl;
+    pResults = load64(pp_results);
+    hSrv = 0;
+    if pResults != 0 { hSrv = load32(pResults); }
+    syscall 1, b_hsrv, hSrv, nl;
+    store32(srv_handles, hSrv);
+
+    store64(pp_syncio, 0);
+    hr = com_qi(pItemMgt, iidSyncIO, pp_syncio);
+    syscall 1, b_qsio, hr, nl;
+    pSyncIO = load64(pp_syncio);
+    if pSyncIO == 0 { syscall 1, b_fail, nl; CoUninitialize(); return 1; }
+
+    store64(pp_values, 0); store64(pp_readerr, 0);
+    hr = callp(vmeth(pSyncIO, 3), pSyncIO, 2, 1, srv_handles, pp_values, pp_readerr);
+    syscall 1, b_read, hr, nl;
+    pValues = load64(pp_values);
+    if pValues != 0 {
+        syscall 1, b_vt, load16(pValues + 16), nl;
+        syscall 1, b_val, load32(pValues + 24), nl;
+        syscall 1, b_ok, nl;
+    }
+
+    # [5b/7b] add the other 2 tags and read ALL 3 in one call -- exercises the multi-item
+    # OPCITEMSTATE array (40B/item on x64). The old single-item read MISSED the stride bug.
+    a2w(w_item2, s_item2); a2w(w_item3, s_item3);
+    store64(itemdefs3 + 0, w_empty); store64(itemdefs3 + 8, w_item2); store32(itemdefs3 + 16, 1); store32(itemdefs3 + 20, 2); store32(itemdefs3 + 24, 0); store64(itemdefs3 + 32, 0); store16(itemdefs3 + 40, 0); store16(itemdefs3 + 42, 0);
+    store64(itemdefs3 + 48, w_empty); store64(itemdefs3 + 56, w_item3); store32(itemdefs3 + 64, 1); store32(itemdefs3 + 68, 3); store32(itemdefs3 + 72, 0); store64(itemdefs3 + 80, 0); store16(itemdefs3 + 88, 0); store16(itemdefs3 + 90, 0);
+    store64(pp_results, 0); store64(pp_adderr, 0);
+    hr = callp(vmeth(pItemMgt, 3), pItemMgt, 2, itemdefs3, pp_results, pp_adderr);   # AddItems(Freq,Volt) -> handles 2,3
+    syscall 1, b_multi, hr, nl;
+    if load64(pp_results) != 0 { CoTaskMemFree(load64(pp_results)); }
+    if load64(pp_adderr) != 0 { CoTaskMemFree(load64(pp_adderr)); }
+    store32(srv_h3 + 0, 1); store32(srv_h3 + 4, 2); store32(srv_h3 + 8, 3);
+    store64(pp_values, 0); store64(pp_readerr, 0);
+    hr = callp(vmeth(pSyncIO, 3), pSyncIO, 2, 3, srv_h3, pp_values, pp_readerr);     # Read(Status,Freq,Volt)
+    syscall 1, b_rd3, nl;
+    pv3 = load64(pp_values);
+    if pv3 != 0 {
+        badrd = 0;
+        k = 0;
+        while k < 3 {
+            st = pv3 + k * 40;                                                        # OPCITEMSTATE = 40B on x64
+            vtk = load16(st + 16);
+            qk = load16(st + 12);
+            syscall 1, b_rdrow; syscall 1, k; syscall 1, b_rdvt; syscall 1, vtk; syscall 1, b_rdval; syscall 1, load32(st + 24); syscall 1, b_rdq; syscall 1, qk; syscall 1, nl;
+            if vtk == 0 { badrd = 1; }
+            if qk != 192 { badrd = 1; }
+            k = k + 1;
+        }
+        if badrd == 0 { syscall 1, b_rdok, nl; } else { syscall 1, b_rdbad, nl; }
+        CoTaskMemFree(pv3);
+    }
+    if load64(pp_readerr) != 0 { CoTaskMemFree(load64(pp_readerr)); }
+
+    # [7c] WRITE test: add the 2 writable tags, write a bool + a float, read them back
+    a2w(w_brk, s_brk); a2w(w_setp, s_setp);
+    store64(itemdefs3 + 0, w_empty); store64(itemdefs3 + 8, w_brk); store32(itemdefs3 + 16, 1); store32(itemdefs3 + 20, 4); store32(itemdefs3 + 24, 0); store64(itemdefs3 + 32, 0); store16(itemdefs3 + 40, 0); store16(itemdefs3 + 42, 0);
+    store64(itemdefs3 + 48, w_empty); store64(itemdefs3 + 56, w_setp); store32(itemdefs3 + 64, 1); store32(itemdefs3 + 68, 5); store32(itemdefs3 + 72, 0); store64(itemdefs3 + 80, 0); store16(itemdefs3 + 88, 0); store16(itemdefs3 + 90, 0);
+    store64(pp_results, 0); store64(pp_adderr, 0);
+    hr = callp(vmeth(pItemMgt, 3), pItemMgt, 2, itemdefs3, pp_results, pp_adderr);   # -> handles 4 (Breaker), 5 (Setpoint)
+    syscall 1, b_addw, hr, nl;
+    if load64(pp_results) != 0 { CoTaskMemFree(load64(pp_results)); }
+    if load64(pp_adderr) != 0 { CoTaskMemFree(load64(pp_adderr)); }
+    # write VARIANTs (24B each): Breaker=VT_BOOL TRUE, Setpoint=VT_R8 250.0
+    store64(wbuf + 0, 0); store64(wbuf + 8, 0); store64(wbuf + 16, 0);
+    store16(wbuf + 0, 11); store16(wbuf + 8, 65535);                    # VT_BOOL = TRUE(0xFFFF)
+    store64(wbuf + 24, 0); store64(wbuf + 32, 0); store64(wbuf + 40, 0);
+    store16(wbuf + 24, 5); store64(wbuf + 32, fbits(itof(250)));        # VT_R8 = 250.0
+    store32(srv_hw + 0, 4); store32(srv_hw + 4, 5);
+    store64(pp_writeerr, 0);
+    hr = callp(vmeth(pSyncIO, 4), pSyncIO, 2, srv_hw, wbuf, pp_writeerr);   # IOPCSyncIO::Write
+    syscall 1, b_wr, hr, nl;
+    if load64(pp_writeerr) != 0 { CoTaskMemFree(load64(pp_writeerr)); }
+    store64(pp_values, 0); store64(pp_readerr, 0);
+    hr = callp(vmeth(pSyncIO, 3), pSyncIO, 2, 2, srv_hw, pp_values, pp_readerr);   # read back handles 4,5
+    pvw = load64(pp_values);
+    if pvw != 0 {
+        brkvt = load16(pvw + 16); brkval = load16(pvw + 24);
+        setvt = load16(pvw + 56); setbits = load64(pvw + 64);          # item 1 OPCITEMSTATE @ +40
+        syscall 1, b_brkrb; syscall 1, brkvt; syscall 1, b_eqv; syscall 1, brkval; syscall 1, nl;
+        syscall 1, b_setrb; syscall 1, setvt; syscall 1, nl;
+        okw = 1;
+        if brkvt != 11 { okw = 0; }
+        if brkval == 0 { okw = 0; }
+        if setvt != 5 { okw = 0; }
+        if setbits != fbits(itof(250)) { okw = 0; }
+        if okw == 1 { syscall 1, b_wrok, nl; } else { syscall 1, b_wrbad, nl; }
+        CoTaskMemFree(pvw);
+    }
+    if load64(pp_readerr) != 0 { CoTaskMemFree(load64(pp_readerr)); }
+
+    # [8/9] Browse the server's address space and list the tags
+    store64(pp_browse, 0);
+    hr = com_qi(pServer, iidBrowse, pp_browse);
+    syscall 1, b_brw, hr, nl;
+    pBrowse = load64(pp_browse);
+    if pBrowse != 0 {
+        callp(vmeth(pBrowse, 3), pBrowse, org_buf);                       # QueryOrganization
+        syscall 1, b_org, load32(org_buf), nl;
+        store64(pp_enum, 0);
+        hr = callp(vmeth(pBrowse, 5), pBrowse, 3, w_empty, 0, 0, pp_enum);  # BrowseOPCItemIDs(OPC_FLAT=3)
+        syscall 1, b_brz, hr, nl;
+        pEnum = load64(pp_enum);
+        if pEnum != 0 {
+            while 1 {
+                store64(pp_str, 0);
+                hr = callp(vmeth(pEnum, 3), pEnum, 1, pp_str, fetched_buf);  # IEnumString::Next(1)
+                if hr != 0 { break; }
+                ws = load64(pp_str);
+                if ws == 0 { break; }
+                w2a(asciibuf, ws);
+                syscall 1, b_item; puts_cstr(asciibuf); syscall 1, nl;
+                CoTaskMemFree(ws);
+            }
+            com_release(pEnum);
+        }
+        com_release(pBrowse);
+        syscall 1, b_bok, nl;
+    }
+
+    # [10/11] IOPCItemProperties (what dOPC needs to show tag types on expand)
+    store64(pp_props, 0);
+    hr = com_qi(pServer, iidProps, pp_props);
+    syscall 1, b_prop, hr, nl;
+    pProps = load64(pp_props);
+    if pProps != 0 {
+        store32(qa_count, 0); store64(qa_ids, 0); store64(qa_descs, 0); store64(qa_vts, 0);
+        hr = callp(vmeth(pProps, 3), pProps, w_item, qa_count, qa_ids, qa_descs, qa_vts);   # QueryAvailableProperties
+        syscall 1, b_qap, hr, nl;
+        syscall 1, b_qcount, load32(qa_count), nl;
+        if load32(qa_count) > 0 { syscall 1, b_propok, nl; }
+
+        # [11b] GetItemProperties for props {1,2,3,5} -> read back each VARIANT (vt@0, data@8; stride 24 on x64)
+        store32(gp_ids + 0, 1); store32(gp_ids + 4, 2); store32(gp_ids + 8, 3); store32(gp_ids + 12, 5);
+        store64(pp_gpdata, 0); store64(pp_gperr, 0);
+        hr = callp(vmeth(pProps, 4), pProps, w_item, 4, gp_ids, pp_gpdata, pp_gperr);   # GetItemProperties
+        syscall 1, b_gip, hr, nl;
+        gpd = load64(pp_gpdata);
+        gpe = load64(pp_gperr);
+        if gpd != 0 {
+            empties = 0;
+            k = 0;
+            while k < 4 {
+                vk = gpd + k * 24;
+                vtk = load16(vk + 0);
+                syscall 1, b_gprow; syscall 1, load32(gp_ids + k * 4);
+                syscall 1, b_gpvt;  syscall 1, vtk;
+                syscall 1, b_gpdat; syscall 1, load64(vk + 8);
+                if gpe != 0 { syscall 1, b_gperr; syscall 1, load32(gpe + k * 4); }
+                syscall 1, nl;
+                if vtk == 0 { empties = empties + 1; }
+                k = k + 1;
+            }
+            if empties > 0 { syscall 1, b_gpbad, nl; } else { syscall 1, b_gpok, nl; }
+            CoTaskMemFree(gpd);
+        }
+        if gpe != 0 { CoTaskMemFree(gpe); }
+
+        com_release(pProps);
+    }
+
+    # [11c] monitoring-setup methods dOPC calls before it goes live (all were E_NOTIMPL stubs)
+    syscall 1, b_mon, nl;
+    monbad = 0;
+    store64(itemdef + 0, w_empty); store64(itemdef + 8, w_item);
+    store32(itemdef + 16, 1); store32(itemdef + 20, 1); store32(itemdef + 24, 0);
+    store64(itemdef + 32, 0); store16(itemdef + 40, 3); store16(itemdef + 42, 0);
+    store64(pp_valres, 0); store64(pp_valerr, 0);
+    hr = callp(vmeth(pItemMgt, 4), pItemMgt, 1, itemdef, 0, pp_valres, pp_valerr);   # ValidateItems
+    syscall 1, b_val2, hr, nl;
+    if hr != 0 { monbad = 1; }
+    if load64(pp_valres) != 0 { CoTaskMemFree(load64(pp_valres)); }
+    if load64(pp_valerr) != 0 { CoTaskMemFree(load64(pp_valerr)); }
+    store32(cli_handles, 4660); store64(pp_cherr, 0);
+    hr = callp(vmeth(pItemMgt, 7), pItemMgt, 1, srv_handles, cli_handles, pp_cherr);  # SetClientHandles
+    syscall 1, b_sch, hr, nl;
+    if hr != 0 { monbad = 1; }
+    if load64(pp_cherr) != 0 { CoTaskMemFree(load64(pp_cherr)); }
+    store64(pp_acterr, 0);
+    hr = callp(vmeth(pItemMgt, 6), pItemMgt, 1, srv_handles, 1, pp_acterr);           # SetActiveState(TRUE)
+    syscall 1, b_act, hr, nl;
+    if hr != 0 { monbad = 1; }
+    if load64(pp_acterr) != 0 { CoTaskMemFree(load64(pp_acterr)); }
+    store64(pp_groupst, 0);
+    com_qi(pItemMgt, iidGroupSt, pp_groupst);                                         # QI -> IOPCGroupStateMgt
+    pGroupSt = load64(pp_groupst);
+    if pGroupSt != 0 {
+        store32(gs_rate, 0); store32(gs_active, 0); store64(gs_name, 0); store32(gs_bias, 0);
+        store32(gs_dead, 0); store32(gs_lcid, 0); store32(gs_hcli, 0); store32(gs_hsrv2, 0);
+        hr = callp(vmeth(pGroupSt, 3), pGroupSt, gs_rate, gs_active, gs_name, gs_bias, gs_dead, gs_lcid, gs_hcli, gs_hsrv2);  # GetState
+        syscall 1, b_getst, hr, nl;
+        if hr != 0 { monbad = 1; }
+        syscall 1, b_getrate, load32(gs_rate), nl;
+        syscall 1, b_getact, load32(gs_active), nl;
+        if load64(gs_name) != 0 { CoTaskMemFree(load64(gs_name)); }
+        store32(req_rate, 500); store32(rev_rate2, 0); store32(set_active, 1);
+        hr = callp(vmeth(pGroupSt, 4), pGroupSt, req_rate, rev_rate2, set_active, 0, 0, 0, 0);  # SetState
+        syscall 1, b_setst, hr, nl;
+        if hr != 0 { monbad = 1; }
+        com_release(pGroupSt);
+    } else { monbad = 1; }
+    if monbad == 0 { syscall 1, b_monok, nl; } else { syscall 1, b_monbad, nl; }
+
+    # [12] async subscription: register IOPCDataCallback, enable, wait for pushes
+    store64(pp_cpc, 0);
+    hr = com_qi(pItemMgt, iidCPC, pp_cpc);                       # QI group -> IConnectionPointContainer
+    pCPC = load64(pp_cpc);
+    if pCPC != 0 {
+        store64(pp_cp, 0);
+        callp(vmeth(pCPC, 4), pCPC, iidDataCb, pp_cp);           # FindConnectionPoint(IID_IOPCDataCallback)
+        pCP = load64(pp_cp);
+        if pCP != 0 {
+            store64(pp_cookie, 0);
+            hr = callp(vmeth(pCP, 5), pCP, cb_obj, pp_cookie);   # Advise(my callback)
+            syscall 1, b_sub, hr, nl;
+            store64(pp_async, 0);
+            com_qi(pItemMgt, iidAsync, pp_async);                # QI group -> IOPCAsyncIO2
+            pAsync = load64(pp_async);
+            if pAsync != 0 { callp(vmeth(pAsync, 7), pAsync, 1); }   # SetEnable(TRUE)
+            syscall 1, b_wait, nl;
+            syscall 1, b_sta, nl;
+            # STA: OnDataChange arrives as a marshaled call dispatched through the message pump.
+            # Sleep() alone would block the pump and receive nothing -- so pump for ~3s.
+            SetTimer(0, 0, 250, 0);                               # thread WM_TIMER every 250ms
+            sta_ticks = 0;
+            while sta_ticks < 12 {                                # ~3 seconds
+                if GetMessageA(sta_msg, 0, 0, 0) == 0 { break; }
+                if load32(sta_msg + 8) == 275 { sta_ticks = sta_ticks + 1; }   # WM_TIMER
+                TranslateMessage(sta_msg);
+                DispatchMessageA(sta_msg);                        # dispatches the COM OnDataChange to cb_OnDataChange
+            }
+            syscall 1, b_fired; syscall 1, load64(g_fired); syscall 1, nl;
+            if load64(g_fired) > 0 {
+                syscall 1, b_rxval; syscall 1, load64(g_rxval); syscall 1, nl;
+                syscall 1, b_subok, nl;
+            } else { syscall 1, b_subno, nl; }
+            if pAsync != 0 { com_release(pAsync); }
+            callp(vmeth(pCP, 6), pCP, load32(pp_cookie));        # Unadvise
+            com_release(pCP);
+        }
+        com_release(pCPC);
+    }
+
+    com_release(pSyncIO);
+    com_release(pItemMgt);
+    com_release(pServer);
+    CoUninitialize();
+    return 0;
+}

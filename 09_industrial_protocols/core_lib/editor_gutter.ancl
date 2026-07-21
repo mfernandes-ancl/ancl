@@ -1,0 +1,87 @@
+# =====================================================================
+#  editor_gutter.ancl - RichEdit code-editor helper routines.
+# =====================================================================
+import "rich_edit.ancl";
+
+@CODE
+
+# WM_GETTEXT from RichEdit usually returns CRLF. RichEdit character indices
+# count the CR only, so syntax selection ranges need this CR-only view.
+func editor_strip_lf(dst: i64, src: i64) -> i64 {
+    i = 0;
+    j = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 {
+            store8(dst + j, 0);
+            return j;
+        }
+        if c != 10 {
+            store8(dst + j, c);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return j;
+}
+
+func editor_set_crange(range: ptr, first: i64, last: i64) -> ptr {
+    store32(range + 0, first);
+    store32(range + 4, last);
+    return range;
+}
+
+func editor_color_range(hwnd: i64, range: ptr, cf: ptr, first: i64, last: i64, color: i64) -> i64 {
+    if last <= first { return 0; }
+    editor_set_crange(range, first, last);
+    rich_exset_sel(hwnd, range);
+    rich_cf_color(cf, color);
+    rich_set_charformat(hwnd, SCF_SELECTION, cf);
+    return 1;
+}
+
+func editor_sign32(v: i64) -> i64 {
+    if v >= 0x80000000 { return v - 0x100000000; }
+    return v;
+}
+
+func editor_draw_line_numbers(hdc: i64, ed: i64, rect: ptr, pt: ptr, numbuf: ptr, font: i64, brush: i64, color: i64) -> i64 {
+    if ed == 0 { return 0; }
+    gx = load32(rect + 0);
+    gy = load32(rect + 4);
+    gh = load32(rect + 12) - gy;
+    if gh <= 0 { return 0; }
+
+    FillRect(hdc, rect, brush);
+    old_font = 0;
+    if font != 0 { old_font = SelectObject(hdc, font); }
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, color);
+
+    first = rich_get_first_visible_line(ed);
+    lc = rich_line_count(ed);
+    i = first;
+    going = 1;
+    while going == 1 {
+        if i >= lc { going = 0; }
+        if going == 1 {
+            ci = rich_line_index(ed, i);
+            if ci < 0 { going = 0; }
+            if going == 1 {
+                rich_pos_from_char(ed, pt, ci);
+                y = editor_sign32(load32(pt + 4));
+                if y > gh { going = 0; }
+                if going == 1 {
+                    if y >= 0 {
+                        int_to_str(numbuf, i + 1);
+                        TextOutA(hdc, gx + 8, gy + y, numbuf, strlen(numbuf));
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+
+    if old_font != 0 { SelectObject(hdc, old_font); }
+    return 0;
+}

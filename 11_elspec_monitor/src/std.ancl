@@ -1,0 +1,35 @@
+# --------------------------------------------------------------------
+#  std.ancl  -  a minimal ANCL standard-library module
+#  (imported via:  import "../lib/std.ancl";)
+# --------------------------------------------------------------------
+
+struct Pair { a: i64; b: i64; }
+
+func imax(x: i64, y: i64) -> i64 {
+    if x >= y { return x; }
+    return y;
+}
+
+func imin(x: i64, y: i64) -> i64 {
+    if x <= y { return x; }
+    return y;
+}
+
+func iabs(x: i64) -> i64 {
+    if x < 0 { return 0 - x; }
+    return x;
+}
+
+func clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    return imax(lo, imin(x, hi));     # calls other module functions
+}
+
+func ipow(base: i64, exp: i64) -> i64 {
+    r = 1;
+    i = 0;
+    while i < exp {
+        r = r * base;
+        i = i + 1;
+    }
+    return r;
+}

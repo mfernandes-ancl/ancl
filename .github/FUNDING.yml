@@ -1,0 +1,12 @@
+# This file adds a "❤ Sponsor" button to the top of the GitHub repo page.
+# GitHub docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+# Custom URLs (shown as buttons). PayPal.me link — no raw email exposed:
+custom: ["https://paypal.me/mmcfernandes"]
+
+# Optional — if you set up a free "Buy Me a Coffee" page at https://www.buymeacoffee.com
+# (it can pay out to your PayPal), uncomment and set your username:
+# buy_me_a_coffee: yourname
+
+# Optional — if you ever enable GitHub Sponsors for your account:
+# github: yourusername

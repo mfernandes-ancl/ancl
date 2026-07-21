@@ -1,0 +1,636 @@
+# =====================================================================
+#  interactive_engine_3d.ancl  -  Interactive 3D Solid Polygon Engine
+#
+#  Open-Source Showcase Engine (ANCL-3D)
+#  100% CRT-free, native 3D vector-projected solid graphics engine.
+#  Features: Multi-shape (Cube/Pyramid/Octahedron), Painter's sorting,
+#            Lambertian shading, child controls & keyboard steering.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" Polygon; # BOOL Polygon(hdc, lpPoints, count)
+extern "user32.dll" GetAsyncKeyState; # SHORT GetAsyncKeyState(vKey)
+
+@DATA
+clsname:     str = "ANCL3DINTERACTIVEWND";
+title:       str = "ANCL-3D Interactive 3D Polygon Engine Showcase";
+btn_class:   str = "BUTTON";
+btn_cube:    str = "Cube";
+btn_pyramid: str = "Pyramid";
+btn_octa:    str = "Octahedron";
+btn_shade:   str = "Toggle Shading";
+
+# Trigonometry LUT Buffers (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# Shape Selection: 0 = Cube, 1 = Pyramid, 2 = Octahedron
+g_shape_idx: buf = 8;
+
+# Shading Mode: 0 = Wireframe, 1 = Solid Shaded
+g_shading_mode: buf = 8;
+
+# Active Shape Buffer addresses & counts
+g_active_vertices_addr: buf = 8;
+g_active_num_vertices:  buf = 8;
+g_active_faces_addr:    buf = 8;
+g_active_num_faces:     buf = 8;
+g_active_colors_addr:   buf = 8;
+
+# Geometry Buffers - Shape 1: Cube (8 vertices, 6 faces)
+g_cube_vertices: buf = 192; # 8 vertices * 3 coords * 8 bytes
+g_cube_faces:    buf = 240; # 6 faces * 5 words (count + 4 v_idx) * 8 bytes
+g_cube_colors:   buf = 48;  # 6 faces * 8 bytes
+
+# Geometry Buffers - Shape 2: Pyramid (5 vertices, 5 faces)
+g_pyr_vertices:  buf = 120; # 5 vertices * 3 coords * 8 bytes
+g_pyr_faces:     buf = 200; # 5 faces * 5 words * 8 bytes
+g_pyr_colors:    buf = 40;  # 5 faces * 8 bytes
+
+# Geometry Buffers - Shape 3: Octahedron (6 vertices, 8 faces)
+g_oct_vertices:  buf = 144; # 6 vertices * 3 coords * 8 bytes
+g_oct_faces:     buf = 320; # 8 faces * 5 words * 8 bytes
+g_oct_colors:    buf = 64;  # 8 faces * 8 bytes
+
+# Viewport Buffers (maximum 8 vertices)
+g_rot_vertices:  buf = 192; # 8 vertices * 3 coordinates * 8 bytes
+g_projected:     buf = 128; # 8 vertices * 2 coordinates * 8 bytes
+
+# Painter's Algorithm sorting buffer (maximum 8 faces)
+# Stores face_idx (8 bytes) + average_rotated_Z (8 bytes) for each entry
+g_sort_faces:    buf = 128; # 8 faces * 16 bytes
+
+# Polygon drawing points buffer (maximum 4 points for quad face)
+g_poly_pts:      buf = 32;  # 4 points * 8 bytes (2 x i32 each)
+
+# Angles for rotation
+g_angleX: buf = 8;
+g_angleY: buf = 8;
+g_angleZ: buf = 8;
+
+# Rotation velocities (steerable via Keyboard)
+g_speedX: buf = 8;
+g_speedY: buf = 8;
+g_speedZ: buf = 8;
+
+# Win32 structures & brushes
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Babylonian Integer Square Root (isqrt)
+# Calculates integer square root of a 64-bit signed integer.
+# ---------------------------------------------------------------------
+func isqrt(val: i64) -> i64 {
+    if val <= 0 { return 0; }
+    x = val;
+    y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + val / x) / 2;
+    }
+    return x;
+}
+
+# ---------------------------------------------------------------------
+# Bhaskara I's Sine Approximation
+# Approximates sin(theta) for theta in [0, 1024) using integer math.
+# Scaled to 65536 amplitude (1.0 = 65536).
+# ---------------------------------------------------------------------
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        # bhaskara formula for sin(x) where x is in [0, pi] mapped to [0, 512]
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    
+    # Cosine is Sine shifted by 90 degrees (256 units)
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Initializes Vertices, Connecting Faces, and Base Colors for 3 Shapes
+# ---------------------------------------------------------------------
+func init_geometry() -> i64 {
+    # -------------------- Shape 1: Cube --------------------
+    # Vertices: 8 vertices * 3 coordinates (X, Y, Z)
+    store64(g_cube_vertices + 0, 0 - 50); store64(g_cube_vertices + 8, 0 - 50); store64(g_cube_vertices + 16, 0 - 50); # V0
+    store64(g_cube_vertices + 24, 50);    store64(g_cube_vertices + 32, 0 - 50); store64(g_cube_vertices + 40, 0 - 50); # V1
+    store64(g_cube_vertices + 48, 50);    store64(g_cube_vertices + 56, 50);    store64(g_cube_vertices + 64, 0 - 50); # V2
+    store64(g_cube_vertices + 72, 0 - 50); store64(g_cube_vertices + 80, 50);    store64(g_cube_vertices + 88, 0 - 50); # V3
+    store64(g_cube_vertices + 96, 0 - 50); store64(g_cube_vertices + 104, 0 - 50); store64(g_cube_vertices + 112, 50);  # V4
+    store64(g_cube_vertices + 120, 50);   store64(g_cube_vertices + 128, 0 - 50); store64(g_cube_vertices + 136, 50);  # V5
+    store64(g_cube_vertices + 144, 50);   store64(g_cube_vertices + 152, 50);    store64(g_cube_vertices + 160, 50);  # V6
+    store64(g_cube_vertices + 168, 0 - 50); store64(g_cube_vertices + 176, 50);    store64(g_cube_vertices + 184, 50);  # V7
+    
+    # Faces: count, v0, v1, v2, v3 (winding order oriented outwards)
+    store64(g_cube_faces + 0, 4); store64(g_cube_faces + 8, 0); store64(g_cube_faces + 16, 3); store64(g_cube_faces + 24, 2); store64(g_cube_faces + 32, 1); # Front
+    store64(g_cube_faces + 40, 4); store64(g_cube_faces + 48, 5); store64(g_cube_faces + 56, 6); store64(g_cube_faces + 64, 7); store64(g_cube_faces + 72, 4); # Back
+    store64(g_cube_faces + 80, 4); store64(g_cube_faces + 88, 0); store64(g_cube_faces + 96, 1); store64(g_cube_faces + 104, 5); store64(g_cube_faces + 112, 4); # Top
+    store64(g_cube_faces + 120, 4); store64(g_cube_faces + 128, 7); store64(g_cube_faces + 136, 6); store64(g_cube_faces + 144, 2); store64(g_cube_faces + 152, 3); # Bottom
+    store64(g_cube_faces + 160, 4); store64(g_cube_faces + 168, 1); store64(g_cube_faces + 176, 2); store64(g_cube_faces + 184, 6); store64(g_cube_faces + 192, 5); # Right
+    store64(g_cube_faces + 200, 4); store64(g_cube_faces + 208, 4); store64(g_cube_faces + 216, 7); store64(g_cube_faces + 224, 3); store64(g_cube_faces + 232, 0); # Left
+    
+    # Colors (Base RGB values)
+    store64(g_cube_colors + 0, 0x00FF3B30);  # Vibrant Red
+    store64(g_cube_colors + 8, 0x0034C759);  # Vibrant Green
+    store64(g_cube_colors + 16, 0x00007AFF); # Vibrant Blue
+    store64(g_cube_colors + 24, 0x00FFCC00); # Vibrant Yellow
+    store64(g_cube_colors + 32, 0x00AF52DE); # Vibrant Purple
+    store64(g_cube_colors + 40, 0x005AC8FA); # Vibrant Cyan
+
+    # -------------------- Shape 2: Pyramid --------------------
+    # Vertices: 5 vertices * 3 coordinates
+    store64(g_pyr_vertices + 0, 0);       store64(g_pyr_vertices + 8, 0 - 60);  store64(g_pyr_vertices + 16, 0);       # V0 (Apex)
+    store64(g_pyr_vertices + 24, 0 - 50); store64(g_pyr_vertices + 32, 40);     store64(g_pyr_vertices + 40, 0 - 50); # V1
+    store64(g_pyr_vertices + 48, 50);     store64(g_pyr_vertices + 56, 40);     store64(g_pyr_vertices + 64, 0 - 50); # V2
+    store64(g_pyr_vertices + 72, 50);     store64(g_pyr_vertices + 80, 40);     store64(g_pyr_vertices + 88, 50);     # V3
+    store64(g_pyr_vertices + 96, 0 - 50); store64(g_pyr_vertices + 104, 40);    store64(g_pyr_vertices + 112, 50);    # V4
+    
+    # Faces: count, v0, v1, v2, v3
+    store64(g_pyr_faces + 0, 4); store64(g_pyr_faces + 8, 1); store64(g_pyr_faces + 16, 4); store64(g_pyr_faces + 24, 3); store64(g_pyr_faces + 32, 2); # Base
+    store64(g_pyr_faces + 40, 3); store64(g_pyr_faces + 48, 0); store64(g_pyr_faces + 56, 2); store64(g_pyr_faces + 64, 1); store64(g_pyr_faces + 72, 0); # Front
+    store64(g_pyr_faces + 80, 3); store64(g_pyr_faces + 88, 0); store64(g_pyr_faces + 96, 3); store64(g_pyr_faces + 104, 2); store64(g_pyr_faces + 112, 0); # Right
+    store64(g_pyr_faces + 120, 3); store64(g_pyr_faces + 128, 0); store64(g_pyr_faces + 136, 4); store64(g_pyr_faces + 144, 3); store64(g_pyr_faces + 152, 0); # Back
+    store64(g_pyr_faces + 160, 3); store64(g_pyr_faces + 168, 0); store64(g_pyr_faces + 176, 1); store64(g_pyr_faces + 184, 4); store64(g_pyr_faces + 192, 0); # Left
+    
+    # Colors
+    store64(g_pyr_colors + 0, 0x008E8E93);  # Cool Gray
+    store64(g_pyr_colors + 8, 0x00FF3B30);  # Red
+    store64(g_pyr_colors + 16, 0x0034C759); # Green
+    store64(g_pyr_colors + 24, 0x00007AFF); # Blue
+    store64(g_pyr_colors + 32, 0x00FFCC00); # Yellow
+
+    # -------------------- Shape 3: Octahedron --------------------
+    # Vertices: 6 vertices * 3 coordinates
+    store64(g_oct_vertices + 0, 0);       store64(g_oct_vertices + 8, 0 - 60);  store64(g_oct_vertices + 16, 0);       # V0 (Top Apex)
+    store64(g_oct_vertices + 24, 0);      store64(g_oct_vertices + 32, 60);     store64(g_oct_vertices + 40, 0);       # V1 (Bottom Apex)
+    store64(g_oct_vertices + 48, 0 - 50); store64(g_oct_vertices + 56, 0);      store64(g_oct_vertices + 64, 0 - 50); # V2
+    store64(g_oct_vertices + 72, 50);     store64(g_oct_vertices + 80, 0);      store64(g_oct_vertices + 88, 0 - 50); # V3
+    store64(g_oct_vertices + 96, 50);     store64(g_oct_vertices + 104, 0);     store64(g_oct_vertices + 112, 50);     # V4
+    store64(g_oct_vertices + 120, 0 - 50); store64(g_oct_vertices + 128, 0);     store64(g_oct_vertices + 136, 50);    # V5
+    
+    # Faces: count, v0, v1, v2, v3
+    store64(g_oct_faces + 0, 3); store64(g_oct_faces + 8, 0); store64(g_oct_faces + 16, 3); store64(g_oct_faces + 24, 2); store64(g_oct_faces + 32, 0); # F0
+    store64(g_oct_faces + 40, 3); store64(g_oct_faces + 48, 0); store64(g_oct_faces + 56, 4); store64(g_oct_faces + 64, 3); store64(g_oct_faces + 72, 0); # F1
+    store64(g_oct_faces + 80, 3); store64(g_oct_faces + 88, 0); store64(g_oct_faces + 96, 5); store64(g_oct_faces + 104, 4); store64(g_oct_faces + 112, 0); # F2
+    store64(g_oct_faces + 120, 3); store64(g_oct_faces + 128, 0); store64(g_oct_faces + 136, 2); store64(g_oct_faces + 144, 5); store64(g_oct_faces + 152, 0); # F3
+    store64(g_oct_faces + 160, 3); store64(g_oct_faces + 168, 1); store64(g_oct_faces + 176, 2); store64(g_oct_faces + 184, 3); store64(g_oct_faces + 192, 0); # F4
+    store64(g_oct_faces + 200, 3); store64(g_oct_faces + 208, 1); store64(g_oct_faces + 216, 3); store64(g_oct_faces + 224, 4); store64(g_oct_faces + 232, 0); # F5
+    store64(g_oct_faces + 240, 3); store64(g_oct_faces + 248, 1); store64(g_oct_faces + 256, 4); store64(g_oct_faces + 264, 5); store64(g_oct_faces + 272, 0); # F6
+    store64(g_oct_faces + 280, 3); store64(g_oct_faces + 288, 1); store64(g_oct_faces + 296, 5); store64(g_oct_faces + 304, 2); store64(g_oct_faces + 312, 0); # F7
+    
+    # Colors
+    store64(g_oct_colors + 0, 0x00FF3B30);  # Red
+    store64(g_oct_colors + 8, 0x0034C759);  # Green
+    store64(g_oct_colors + 16, 0x00007AFF); # Blue
+    store64(g_oct_colors + 24, 0x00FFCC00); # Yellow
+    store64(g_oct_colors + 32, 0x00AF52DE); # Purple
+    store64(g_oct_colors + 40, 0x005AC8FA); # Cyan
+    store64(g_oct_colors + 48, 0x00FF9500); # Orange
+    store64(g_oct_colors + 56, 0x00FF2D55); # Pink
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Redirect active shape pointers based on Selected Shape Index
+# ---------------------------------------------------------------------
+func update_active_shape() -> i64 {
+    idx = load64(g_shape_idx);
+    if idx == 0 {
+        store64(g_active_vertices_addr, g_cube_vertices);
+        store64(g_active_num_vertices, 8);
+        store64(g_active_faces_addr, g_cube_faces);
+        store64(g_active_num_faces, 6);
+        store64(g_active_colors_addr, g_cube_colors);
+    } else if idx == 1 {
+        store64(g_active_vertices_addr, g_pyr_vertices);
+        store64(g_active_num_vertices, 5);
+        store64(g_active_faces_addr, g_pyr_faces);
+        store64(g_active_num_faces, 5);
+        store64(g_active_colors_addr, g_pyr_colors);
+    } else {
+        store64(g_active_vertices_addr, g_oct_vertices);
+        store64(g_active_num_vertices, 6);
+        store64(g_active_faces_addr, g_oct_faces);
+        store64(g_active_num_faces, 8);
+        store64(g_active_colors_addr, g_oct_colors);
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Rotates 3D coordinates based on active rotation matrices & projects to 2D
+# ---------------------------------------------------------------------
+func rotate_and_project(centerX: i64, centerY: i64) -> i64 {
+    update_active_shape();
+    
+    vertices_addr = load64(g_active_vertices_addr);
+    num_vertices = load64(g_active_num_vertices);
+    
+    ax = load64(g_angleX);
+    ay = load64(g_angleY);
+    az = load64(g_angleZ);
+    
+    cosX = load64(g_cos + ax * 8);
+    sinX = load64(g_sin + ax * 8);
+    
+    cosY = load64(g_cos + ay * 8);
+    sinY = load64(g_sin + ay * 8);
+    
+    cosZ = load64(g_cos + az * 8);
+    sinZ = load64(g_sin + az * 8);
+    
+    i = 0;
+    while i < num_vertices {
+        x = load64(vertices_addr + i * 24);
+        y = load64(vertices_addr + i * 24 + 8);
+        z = load64(vertices_addr + i * 24 + 16);
+        
+        # 1. Rotate around X axis
+        y1 = (y * cosX - z * sinX) / 65536;
+        z1 = (y * sinX + z * cosX) / 65536;
+        x1 = x;
+        
+        # 2. Rotate around Y axis
+        x2 = (x1 * cosY + z1 * sinY) / 65536;
+        z2 = (0 - x1 * sinY + z1 * cosY) / 65536;
+        y2 = y1;
+        
+        # 3. Rotate around Z axis
+        x3 = (x2 * cosZ - y2 * sinZ) / 65536;
+        y3 = (x2 * sinZ + y2 * cosZ) / 65536;
+        z3 = z2;
+        
+        # Store rotated coordinates for lighting & Painter's depth sorting
+        store64(g_rot_vertices + i * 24, x3);
+        store64(g_rot_vertices + i * 24 + 8, y3);
+        store64(g_rot_vertices + i * 24 + 16, z3);
+        
+        # 4. Perspective Projection (Focal focal length = 256, depth offset = 150)
+        denom = z3 + 150;
+        if denom < 1 { denom = 1; }
+        
+        projX = centerX + (x3 * 256) / denom;
+        projY = centerY + (y3 * 256) / denom;
+        
+        store64(g_projected + i * 16, projX);
+        store64(g_projected + i * 16 + 8, projY);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Painter's Algorithm - Sort face indices by average rotated Z depth
+# ---------------------------------------------------------------------
+func prepare_and_sort_faces() -> i64 {
+    faces_addr = load64(g_active_faces_addr);
+    num_faces = load64(g_active_num_faces);
+    
+    i = 0;
+    while i < num_faces {
+        count = load64(faces_addr + i * 40);
+        
+        sumZ = 0;
+        k = 0;
+        while k < count {
+            v_idx = load64(faces_addr + i * 40 + 8 + k * 8);
+            z_val = load64(g_rot_vertices + v_idx * 24 + 16);
+            sumZ = sumZ + z_val;
+            k = k + 1;
+        }
+        avgZ = sumZ / count;
+        
+        # Populate sorting buffer
+        store64(g_sort_faces + i * 16, i);
+        store64(g_sort_faces + i * 16 + 8, avgZ);
+        
+        i = i + 1;
+    }
+    
+    # Sort g_sort_faces descending (furthest faces first) using bubble sort
+    i = 0;
+    while i < num_faces - 1 {
+        j = 0;
+        while j < num_faces - i - 1 {
+            z1 = load64(g_sort_faces + j * 16 + 8);
+            z2 = load64(g_sort_faces + (j + 1) * 16 + 8);
+            if z1 < z2 {
+                idx1 = load64(g_sort_faces + j * 16);
+                idx2 = load64(g_sort_faces + (j + 1) * 16);
+                
+                store64(g_sort_faces + j * 16, idx2);
+                store64(g_sort_faces + j * 16 + 8, z2);
+                
+                store64(g_sort_faces + (j + 1) * 16, idx1);
+                store64(g_sort_faces + (j + 1) * 16 + 8, z1);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 Window Procedure
+# ---------------------------------------------------------------------
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetTimer(hwnd, 1, 16, 0); # ~60 FPS update
+        
+        # Spawn child buttons
+        # WS_TABSTOP | WS_VISIBLE | WS_CHILD = 0x50010000 = 1342242816
+        CreateWindowExA(0, btn_class, btn_cube, 1342242816, 10, 10, 80, 25, hwnd, 101, load64(g_hinst), 0);
+        CreateWindowExA(0, btn_class, btn_pyramid, 1342242816, 100, 10, 80, 25, hwnd, 102, load64(g_hinst), 0);
+        CreateWindowExA(0, btn_class, btn_octa, 1342242816, 190, 10, 100, 25, hwnd, 103, load64(g_hinst), 0);
+        CreateWindowExA(0, btn_class, btn_shade, 1342242816, 300, 10, 120, 25, hwnd, 104, load64(g_hinst), 0);
+        return 0;
+    }
+    
+    if msg == 273 { # WM_COMMAND
+        cmdId = band(wParam, 65535);
+        if cmdId == 101 {
+            store64(g_shape_idx, 0); # Render Cube
+        }
+        if cmdId == 102 {
+            store64(g_shape_idx, 1); # Render Pyramid
+        }
+        if cmdId == 103 {
+            store64(g_shape_idx, 2); # Render Octahedron
+        }
+        if cmdId == 104 {
+            # Toggle shading mode: 0 = Wireframe, 1 = Solid Shaded
+            store64(g_shading_mode, 1 - load64(g_shading_mode));
+        }
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Steering rotation vectors: VK_LEFT=37, VK_UP=38, VK_RIGHT=39, VK_DOWN=40
+        if GetAsyncKeyState(37) != 0 {
+            store64(g_speedY, load64(g_speedY) - 1);
+        }
+        if GetAsyncKeyState(39) != 0 {
+            store64(g_speedY, load64(g_speedY) + 1);
+        }
+        if GetAsyncKeyState(38) != 0 {
+            store64(g_speedX, load64(g_speedX) - 1);
+        }
+        if GetAsyncKeyState(40) != 0 {
+            store64(g_speedX, load64(g_speedX) + 1);
+        }
+        
+        # Clamp rotation speeds within range [-20, 20] to ensure smooth controls
+        sx = load64(g_speedX);
+        if sx < 0 - 20 { store64(g_speedX, 0 - 20); }
+        if sx > 20 { store64(g_speedX, 20); }
+        
+        sy = load64(g_speedY);
+        if sy < 0 - 20 { store64(g_speedY, 0 - 20); }
+        if sy > 20 { store64(g_speedY, 20); }
+        
+        # Progress rotation angles
+        store64(g_angleX, band(load64(g_angleX) + load64(g_speedX) + 1024, 1023));
+        store64(g_angleY, band(load64(g_angleY) + load64(g_speedY) + 1024, 1023));
+        store64(g_angleZ, band(load64(g_angleZ) + load64(g_speedZ) + 1024, 1023));
+        
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Centering offset shifted down by 20 pixels to avoid overlapping button UI
+        centerX = w / 2;
+        centerY = h / 2 + 20;
+        
+        # Compute rotated projections & execute Painter's sorting algorithm
+        rotate_and_project(centerX, centerY);
+        prepare_and_sort_faces();
+        
+        faces_addr = load64(g_active_faces_addr);
+        num_faces = load64(g_active_num_faces);
+        
+        # Render polygons back-to-front
+        h_idx = 0;
+        while h_idx < num_faces {
+            face_idx = load64(g_sort_faces + h_idx * 16);
+            count = load64(faces_addr + face_idx * 40);
+            
+            # Fetch base color
+            base_col = load64(load64(g_active_colors_addr) + face_idx * 8);
+            color = base_col;
+            
+            # Calculate Lambertian flat shading intensity (if solid shaded)
+            if load64(g_shading_mode) == 1 {
+                v0 = load64(faces_addr + face_idx * 40 + 8);
+                v1 = load64(faces_addr + face_idx * 40 + 16);
+                v2 = load64(faces_addr + face_idx * 40 + 24);
+                
+                x0 = load64(g_rot_vertices + v0 * 24);
+                y0 = load64(g_rot_vertices + v0 * 24 + 8);
+                z0 = load64(g_rot_vertices + v0 * 24 + 16);
+                
+                x1 = load64(g_rot_vertices + v1 * 24);
+                y1 = load64(g_rot_vertices + v1 * 24 + 8);
+                z1 = load64(g_rot_vertices + v1 * 24 + 16);
+                
+                x2 = load64(g_rot_vertices + v2 * 24);
+                y2 = load64(g_rot_vertices + v2 * 24 + 8);
+                z2 = load64(g_rot_vertices + v2 * 24 + 16);
+                
+                e1x = x1 - x0;
+                e1y = y1 - y0;
+                e1z = z1 - z0;
+                
+                e2x = x2 - x0;
+                e2y = y2 - y0;
+                e2z = z2 - z0;
+                
+                # Cross product normal
+                nx = e1y * e2z - e1z * e2y;
+                ny = e1z * e2x - e1x * e2z;
+                nz = e1x * e2y - e1y * e2x;
+                
+                len_sq = nx * nx + ny * ny + nz * nz;
+                len_N = isqrt(len_sq);
+                if len_N < 1 { len_N = 1; }
+                
+                # LightVector = (0, 70, -70), length approx 99
+                dot = ny * 70 - nz * 70;
+                
+                intensity = 0;
+                if dot > 0 {
+                    intensity = (dot * 255) / (len_N * 99);
+                }
+                if intensity > 255 { intensity = 255; }
+                
+                # Shade scale: 60 (ambient) to 255 (full specular highlight)
+                shade = 60 + (intensity * 195) / 255;
+                
+                # Apply shading multiplier to color channels
+                R = band(shr(base_col, 16), 255);
+                G = band(shr(base_col, 8), 255);
+                B = band(base_col, 255);
+                
+                shadedR = (R * shade) / 255;
+                shadedG = (G * shade) / 255;
+                shadedB = (B * shade) / 255;
+                
+                color = shl(shadedR, 16) + shl(shadedG, 8) + shadedB;
+            }
+            
+            # Setup Polygon POINT structures in the temporary array buffer
+            k = 0;
+            while k < count {
+                v_idx = load64(faces_addr + face_idx * 40 + 8 + k * 8);
+                px = load64(g_projected + v_idx * 16);
+                py = load64(g_projected + v_idx * 16 + 8);
+                
+                store32(g_poly_pts + k * 8, px);
+                store32(g_poly_pts + k * 8 + 4, py);
+                k = k + 1;
+            }
+            
+            # Solid Flat Shaded drawing via Win32 Polygon
+            if load64(g_shading_mode) == 1 {
+                hBrush = CreateSolidBrush(color);
+                oldBrush = SelectObject(hdc, hBrush);
+                hPen = CreatePen(0, 1, color);
+                oldPen = SelectObject(hdc, hPen);
+                
+                Polygon(hdc, g_poly_pts, count);
+                
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBrush);
+                DeleteObject(hPen);
+                DeleteObject(hBrush);
+            } else {
+                # Wireframe drawing: draw outline borders manually via lines to prevent shape fill
+                hPen = CreatePen(0, 1, color);
+                oldPen = SelectObject(hdc, hPen);
+                
+                k = 0;
+                while k < count {
+                    v_start = load64(faces_addr + face_idx * 40 + 8 + k * 8);
+                    
+                    next_k = k + 1;
+                    if next_k == count { next_k = 0; }
+                    v_end = load64(faces_addr + face_idx * 40 + 8 + next_k * 8);
+                    
+                    startX = load64(g_projected + v_start * 16);
+                    startY = load64(g_projected + v_start * 16 + 8);
+                    endX = load64(g_projected + v_end * 16);
+                    endY = load64(g_projected + v_end * 16 + 8);
+                    
+                    MoveToEx(hdc, startX, startY, 0);
+                    LineTo(hdc, endX, endY);
+                    k = k + 1;
+                }
+                
+                SelectObject(hdc, oldPen);
+                DeleteObject(hPen);
+            }
+            
+            h_idx = h_idx + 1;
+        }
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Initialization and Windows Loop
+# ---------------------------------------------------------------------
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize lookup tables and geometric vectors
+    init_lut();
+    init_geometry();
+    
+    # Defaults: Render Cube (0), start in Shaded mode (1)
+    store64(g_shape_idx, 0);
+    store64(g_shading_mode, 1);
+    
+    # Default velocities: steady spinning state
+    store64(g_speedX, 4);
+    store64(g_speedY, 6);
+    store64(g_speedZ, 2);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F)); # Solid dark background
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA
+    # WS_OVERLAPPEDWINDOW | WS_VISIBLE = 0x10CF0000 = 282001408
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 150, 150, 640, 480, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

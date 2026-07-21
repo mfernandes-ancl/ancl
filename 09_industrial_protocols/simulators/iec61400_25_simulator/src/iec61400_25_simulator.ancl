@@ -1,0 +1,1579 @@
+# ============================================================================
+#  iec61400_25_simulator.ancl  -  ANCL Native IEC 61400-25 Wind Simulator
+#
+#  Exposes a dynamic MMS server mimicking an IEC 61400-25 Wind Turbine Node.
+#  Natively binds to iec61850.dll to run a robust MMS/TCP server.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+import "../../../core_lib/win32_api.ancl";
+import "../../../core_lib/numfmt.ancl";
+import "../../../core_lib/iec61850_server.ancl";   # pure-ANCL MMS server + IedServer_* shim (replaces iec61850.dll)
+
+# ---- Additional Win32 FFI ----
+extern "user32.dll" PostMessageA;
+extern "user32.dll" PeekMessageA -> i32;
+extern "comctl32.dll" InitCommonControlsEx;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll" RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> ptr;
+extern "user32.dll" CallWindowProcA -> i64;
+extern "gdi32.dll" GetStockObject -> ptr;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+extern "user32.dll" GetWindow -> ptr;
+
+# ---- IedServer_*/IedModel_*/MmsValue_* now from core_lib/iec61850_server.ancl (pure-ANCL) ----
+
+@DATA
+
+# ---- Window Setup ----
+clsname:    str = "ANCL_WIND_SIMULATOR";
+title:      str = "ANCL IEC 61400-25 Wind Turbine Simulator";
+title_draw: str = "ANCL IEC 61400-25 WIND TURBINE SIMULATOR";
+st_run_ind: str = "* RUNNING";
+st_stop_ind:str = "* STOPPED";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge Custom Button Class ----
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+
+# ---- UI Labels ----
+lbl_port:   str = "Port:";
+lbl_log:    str = "Traffic Log:";
+lbl_status: str = "Status: Stopped";
+lbl_reg:    str = "Tag:";
+lbl_val:    str = "Value:";
+lbl_client: str = "Clients: 0";
+lbl_rate:   str = "Rate:";
+
+# ---- ListView Columns ----
+cls_lv:     str = "SysListView32";
+col_ref:    str = "Tag Reference";
+col_type:   str = "Type";
+col_val:    str = "Value";
+col_status: str = "Status";
+
+# ---- Buttons ----
+btn_start:  str = "Start";
+btn_stop:   str = "Stop";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_update: str = "Update";
+btn_auto_rand: str = "Auto Rand";
+btn_stop_rand: str = "Stop Rand";
+btn_min:    str = "-";
+btn_close:  str = "X";
+ID_BTN_MIN:   i64 = 301;
+ID_BTN_CLOSE: i64 = 302;
+
+# ---- Defaults ----
+def_port:   str = "10104";
+WIN_W:      i64 = 1100;
+WIN_H:      i64 = 640;
+
+# ---- Logs ----
+crlf:       str = "\r\n";
+m_start_try:str = "[Server] Starting MMS server on port ";
+m_dots:     str = "...\r\n";
+m_start_ok: str = "[Server] Server started successfully. Listening for client connections.\r\n";
+m_start_err:str = "[Server] Failed to start server. Verify port is not in use.\r\n";
+m_stop_msg: str = "[Server] Server stopped.\r\n";
+g_logpath:  str = "wind_sim_log.txt";
+m_save_ok:  str = "[Server] Traffic log saved to wind_sim_log.txt\r\n";
+m_save_err: str = "[Server] Traffic log save failed.\r\n";
+
+# ---- Tag Configuration ----
+tag_ref_0: str = "WTG1Sim/Wmet1.HorWdSpd.mag.f";
+tag_ref_1: str = "WTG1Sim/WROT1.RotSpd.mag.f";
+tag_ref_2: str = "WTG1Sim/WGEN1.Tmp.mag.f";
+tag_ref_3: str = "WTG1Sim/WAPC1.W.mag.f";
+tag_ref_4: str = "WTG1Sim/Wnac1.TurSt.stVal";
+tag_ref_5: str = "WTG1Sim/Wnac1.Start.stVal";
+tag_ref_6: str = "WTG1Sim/Wnac1.Start.Oper.ctlVal";
+tag_ref_7: str = "WTG1Sim/Wnac1.Stop.stVal";
+tag_ref_8: str = "WTG1Sim/Wnac1.Stop.Oper.ctlVal";
+
+# ---- UI Handles ----
+g_hwnd:     buf = 8;
+g_hinst:    buf = 8;
+g_port_ed:  buf = 8;
+g_log:      buf = 8;
+g_status:   buf = 8;
+g_clients:  buf = 8;
+g_font:     buf = 8;
+g_listview: buf = 8;
+g_reg_ed:   buf = 8;
+g_val_ed:   buf = 8;
+g_btn_autorand: buf = 8;
+g_rate_ed:      buf = 8;
+
+# ---- Win32 Structs ----
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+g_track_mouse: buf = 24;
+g_lvcol:    buf = 64;
+g_lvitem:   buf = 96;
+g_hditem:   buf = 80;
+
+# ---- Dark Mode Settings ----
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40;
+thm_dm_exp_a:   str = "DarkMode_Explorer";
+thm_dm_cfd_w:   buf = 40;
+thm_dm_cfd_a:   str = "DarkMode_CFD";
+thm_items_w:    buf = 40;
+thm_items_a:    str = "ItemsView";
+g_allowdark:    buf = 8;
+
+# ---- Aesthetic Brushes & Pens (Teal/Mint Theme) ----
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+
+COL_BG:      i64 = 0x1A1C16; # Deep dark slate-teal
+COL_PANEL:   i64 = 0x0A0B09; # Near black
+COL_TEXT:    i64 = 0xD4DDD4; # Minty grey
+COL_ACCENT:  i64 = 0xFFE500; # Neon Cyan (BGR)
+COL_DIM:     i64 = 0x808080;
+COL_GREEN:   i64 = 0x40F080;
+COL_RED:     i64 = 0x4040FF;
+
+# ---- MMS Server State ----
+g_mms_model:      buf = 8;
+g_mms_server:     buf = 8;
+g_mms_val_offset: buf = 8;
+g_client_count:   buf = 8;
+
+# Tag database buffers (9 tags)
+g_tag_refs:   buf = 72;  # 9 pointers * 8 bytes
+g_tag_attrs:  buf = 72;  # 9 pointers * 8 bytes
+g_tag_types:  buf = 72;  # 9 integers * 8 bytes (0=Float32, 2=Boolean)
+g_prev_vals:  buf = 2304; # 9 strings * 256 bytes
+
+# Caching/Format Buffers
+g_temp_text:  buf = 256;
+g_port_str:   buf = 32;
+g_temp_val:   buf = 256;
+g_logbuf:     buf = 1024;
+g_savebuf:    buf = 4096;
+g_numbuf:     buf = 32;
+
+# ---- Simulation variables (Scaled by 10) ----
+g_auto_rand:  buf = 8;
+g_sim_wind:   buf = 8;  # 12.5 m/s = 125
+g_sim_rotor:  buf = 8;  # 14.8 rpm = 148
+g_sim_temp:   buf = 8;  # 65.0 C   = 650
+g_sim_power:  buf = 8;  # 1250 kW  = 12500
+
+ID_TIMER_POLL: i64 = 1;
+ID_TIMER_RAND: i64 = 2;
+ID_BTN_AUTORAND: i64 = 109;
+
+@CODE
+
+# ============================================================================
+# PROTOCOL METADATA & DATA MODEL SETUP
+# ============================================================================
+
+func init_tag_metadata() -> i64 {
+    # Types: 0 = Float32, 2 = Boolean
+    store64(g_tag_types + 0 * 8, 0); # HorWdSpd.mag.f
+    store64(g_tag_types + 1 * 8, 0); # RotSpd.mag.f
+    store64(g_tag_types + 2 * 8, 0); # Tmp.mag.f
+    store64(g_tag_types + 3 * 8, 0); # W.mag.f
+    store64(g_tag_types + 4 * 8, 2); # TurSt.stVal
+    store64(g_tag_types + 5 * 8, 2); # Start.stVal
+    store64(g_tag_types + 6 * 8, 2); # Start.Oper.ctlVal
+    store64(g_tag_types + 7 * 8, 2); # Stop.stVal
+    store64(g_tag_types + 8 * 8, 2); # Stop.Oper.ctlVal
+    
+    # Store references
+    store64(g_tag_refs + 0 * 8, tag_ref_0);
+    store64(g_tag_refs + 1 * 8, tag_ref_1);
+    store64(g_tag_refs + 2 * 8, tag_ref_2);
+    store64(g_tag_refs + 3 * 8, tag_ref_3);
+    store64(g_tag_refs + 4 * 8, tag_ref_4);
+    store64(g_tag_refs + 5 * 8, tag_ref_5);
+    store64(g_tag_refs + 6 * 8, tag_ref_6);
+    store64(g_tag_refs + 7 * 8, tag_ref_7);
+    store64(g_tag_refs + 8 * 8, tag_ref_8);
+    
+    # Zero out the previous values cache
+    memset(g_prev_vals, 0, 2304);
+    return 0;
+}
+
+func cache_tag_pointers() -> i64 {
+    model = load64(g_mms_model);
+    if model == 0 { return 0; }
+    
+    i = 0;
+    while i < 9 {
+        ref = load64(g_tag_refs + i * 8);
+        attr = IedModel_getModelNodeByObjectReference(model, ref);
+        store64(g_tag_attrs + i * 8, attr);
+        
+        # Log resolution
+        p = g_logbuf;
+        p = str_copy(p, "[Server] Cache: ");
+        p = str_copy(p, ref);
+        p = str_copy(p, " -> ");
+        end = nf_u64dec(attr, g_temp_text);
+        store8(end, 0);
+        p = str_copy(p, g_temp_text);
+        str_copy(p, "\r\n");
+        log_append(g_logbuf);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+func setup_data_model() -> i64 {
+    srv_use_wind();                        # select the WTG1Sim / 68-var wind model in the pure-ANCL server
+    # 1. Create model container
+    model = IedModel_create("WTG1");
+    if model == 0 { return 0; }
+    store64(g_mms_model, model);
+    
+    # 2. Create Logical Device
+    ld = LogicalDevice_create("Sim", model);
+    
+    # 3. Create Logical Nodes
+    ln_met = LogicalNode_create("Wmet1", ld);
+    ln_rot = LogicalNode_create("WROT1", ld);
+    ln_gen = LogicalNode_create("WGEN1", ld);
+    ln_apc = LogicalNode_create("WAPC1", ld);
+    ln_nac = LogicalNode_create("Wnac1", ld);
+    
+    # 4. Create Measured Values (Analogs)
+    CDC_MV_create("HorWdSpd", ln_met, 0, 0); # Wind Speed
+    CDC_MV_create("RotSpd", ln_rot, 0, 0);   # Rotor Speed
+    CDC_MV_create("Tmp", ln_gen, 0, 0);      # Generator Temp
+    CDC_MV_create("W", ln_apc, 0, 0);        # Active Power
+    
+    # 5. Create Single Point Status (SPS)
+    CDC_SPS_create("TurSt", ln_nac, 0);      # Turbine State
+    
+    # 6. Create Single Point Controls (SPC)
+    CDC_SPC_create("Start", ln_nac, 0, 1);   # Start command
+    CDC_SPC_create("Stop", ln_nac, 0, 1);    # Stop command
+    
+    return model;
+}
+
+func init_default_values() -> i64 {
+    server = load64(g_mms_server);
+    if server == 0 { return 0; }
+    
+    # Defaults (Scaled by 10)
+    store64(g_sim_wind, 50);    # 5.0 m/s initially
+    store64(g_sim_rotor, 0);    # Stopped
+    store64(g_sim_temp, 220);   # 22.0 °C ambient
+    store64(g_sim_power, 0);    # 0 kW
+    
+    update_float_tag(server, load64(g_tag_attrs + 0 * 8), "5.0");
+    update_float_tag(server, load64(g_tag_attrs + 1 * 8), "0.0");
+    update_float_tag(server, load64(g_tag_attrs + 2 * 8), "22.0");
+    update_float_tag(server, load64(g_tag_attrs + 3 * 8), "0.0");
+    
+    # Initialize Turbine State to Stopped (False)
+    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), 0);
+    
+    # Initialize Controls to False
+    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), 0);
+    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 6 * 8), 0);
+    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), 0);
+    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 8 * 8), 0);
+    
+    return 0;
+}
+
+# ============================================================================
+# MEMORY ALIGNMENT & FLOAT32 HACK
+# ============================================================================
+
+func detect_mms_alignment() -> i64 {
+    val1 = MmsValue_newBoolean(1);
+    val0 = MmsValue_newBoolean(0);
+    offset = 8;
+    
+    if load8(val1 + 5) == 1 {
+        if load8(val0 + 5) == 0 {
+            offset = 5;
+        }
+    }
+    
+    MmsValue_delete(val1);
+    MmsValue_delete(val0);
+    
+    store64(g_mms_val_offset, offset);
+    return offset;
+}
+
+func update_float_tag(server: i64, attr: i64, val_str: i64) -> i64 {
+    if attr == 0 { return 0; }
+    
+    # Parse float to bits
+    f_bits = parse_float_string_to_f32_bits(val_str);
+    
+    # Create dummy integer MmsValue (allocates sufficient memory space)
+    mmsVal = MmsValue_newInteger(0);
+    if mmsVal == 0 { return 0; }
+    
+    # Overwrite type to MMS_FLOAT (6)
+    store32(mmsVal, 6);
+    
+    # Write metadata and value
+    offset = load64(g_mms_val_offset);
+    store8(mmsVal + offset + 0, 4);          # size = 4 bytes
+    store8(mmsVal + offset + 1, 32);         # format width = 32 bits
+    store32(mmsVal + offset + 2, f_bits);    # raw float bits
+    
+    # Update on server
+    IedServer_updateAttributeValue(server, attr, mmsVal);
+    
+    # Clean up
+    MmsValue_delete(mmsVal);
+    return 1;
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+func str_equal(s1: i64, s2: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c1 = load8(s1 + i);
+        c2 = load8(s2 + i);
+        if c1 != c2 { return 0; }
+        if c1 == 0 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func str_copy(dst: i64, src: i64) -> i64 {
+    d = dst; s = src;
+    while load8(s) != 0 {
+        store8(d, load8(s));
+        d = d + 1; s = s + 1;
+    }
+    store8(d, 0);
+    return d;
+}
+
+func str_to_int(s: i64) -> i64 {
+    v = 0; p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    while load8(p) >= 48 && load8(p) <= 57 {
+        v = v * 10;
+        v = v + load8(p) - 48;
+        p = p + 1;
+    }
+    return v;
+}
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    SendMessageA(hwnd_log, 177, len, len);
+    SendMessageA(hwnd_log, 194, 0, text);
+    return 0;
+}
+
+func parse_float_string_to_f32_bits(s: i64) -> i64 {
+    p = s;
+    while load8(p) == 32 || load8(p) == 9 { p = p + 1; }
+    sign = 1.0;
+    if load8(p) == 45 {
+        sign = 0.0 - 1.0;
+        p = p + 1;
+    } else if load8(p) == 43 {
+        p = p + 1;
+    }
+    val = 0.0;
+    while load8(p) >= 48 && load8(p) <= 57 {
+        val = val * 10.0 + itof(load8(p) - 48);
+        p = p + 1;
+    }
+    if load8(p) == 46 {
+        p = p + 1;
+        divisor = 10.0;
+        while load8(p) >= 48 && load8(p) <= 57 {
+            val = val + itof(load8(p) - 48) / divisor;
+            divisor = divisor * 10.0;
+            p = p + 1;
+        }
+    }
+    fval = val * sign;
+    bits = fbits(fval);
+    sgn  = band(shr(bits, 63), 1);
+    exp  = band(shr(bits, 52), 2047);
+    mant = band(bits, 4503599627370495);
+    if exp == 0 { return shl(sgn, 31); }
+    if exp == 2047 { return shl(sgn, 31) + shl(255, 23) + shr(mant, 29); }
+    new_exp = exp - 1023 + 127;
+    if new_exp <= 0 { return shl(sgn, 31); }
+    if new_exp >= 255 { return shl(sgn, 31) + shl(255, 23); }
+    new_mant = shr(mant, 29);
+    return shl(sgn, 31) + shl(new_exp, 23) + new_mant;
+}
+
+func format_scaled_int(val: i64, scale: i64, dst: i64) -> i64 {
+    if val < 0 {
+        store8(dst, 45); # '-'
+        dst = dst + 1;
+        val = 0 - val;
+    }
+    whole = val / scale;
+    frac = val % scale;
+    
+    p = dst;
+    end = nf_u64dec(whole, p);
+    store8(end, 46); # '.'
+    p = end + 1;
+    
+    if scale == 100 {
+        if frac < 10 {
+            store8(p, 48);
+            p = p + 1;
+        }
+    }
+    end = nf_u64dec(frac, p);
+    store8(end, 0);
+    return dst;
+}
+
+# ============================================================================
+# SERVER CONTROL & BACKGROUND THREAD LOGGING
+# ============================================================================
+
+func control_handler_start(object: i64, parameter: i64, value: i64, test: i64) -> i64 {
+    b_val = MmsValue_getBoolean(value);
+    PostMessageA(load64(g_hwnd), 0x400 + 2, 1, b_val);
+    return 1; # CONTROL_RESULT_OK
+}
+
+func control_handler_stop(object: i64, parameter: i64, value: i64, test: i64) -> i64 {
+    b_val = MmsValue_getBoolean(value);
+    PostMessageA(load64(g_hwnd), 0x400 + 2, 2, b_val);
+    return 1; # CONTROL_RESULT_OK
+}
+
+func connection_handler(server: i64, connection: i64, connected: i64, parameter: i64) -> i64 {
+    PostMessageA(load64(g_hwnd), 0x400 + 1, connected, connection);
+    return 0;
+}
+
+func do_start_server() -> i64 {
+    server = load64(g_mms_server);
+    if server != 0 { return 0; }
+    
+    GetWindowTextA(load64(g_port_ed), g_port_str, 32);
+    port = str_to_int(g_port_str);
+    if port == 0 { port = 10104; }
+    
+    # 1. Setup the data model (if not already set up)
+    model = load64(g_mms_model);
+    if model == 0 {
+        model = setup_data_model();
+        cache_tag_pointers();
+    }
+    
+    # 2. Start server
+    log_append(m_start_try);
+    end = nf_u64dec(port, g_temp_text);
+    store8(end, 0);
+    log_append(g_temp_text);
+    log_append(m_dots);
+    
+    server = IedServer_create(model);
+    if server == 0 {
+        log_append(m_start_err);
+        return 0;
+    }
+    store64(g_mms_server, server);
+    
+    # Set Connection Handler
+    IedServer_setConnectionIndicationHandler(server, &connection_handler, 0);
+    
+    # Set Control Handlers
+    spc_start = IedModel_getModelNodeByObjectReference(model, "WTG1Sim/Wnac1.Start");
+    if spc_start != 0 {
+        IedServer_setControlHandler(server, spc_start, &control_handler_start, 0);
+    }
+    spc_stop = IedModel_getModelNodeByObjectReference(model, "WTG1Sim/Wnac1.Stop");
+    if spc_stop != 0 {
+        IedServer_setControlHandler(server, spc_stop, &control_handler_stop, 0);
+    }
+    
+    # Default initial values
+    init_default_values();
+    
+    # Start listening
+    IedServer_start(server, port);
+    
+    if IedServer_isRunning(server) != 0 {
+        log_append(m_start_ok);
+        SetWindowTextA(load64(g_status), "Status: Running");
+    } else {
+        log_append(m_start_err);
+        IedServer_destroy(server);
+        store64(g_mms_server, 0);
+        SetWindowTextA(load64(g_status), "Status: Stopped");
+    }
+    
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    populate_listview();
+    return 1;
+}
+
+func do_stop_server() -> i64 {
+    server = load64(g_mms_server);
+    if server == 0 { return 0; }
+    
+    IedServer_stop(server);
+    IedServer_destroy(server);
+    store64(g_mms_server, 0);
+    store64(g_client_count, 0);
+    
+    log_append(m_stop_msg);
+    SetWindowTextA(load64(g_status), "Status: Stopped");
+    SetWindowTextA(load64(g_clients), "Clients: 0");
+    
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    populate_listview();
+    return 1;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), "");
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    if len < 1 { return 0; }
+    if len > 4094 { len = 4094; }
+    SendMessageA(hwnd_log, 13, 4095, g_savebuf);
+    
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 {
+        log_append(m_save_err);
+        return 0;
+    }
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+# ============================================================================
+# AUTO-RANDOMIZATION & SIMULATION LOOP
+# ============================================================================
+
+func randomize_values() -> i64 {
+    server = load64(g_mms_server);
+    if server == 0 { return 0; }
+    
+    offset = load64(g_mms_val_offset);
+    tur_st_attr = load64(g_tag_attrs + 4 * 8);
+    if tur_st_attr == 0 { return 0; }
+    
+    val_ptr = IedServer_getAttributeValue(server, tur_st_attr);
+    if val_ptr == 0 { return 0; }
+    
+    r = GetTickCount();
+    
+    # Automatically toggle turbine running state occasionally
+    if band(r, 31) == 0 {
+        new_run = band(shr(r, 5), 1);
+        IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), new_run);
+        IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), new_run);
+        IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), band(1 - new_run, 1));
+        is_running = new_run;
+    } else {
+        is_running = load8(val_ptr + offset);
+    }
+    
+    if is_running != 0 {
+        # Turbine Running Simulation
+        wind = load64(g_sim_wind);
+        diff = band(r, 7) - 3; # -0.3 to +0.4
+        wind = wind + diff;
+        if wind < 80 { wind = 80; }     # Min 8.0 m/s
+        if wind > 160 { wind = 160; }   # Max 16.0 m/s
+        store64(g_sim_wind, wind);
+        
+        # Rotor speed tracks wind speed
+        rotor = wind * 12 / 10 + (band(r, 3) - 1);
+        if rotor < 0 { rotor = 0; }
+        store64(g_sim_rotor, rotor);
+        
+        # Active Power proportional to rotor speed
+        power = rotor * 900 / 10 + (band(r, 15) - 7);
+        if power < 0 { power = 0; }
+        store64(g_sim_power, power);
+        
+        # Generator Temp heats up to ~75.0 °C
+        temp = load64(g_sim_temp);
+        if temp < 750 {
+            temp = temp + 3;
+        } else {
+            temp = temp + (band(r, 3) - 1);
+        }
+        store64(g_sim_temp, temp);
+    } else {
+        # Turbine Stopped Simulation
+        wind = load64(g_sim_wind);
+        diff = band(r, 3) - 1; # -0.1 to +0.2
+        wind = wind + diff;
+        if wind < 30 { wind = 30; }     # Min 3.0 m/s ambient
+        if wind > 60 { wind = 60; }     # Max 6.0 m/s ambient
+        store64(g_sim_wind, wind);
+        
+        # Rotor decay to 0, with minor fluctuation noise
+        rotor = load64(g_sim_rotor);
+        if rotor > 5 {
+            rotor = rotor * 8 / 10;
+        } else {
+            rotor = band(r, 3);
+        }
+        store64(g_sim_rotor, rotor);
+        
+        # Power decay to 0, with minor fluctuation noise
+        power = load64(g_sim_power);
+        if power > 10 {
+            power = power * 7 / 10;
+        } else {
+            power = band(r, 7);
+        }
+        store64(g_sim_power, power);
+        
+        # Generator Temp cools down to ambient ~22.0 °C and fluctuates
+        temp = load64(g_sim_temp);
+        if temp > 220 {
+            temp = temp - 4;
+        } else {
+            temp = 220 + (band(r, 3) - 1);
+        }
+        store64(g_sim_temp, temp);
+    }
+    
+    # Apply to server attributes
+    format_scaled_int(load64(g_sim_wind), 10, g_temp_text);
+    update_float_tag(server, load64(g_tag_attrs + 0 * 8), g_temp_text);
+    
+    format_scaled_int(load64(g_sim_rotor), 10, g_temp_text);
+    update_float_tag(server, load64(g_tag_attrs + 1 * 8), g_temp_text);
+    
+    format_scaled_int(load64(g_sim_temp), 10, g_temp_text);
+    update_float_tag(server, load64(g_tag_attrs + 2 * 8), g_temp_text);
+    
+    format_scaled_int(load64(g_sim_power), 10, g_temp_text);
+    update_float_tag(server, load64(g_tag_attrs + 3 * 8), g_temp_text);
+    
+    return 1;
+}
+
+func handle_auto_rand_toggle() -> i64 {
+    state = load64(g_auto_rand);
+    if state == 0 {
+        # Parse timer rate from input field
+        GetWindowTextA(load64(g_rate_ed), g_temp_text, 32);
+        rate = str_to_int(g_temp_text);
+        if rate < 100 { rate = 250; }
+        if rate > 300000 { rate = 300000; } # 5 min max
+        
+        store64(g_auto_rand, 1);
+        SetWindowTextA(load64(g_btn_autorand), btn_stop_rand);
+        SetTimer(load64(g_hwnd), ID_TIMER_RAND, rate, 0);
+        log_append("[Server] Auto-Simulation started.\r\n");
+    } else {
+        store64(g_auto_rand, 0);
+        SetWindowTextA(load64(g_btn_autorand), btn_auto_rand);
+        KillTimer(load64(g_hwnd), ID_TIMER_RAND);
+        log_append("[Server] Auto-Simulation stopped.\r\n");
+    }
+    return 0;
+}
+
+# ============================================================================
+# GRID REFRESH & USER TAG MANIPULATION
+# ============================================================================
+
+func update_listview_row_value(idx: i64) -> i64 {
+    hlv = load64(g_listview);
+    server = load64(g_mms_server);
+    attr = load64(g_tag_attrs + idx * 8);
+    
+    if hlv == 0 { return 0; }
+    
+    new_str = "Error";
+    if server == 0 {
+        new_str = "Stopped";
+    } else {
+        if attr != 0 {
+            mmsVal = IedServer_getAttributeValue(server, attr);
+            if mmsVal != 0 {
+                offset = load64(g_mms_val_offset);
+                type_code = load64(g_tag_types + idx * 8);
+                
+                if type_code == 0 {
+                    raw_bits = load32(mmsVal + offset + 2);
+                    nf_ftoa(raw_bits, g_temp_val);
+                    new_str = g_temp_val;
+                }
+                if type_code == 2 {
+                    b_val = load8(mmsVal + offset);
+                    if b_val != 0 { new_str = "True"; }
+                    else { new_str = "False"; }
+                }
+            }
+        }
+    }
+    
+    # Store in prev_vals
+    prev_str = g_prev_vals + idx * 256;
+    str_copy(prev_str, new_str);
+    
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1); # LVIF_TEXT
+    store32(g_lvitem + 4, idx);
+    store32(g_lvitem + 8, 2); # Col 2: Value
+    store64(g_lvitem + 24, new_str);
+    SendMessageA(hlv, 4142, idx, g_lvitem); # LVM_SETITEMTEXTA
+    return 0;
+}
+
+func poll_and_update_values() -> i64 {
+    server = load64(g_mms_server);
+    if server == 0 { return 0; }
+    
+    # Propagate Start/Stop command overrides to Turbine state
+    offset = load64(g_mms_val_offset);
+    
+    # Check Start command
+    attr_start = load64(g_tag_attrs + 6 * 8); # Start.ctlVal
+    if attr_start != 0 {
+        val_ptr = IedServer_getAttributeValue(server, attr_start);
+        if val_ptr != 0 {
+            b_start = load8(val_ptr + offset);
+            if b_start != 0 {
+                # Turn turbine ON
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), 1); # TurSt = True
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), 1); # Start.stVal = True
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), 0); # Stop.stVal = False
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 8 * 8), 0); # Stop.ctlVal = False
+            }
+        }
+    }
+    
+    # Check Stop command
+    attr_stop = load64(g_tag_attrs + 8 * 8); # Stop.ctlVal
+    if attr_stop != 0 {
+        val_ptr = IedServer_getAttributeValue(server, attr_stop);
+        if val_ptr != 0 {
+            b_stop = load8(val_ptr + offset);
+            if b_stop != 0 {
+                # Turn turbine OFF
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), 0); # TurSt = False
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), 0); # Start.stVal = False
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 6 * 8), 0); # Start.ctlVal = False
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), 1); # Stop.stVal = True
+            }
+        }
+    }
+    
+    # Update all listview rows
+    i = 0;
+    while i < 9 {
+        attr = load64(g_tag_attrs + i * 8);
+        if attr != 0 {
+            mmsVal = IedServer_getAttributeValue(server, attr);
+            if mmsVal != 0 {
+                type_code = load64(g_tag_types + i * 8);
+                new_str = "Error";
+                if type_code == 0 {
+                    raw_bits = load32(mmsVal + offset + 2);
+                    nf_ftoa(raw_bits, g_temp_val);
+                    new_str = g_temp_val;
+                }
+                if type_code == 2 {
+                    b_val = load8(mmsVal + offset);
+                    if b_val != 0 { new_str = "True"; }
+                    else { new_str = "False"; }
+                }
+                
+                prev_str = g_prev_vals + i * 256;
+                if str_equal(prev_str, new_str) == 0 {
+                    if load8(prev_str) != 0 {
+                        ref = load64(g_tag_refs + i * 8);
+                        
+                        p = g_logbuf;
+                        p = str_copy(p, "[Server] ");
+                        p = str_copy(p, ref);
+                        p = str_copy(p, " changed to ");
+                        p = str_copy(p, new_str);
+                        str_copy(p, "\r\n");
+                        log_append(g_logbuf);
+                        
+                        # Set cell status to Modified
+                        hlv = load64(g_listview);
+                        memset(g_lvitem, 0, 96);
+                        store32(g_lvitem + 0, 1);
+                        store32(g_lvitem + 4, i);
+                        store32(g_lvitem + 8, 3);
+                        store64(g_lvitem + 24, "Modified");
+                        SendMessageA(hlv, 4142, i, g_lvitem);
+                    }
+                    update_listview_row_value(i);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func handle_update_tag() -> i64 {
+    server = load64(g_mms_server);
+    if server == 0 {
+        MessageBoxA(load64(g_hwnd), "Start the MMS Server simulator first.", "Info", 64);
+        return 0;
+    }
+    
+    GetWindowTextA(load64(g_reg_ed), g_temp_text, 256);
+    if load8(g_temp_text) == 0 { return 0; }
+    
+    # Locate index
+    idx = 0 - 1;
+    i = 0;
+    while i < 9 {
+        if str_equal(g_temp_text, load64(g_tag_refs + i * 8)) != 0 {
+            idx = i;
+        }
+        i = i + 1;
+    }
+    
+    if idx < 0 {
+        MessageBoxA(load64(g_hwnd), "Select a valid tag reference from the list first.", "Invalid Tag", 48);
+        return 0;
+    }
+    
+    GetWindowTextA(load64(g_val_ed), g_temp_val, 256);
+    type_code = load64(g_tag_types + idx * 8);
+    attr = load64(g_tag_attrs + idx * 8);
+    
+    if type_code == 0 {
+        update_float_tag(server, attr, g_temp_val);
+    }
+    if type_code == 2 {
+        b_val = 0;
+        if str_equal(g_temp_val, "True") != 0 { b_val = 1; }
+        else if str_equal(g_temp_val, "1") != 0 { b_val = 1; }
+        
+        IedServer_updateBooleanAttributeValue(server, attr, b_val);
+    }
+    
+    p = g_logbuf;
+    p = str_copy(p, "[Local Override] ");
+    p = str_copy(p, load64(g_tag_refs + idx * 8));
+    p = str_copy(p, " manually updated to ");
+    p = str_copy(p, g_temp_val);
+    str_copy(p, "\r\n");
+    log_append(g_logbuf);
+    
+    update_listview_row_value(idx);
+    return 1;
+}
+
+func handle_listview_click() -> i64 {
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    
+    idx = SendMessageA(hlv, 4108, 0 - 1, 2); # LVM_GETNEXTITEM with LVNI_SELECTED
+    if idx < 0 { return 0; }
+    
+    ref = load64(g_tag_refs + idx * 8);
+    SetWindowTextA(load64(g_reg_ed), ref);
+    
+    val_ptr = g_prev_vals + idx * 256;
+    SetWindowTextA(load64(g_val_ed), val_ptr);
+    return 1;
+}
+
+func populate_listview() -> i64 {
+    hlv = load64(g_listview);
+    if hlv == 0 { return 0; }
+    
+    SendMessageA(hlv, 4105, 0, 0); # LVM_DELETEALLITEMS
+    
+    i = 0;
+    while i < 9 {
+        ref = load64(g_tag_refs + i * 8);
+        type_code = load64(g_tag_types + i * 8);
+        
+        type_str = "Unknown";
+        if type_code == 0 { type_str = "Float32"; }
+        if type_code == 2 { type_str = "Boolean"; }
+        
+        # Col 0: Reference
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 0);
+        store64(g_lvitem + 24, ref);
+        SendMessageA(hlv, 4103, 0, g_lvitem);
+        
+        # Col 1: Type
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 1);
+        store64(g_lvitem + 24, type_str);
+        SendMessageA(hlv, 4142, i, g_lvitem);
+        
+        # Col 2: Value
+        update_listview_row_value(i);
+        
+        # Col 3: Status
+        memset(g_lvitem, 0, 96);
+        store32(g_lvitem + 0, 1);
+        store32(g_lvitem + 4, i);
+        store32(g_lvitem + 8, 3);
+        store64(g_lvitem + 24, "OK");
+        SendMessageA(hlv, 4142, i, g_lvitem);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE & THEME INTEGRATION
+# ============================================================================
+
+func a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i + i, c);
+        store8(dst + i + i + 1, 0);
+        if c == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    # Alloc solid brushes for custom drawing
+    store64(g_brush_deep, CreateSolidBrush(COL_BG));
+    store64(g_brush_panel, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_card, CreateSolidBrush(0x282C25)); # card border dark green
+    store64(g_brush_input, CreateSolidBrush(0x0C0806)); # deep black
+    store64(g_brush_hover, CreateSolidBrush(0x384032));
+    store64(g_brush_neon, CreateSolidBrush(COL_ACCENT));
+    store64(g_pen_border, CreatePen(0, 1, 0x2C3026));
+    store64(g_pen_neon, CreatePen(0, 1, COL_ACCENT));
+    
+    # Create Consolas fonts
+    store64(g_font, CreateFontA(14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+    
+    # Dark mode flag for Win10/11
+    a2w(thm_dm_exp_w, thm_dm_exp_a);
+    a2w(thm_dm_cfd_w, thm_dm_cfd_a);
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func register_class(wndclass: ptr, clsname_arg: str, wndproc_fn: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    memset(wndclass, 0, 80);
+    store32(wndclass + 0, 80);        # cbSize
+    store32(wndclass + 4, 3);         # CS_HREDRAW | CS_VREDRAW
+    store64(wndclass + 8, wndproc_fn);
+    store64(wndclass + 24, hinst);
+    store64(wndclass + 40, cursor);
+    store64(wndclass + 48, brush);
+    store64(wndclass + 64, clsname_arg);
+    return RegisterClassExA(wndclass);
+}
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetWindowLongPtrA(hwnd, 0, 0); # hover state
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+        GetClientRect(hwnd, g_rect);
+        
+        is_hover = GetWindowLongA(hwnd, 0);
+        
+        # Paint background
+        if is_hover != 0 {
+            FillRect(hdc, g_rect, load64(g_brush_hover));
+        } else {
+            FillRect(hdc, g_rect, load64(g_brush_panel));
+        }
+        
+        # Border
+        pen = CreatePen(0, 1, COL_ACCENT);
+        SelectObject(hdc, pen);
+        SelectObject(hdc, GetStockObject(5)); # NULL_BRUSH
+        RoundRect(hdc, 0, 0, load32(g_rect + 8), load32(g_rect + 12), 4, 4);
+        DeleteObject(pen);
+        
+        # Text
+        GetWindowTextA(hwnd, g_temp_text, 256);
+        if load8(g_temp_text) != 0 {
+            SetBkMode(hdc, 1);
+            SetTextColor(hdc, COL_TEXT);
+            font = SendMessageA(GetParent(hwnd), 49, 0, 0); # GETFONT
+            if font == 0 { font = load64(g_font); }
+            SelectObject(hdc, font);
+            DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37); # DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        }
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 512 { # WM_MOUSEMOVE
+        is_hover = GetWindowLongA(hwnd, 0);
+        if is_hover == 0 {
+            SetWindowLongA(hwnd, 0, 1);
+            InvalidateRect(hwnd, 0, 1);
+            
+            # Track mouse leave
+            store32(g_track_mouse + 0, 16); # cbSize
+            store32(g_track_mouse + 4, 2);  # TME_LEAVE
+            store64(g_track_mouse + 8, hwnd);
+            store32(g_track_mouse + 16, 0); # hoverTime
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    
+    if msg == 0x02A2 { # WM_MOUSELEAVE
+        SetWindowLongA(hwnd, 0, 0);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 513 { # WM_LBUTTONDOWN
+        SetCapture(hwnd);
+        return 0;
+    }
+    
+    if msg == 514 { # WM_LBUTTONUP
+        ReleaseCapture();
+        GetClientRect(hwnd, g_rect);
+        
+        # Check if mouse is within rect
+        x = band(lParam, 65535);
+        y = band(shr(lParam, 16), 65535);
+        if x >= 0 {
+            if x <= load32(g_rect + 8) {
+                if y >= 0 {
+                    if y <= load32(g_rect + 12) {
+                        # Trigger parent WM_COMMAND
+                        id = GetWindowLongA(hwnd, 0 - 12); # GWL_ID
+                        PostMessageA(GetParent(hwnd), 273, id, hwnd);
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func WndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        
+        # Title Bar Buttons
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 1040, 10, 24, 24, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1068, 10, 24, 24, hwnd, ID_BTN_CLOSE, hinst, 0);
+        
+        # Start button
+        CreateWindowExA(0, cls_glow_btn, btn_start, 0x50000000, 15, 60, 75, 28, hwnd, 101, hinst, 0);
+        # Stop button
+        CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 95, 60, 75, 28, hwnd, 102, hinst, 0);
+        
+        # Port Label and Input
+        h = CreateWindowExA(0, cls_stat, lbl_port, 0x50000000, 185, 64, 40, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font), 1);
+        g_port_ed_h = CreateWindowExA(0, cls_edit, def_port, 0x50010080, 225, 60, 60, 28, hwnd, 103, hinst, 0);
+        store64(g_port_ed, g_port_ed_h);
+        SendMessageA(g_port_ed_h, 48, load64(g_font), 1);
+        
+        # Auto Rand button
+        g_btn_autorand_h = CreateWindowExA(0, cls_glow_btn, btn_auto_rand, 0x50000000, 295, 60, 90, 28, hwnd, ID_BTN_AUTORAND, hinst, 0);
+        store64(g_btn_autorand, g_btn_autorand_h);
+        
+        # Rate label & input
+        h = CreateWindowExA(0, cls_stat, lbl_rate, 0x50000000, 395, 64, 45, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font), 1);
+        grate = CreateWindowExA(0, cls_edit, "250", 0x50010080, 445, 60, 60, 28, hwnd, 116, hinst, 0);
+        store64(g_rate_ed, grate);
+        SendMessageA(grate, 48, load64(g_font), 1);
+        dark_scroll(grate);
+        
+        # Status & Client labels
+        hstat = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 520, 64, 150, 20, hwnd, 104, hinst, 0);
+        store64(g_status, hstat);
+        hclients = CreateWindowExA(0, cls_stat, lbl_client, 0x50000000, 660, 12, 120, 20, hwnd, 105, hinst, 0);
+        store64(g_clients, hclients);
+        
+        # Set theme and drag bar support
+        dark_scroll(g_port_ed_h);
+        
+        # Grid View
+        hlv = CreateWindowExA(0, cls_lv, gui_empty, 0x50004009, 20, 130, 745, 255, hwnd, 110, hinst, 0);
+        store64(g_listview, hlv);
+        SendMessageA(hlv, 48, load64(g_font), 1);
+        SendMessageA(hlv, 4150, 0, 32); # LVS_EX_FULLROWSELECT = 32
+        SendMessageA(hlv, 4097, 0, COL_PANEL);
+        SendMessageA(hlv, 4132, 0, COL_TEXT);
+        SendMessageA(hlv, 4134, 0, COL_PANEL);
+        dark_scroll(hlv);
+        
+        # ListView columns setup
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15); # LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM
+        store32(g_lvcol + 4, 0);
+        store32(g_lvcol + 8, 300); # Width
+        store64(g_lvcol + 16, col_ref);
+        SendMessageA(hlv, 4123, 0, g_lvcol);
+        
+        store32(g_lvcol + 8, 100);
+        store64(g_lvcol + 16, col_type);
+        SendMessageA(hlv, 4123, 1, g_lvcol);
+        
+        store32(g_lvcol + 8, 220);
+        store64(g_lvcol + 16, col_val);
+        SendMessageA(hlv, 4123, 2, g_lvcol);
+        
+        store32(g_lvcol + 8, 100);
+        store64(g_lvcol + 16, col_status);
+        SendMessageA(hlv, 4123, 3, g_lvcol);
+        
+        # Override Card components
+        h = CreateWindowExA(0, cls_stat, lbl_reg, 0x50000000, 795, 115, 270, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font), 1);
+        g_reg_ed_h = CreateWindowExA(0, cls_edit, gui_empty, 0x50010880, 795, 140, 270, 28, hwnd, 111, hinst, 0);
+        store64(g_reg_ed, g_reg_ed_h);
+        SendMessageA(g_reg_ed_h, 48, load64(g_font), 1);
+        dark_scroll(g_reg_ed_h);
+        
+        h = CreateWindowExA(0, cls_stat, lbl_val, 0x50000000, 795, 185, 270, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font), 1);
+        g_val_ed_h = CreateWindowExA(0, cls_edit, gui_empty, 0x50010080, 795, 210, 270, 28, hwnd, 113, hinst, 0);
+        store64(g_val_ed, g_val_ed_h);
+        SendMessageA(g_val_ed_h, 48, load64(g_font), 1);
+        dark_scroll(g_val_ed_h);
+        
+        CreateWindowExA(0, cls_glow_btn, btn_update, 0x50000000, 795, 255, 120, 28, hwnd, 112, hinst, 0);
+        
+        # Traffic Log title and window
+        h = CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 20, 410, 200, 20, hwnd, 0, hinst, 0);
+        SendMessageA(h, 48, load64(g_font), 1);
+        
+        hl = CreateWindowExA(0, cls_edit, gui_empty, 0x502108C4, 20, 435, 745, 150, hwnd, 114, hinst, 0);
+        store64(g_log, hl);
+        SendMessageA(hl, 48, load64(g_font), 1);
+        dark_scroll(hl);
+        
+        # Clear & Save buttons
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 795, 435, 90, 28, hwnd, 106, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 795, 475, 90, 28, hwnd, 107, hinst, 0);
+        
+        # Specific headers / indicators styling overrides
+        SendMessageA(hstat, 48, load64(g_font), 1);
+        SendMessageA(hclients, 48, load64(g_font), 1);
+        
+        # Initialize internal tag metadata lists
+        init_tag_metadata();
+        
+        # Populate initially empty Grid
+        populate_listview();
+        
+        # Setup polling network timer (for background MMC changes notification)
+        SetTimer(hwnd, ID_TIMER_POLL, 250, 0);
+        
+        # Write welcome log entry
+        log_append("ANCL IEC 61400-25 Wind Turbine Server Simulator ready.\r\n");
+        log_append("Click 'Start' to listen on Port 10104.\r\n");
+        
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        if wp == ID_TIMER_POLL {
+            poll_and_update_values();
+        }
+        if wp == ID_TIMER_RAND {
+            randomize_values();
+        }
+        return 0;
+    }
+    
+    if msg == 0x400 + 1 { # WM_CLIENT_CONN
+        connected = wp;
+        conn = lp;
+        clients = load64(g_client_count);
+        
+        if connected != 0 {
+            clients = clients + 1;
+            store64(g_client_count, clients);
+            
+            p = g_logbuf;
+            p = str_copy(p, "[Server] Client connected. Socket: ");
+            end = nf_u64dec(conn, g_temp_text);
+            store8(end, 0);
+            p = str_copy(p, g_temp_text);
+            str_copy(p, "\r\n");
+            log_append(g_logbuf);
+        } else {
+            if clients > 0 { clients = clients - 1; }
+            store64(g_client_count, clients);
+            
+            p = g_logbuf;
+            p = str_copy(p, "[Server] Client disconnected. Socket: ");
+            end = nf_u64dec(conn, g_temp_text);
+            store8(end, 0);
+            p = str_copy(p, g_temp_text);
+            str_copy(p, "\r\n");
+            log_append(g_logbuf);
+        }
+        
+        # Update connection count label
+        p = g_temp_text;
+        p = str_copy(p, "Clients: ");
+        end = nf_u64dec(clients, p);
+        store8(end, 0);
+        SetWindowTextA(load64(g_clients), g_temp_text);
+        
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 0x400 + 2 { # WM_CONTROL_OP
+        spc_idx = wp;
+        b_val = lp;
+        
+        server = load64(g_mms_server);
+        if server != 0 {
+            if spc_idx == 1 {
+                # Start control
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), b_val); # TurSt
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), b_val); # Start.stVal
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 6 * 8), b_val); # Start.ctlVal
+                if b_val != 0 {
+                    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), 0); # Stop.stVal
+                    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 8 * 8), 0); # Stop.ctlVal
+                }
+                
+                p = g_logbuf;
+                p = str_copy(p, "[Server] Start turbine operated -> ");
+                if b_val != 0 { p = str_copy(p, "True (Running)"); } else { p = str_copy(p, "False"); }
+                str_copy(p, "\r\n");
+                log_append(g_logbuf);
+            }
+            if spc_idx == 2 {
+                # Stop control
+                if b_val != 0 {
+                    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 4 * 8), 0); # TurSt = False
+                    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 5 * 8), 0); # Start.stVal = False
+                    IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 6 * 8), 0); # Start.ctlVal = False
+                }
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 7 * 8), b_val); # Stop.stVal
+                IedServer_updateBooleanAttributeValue(server, load64(g_tag_attrs + 8 * 8), b_val); # Stop.ctlVal
+                
+                p = g_logbuf;
+                p = str_copy(p, "[Server] Stop turbine operated -> ");
+                if b_val != 0 { p = str_copy(p, "True (Stopped)"); } else { p = str_copy(p, "False"); }
+                str_copy(p, "\r\n");
+                log_append(g_logbuf);
+            }
+            
+            # Force UI update
+            populate_listview();
+        }
+        return 0;
+    }
+    
+    if msg == 132 { # WM_NCHITTEST
+        x = band(lp, 65535);
+        y = band(shr(lp, 16), 65535);
+        GetWindowRect(hwnd, g_rect);
+        cx = x - load32(g_rect + 0);
+        cy = y - load32(g_rect + 4);
+        if cy < 45 {
+            if cx >= 1040 { return 1; } # HTCLIENT = 1
+            return 2; # HTCAPTION = 2
+        }
+        return 1;
+    }
+    
+    if msg == 273 { # WM_COMMAND
+        id = wp;
+        if id == ID_BTN_MIN   { ShowWindow(hwnd, 6); return 0; }
+        if id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        if id == 101 { do_start_server(); return 0; }
+        if id == 102 { do_stop_server(); return 0; }
+        if id == 106 { do_clear_log(); return 0; }
+        if id == 107 { do_save_log(); return 0; }
+        if id == 112 { handle_update_tag(); return 0; }
+        if id == ID_BTN_AUTORAND { handle_auto_rand_toggle(); return 0; }
+        return 0;
+    }
+    
+    if msg == 78 { # WM_NOTIFY
+        hdr = lp;
+        code = load32(hdr + 16);
+        hwndFrom = load64(hdr + 0);
+        
+        is_click = band(code, 4294967295) == 4294967294; # -2 (NM_CLICK)
+        is_dblclk = band(code, 4294967295) == 4294967293; # -3 (NM_DBLCLK)
+        is_changed = band(code, 4294967295) == 4294967193; # -103 (LVN_ITEMCHANGED)
+        
+        if bor(is_click, bor(is_dblclk, is_changed)) != 0 {
+            if hwndFrom == load64(g_listview) {
+                handle_listview_click();
+            }
+        }
+        return 0;
+    }
+    
+    if msg == 312 { # WM_CTLCOLORSTATIC
+        if lp == load64(g_clients) {
+            SetTextColor(wp, COL_TEXT);
+            SetBkColor(wp, COL_PANEL);
+            return load64(g_brush_panel);
+        }
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_BG);
+        return load64(g_brush_deep);
+    }
+    
+    if msg == 307 || msg == 308 || msg == 309 { # WM_CTLCOLOREDIT / LISTBOX / BTN
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, 0x0C0806);
+        return load64(g_brush_input);
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        BeginPaint(hwnd, g_ps);
+        hdc = load64(g_ps + 0);
+        GetClientRect(hwnd, g_rect);
+        
+        # Background
+        FillRect(hdc, g_rect, load64(g_brush_deep));
+        
+        # Header strip panel
+        store32(g_rect + 12, 45); # height = 45
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+        
+        # Bottom accent border on header
+        pen = CreatePen(0, 1, COL_ACCENT);
+        SelectObject(hdc, pen);
+        MoveToEx(hdc, 0, 45, 0);
+        LineTo(hdc, load32(g_rect + 8), 45);
+        DeleteObject(pen);
+        
+        # Header text
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COL_TEXT);
+        SelectObject(hdc, load64(g_font_header));
+        store32(g_rect + 0, 20);
+        store32(g_rect + 4, 12);
+        DrawTextA(hdc, title_draw, 0 - 1, g_rect, 0);
+        
+        # Server Active Indicator
+        is_running = 0;
+        server = load64(g_mms_server);
+        if server != 0 {
+            if IedServer_isRunning(server) != 0 {
+                is_running = 1;
+            }
+        }
+        
+        SelectObject(hdc, load64(g_font));
+        if is_running != 0 {
+            SetTextColor(hdc, COL_GREEN);
+            store32(g_rect + 0, load32(g_rect + 8) - 200);
+            DrawTextA(hdc, st_run_ind, 0 - 1, g_rect, 0);
+        } else {
+            SetTextColor(hdc, COL_RED);
+            store32(g_rect + 0, load32(g_rect + 8) - 200);
+            DrawTextA(hdc, st_stop_ind, 0 - 1, g_rect, 0);
+        }
+        
+        # Paint card borders around controls
+        # ListView panel border
+        SelectObject(hdc, load64(g_pen_border));
+        SelectObject(hdc, GetStockObject(5)); # NULL_BRUSH
+        RoundRect(hdc, 15, 100, 775, 395, 4, 4);
+        
+        # Update Tag Panel card
+        RoundRect(hdc, 785, 100, 1090, 300, 4, 4);
+        
+        # Traffic Log card
+        RoundRect(hdc, 15, 430, 775, 595, 4, 4);
+        
+        # Draw custom flat headers for ListView Tag Grid
+        SelectObject(hdc, load64(g_pen_border));
+        SelectObject(hdc, load64(g_brush_panel));
+        
+        # Column 0: Tag Reference
+        Rectangle(hdc, 20, 105, 320, 130);
+        # Column 1: Type
+        Rectangle(hdc, 320, 105, 420, 130);
+        # Column 2: Value
+        Rectangle(hdc, 420, 105, 640, 130);
+        # Column 3: Status
+        Rectangle(hdc, 640, 105, 765, 130);
+        
+        # Draw header text labels
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COL_TEXT);
+        old_font = SelectObject(hdc, load64(g_font));
+        TextOutA(hdc, 26, 109, col_ref, 13);
+        TextOutA(hdc, 326, 109, col_type, 4);
+        TextOutA(hdc, 426, 109, col_val, 5);
+        TextOutA(hdc, 646, 109, col_status, 6);
+        SelectObject(hdc, old_font);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        do_stop_server();
+        KillTimer(hwnd, ID_TIMER_POLL);
+        KillTimer(hwnd, ID_TIMER_RAND);
+        
+        # Clean up GDI objects
+        DeleteObject(load64(g_brush_deep));
+        DeleteObject(load64(g_brush_panel));
+        DeleteObject(load64(g_brush_card));
+        DeleteObject(load64(g_brush_input));
+        DeleteObject(load64(g_brush_hover));
+        DeleteObject(load64(g_brush_neon));
+        DeleteObject(load64(g_pen_border));
+        DeleteObject(load64(g_pen_neon));
+        DeleteObject(load64(g_font));
+        DeleteObject(load64(g_font_header));
+        
+        # Clean up dynamic data model
+        model = load64(g_mms_model);
+        if model != 0 {
+            IedModel_destroy(model);
+            store64(g_mms_model, 0);
+        }
+        
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    InitCommonControlsEx();
+    
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    
+    # 1. Detect DLL structure alignment
+    detect_mms_alignment();
+    
+    # 2. Setup theme settings
+    enable_dark_mode();
+    
+    # 3. Register custom glow button class
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    res = register_class(g_wndcls, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, 0);
+    
+    # 4. Register main window class
+    bg_brush = CreateSolidBrush(COL_BG);
+    res = register_class(g_wndcls, clsname, &WndProc, hinst, cursor, bg_brush);
+    
+    # 5. Create main window
+    hwnd = CreateWindowExA(0, clsname, title, 0x92000000, 100, 100, WIN_W, WIN_H, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    
+    if hwnd == 0 { return 1; }
+    
+    ShowWindow(hwnd, 5); # SW_SHOW = 5
+    UpdateWindow(hwnd);
+    
+    # Init dynamic values default
+    store64(g_auto_rand, 0);
+    
+    # Message Loop
+    while GetMessageA(g_msg, 0, 0, 0) > 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    
+    return 0;
+}

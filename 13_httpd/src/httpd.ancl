@@ -1,0 +1,218 @@
+# =====================================================================
+#  httpd.ancl  -  ANCL Bare-Metal HTTP/1.1 Static File Server
+#
+#  showcase/httpd - GitHub Entryway Showcase
+#
+#  Demonstrates ANCL V6 capabilities in a universally-understandable
+#  program:  a real HTTP/1.1 server that serves a static index.html
+#  on port 8080.  Zero CRT, zero runtime deps - just Win32 + Winsock.
+#
+#  Architecture:
+#    - WSAStartup / socket / bind / listen / accept loop (built-ins)
+#    - CreateFileA / ReadFile / CloseHandle (FFI via win32_api.ancl)
+#    - Manual HTTP/1.1 response assembly into a scratch buffer
+#    - str_copy chaining to build response header + body in one pass
+#    - send() writes the assembled bytes back to the client
+#
+#  Build:  bin\anclc.exe showcase\httpd\src\httpd.ancl showcase\httpd\bin\httpd.exe
+#  Run:    showcase\httpd\bin\httpd.exe
+#  Browse: http://localhost:8080/
+#
+#  100% CRT-free.  Only imports: kernel32.dll + ws2_32.dll.
+#  Verify with:  dumpbin /dependents showcase\httpd\bin\httpd.exe
+# =====================================================================
+
+import "std.ancl";         # imin / imax / iabs
+import "win32_api.ancl";   # CreateFileA, CloseHandle, GetModuleFileNameA
+
+# ---- Winsock FFI not in the built-in table --------------------------
+extern "ws2_32.dll"   setsockopt;            # int setsockopt(s, level, optname, optval, optlen)
+
+@DATA
+
+# ---- server config --------------------------------------------------
+HTTP_PORT:   i64 = 8080;
+
+# ---- index.html path: resolved at runtime from the exe directory ----
+html_suf:    str = "\\index.html";           # appended to <exedir>
+html_rel:    str = "showcase\\httpd\\bin\\index.html";  # fallback when run from repo root (CWD=root)
+g_exepath:   buf = 512;
+g_htmlpath:  buf = 512;
+
+# ---- response header parts ------------------------------------------
+hdr_200:     str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
+hdr_sep:     str = "\r\n\r\n";
+hdr_404:     str = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 30\r\n\r\nFile not found. Check httpd dir.";
+hdr_400:     str = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+
+# ---- startup / log messages -----------------------------------------
+m_boot:      str = "[httpd] ANCL bare-metal HTTP/1.1 server\n";
+m_port:      str = "[httpd] listening on http://localhost:";
+m_nl:        str = "\n";
+m_slash:     str = "/\n";
+m_wait:      str = "[httpd] waiting for connection...\n";
+m_conn:      str = "[httpd] connection accepted\n";
+m_get:       str = "[httpd] GET / -> ";
+m_bytes:     str = " bytes\n";
+m_404:       str = "[httpd] GET / -> 404 (index.html not found at: ";
+m_rparen:    str = ")\n";
+m_bad:       str = "[httpd] non-GET or unrecognised request - 400\n";
+m_err_bind:  str = "[httpd] ERROR: bind() failed (port in use?)\n";
+m_err_wsa:   str = "[httpd] ERROR: WSAStartup failed\n";
+m_err_sock:  str = "[httpd] ERROR: socket() failed\n";
+m_err_listen:str = "[httpd] ERROR: listen() failed\n";
+
+# ---- scratch buffers ------------------------------------------------
+g_wsa:       buf = 512;       # WSADATA
+g_saddr:     buf = 16;        # sockaddr_in for bind
+g_req:       buf = 4096;      # incoming HTTP request
+g_html:      buf = 65536;     # file read buffer (64 KB max)
+g_hdr:       buf = 256;       # assembled response header
+g_numstr:    buf = 24;        # int_to_str scratch
+g_nread:     buf = 8;         # ReadFile bytesRead out-param
+g_one:       buf = 8;         # SO_REUSEADDR optval = 1
+
+SOL_SOCKET:  i64 = 0xFFFF;    # level for setsockopt
+SO_REUSEADDR:i64 = 4;         # option: allow port reuse after restart
+
+@CODE
+
+# ---- resolve <exedir>\index.html into g_htmlpath -------------------
+# Mirrors the proven build_paths() pattern from linguistic.ancl:
+#   memcpy up to (not including) the last '\', then str_copy a suffix
+#   that starts with '\'.  Falls back to the relative path when called
+#   from the repo root (no parent dir in path).
+func resolve_html_path() -> i64 {
+    GetModuleFileNameA(0, g_exepath, 512);
+    # find position of the last backslash
+    bs = 0 - 1;
+    i = strlen(g_exepath) - 1;
+    while i >= 0 {
+        if load8(g_exepath + i) == 92 { bs = i; break; }
+        i = i - 1;
+    }
+    if bs < 0 { return 0; }
+    # copy <exedir> (up to, not including, the last '\') then append \index.html
+    # html_suf = "\\index.html" which encodes as '\' + "index.html" at runtime
+    memcpy(g_htmlpath, g_exepath, bs);
+    str_copy(g_htmlpath + bs, html_suf);
+    return 1;
+}
+
+# ---- load index.html -> g_html, return byte count (0 = not found) --
+func load_html() -> i64 {
+    # try exe-relative path first
+    h = CreateFileA(g_htmlpath, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == 0 - 1 {
+        # fallback: repo-root-relative path (CWD = repo root)
+        h = CreateFileA(html_rel, 0x80000000, 1, 0, 3, 0x80, 0);
+    }
+    if h == 0 - 1 { return 0; }
+    ReadFile(h, g_html, 65535, g_nread, 0);
+    CloseHandle(h);
+    n = load32(g_nread);
+    store8(g_html + n, 0);    # NUL-terminate for safety
+    return n;
+}
+
+# ---- check if the request starts with "GET " -----------------------
+func is_get_request(buf: i64) -> i64 {
+    if load8(buf + 0) != 71 { return 0; }    # 'G'
+    if load8(buf + 1) != 69 { return 0; }    # 'E'
+    if load8(buf + 2) != 84 { return 0; }    # 'T'
+    if load8(buf + 3) != 32 { return 0; }    # ' '
+    return 1;
+}
+
+# ---- serve one connection ------------------------------------------
+# Reads a request, writes an HTTP response, closes the client socket.
+func serve(client: i64) -> i64 {
+    # drain the request (we only need the first line, but recv one chunk)
+    n = recv(client, g_req, 4095, 0);
+    if n <= 0 { closesocket(client); return 0; }
+    store8(g_req + n, 0);    # NUL-terminate
+
+    # validate it's a GET request
+    if is_get_request(g_req) == 0 {
+        syscall 1, m_bad;
+        send(client, hdr_400, strlen(hdr_400), 0);
+        closesocket(client);
+        return 0;
+    }
+
+    # load the HTML file
+    file_len = load_html();
+
+    if file_len == 0 {
+        # 404 - file not found
+        syscall 1, m_404;
+        puts_cstr(g_htmlpath);
+        syscall 1, m_rparen;
+        send(client, hdr_404, strlen(hdr_404), 0);
+        closesocket(client);
+        return 0;
+    }
+
+    # assemble header:  "HTTP/1.1 200 OK\r\n...Content-Length: <N>\r\n\r\n"
+    int_to_str(g_numstr, file_len);
+    w = str_copy(g_hdr, hdr_200);      # "HTTP/1.1 200 OK\r\n...Content-Length: "
+    w = str_copy(w, g_numstr);          # "<decimal byte count>"
+    w = str_copy(w, hdr_sep);           # "\r\n\r\n"
+    hdr_len = w - g_hdr;
+
+    # send header then body as two separate writes (avoids a 64KB+256 merged buffer)
+    send(client, g_hdr, hdr_len, 0);
+    send(client, g_html, file_len, 0);
+
+    syscall 1, m_get, file_len, m_bytes;
+
+    closesocket(client);
+    return 1;
+}
+
+# ---- main: init Winsock, bind, listen, accept loop -----------------
+func main() -> i32 {
+    syscall 1, m_boot;
+
+    # Winsock 2.2
+    rc = WSAStartup(514, g_wsa);
+    if rc != 0 { syscall 1, m_err_wsa; return 1; }
+
+    # TCP stream socket
+    srv = socket(2, 1, 6);    # AF_INET=2, SOCK_STREAM=1, IPPROTO_TCP=6
+    if srv == 0 - 1 { syscall 1, m_err_sock; return 1; }
+
+    # SO_REUSEADDR so a quick restart doesn't hit TIME_WAIT
+    store64(g_one, 1);
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, g_one, 4);
+
+    # bind to 0.0.0.0:8080
+    store16(g_saddr + 0, 2);                     # sin_family = AF_INET
+    store16(g_saddr + 2, htons(HTTP_PORT));       # sin_port   (network byte order)
+    store32(g_saddr + 4, 0);                      # sin_addr   = INADDR_ANY
+    store64(g_saddr + 8, 0);                      # padding
+
+    rc = bind(srv, g_saddr, 16);
+    if rc != 0 { syscall 1, m_err_bind; return 1; }
+
+    rc = listen(srv, 16);
+    if rc != 0 { syscall 1, m_err_listen; return 1; }
+
+    # resolve the HTML file path once at startup
+    resolve_html_path();
+
+    # print startup line: "[httpd] listening on http://localhost:8080/"
+    syscall 1, m_port, HTTP_PORT, m_slash;
+
+    # accept loop
+    while 1 {
+        syscall 1, m_wait;
+        client = accept(srv, 0, 0);
+        if client == 0 - 1 { break; }
+        syscall 1, m_conn;
+        serve(client);
+    }
+
+    closesocket(srv);
+    return 0;
+}

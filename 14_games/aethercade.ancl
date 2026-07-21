@@ -1,0 +1,473 @@
+# AetherCade - a retro game-console launcher for the ANCL arcade, in pure ANCL.
+# One native Win32 window, double-buffered GDI, CRT-scanline styling. Picks a game
+# cartridge and launches its standalone .exe (ShellExecute). Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+
+extern "user32.dll" PeekMessageA -> i32;
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "gdi32.dll"  DeleteDC;
+
+@DATA
+class_name:   str = "AetherCade";
+window_title: str = "AetherCade - ANCL Arcade";
+
+g_hinst: buf = 8;
+hwnd:    buf = 8;
+
+# selection + timing
+sel:       buf = 8;
+last_tick: buf = 8;
+
+# brushes
+bg_brush:      buf = 8;   # window background (near black)
+panel_brush:   buf = 8;   # header / footer band
+tile_brush:    buf = 8;   # unselected row
+tile_sel_brush:buf = 8;   # selected row
+border_brush:  buf = 8;   # tile border
+scan_pen:      buf = 8;   # scanline pen
+
+# per-game accent brushes (7)
+gb0: buf = 8; gb1: buf = 8; gb2: buf = 8; gb3: buf = 8; gb4: buf = 8; gb5: buf = 8; gb6: buf = 8;
+
+# fonts
+title_font: buf = 8;
+sub_font:   buf = 8;
+name_font:  buf = 8;
+blurb_font: buf = 8;
+badge_font: buf = 8;
+foot_font:  buf = 8;
+
+# windows structs / scratch
+wc_buf:      buf = 80;
+msg_buf:     buf = 48;
+ps_buf:      buf = 64;
+client_rect: buf = 16;
+draw_rect_b: buf = 16;
+
+# path scratch
+g_basedir: buf = 600;
+g_pathbuf: buf = 700;
+g_dirbuf:  buf = 640;
+proc_si:   buf = 104;   # STARTUPINFOA
+proc_pi:   buf = 24;    # PROCESS_INFORMATION
+
+# game-name strings (7)
+gn0: str = "NEON TETRIS";
+gn1: str = "SNAKE";
+gn2: str = "BREAKOUT";
+gn3: str = "AETHER SAND";
+gn4: str = "COSMIC VECTOR";
+gn5: str = "AETHER BLOCKS";
+gn6: str = "AETHER RUN";
+
+# blurbs (7)
+gd0: str = "Neon falling blocks - the classic, in pure ANCL";
+gd1: str = "Grow the snake, don't bite your tail";
+gd2: str = "Smash every brick with the paddle";
+gd3: str = "Falling-sand physics playground";
+gd4: str = "Vector-graphics space shooter";
+gd5: str = "Minecraft-style voxel sandbox";
+gd6: str = "First-person 3D maze runner";
+
+# launch subfolders (7)
+gs0: str = "tetris";
+gs1: str = "snake";
+gs2: str = "breakout";
+gs3: str = "aether_sand";
+gs4: str = "cosmic_vector";
+gs5: str = "aether_blocks";
+gs6: str = "aether_run";
+
+# launch exe names (7)
+ge0: str = "tetris.exe";
+ge1: str = "snake.exe";
+ge2: str = "breakout.exe";
+ge3: str = "aether_sand.exe";
+ge4: str = "cosmic_vector.exe";
+ge5: str = "aether_blocks.exe";
+ge6: str = "aether_run.exe";
+
+sep_bs:   str = "\\";
+badge_3d: str = "3D";
+foot_a:   str = "PRESS ENTER TO PLAY";
+foot_b:   str = "UP/DOWN SELECT    ESC QUIT";
+subtitle: str = "ANCL ARCADE  -  native games, zero dependencies";
+
+@CODE
+
+func game_count() -> i64 { return 7; }
+
+func game_name(i: i64) -> ptr {
+    if i == 0 { return gn0; } if i == 1 { return gn1; } if i == 2 { return gn2; }
+    if i == 3 { return gn3; } if i == 4 { return gn4; } if i == 5 { return gn5; }
+    return gn6;
+}
+func game_blurb(i: i64) -> ptr {
+    if i == 0 { return gd0; } if i == 1 { return gd1; } if i == 2 { return gd2; }
+    if i == 3 { return gd3; } if i == 4 { return gd4; } if i == 5 { return gd5; }
+    return gd6;
+}
+func game_sub(i: i64) -> ptr {
+    if i == 0 { return gs0; } if i == 1 { return gs1; } if i == 2 { return gs2; }
+    if i == 3 { return gs3; } if i == 4 { return gs4; } if i == 5 { return gs5; }
+    return gs6;
+}
+func game_exe(i: i64) -> ptr {
+    if i == 0 { return ge0; } if i == 1 { return ge1; } if i == 2 { return ge2; }
+    if i == 3 { return ge3; } if i == 4 { return ge4; } if i == 5 { return ge5; }
+    return ge6;
+}
+func game_brush(i: i64) -> ptr {
+    if i == 0 { return load64(gb0); } if i == 1 { return load64(gb1); }
+    if i == 2 { return load64(gb2); } if i == 3 { return load64(gb3); }
+    if i == 4 { return load64(gb4); } if i == 5 { return load64(gb5); }
+    return load64(gb6);
+}
+# accent COLORREF (0x00BBGGRR) per game, for text
+func game_color(i: i64) -> i64 {
+    if i == 0 { return 0xFFFF00; } if i == 1 { return 0x00E000; }
+    if i == 2 { return 0x00A5FF; } if i == 3 { return 0x70C0E0; }
+    if i == 4 { return 0xFF00FF; } if i == 5 { return 0x40C050; }
+    return 0xFFA000;
+}
+func game_is3d(i: i64) -> i64 {
+    if i == 5 { return 1; }
+    if i == 6 { return 1; }
+    return 0;
+}
+
+# fill an absolute-coord rect with a brush
+func fill_rect(hdc: ptr, l: i32, t: i32, r: i32, b: i32, brush: ptr) -> i64 {
+    store32(draw_rect_b + 0, l);
+    store32(draw_rect_b + 4, t);
+    store32(draw_rect_b + 8, r);
+    store32(draw_rect_b + 12, b);
+    FillRect(hdc, draw_rect_b, brush);
+    return 0;
+}
+
+# a 1px-thick border made of four thin fills
+func stroke_rect(hdc: ptr, l: i32, t: i32, r: i32, b: i32, w: i32, brush: ptr) -> i64 {
+    fill_rect(hdc, l, t, r, t + w, brush);       # top
+    fill_rect(hdc, l, b - w, r, b, brush);       # bottom
+    fill_rect(hdc, l, t, l + w, b, brush);       # left
+    fill_rect(hdc, r - w, t, r, b, brush);       # right
+    return 0;
+}
+
+# string append: copy src into dst at off, return new off
+func str_app(dst: ptr, off: i64, src: ptr) -> i64 {
+    l = strlen(src);
+    memcpy(dst + off, src, l);
+    return off + l;
+}
+
+# resolve <basedir><sub>\<exe> into g_pathbuf and <basedir><sub> into g_dirbuf
+func build_paths(i: i64) -> i64 {
+    memset(g_pathbuf, 0, 700);
+    o = 0;
+    o = str_app(g_pathbuf, o, g_basedir);
+    o = str_app(g_pathbuf, o, game_sub(i));
+    o = str_app(g_pathbuf, o, sep_bs);
+    o = str_app(g_pathbuf, o, game_exe(i));
+    store8(g_pathbuf + o, 0);
+
+    memset(g_dirbuf, 0, 640);
+    o = 0;
+    o = str_app(g_dirbuf, o, g_basedir);
+    o = str_app(g_dirbuf, o, game_sub(i));
+    store8(g_dirbuf + o, 0);
+    return 0;
+}
+
+func launch_selected() -> i64 {
+    i = load64(sel);
+    build_paths(i);
+    # Launch the game exe with its own folder as the working directory. CreateProcessA
+    # (kernel32, no COM) is more reliable than ShellExecute from a fresh GUI thread.
+    memset(proc_si, 0, 104);
+    memset(proc_pi, 0, 24);
+    store32(proc_si + 0, 104);                 # STARTUPINFOA.cb
+    ok = CreateProcessA(g_pathbuf, 0, 0, 0, 0, 0, 0, g_dirbuf, proc_si, proc_pi);
+    if ok != 0 {
+        CloseHandle(load64(proc_pi + 0));      # hProcess
+        CloseHandle(load64(proc_pi + 8));      # hThread
+    }
+    return 0;
+}
+
+# draw the whole launcher into a device context
+func render(hdc: ptr, width: i64, height: i64) -> i64 {
+    # background
+    fill_rect(hdc, 0, 0, width, height, load64(bg_brush));
+
+    header_h = 100;
+    footer_h = 58;
+
+    # header band
+    fill_rect(hdc, 0, 0, width, header_h, load64(panel_brush));
+    fill_rect(hdc, 0, header_h - 3, width, header_h, load64(gb0)); # cyan underline
+
+    SetBkMode(hdc, 1);
+    SelectObject(hdc, load64(title_font));
+    SetTextColor(hdc, 0xFFFF00);                       # cyan
+    TextOutA(hdc, 40, 22, "AETHERCADE", 10);
+    SelectObject(hdc, load64(sub_font));
+    SetTextColor(hdc, 0x999999);
+    TextOutA(hdc, 44, 70, subtitle, strlen(subtitle));
+
+    # game list
+    n = game_count();
+    list_top = header_h + 14;
+    list_bot = height - footer_h - 8;
+    gap = 10;
+    avail = list_bot - list_top - (n - 1) * gap;
+    row_h = avail / n;
+    margin = 36;
+    rx = margin;
+    rw = width - margin * 2;
+
+    i = 0;
+    while i < n {
+        ry = list_top + i * (row_h + gap);
+        rb = ry + row_h;
+        selected = 0;
+        if i == load64(sel) { selected = 1; }
+
+        # row background
+        if selected == 1 {
+            fill_rect(hdc, rx, ry, rx + rw, rb, load64(tile_sel_brush));
+        } else {
+            fill_rect(hdc, rx, ry, rx + rw, rb, load64(tile_brush));
+        }
+
+        # left accent bar (game color)
+        fill_rect(hdc, rx, ry, rx + 8, rb, game_brush(i));
+
+        # cartridge icon square
+        icon = row_h - 22;
+        ix = rx + 22;
+        iy = ry + 11;
+        fill_rect(hdc, ix, iy, ix + icon, iy + icon, game_brush(i));
+        stroke_rect(hdc, ix, iy, ix + icon, iy + icon, 2, load64(border_brush));
+
+        tx = ix + icon + 20;
+
+        # game name
+        SelectObject(hdc, load64(name_font));
+        if selected == 1 { SetTextColor(hdc, game_color(i)); }
+        else { SetTextColor(hdc, 0xFFFFFF); }
+        nm = game_name(i);
+        TextOutA(hdc, tx, ry + 11, nm, strlen(nm));
+
+        # blurb
+        SelectObject(hdc, load64(blurb_font));
+        SetTextColor(hdc, 0x9A9A9A);
+        bl = game_blurb(i);
+        TextOutA(hdc, tx, ry + 40, bl, strlen(bl));
+
+        # 3D badge (right side)
+        if game_is3d(i) == 1 {
+            bw = 44;
+            bh = 26;
+            bx = rx + rw - bw - 18;
+            by = ry + (row_h - bh) / 2;
+            fill_rect(hdc, bx, by, bx + bw, by + bh, game_brush(i));
+            SelectObject(hdc, load64(badge_font));
+            SetTextColor(hdc, 0x101010);
+            TextOutA(hdc, bx + 12, by + 5, badge_3d, 2);
+        }
+
+        # selection glow border
+        if selected == 1 {
+            stroke_rect(hdc, rx, ry, rx + rw, rb, 2, game_brush(i));
+            stroke_rect(hdc, rx - 2, ry - 2, rx + rw + 2, rb + 2, 1, load64(border_brush));
+        } else {
+            stroke_rect(hdc, rx, ry, rx + rw, rb, 1, load64(border_brush));
+        }
+
+        i = i + 1;
+    }
+
+    # footer band
+    fy = height - footer_h;
+    fill_rect(hdc, 0, fy, width, height, load64(panel_brush));
+    fill_rect(hdc, 0, fy, width, fy + 3, load64(gb0));
+
+    SelectObject(hdc, load64(foot_font));
+    flash = band(shr(GetTickCount(), 9), 1);
+    if flash == 1 { SetTextColor(hdc, 0xFFFF00); }
+    else { SetTextColor(hdc, 0x556655); }
+    TextOutA(hdc, 40, fy + 18, foot_a, strlen(foot_a));
+    SetTextColor(hdc, 0x888888);
+    tw = strlen(foot_b);
+    TextOutA(hdc, width - tw * 10 - 40, fy + 18, foot_b, tw);
+
+    # CRT scanline overlay
+    old_pen = SelectObject(hdc, load64(scan_pen));
+    yy = 0;
+    while yy < height {
+        MoveToEx(hdc, 0, yy, 0);
+        LineTo(hdc, width, yy);
+        yy = yy + 3;
+    }
+    SelectObject(hdc, old_pen);
+    return 0;
+}
+
+func paint(hwnd_val: i64) -> i64 {
+    hdc = BeginPaint(hwnd_val, ps_buf);
+    GetClientRect(hwnd_val, client_rect);
+    w = load32(client_rect + 8);
+    h = load32(client_rect + 12);
+
+    # double-buffer
+    mem_dc = CreateCompatibleDC(hdc);
+    mem_bmp = CreateCompatibleBitmap(hdc, w, h);
+    old = SelectObject(mem_dc, mem_bmp);
+
+    render(mem_dc, w, h);
+    BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, 0x00CC0020);   # SRCCOPY
+
+    SelectObject(mem_dc, old);
+    DeleteObject(mem_bmp);
+    DeleteDC(mem_dc);
+    EndPaint(hwnd_val, ps_buf);
+    return 0;
+}
+
+func move_sel(delta: i64) -> i64 {
+    n = game_count();
+    s = load64(sel) + delta;
+    if s < 0 { s = n - 1; }
+    if s >= n { s = 0; }
+    store64(sel, s);
+    InvalidateRect(load64(hwnd), 0, 0);
+    return 0;
+}
+
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { paint(hwnd_val); return 0; }        # WM_PAINT
+    if msg == 20 { return 1; }                          # WM_ERASEBKGND
+    if msg == 2  { PostQuitMessage(0); return 0; }      # WM_DESTROY
+
+    if msg == 256 {                                     # WM_KEYDOWN
+        if wParam == 38 { move_sel(0 - 1); return 0; }  # Up
+        if wParam == 87 { move_sel(0 - 1); return 0; }  # W
+        if wParam == 40 { move_sel(1); return 0; }      # Down
+        if wParam == 83 { move_sel(1); return 0; }      # S
+        if wParam == 13 { launch_selected(); return 0; }# Enter
+        if wParam == 32 { launch_selected(); return 0; }# Space
+        if wParam == 27 { PostQuitMessage(0); return 0; }# Esc
+        return 0;
+    }
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+func compute_basedir() -> i64 {
+    memset(g_pathbuf, 0, 700);
+    GetModuleFileNameA(0, g_pathbuf, 600);
+    # find last backslash
+    last = 0 - 1;
+    i = 0;
+    while load8(g_pathbuf + i) != 0 {
+        if load8(g_pathbuf + i) == 92 { last = i; }     # '\'
+        i = i + 1;
+    }
+    memset(g_basedir, 0, 600);
+    if last >= 0 {
+        memcpy(g_basedir, g_pathbuf, last + 1);          # include trailing '\'
+        store8(g_basedir + last + 1, 0);
+    }
+    return 0;
+}
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    compute_basedir();
+    store64(sel, 0);
+
+    # brushes
+    store64(bg_brush,       CreateSolidBrush(0x0E0E10));
+    store64(panel_brush,    CreateSolidBrush(0x1A1A1E));
+    store64(tile_brush,     CreateSolidBrush(0x1E1E22));
+    store64(tile_sel_brush, CreateSolidBrush(0x2A2A30));
+    store64(border_brush,   CreateSolidBrush(0x3A3A42));
+    store64(scan_pen,       CreatePen(0, 1, 0x000000));
+
+    store64(gb0, CreateSolidBrush(0xFFFF00)); # cyan
+    store64(gb1, CreateSolidBrush(0x00E000)); # green
+    store64(gb2, CreateSolidBrush(0x00A5FF)); # orange
+    store64(gb3, CreateSolidBrush(0x70C0E0)); # sand
+    store64(gb4, CreateSolidBrush(0xFF00FF)); # magenta
+    store64(gb5, CreateSolidBrush(0x40C050)); # grass
+    store64(gb6, CreateSolidBrush(0xFFA000)); # electric blue
+
+    # fonts
+    store64(title_font, CreateFontA(46, 0, 0, 0, 800, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(sub_font,   CreateFontA(16, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(name_font,  CreateFontA(26, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(blurb_font, CreateFontA(15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(badge_font, CreateFontA(15, 0, 0, 0, 800, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(foot_font,  CreateFontA(18, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+
+    # WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3);
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 180, 60, 760, 720, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    if hwnd_val == 0 { return 1; }
+
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    store64(last_tick, GetTickCount());
+
+    while 1 {
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; }                  # WM_QUIT
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            Sleep(1);
+        }
+        # ~30Hz repaint to animate the blinking footer
+        current = GetTickCount();
+        if current - load64(last_tick) >= 33 {
+            store64(last_tick, current);
+            InvalidateRect(hwnd_val, 0, 0);
+        }
+    }
+
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(panel_brush));
+    DeleteObject(load64(tile_brush));
+    DeleteObject(load64(tile_sel_brush));
+    DeleteObject(load64(border_brush));
+    DeleteObject(load64(scan_pen));
+    DeleteObject(load64(gb0)); DeleteObject(load64(gb1)); DeleteObject(load64(gb2));
+    DeleteObject(load64(gb3)); DeleteObject(load64(gb4)); DeleteObject(load64(gb5));
+    DeleteObject(load64(gb6));
+    DeleteObject(load64(title_font)); DeleteObject(load64(sub_font));
+    DeleteObject(load64(name_font));  DeleteObject(load64(blurb_font));
+    DeleteObject(load64(badge_font)); DeleteObject(load64(foot_font));
+    return 0;
+}

@@ -1,0 +1,1027 @@
+# =====================================================================
+#  fluid_engine_3d.ancl  -  Bitwise 3D Cellular Automata Fluid Simulator
+#
+#  Open-Source Systems Mathematics Showcase (Project Fluid-Matrix)
+#  100% CRT-free, high-performance CPU-bound fluid dynamics engine.
+# =====================================================================
+import "win32_api.ancl";
+
+extern "gdi32.dll" StretchDIBits;
+extern "gdi32.dll" CreateFontA -> ptr;
+extern "user32.dll" GetAsyncKeyState;
+
+@DATA
+clsname:      str = "FLUIDMATRIXWND";
+title:        str = "ANCL Project Fluid-Matrix: 3D Cellular Automata Fluid Simulator";
+font_name:    str = "Consolas";
+btn_class:    str = "BUTTON";
+
+# Fluid Grid Buffers (64x64x64 bytes = 262144 bytes each)
+# Grid A
+g_grid_a: buf = 262144;
+# Grid B
+g_grid_b: buf = 262144;
+
+# Grid pointers
+g_active_grid: buf = 8;
+g_temp_grid:   buf = 8;
+
+# Random seed for collision LCG
+g_rand_seed: buf = 8;
+
+# Mouse state tracking
+g_mouse_last_x: buf = 8;
+g_mouse_last_y: buf = 8;
+
+# First-person Camera state
+g_camX: buf = 8;
+g_camY: buf = 8;
+g_camZ: buf = 8;
+g_camYaw: buf = 8;
+g_camPitch: buf = 8;
+g_zoom_factor: buf = 8;
+
+# 3D Rotations (fallback/legacy)
+g_angleY: buf = 8;
+
+# Trig tables (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# Viewport buffers
+# Framebuffer: 320x240 pixels * 4 bytes/pixel = 307200 bytes
+g_framebuffer: buf = 307200;
+# Z-buffer: 320x240 pixels * 4 bytes/pixel = 307200 bytes
+g_zbuffer: buf = 307200;
+# BITMAPINFO structure (48 bytes)
+g_bitmapinfo: buf = 48;
+
+# Color palette mode: 0 = Neon-Cyan, 1 = Copper-Amber
+g_palette_mode: buf = 8;
+
+# Temporary string buffers
+g_txt_buf: buf = 256;
+g_num_buf: buf = 32;
+
+# Standard Win32 variables
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Math & String Utilities
+# ---------------------------------------------------------------------
+
+func strcpy(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i, c);
+        if c == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strcat(dst: i64, src: i64) -> i64 {
+    p = dst;
+    while load8(p) != 0 {
+        p = p + 1;
+    }
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(p + i, c);
+        if c == 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func strlen(s: i64) -> i64 {
+    i = 0;
+    while load8(s + i) != 0 {
+        i = i + 1;
+    }
+    return i;
+}
+
+func itoa(val: i64, buf: i64) -> i64 {
+    if val == 0 {
+        store8(buf, 48); # '0'
+        store8(buf + 1, 0);
+        return 1;
+    }
+    negative = 0;
+    temp = val;
+    if temp < 0 {
+        negative = 1;
+        temp = 0 - temp;
+    }
+    p = buf;
+    if negative == 1 {
+        store8(p, 45); # '-'
+        p = p + 1;
+    }
+    start_digits = p;
+    while temp > 0 {
+        digit = temp % 10;
+        store8(p, 48 + digit); # '0' + digit
+        p = p + 1;
+        temp = temp / 10;
+    }
+    store8(p, 0);
+    end_digits = p - 1;
+    while start_digits < end_digits {
+        c1 = load8(start_digits);
+        c2 = load8(end_digits);
+        store8(start_digits, c2);
+        store8(end_digits, c1);
+        start_digits = start_digits + 1;
+        end_digits = end_digits - 1;
+    }
+    return p - buf;
+}
+
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+func get_sin(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_sin + idx * 8);
+}
+
+func get_cos(angle: i64) -> i64 {
+    idx = band(angle + 1024, 1023);
+    return load64(g_cos + idx * 8);
+}
+
+# ---------------------------------------------------------------------
+# Cellular Automata Fluid Simulator Core
+# ---------------------------------------------------------------------
+
+func init_fluid_grid() -> i64 {
+    active = load64(g_active_grid);
+    temp = load64(g_temp_grid);
+    
+    # Clear both grids
+    i = 0;
+    while i < 32768 {
+        store64(active + i * 8, 0);
+        store64(temp + i * 8, 0);
+        i = i + 1;
+    }
+    
+    # Set boundary walls (x=0, 63, y=0, 63, z=0, 63)
+    x = 0;
+    while x < 64 {
+        y = 0;
+        while y < 64 {
+            z = 0;
+            while z < 64 {
+                is_boundary = 0;
+                if x == 0 || x == 63 { is_boundary = 1; }
+                if y == 0 || y == 63 { is_boundary = 1; }
+                if z == 0 || z == 63 { is_boundary = 1; }
+                
+                # Central solid obstacle sphere of radius 6
+                dx = x - 32;
+                dy = y - 32;
+                dz = z - 32;
+                dist_sq = dx * dx + dy * dy + dz * dz;
+                if dist_sq <= 36 {
+                    is_boundary = 1;
+                }
+                
+                if is_boundary {
+                    store8(active + x * 4096 + y * 64 + z, 128);
+                    store8(temp + x * 4096 + y * 64 + z, 128);
+                }
+                z = z + 1;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    
+    # Seed floating fluid vortex particles
+    seed = 12345;
+    x = 20;
+    while x < 44 {
+        y = 20;
+        while y < 44 {
+            z = 20;
+            while z < 44 {
+                dx = x - 32;
+                dy = y - 32;
+                dz = z - 32;
+                dist_sq = dx * dx + dy * dy + dz * dz;
+                if dist_sq > 36 {
+                    seed = band(seed * 1103515245 + 12345, 2147483647);
+                    if band(seed, 7) == 0 {
+                        dir = band(seed, 63); # random bits 0..5
+                        if dir > 0 {
+                            store8(active + x * 4096 + y * 64 + z, dir);
+                        }
+                    }
+                }
+                z = z + 1;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return 0;
+}
+
+func propagate_fluid() -> i64 {
+    active = load64(g_active_grid);
+    temp = load64(g_temp_grid);
+    
+    # Clear temp grid to 0 by i64
+    i = 0;
+    while i < 32768 {
+        store64(temp + i * 8, 0);
+        i = i + 1;
+    }
+    
+    x = 0;
+    while x < 64 {
+        y = 0;
+        while y < 64 {
+            z = 0;
+            while z < 64 {
+                val = load8(active + x * 4096 + y * 64 + z);
+                if val != 0 {
+                    if band(val, 128) {
+                        store8(temp + x * 4096 + y * 64 + z, bor(load8(temp + x * 4096 + y * 64 + z), 128));
+                    }
+                    
+                    # Bit 0: +X direction (+1, 0, 0)
+                    if band(val, 1) {
+                        nx = x + 1; ny = y; nz = z;
+                        out_bit = 1;
+                        if nx >= 64 {
+                            nx = x; ny = y; nz = z; out_bit = 2;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 2; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 1: -X direction (-1, 0, 0)
+                    if band(val, 2) {
+                        nx = x - 1; ny = y; nz = z;
+                        out_bit = 2;
+                        if nx < 0 {
+                            nx = x; ny = y; nz = z; out_bit = 1;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 1; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 2: +Y direction (0, +1, 0)
+                    if band(val, 4) {
+                        nx = x; ny = y + 1; nz = z;
+                        out_bit = 4;
+                        if ny >= 64 {
+                            nx = x; ny = y; nz = z; out_bit = 8;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 8; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 3: -Y direction (0, -1, 0)
+                    if band(val, 8) {
+                        nx = x; ny = y - 1; nz = z;
+                        out_bit = 8;
+                        if ny < 0 {
+                            nx = x; ny = y; nz = z; out_bit = 4;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 4; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 4: +Z direction (0, 0, +1)
+                    if band(val, 16) {
+                        nx = x; ny = y; nz = z + 1;
+                        out_bit = 16;
+                        if nz >= 64 {
+                            nx = x; ny = y; nz = z; out_bit = 32;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 32; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 5: -Z direction (0, 0, -1)
+                    if band(val, 32) {
+                        nx = x; ny = y; nz = z - 1;
+                        out_bit = 32;
+                        if nz < 0 {
+                            nx = x; ny = y; nz = z; out_bit = 16;
+                        } else {
+                            target_val = load8(active + nx * 4096 + ny * 64 + nz);
+                            if band(target_val, 128) { nx = x; ny = y; nz = z; out_bit = 16; }
+                        }
+                        offset = nx * 4096 + ny * 64 + nz;
+                        store8(temp + offset, bor(load8(temp + offset), out_bit));
+                    }
+                    # Bit 6: Rest particle (zero velocity)
+                    if band(val, 64) {
+                        offset = x * 4096 + y * 64 + z;
+                        store8(temp + offset, bor(load8(temp + offset), 64));
+                    }
+                }
+                z = z + 1;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    
+    # Swap active and temporary grids
+    t = active;
+    store64(g_active_grid, temp);
+    store64(g_temp_grid, t);
+    return 0;
+}
+
+func collide_fluid() -> i64 {
+    active = load64(g_active_grid);
+    
+    # Simple LCG Random step
+    g_seed = load64(g_rand_seed);
+    g_seed = band(g_seed * 1103515245 + 12345, 2147483647);
+    store64(g_rand_seed, g_seed);
+    
+    x = 0;
+    while x < 64 {
+        y = 0;
+        while y < 64 {
+            z = 0;
+            while z < 64 {
+                offset = x * 4096 + y * 64 + z;
+                val = load8(active + offset);
+                
+                if band(val, 128) == 0 {
+                    px = band(val, 3);
+                    py = band(val, 12);
+                    pz = band(val, 48);
+                    rest = band(val, 64);
+                    
+                    # Case 1: Head-on X collision (+X and -X)
+                    if px == 3 && py == 0 && pz == 0 {
+                        if band(g_seed, 1) {
+                            val = rest + 12; # Scatter to +Y, -Y
+                        } else {
+                            val = rest + 48; # Scatter to +Z, -Z
+                        }
+                        store8(active + offset, val);
+                    }
+                    # Case 2: Head-on Y collision (+Y and -Y)
+                    else if py == 12 && px == 0 && pz == 0 {
+                        if band(g_seed, 2) {
+                            val = rest + 3;  # Scatter to +X, -X
+                        } else {
+                            val = rest + 48; # Scatter to +Z, -Z
+                        }
+                        store8(active + offset, val);
+                    }
+                    # Case 3: Head-on Z collision (+Z and -Z)
+                    else if pz == 48 && px == 0 && py == 0 {
+                        if band(g_seed, 4) {
+                            val = rest + 3;  # Scatter to +X, -X
+                        } else {
+                            val = rest + 12; # Scatter to +Y, -Y
+                        }
+                        store8(active + offset, val);
+                    }
+                }
+                z = z + 1;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return 0;
+}
+
+func inject_force(gx: i64, gy: i64, gz: i64, dx: i64, dy: i64) -> i64 {
+    active = load64(g_active_grid);
+    
+    bits = 0;
+    if dx > 0 { bits = bor(bits, 1); }   # +X (Bit 0)
+    if dx < 0 { bits = bor(bits, 2); }   # -X (Bit 1)
+    if dy > 0 { bits = bor(bits, 4); }   # +Y (Bit 2)
+    if dy < 0 { bits = bor(bits, 8); }   # -Y (Bit 3)
+    
+    if bits == 0 {
+        bits = 64;
+    }
+    
+    # Inject inside a sphere of radius 3
+    rx = 0 - 3;
+    while rx <= 3 {
+        igx = gx + rx;
+        if igx >= 0 && igx < 64 {
+            ry = 0 - 3;
+            while ry <= 3 {
+                igy = gy + ry;
+                if igy >= 0 && igy < 64 {
+                    rz = 0 - 3;
+                    while rz <= 3 {
+                        igz = gz + rz;
+                        if igz >= 0 && igz < 64 {
+                            dist_sq = rx * rx + ry * ry + rz * rz;
+                            if dist_sq <= 9 {
+                                offset = igx * 4096 + igy * 64 + igz;
+                                val = load8(active + offset);
+                                if band(val, 128) == 0 {
+                                    store8(active + offset, bor(val, bits));
+                                }
+                            }
+                        }
+                        rz = rz + 1;
+                    }
+                }
+                ry = ry + 1;
+            }
+        }
+        rx = rx + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Volumetric Rendering & Splatting
+# ---------------------------------------------------------------------
+
+func render_scene() -> i64 {
+    # 1. Clear color framebuffer and Z-depth buffer
+    i = 0;
+    while i < 76800 {
+        store32(g_framebuffer + i * 4, 0x000B0B0D); # Dark background
+        store32(g_zbuffer + i * 4, 0x7FFFFFFF);     # Max depth
+        i = i + 1;
+    }
+    
+    # 2. Setup first-person rotations & position
+    ax = load64(g_camPitch);
+    ay = load64(g_camYaw);
+    
+    cosX = get_cos(ax);
+    sinX = get_sin(ax);
+    cosY = get_cos(ay);
+    sinY = get_sin(ay);
+    
+    cx = load64(g_camX);
+    cy = load64(g_camY);
+    cz = load64(g_camZ);
+    zoom = load64(g_zoom_factor);
+    
+    active = load64(g_active_grid);
+    palette = load64(g_palette_mode);
+    
+    # 3. Additive volumetric splatting loop
+    gx = 0;
+    while gx < 64 {
+        off_x = gx * 4096;
+        tx_fixed = gx * 65536 - cx;
+        
+        gy = 0;
+        while gy < 64 {
+            off_xy = off_x + gy * 64;
+            ty_fixed = gy * 65536 - cy;
+            
+            gz = 0;
+            while gz < 64 {
+                val = load8(active + off_xy + gz);
+                if val != 0 {
+                    # Compute particle density (popcount)
+                    density = 0;
+                    if band(val, 1) { density = density + 1; }
+                    if band(val, 2) { density = density + 1; }
+                    if band(val, 4) { density = density + 1; }
+                    if band(val, 8) { density = density + 1; }
+                    if band(val, 16) { density = density + 1; }
+                    if band(val, 32) { density = density + 1; }
+                    if band(val, 64) { density = density + 1; }
+                    
+                    is_wall = band(val, 128);
+                    
+                    if density > 0 || is_wall != 0 {
+                        tz_fixed = gz * 65536 - cz;
+                        
+                        # Rotate coordinates around Y axis (Yaw)
+                        rx1 = (tx_fixed * cosY + tz_fixed * sinY) / 65536;
+                        rz1 = (0 - tx_fixed * sinY + tz_fixed * cosY) / 65536;
+                        
+                        # Rotate coordinates around X axis (Pitch)
+                        rx = rx1;
+                        ry = (ty_fixed * cosX - rz1 * sinX) / 65536;
+                        rz = (ty_fixed * sinX + rz1 * cosX) / 65536;
+                        
+                        # Convert fixed-point coordinates to integer grid coordinates
+                        rx = rx / 65536;
+                        ry = ry / 65536;
+                        rz = rz / 65536;
+                        
+                        # Strict near-plane clip: Z-depth <= 3 drops the cell immediately
+                        if rz > 3 {
+                            px = 160 + (rx * zoom) / rz;
+                            py = 120 + (ry * zoom) / rz;
+                        
+                        if px >= 0 && px < 320 && py >= 0 && py < 240 {
+                            offset = py * 320 + px;
+                            z_buffered = load32(g_zbuffer + offset * 4);
+                            
+                            if rz < z_buffered {
+                                color = 0;
+                                if is_wall != 0 {
+                                    color = 0x00333339; # Dark gray solid boundary/obstacle
+                                } else {
+                                    if palette == 0 { # Neon-Cyan
+                                        g_ch = density * 30;
+                                        if g_ch > 255 { g_ch = 255; }
+                                        b_ch = density * 36;
+                                        if b_ch > 255 { b_ch = 255; }
+                                        color = shl(g_ch, 8) + b_ch;
+                                    } else { # Copper-Amber
+                                        r_ch = density * 36;
+                                        if r_ch > 255 { r_ch = 255; }
+                                        g_ch = density * 18;
+                                        if g_ch > 255 { g_ch = 255; }
+                                        b_ch = density * 4;
+                                        if b_ch > 255 { b_ch = 255; }
+                                        color = shl(r_ch, 16) + shl(g_ch, 8) + b_ch;
+                                    }
+                                }
+                                
+                                # Additive blend
+                                old_col = load32(g_framebuffer + offset * 4);
+                                o_r = band(shr(old_col, 16), 255);
+                                o_g = band(shr(old_col, 8), 255);
+                                o_b = band(old_col, 255);
+                                
+                                n_r = band(shr(color, 16), 255);
+                                n_g = band(shr(color, 8), 255);
+                                n_b = band(color, 255);
+                                
+                                fin_r = o_r + n_r; if fin_r > 255 { fin_r = 255; }
+                                fin_g = o_g + n_g; if fin_g > 255 { fin_g = 255; }
+                                fin_b = o_b + n_b; if fin_b > 255 { fin_b = 255; }
+                                
+                                fin_color = shl(fin_r, 16) + shl(fin_g, 8) + fin_b;
+                                store32(g_framebuffer + offset * 4, fin_color);
+                                
+                                if is_wall != 0 {
+                                    store32(g_zbuffer + offset * 4, rz);
+                                }
+                            }
+                        }
+                        }
+                    }
+                }
+                gz = gz + 1;
+            }
+            gy = gy + 1;
+        }
+        gx = gx + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 WndProc & Message Loop
+# ---------------------------------------------------------------------
+
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        hinst = load64(g_hinst);
+        CreateWindowExA(0, btn_class, "CYAN", 1342242816, 380, 445, 60, 30, hwnd, 101, hinst, 0);
+        CreateWindowExA(0, btn_class, "AMBER", 1342242816, 450, 445, 60, 30, hwnd, 102, hinst, 0);
+        CreateWindowExA(0, btn_class, "RESET", 1342242816, 520, 445, 60, 30, hwnd, 103, hinst, 0);
+        
+        SetTimer(hwnd, 1, 30, 0);
+        return 0;
+    }
+    
+    if msg == 273 { # WM_COMMAND
+        cmdId = band(wParam, 65535);
+        if cmdId == 101 { # CYAN
+            store64(g_palette_mode, 0);
+        }
+        if cmdId == 102 { # AMBER
+            store64(g_palette_mode, 1);
+        }
+        if cmdId == 103 { # RESET
+            init_fluid_grid();
+        }
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 513 { # WM_LBUTTONDOWN
+        mx = band(lParam, 65535);
+        my = band(shr(lParam, 16), 65535);
+        store64(g_mouse_last_x, mx);
+        store64(g_mouse_last_y, my);
+        return 0;
+    }
+    
+    if msg == 516 { # WM_RBUTTONDOWN
+        mx = band(lParam, 65535);
+        my = band(shr(lParam, 16), 65535);
+        store64(g_mouse_last_x, mx);
+        store64(g_mouse_last_y, my);
+        return 0;
+    }
+    
+    if msg == 512 { # WM_MOUSEMOVE
+        if band(wParam, 1) { # MK_LBUTTON
+            mx = band(lParam, 65535);
+            my = band(shr(lParam, 16), 65535);
+            
+            last_x = load64(g_mouse_last_x);
+            last_y = load64(g_mouse_last_y);
+            
+            store64(g_mouse_last_x, mx);
+            store64(g_mouse_last_y, my);
+            
+            dx = mx - last_x;
+            dy = my - last_y;
+            
+            if dx != 0 || dy != 0 {
+                GetClientRect(hwnd, g_rect);
+                cw = load32(g_rect + 8);
+                ch = load32(g_rect + 12);
+                vh = ch - 80;
+                if cw > 0 && vh > 0 {
+                    smx = (mx * 320) / cw;
+                    smy = (my * 240) / vh;
+                    gx = (smx * 64) / 320;
+                    gy = (smy * 64) / 240;
+                    
+                    inject_force(gx, gy, 32, dx, dy);
+                }
+            }
+        }
+        if band(wParam, 2) { # MK_RBUTTON
+            mx = band(lParam, 65535);
+            my = band(shr(lParam, 16), 65535);
+            
+            last_x = load64(g_mouse_last_x);
+            last_y = load64(g_mouse_last_y);
+            
+            store64(g_mouse_last_x, mx);
+            store64(g_mouse_last_y, my);
+            
+            dx = mx - last_x;
+            dy = my - last_y;
+            
+            if dx != 0 || dy != 0 {
+                yaw = load64(g_camYaw);
+                yaw = band(yaw + dx * 2, 1023);
+                store64(g_camYaw, yaw);
+                
+                pitch = load64(g_camPitch);
+                pitch = pitch - dy * 2;
+                if pitch < -250 { pitch = -250; }
+                if pitch > 250 { pitch = 250; }
+                store64(g_camPitch, pitch);
+            }
+        }
+        return 0;
+    }
+    
+    if msg == 522 { # WM_MOUSEWHEEL
+        raw_delta = band(shr(wParam, 16), 65535);
+        delta = 0;
+        if band(raw_delta, 32768) {
+            delta = raw_delta - 65536;
+        } else {
+            delta = raw_delta;
+        }
+        
+        cz = load64(g_camZ);
+        cz = cz + (delta * 1638);
+        if cz < -6553600 { cz = -6553600; }
+        if cz > 4063232 { cz = 4063232; }
+        store64(g_camZ, cz);
+        
+        zf = load64(g_zoom_factor);
+        zf = zf + (delta / 12);
+        if zf < 50 { zf = 50; }
+        if zf > 600 { zf = 600; }
+        store64(g_zoom_factor, zf);
+        
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Step Cellular Automata Simulation
+        propagate_fluid();
+        collide_fluid();
+        
+        # Update camera rotation from Arrow keys
+        yaw = load64(g_camYaw);
+        pitch = load64(g_camPitch);
+        
+        if band(GetAsyncKeyState(37), 32768) { # Left Arrow -> Turn Left
+            yaw = band(yaw - 8 + 1024, 1023);
+        }
+        if band(GetAsyncKeyState(39), 32768) { # Right Arrow -> Turn Right
+            yaw = band(yaw + 8, 1023);
+        }
+        if band(GetAsyncKeyState(38), 32768) { # Up Arrow -> Look Up
+            pitch = pitch + 8;
+            if pitch > 250 { pitch = 250; }
+        }
+        if band(GetAsyncKeyState(40), 32768) { # Down Arrow -> Look Down
+            pitch = pitch - 8;
+            if pitch < -250 { pitch = -250; }
+        }
+        
+        store64(g_camYaw, yaw);
+        store64(g_camPitch, pitch);
+        
+        # Update camera position and zoom from WASD & +/- keyboard state
+        cosY = get_cos(yaw);
+        sinY = get_sin(yaw);
+        cosX = get_cos(pitch);
+        sinX = get_sin(pitch);
+        
+        cx = load64(g_camX);
+        cy = load64(g_camY);
+        cz = load64(g_camZ);
+        
+        is_plus = 0;
+        if band(GetAsyncKeyState(0x6B), 32768) || band(GetAsyncKeyState(0xBB), 32768) {
+            is_plus = 1;
+        }
+        is_minus = 0;
+        if band(GetAsyncKeyState(0x6D), 32768) || band(GetAsyncKeyState(0xBD), 32768) {
+            is_minus = 1;
+        }
+        
+        if is_plus {
+            cz = cz + 65536;
+            zf = load64(g_zoom_factor);
+            zf = zf + 5;
+            if zf > 600 { zf = 600; }
+            store64(g_zoom_factor, zf);
+        }
+        if is_minus {
+            cz = cz - 65536;
+            zf = load64(g_zoom_factor);
+            zf = zf - 5;
+            if zf < 50 { zf = 50; }
+            store64(g_zoom_factor, zf);
+        }
+        
+        # W/S: move forward / backward along look-vector
+        # Forward vector in world space:
+        # dx = -sinY * cosX / 65536
+        # dy = sinX
+        # dz = cosY * cosX / 65536
+        fw_x = (0 - sinY * cosX) / 65536;
+        fw_y = sinX;
+        fw_z = (cosY * cosX) / 65536;
+        
+        # Speed: 25000 units (~0.38 grid cells per frame)
+        speed_factor = 25000;
+        
+        if band(GetAsyncKeyState(0x57), 32768) { # W key
+            cx = cx + (fw_x * speed_factor) / 65536;
+            cy = cy + (fw_y * speed_factor) / 65536;
+            cz = cz + (fw_z * speed_factor) / 65536;
+        }
+        if band(GetAsyncKeyState(0x53), 32768) { # S key
+            cx = cx - (fw_x * speed_factor) / 65536;
+            cy = cy - (fw_y * speed_factor) / 65536;
+            cz = cz - (fw_z * speed_factor) / 65536;
+        }
+        
+        # A/D: strafe left / right
+        # Strafe right vector: dx = cosY, dy = 0, dz = sinY
+        rt_x = cosY;
+        rt_z = sinY;
+        
+        if band(GetAsyncKeyState(0x44), 32768) { # D key
+            cx = cx + (rt_x * speed_factor) / 65536;
+            cz = cz + (rt_z * speed_factor) / 65536;
+        }
+        if band(GetAsyncKeyState(0x41), 32768) { # A key
+            cx = cx - (rt_x * speed_factor) / 65536;
+            cz = cz - (rt_z * speed_factor) / 65536;
+        }
+        
+        # Clamp camera coordinates to stay inside the grid [1.0, 62.0]
+        # Allow camZ to range smoothly from -100 (-6553600) to 62 (4063232)
+        if cx < 65536 { cx = 65536; }
+        if cx > 4063232 { cx = 4063232; }
+        if cy < 65536 { cy = 65536; }
+        if cy > 4063232 { cy = 4063232; }
+        if cz < -6553600 { cz = -6553600; }
+        if cz > 4063232 { cz = 4063232; }
+        
+        store64(g_camX, cx);
+        store64(g_camY, cy);
+        store64(g_camZ, cz);
+        
+        # Increment legacy Y rotation angle (for backward compatibility if needed)
+        ay = load64(g_angleY);
+        ay = band(ay + 2, 1023);
+        store64(g_angleY, ay);
+        
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        # Render volumetric fluid scene
+        render_scene();
+        
+        # Blit 320x240 framebuffer to top canvas area
+        StretchDIBits(hdc, 0, 0, w, h - 80, 0, 0, 320, 240, g_framebuffer, g_bitmapinfo, 0, 0x00CC0020);
+        
+        # Paint bottom control panel bar
+        hBrushPanel = CreateSolidBrush(0x001B1B15);
+        oldBrush = SelectObject(hdc, hBrushPanel);
+        hPenPanel = CreatePen(0, 1, 0x0033332D);
+        oldPen = SelectObject(hdc, hPenPanel);
+        Rectangle(hdc, 0, h - 80, w, h);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(hPenPanel);
+        DeleteObject(hBrushPanel);
+        
+        # Text Overlay
+        hFont = CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, font_name);
+        oldFont = SelectObject(hdc, hFont);
+        SetBkMode(hdc, 1);
+        
+        SetTextColor(hdc, 0x0000FF95); # Mint Green
+        strcpy(g_txt_buf, "PROJECT FLUID-MATRIX // 3D CELLULAR AUTOMATA SIMULATOR");
+        TextOutA(hdc, 15, 10, g_txt_buf, strlen(g_txt_buf));
+        
+        SetTextColor(hdc, 0x00E0E0E0); # Light Gray
+        strcpy(g_txt_buf, "Grid: 64x64x64 CA | Controls: WASD (Fly), Arrows (Look)");
+        TextOutA(hdc, 15, h - 70, g_txt_buf, strlen(g_txt_buf));
+        
+        strcpy(g_txt_buf, "Cam: X=");
+        itoa(load64(g_camX) / 65536, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, ", Y=");
+        itoa(load64(g_camY) / 65536, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, ", Z=");
+        itoa(load64(g_camZ) / 65536, g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, " | Zoom=");
+        itoa(load64(g_zoom_factor), g_num_buf);
+        strcat(g_txt_buf, g_num_buf);
+        strcat(g_txt_buf, " | MouseWheel / +/-: Zoom");
+        TextOutA(hdc, 15, h - 50, g_txt_buf, strlen(g_txt_buf));
+        
+        # Show palette name
+        strcpy(g_txt_buf, "Active Color Palette: ");
+        if load64(g_palette_mode) == 0 {
+            strcat(g_txt_buf, "VIBRANT NEON-CYAN");
+        } else {
+            strcat(g_txt_buf, "GLOWING COPPER-AMBER");
+        }
+        TextOutA(hdc, 15, h - 30, g_txt_buf, strlen(g_txt_buf));
+        
+        SelectObject(hdc, oldFont);
+        DeleteObject(hFont);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Execution Entry Point
+# ---------------------------------------------------------------------
+
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize Trigonometry Tables & Seed
+    init_lut();
+    store64(g_rand_seed, 987654321);
+    
+    # Initialize double grids A/B
+    store64(g_active_grid, g_grid_a);
+    store64(g_temp_grid, g_grid_b);
+    
+    init_fluid_grid();
+    
+    # Initialize Camera position and orientation inside the grid
+    # Place camera at x=32, y=32, z=5
+    store64(g_camX, 2097152);     # 32 * 65536
+    store64(g_camY, 2097152);     # 32 * 65536
+    store64(g_camZ, 327680);      # 5 * 65536
+    store64(g_camYaw, 0);
+    store64(g_camPitch, 0);
+    store64(g_zoom_factor, 180);
+    
+    # Default Palette: Cyan
+    store64(g_palette_mode, 0);
+    
+    # Initialize BITMAPINFO for 320x240 Top-Down DIB
+    store32(g_bitmapinfo + 0, 40);
+    store32(g_bitmapinfo + 4, 320);
+    store32(g_bitmapinfo + 8, 0 - 240);
+    store16(g_bitmapinfo + 12, 1);
+    store16(g_bitmapinfo + 14, 32);
+    store32(g_bitmapinfo + 16, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F));
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA (width 650, height 520)
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 100, 100, 650, 520, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Windows FFI Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

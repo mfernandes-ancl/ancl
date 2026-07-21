@@ -1,0 +1,44 @@
+# =====================================================================
+#  test_infix.ancl  -  ANCL language feature #1: infix bitwise operators.
+#
+#  Asserts each infix form (`& | ^ << >>`) equals its intrinsic call, and
+#  that C precedence holds (& > ^ > | ; << tighter than < but looser than +).
+#  Exit 0 = PASS, 1 = FAIL.
+# =====================================================================
+@DATA
+m_pass: str = "[PASS] test_infix: infix == intrinsic, C precedence verified\n";
+m_fail: str = "[FAIL] test_infix: mismatches = ";
+m_nl:   str = "\n";
+
+@CODE
+func chk(got: i64, want: i64) -> i64 {
+    if got == want { return 0; }
+    return 1;
+}
+
+func main() -> i32 {
+    f = 0;
+    a = 0xF0;
+    b = 0x0F;
+    c = 0x33;
+
+    # per-operator equivalence
+    f = f + chk(a | b, bor(a, b));
+    f = f + chk(a & b, band(a, b));
+    f = f + chk(a ^ c, bxor(a, c));
+    f = f + chk(a << 4, shl(a, 4));
+    f = f + chk(a >> 4, shr(a, 4));
+
+    # nesting + precedence (no parens) vs the explicit intrinsic tree
+    f = f + chk((a | b) ^ c, bxor(bor(a, b), c));
+    f = f + chk((a & 0xF0) >> 4, shr(band(a, 0xF0), 4));
+    f = f + chk(a | b & c, bor(a, band(b, c)));        # & binds tighter than |
+    f = f + chk(a ^ b | c, bor(bxor(a, b), c));        # ^ binds tighter than |
+    f = f + chk(1 << 4 | 1, bor(shl(1, 4), 1));        # << binds tighter than |
+    f = f + chk(8 + 1 << 2, shl(8 + 1, 2));            # + binds tighter than <<
+    f = f + chk(1 << 3 < 9, 1);                        # << binds tighter than <  -> (1<<3)<9 -> 8<9 -> 1
+
+    if f == 0 { syscall 1, m_pass; return 0; }
+    syscall 1, m_fail; syscall 1, f; syscall 1, m_nl;
+    return 1;
+}

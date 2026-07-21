@@ -1,0 +1,413 @@
+# =====================================================================
+#  theme.ancl  -  Aether Studio "NexusEdge" dark theme.
+#
+#  Shared palette + GDI objects (brushes/pens/fonts) + a glow-button
+#  painter, so main.ancl and settings.ancl render one consistent look:
+#  deep navy-black panels, neon-cyan accents, RoundRect glow buttons,
+#  Segoe UI chrome. Matches the user's test_ui_components / OPC tools.
+#
+#  Colors are COLORREF (0x00BBGGRR). theme_init() creates the GDI objects
+#  once (idempotent); call it before creating controls.
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+
+extern "gdi32.dll"  RoundRect;
+extern "gdi32.dll"  GetStockObject -> ptr;
+extern "gdi32.dll"  SetBkColor;              # match the editable combo's edit field to the backend tone
+extern "user32.dll" SetWindowPos;            # FRAMECHANGED after stripping the edit child's border
+extern "gdi32.dll"  CreateFontA -> ptr;      # merges with main.ancl's identical decl
+extern "user32.dll" DrawTextA;               # merges with main.ancl's identical decl
+extern "user32.dll" GetWindowLongPtrA -> i64;   # GlowButton state (GWLP_USERDATA -21, GWLP_ID -12) - 64-bit-correct
+extern "user32.dll" SetWindowLongPtrA -> i64;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" TrackMouseEvent;         # for reliable WM_MOUSELEAVE hover
+extern "uxtheme.dll"  SetWindowTheme;        # dark scrollbars/combos (DarkMode_Explorer / DarkMode_CFD)
+extern "gdi32.dll"    CreateRoundRectRgn -> ptr;
+extern "user32.dll"   SetWindowRgn;          # rounded-corner pane regions
+extern "kernel32.dll" GetProcAddress -> ptr; # SetPreferredAppMode by ordinal
+extern "user32.dll" CallWindowProcA -> i64;  # chain a combo subclass to the default COMBOBOX proc
+extern "user32.dll" GetDC -> ptr;            # editable-combo arrow overpaint
+extern "user32.dll" ReleaseDC;
+
+@DATA
+# ---- NexusEdge palette (BGR) ---------------------------------------
+# Modern neutral-charcoal palette + one soft purple accent (Kiro/Claude/Antigravity vibe).
+TH_BG_DEEP:  i64 = 0x00221E1E;   # #1E1E22  editor / main canvas
+TH_BG_PANEL: i64 = 0x00171414;   # #141417  darkest: window canvas / toolbar / status (cards float on this)
+TH_BG_CARD:  i64 = 0x002B2626;   # #26262B  button face / cards
+TH_BG_INPUT: i64 = 0x00191616;   # #161619  input fields / pressed button
+TH_BG_HOVER: i64 = 0x00362E2E;   # #2E2E36  hover state
+TH_TEXT:     i64 = 0x00CEC8C8;   # #C8C8CE  primary text
+TH_TEXT_BRT: i64 = 0x00FFFFFF;   # white (active/hover text)
+TH_TEXT_DIM: i64 = 0x00887E7E;   # #7E7E88  dim/secondary
+TH_NEON:     i64 = 0x00FA8BA7;   # #A78BFA  soft purple accent (hover/active)
+TH_GREEN:    i64 = 0x0080DE4A;   # #4ADE80  ok/ready
+TH_GOLD:     i64 = 0x0024BFFB;   # #FBBF24  warn / hint
+TH_RED:      i64 = 0x007171F8;   # #F87171  error
+TH_BORDER:   i64 = 0x003A3030;   # #30303A  subtle separators
+
+# ---- GDI handles (created by theme_init) ---------------------------
+thm_done:    buf = 8;
+thm_b_deep:  buf = 8;
+thm_b_panel: buf = 8;
+thm_b_card:  buf = 8;
+thm_b_input: buf = 8;
+thm_b_hover: buf = 8;
+thm_b_neon:   buf = 8;          # accent (purple) fill
+thm_b_green:  buf = 8;          # ok/idle fill
+thm_p_border: buf = 8;
+thm_p_neon:   buf = 8;          # 1px accent
+thm_p_neon2:  buf = 8;          # 2px accent
+thm_f_ui:     buf = 8;          # Segoe UI 15
+thm_f_hdr:    buf = 8;          # Segoe UI 16 bold
+thm_f_mono:   buf = 8;          # Consolas 16
+
+thm_face_ui:   str = "Segoe UI";
+thm_face_mono: str = "Consolas";
+
+# ---- GlowButton custom control (reliable hover via TrackMouseEvent) -
+thm_cls_glow: str = "AetherGlowBtn";
+thm_accent_id: buf = 8;          # control id of the ONE accent-filled (primary) button, else 0
+thm_glow_reg: buf = 8;
+thm_glow_wc:  buf = 80;
+thm_ps:       buf = 72;          # PAINTSTRUCT
+thm_rc:       buf = 16;          # RECT
+thm_track:    buf = 24;          # TRACKMOUSEEVENT
+thm_btntext:  buf = 128;         # GetWindowTextA scratch
+
+# ---- dark mode (native dark scrollbars + combos) -------------------
+thm_uxtheme:       str = "uxtheme.dll";
+thm_dm_explorer:   str = "DarkMode_Explorer";
+thm_dm_cfd:        str = "DarkMode_CFD";
+thm_dm_explorer_w: buf = 64;     # wide (SetWindowTheme wants LPCWSTR)
+thm_dm_cfd_w:      buf = 64;
+thm_dm_done:       buf = 8;
+g_allowdark:       buf = 8;       # uxtheme!AllowDarkModeForWindow (ordinal 133) fn ptr
+
+# ---- dark combobox subclass (the native drop-arrow won't dark-theme, so we paint it) ----
+thm_p_arrow:    buf = 8;          # the drop-arrow pen
+thm_old_combo:  buf = 8;          # saved original COMBOBOX wndproc (shared by all combos)
+thm_combo_ps:   buf = 72;         # PAINTSTRUCT
+thm_combo_rc:   buf = 16;         # RECT
+thm_combo_txt:  buf = 256;        # CB_GETLBTEXT scratch (selected item text)
+thm_cbi:        buf = 64;         # COMBOBOXINFO (CB_GETCOMBOBOXINFO -> the edit child @48)
+
+@CODE
+func theme_init() -> i64 {
+    if load64(thm_done) == 1 { return 0; }
+    store64(thm_b_deep,  CreateSolidBrush(TH_BG_DEEP));
+    store64(thm_b_panel, CreateSolidBrush(TH_BG_PANEL));
+    store64(thm_b_card,  CreateSolidBrush(TH_BG_CARD));
+    store64(thm_b_input, CreateSolidBrush(TH_BG_INPUT));
+    store64(thm_b_hover, CreateSolidBrush(TH_BG_HOVER));
+    store64(thm_b_neon,  CreateSolidBrush(TH_NEON));
+    store64(thm_b_green, CreateSolidBrush(TH_GREEN));
+    store64(thm_p_border, CreatePen(0, 1, TH_BORDER));
+    store64(thm_p_neon,   CreatePen(0, 1, TH_NEON));
+    store64(thm_p_neon2,  CreatePen(0, 2, TH_NEON));
+    store64(thm_p_arrow,  CreatePen(0, 1, TH_TEXT));           # combo drop-arrow
+    store64(thm_f_ui,   CreateFontA(0 - 15, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0,    thm_face_ui));
+    store64(thm_f_hdr,  CreateFontA(0 - 16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0,    thm_face_ui));
+    store64(thm_f_mono, CreateFontA(0 - 16, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0x31, thm_face_mono));
+    store64(thm_done, 1);
+    return 0;
+}
+
+# Paint a glow button into rc (RECT ptr l,t,r,b). state bits: 1=pressed, 2=hover.
+func thm_draw_button(hdc: i64, rc: i64, label: i64, state: i64) -> i64 {
+    l = load32(rc + 0);
+    t = load32(rc + 4);
+    r = load32(rc + 8);
+    b = load32(rc + 12);
+    pressed = band(state, 1);
+    hover = band(state, 2);
+    accent = band(state, 4);                         # primary button: purple-filled
+
+    br = load64(thm_b_card);
+    if pressed != 0 { br = load64(thm_b_input); }
+    else { if hover != 0 { br = load64(thm_b_hover); } }
+    pen = load64(thm_p_border);
+    if hover != 0 { pen = load64(thm_p_neon); }      # subtle purple accent outline on hover
+
+    tc = TH_TEXT;
+    if pressed != 0 { tc = TH_TEXT_BRT; }
+    if hover != 0 { tc = TH_TEXT_BRT; }
+
+    if accent != 0 {                                 # accent (primary) button: solid purple fill
+        br = load64(thm_b_neon);
+        pen = load64(thm_p_neon);
+        tc = TH_BG_PANEL;                            # near-black text reads on the purple fill
+        if pressed != 0 { br = load64(thm_b_input); tc = TH_TEXT_BRT; }   # pressed feedback
+    }
+
+    ob = SelectObject(hdc, br);
+    op = SelectObject(hdc, pen);
+    RoundRect(hdc, l, t, r, b, 6, 6);                # flat, subtly rounded
+
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, tc);
+    SelectObject(hdc, load64(thm_f_ui));
+    DrawTextA(hdc, label, 0 - 1, rc, 0x25);          # DT_CENTER|VCENTER|SINGLELINE
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    return 0;
+}
+
+# Draw a 1px neon accent line from (x1,y) to (x2,y).
+func thm_neon_line(hdc: i64, x1: i64, y: i64, x2: i64) -> i64 {
+    op = SelectObject(hdc, load64(thm_p_neon));
+    MoveToEx(hdc, x1, y, 0);
+    LineTo(hdc, x2, y);
+    SelectObject(hdc, op);
+    return 0;
+}
+
+# Draw a subtle 1px separator line (border tone) from (x1,y) to (x2,y).
+func thm_sep_line(hdc: i64, x1: i64, y: i64, x2: i64) -> i64 {
+    op = SelectObject(hdc, load64(thm_p_border));
+    MoveToEx(hdc, x1, y, 0);
+    LineTo(hdc, x2, y);
+    SelectObject(hdc, op);
+    return 0;
+}
+
+# Draw a subtle 1px vertical separator from (x,y1) to (x,y2).
+func thm_vsep_line(hdc: i64, x: i64, y1: i64, y2: i64) -> i64 {
+    op = SelectObject(hdc, load64(thm_p_border));
+    MoveToEx(hdc, x, y1, 0);
+    LineTo(hdc, x, y2);
+    SelectObject(hdc, op);
+    return 0;
+}
+
+# ANSI -> UTF-16LE (SetWindowTheme takes wide strings).
+func thm_a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i * 2, c);
+        store8(dst + i * 2 + 1, 0);
+        if c == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Opt the whole app into dark mode (so DarkMode_* control themes take effect):
+# uxtheme!SetPreferredAppMode(ForceDark=2), ordinal 135 (Win10 1903+/Win11). Idempotent.
+func thm_enable_dark_app() -> i64 {
+    if load64(thm_dm_done) == 1 { return 0; }
+    store64(thm_dm_done, 1);
+    thm_a2w(thm_dm_explorer_w, thm_dm_explorer);
+    thm_a2w(thm_dm_cfd_w, thm_dm_cfd);
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);            # SetPreferredAppMode(ForceDark)
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));   # AllowDarkModeForWindow
+    }
+    return 0;
+}
+
+# Opt a single window into dark mode (per-window; combos need this before the theme).
+func thm_allow_dark(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    return 0;
+}
+# Dark native scrollbars on a scrolling control (EDIT/RichEdit/TreeView).
+func thm_dark_scroll(hwnd: i64) -> i64 { thm_allow_dark(hwnd); SetWindowTheme(hwnd, thm_dm_explorer_w, 0); return 0; }
+# Dark combobox chrome (the dropdown button + list).
+func thm_dark_combo(hwnd: i64) -> i64 {
+    thm_allow_dark(hwnd);
+    SetWindowTheme(hwnd, thm_dm_cfd_w, 0);
+    SendMessageA(hwnd, 0x031A, 0, 0);            # WM_THEMECHANGED -> repaint with the dark theme
+    return 0;
+}
+# A 5-line filled downward triangle (the dark drop-arrow), centered at (ax, ay).
+func thm_draw_combo_arrow(hdc: i64, ax: i64, ay: i64) -> i64 {
+    oa = SelectObject(hdc, load64(thm_p_arrow));
+    MoveToEx(hdc, ax - 4, ay - 2, 0); LineTo(hdc, ax + 5, ay - 2);
+    MoveToEx(hdc, ax - 3, ay - 1, 0); LineTo(hdc, ax + 4, ay - 1);
+    MoveToEx(hdc, ax - 2, ay,     0); LineTo(hdc, ax + 3, ay);
+    MoveToEx(hdc, ax - 1, ay + 1, 0); LineTo(hdc, ax + 2, ay + 1);
+    MoveToEx(hdc, ax,     ay + 2, 0); LineTo(hdc, ax + 1, ay + 2);
+    SelectObject(hdc, oa);
+    return 0;
+}
+# Subclass for a CBS_DROPDOWNLIST combo: fully dark-paint the CLOSED box (flat
+# field + border + selected item text + the hand-drawn arrow). The dropdown LIST
+# itself is darkened by thm_dark_combo. NOT for editable (CBS_DROPDOWN) combos.
+func thm_combo_proc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 15 {                                          # WM_PAINT
+        hdc = BeginPaint(hwnd, thm_combo_ps);
+        GetClientRect(hwnd, thm_combo_rc);
+        l = load32(thm_combo_rc + 0); t = load32(thm_combo_rc + 4);
+        r = load32(thm_combo_rc + 8); b = load32(thm_combo_rc + 12);
+        FillRect(hdc, thm_combo_rc, load64(thm_b_input));   # input-tone field
+        ob = SelectObject(hdc, GetStockObject(5));          # NULL_BRUSH (outline only)
+        op = SelectObject(hdc, load64(thm_p_border));
+        Rectangle(hdc, l, t, r, b);                         # flat border
+        SelectObject(hdc, op); SelectObject(hdc, ob);
+        of = SelectObject(hdc, load64(thm_f_ui));
+        SetTextColor(hdc, TH_TEXT);
+        SetBkMode(hdc, 1);                                  # TRANSPARENT
+        sel = SendMessageA(hwnd, 327, 0, 0);                # CB_GETCURSEL
+        if sel >= 0 {
+            SendMessageA(hwnd, 328, sel, thm_combo_txt);    # CB_GETLBTEXT -> selected text
+            store32(thm_combo_rc + 0, l + 8); store32(thm_combo_rc + 4, t + 1);
+            store32(thm_combo_rc + 8, r - 20); store32(thm_combo_rc + 12, b - 1);
+            DrawTextA(hdc, thm_combo_txt, 0 - 1, thm_combo_rc, 0x8024);   # VCENTER|SINGLELINE|END_ELLIPSIS
+        }
+        thm_draw_combo_arrow(hdc, r - 13, shr(t + b, 1));
+        SelectObject(hdc, of);
+        EndPaint(hwnd, thm_combo_ps);
+        return 0;
+    }
+    if msg == 20 { return 1; }                              # WM_ERASEBKGND -> we own the box
+    if msg == 7 { res = CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp); InvalidateRect(hwnd, 0, 1); return res; }   # WM_SETFOCUS
+    if msg == 8 { res = CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp); InvalidateRect(hwnd, 0, 1); return res; }   # WM_KILLFOCUS
+    return CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp);
+}
+func thm_combo_subclass(hwnd: i64) -> i64 {
+    thm_dark_combo(hwnd);                                   # dark the dropdown LIST (DarkMode_CFD)
+    old = SetWindowLongPtrA(hwnd, 0 - 4, &thm_combo_proc);  # GWLP_WNDPROC -> custom paint the closed box
+    if load64(thm_old_combo) == 0 { store64(thm_old_combo, old); }   # all combos share one default proc
+    return 0;
+}
+# Subclass for an EDITABLE (CBS_DROPDOWN) combo: let the control paint its edit +
+# content normally, then overpaint just the native (light) drop-button with a dark
+# fill + the hand-drawn arrow, so the edit field keeps working.
+func thm_ecombo_proc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 0x133 {                                       # WM_CTLCOLOREDIT (the edit child) -> match the backend field tone
+        SetBkColor(wp, TH_BG_INPUT);
+        SetTextColor(wp, TH_TEXT);
+        return load64(thm_b_input);
+    }
+    if msg == 15 {                                          # WM_PAINT
+        res = CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp);   # default: edit child + frame + system arrow
+        hdc = GetDC(hwnd);
+        GetClientRect(hwnd, thm_combo_rc);
+        l = load32(thm_combo_rc + 0); t = load32(thm_combo_rc + 4);
+        r = load32(thm_combo_rc + 8); b = load32(thm_combo_rc + 12);
+        store32(thm_combo_rc + 0, r - 19); store32(thm_combo_rc + 4, t + 1);   # arrow-button area -> input tone
+        store32(thm_combo_rc + 8, r - 1);  store32(thm_combo_rc + 12, b - 1);
+        FillRect(hdc, thm_combo_rc, load64(thm_b_input));
+        thm_draw_combo_arrow(hdc, r - 13, shr(t + b, 1));   # same arrow position as the backend combo
+        ob = SelectObject(hdc, GetStockObject(5));          # NULL_BRUSH (outline only)
+        op = SelectObject(hdc, load64(thm_p_border));
+        Rectangle(hdc, l, t, r, b);                         # same flat border as the backend combo
+        SelectObject(hdc, op); SelectObject(hdc, ob);
+        ReleaseDC(hwnd, hdc);
+        return res;
+    }
+    if msg == 8 { res = CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp); InvalidateRect(hwnd, 0, 0); return res; }   # WM_KILLFOCUS -> repaint
+    return CallWindowProcA(load64(thm_old_combo), hwnd, msg, wp, lp);
+}
+func thm_ecombo_subclass(hwnd: i64) -> i64 {
+    thm_dark_combo(hwnd);
+    old = SetWindowLongPtrA(hwnd, 0 - 4, &thm_ecombo_proc);
+    if load64(thm_old_combo) == 0 { store64(thm_old_combo, old); }
+    # Strip the embedded EDIT child's own border so only OUR flat border shows
+    # (an editable combo nests a real edit control with WS_EX_CLIENTEDGE -> a doubled box line).
+    store32(thm_cbi, 64);                                   # cbSize
+    SendMessageA(hwnd, 0x164, 0, thm_cbi);                 # CB_GETCOMBOBOXINFO -> hwndItem@48 = the edit child
+    ed = load64(thm_cbi + 48);
+    if ed != 0 {
+        st = GetWindowLongPtrA(ed, 0 - 16);                # GWL_STYLE: clear WS_BORDER (0x00800000)
+        SetWindowLongPtrA(ed, 0 - 16, band(st, bxor(0x00800000, 0 - 1)));
+        ex = GetWindowLongPtrA(ed, 0 - 20);                # GWL_EXSTYLE: clear WS_EX_CLIENTEDGE (0x200)
+        SetWindowLongPtrA(ed, 0 - 20, band(ex, bxor(0x200, 0 - 1)));
+        SetWindowPos(ed, 0, 0, 0, 0, 0, 0x27);             # SWP_NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED
+    }
+    return 0;
+}
+# Clip a control to a rounded rect (call after sizing; re-apply on resize).
+func thm_round(hwnd: i64, w: i64, h: i64, r: i64) -> i64 {
+    SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r), 1);
+    return 0;
+}
+
+# GlowButton WndProc: state in GWL_USERDATA (bit0=hover, bit1=pressed). Self-paints
+# via thm_draw_button; sends WM_COMMAND(id) to the parent on a hover-release click.
+func GlowBtnProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { SetWindowLongPtrA(hwnd, 0 - 21, 0); return 0; }   # WM_CREATE
+    if msg == 512 {                                                # WM_MOUSEMOVE
+        state = GetWindowLongPtrA(hwnd, 0 - 21);
+        if band(state, 1) == 0 {
+            SetWindowLongPtrA(hwnd, 0 - 21, bor(state, 1));         # hover on
+            InvalidateRect(hwnd, 0, 1);
+            store32(thm_track + 0, 24); store32(thm_track + 4, 2);  # TME_LEAVE
+            store64(thm_track + 8, hwnd); store64(thm_track + 16, 0);
+            TrackMouseEvent(thm_track);
+        }
+        return 0;
+    }
+    if msg == 675 {                                                # WM_MOUSELEAVE
+        state = GetWindowLongPtrA(hwnd, 0 - 21);
+        SetWindowLongPtrA(hwnd, 0 - 21, band(state, 2));          # hover off, keep pressed
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {                                                # WM_LBUTTONDOWN
+        state = GetWindowLongPtrA(hwnd, 0 - 21);
+        SetWindowLongPtrA(hwnd, 0 - 21, bor(state, 2));          # pressed on
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 {                                                # WM_LBUTTONUP
+        state = GetWindowLongPtrA(hwnd, 0 - 21);
+        if band(state, 2) != 0 {
+            ReleaseCapture();
+            SetWindowLongPtrA(hwnd, 0 - 21, band(state, 1));      # pressed off, keep hover
+            InvalidateRect(hwnd, 0, 1);
+            GetClientRect(hwnd, thm_rc);                          # click = release inside the button
+            ux = band(lParam, 65535);
+            uy = band(shr(lParam, 16), 65535);
+            if ux < load32(thm_rc + 8) { if uy < load32(thm_rc + 12) {
+                SendMessageA(GetParent(hwnd), 273, GetWindowLongPtrA(hwnd, 0 - 12), hwnd);
+            } }
+        }
+        return 0;
+    }
+    if msg == 15 {                                                # WM_PAINT
+        hdc = BeginPaint(hwnd, thm_ps);
+        GetClientRect(hwnd, thm_rc);
+        state = GetWindowLongPtrA(hwnd, 0 - 21);
+        ds = 0;
+        if band(state, 2) != 0 { ds = bor(ds, 1); }               # pressed -> thm bit0
+        if band(state, 1) != 0 { ds = bor(ds, 2); }               # hover   -> thm bit1
+        acc = load64(thm_accent_id);                              # the ONE primary button -> accent fill
+        if acc != 0 { if GetWindowLongPtrA(hwnd, 0 - 12) == acc { ds = bor(ds, 4); } }
+        GetWindowTextA(hwnd, thm_btntext, 128);
+        thm_draw_button(hdc, thm_rc, thm_btntext, ds);
+        EndPaint(hwnd, thm_ps);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# Register the GlowButton class once. Create buttons with class thm_cls_glow,
+# style 0x50000000 (WS_CHILD|WS_VISIBLE), text = the label.
+func thm_register_glowbtn(hinst: i64) -> i64 {
+    if load64(thm_glow_reg) == 1 { return 0; }
+    cursor = LoadCursorA(0, 32512);
+    store32(thm_glow_wc + 0,  80);
+    store32(thm_glow_wc + 4,  3);
+    store64(thm_glow_wc + 8,  &GlowBtnProc);
+    store32(thm_glow_wc + 16, 0);
+    store32(thm_glow_wc + 20, 0);
+    store64(thm_glow_wc + 24, hinst);
+    store64(thm_glow_wc + 32, 0);
+    store64(thm_glow_wc + 40, cursor);
+    store64(thm_glow_wc + 48, load64(thm_b_panel));
+    store64(thm_glow_wc + 56, 0);
+    store64(thm_glow_wc + 64, thm_cls_glow);
+    store64(thm_glow_wc + 72, 0);
+    RegisterClassExA(thm_glow_wc);
+    store64(thm_glow_reg, 1);
+    return 0;
+}

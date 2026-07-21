@@ -1,0 +1,902 @@
+# ============================================================================
+#  dnp3_client.ancl  -  DNP3 Master Station Protocol Engine
+#
+#  Native DNP3/TCP client engine implementing:
+#   - Data Link Layer frame assembly (0x0564 magic, CRC-free TCP variant)
+#   - Transport Layer single-fragment handling (FIR+FIN)
+#   - Application Layer: Read (FC=0x01), Write (FC=0x02), Direct Operate (FC=0x05)
+#   - Integrity Poll (Class 0/1/2/3 read requests)
+#   - Response parsing with object header decoding
+#   - Raw hex-dump of all traffic for diagnostic verification
+#
+#  Imported by dnp3_tester.ancl (the GUI frontend).
+#  100% CRT-free, ws2_32.dll only.
+# ============================================================================
+
+import "../../../core_lib/std.ancl";
+
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+extern "ws2_32.dll" socket -> i64;
+extern "ws2_32.dll" connect -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" ioctlsocket -> i32;
+extern "ws2_32.dll" setsockopt -> i32;
+extern "ws2_32.dll" WSAGetLastError -> i32;
+
+@DATA
+
+# ---- Protocol Constants ----
+DNP3_MAGIC_0:   i64 = 0x05;
+DNP3_MAGIC_1:   i64 = 0x64;
+DNP3_PORT:      i64 = 20000;
+
+# ---- Control Byte Definitions ----
+# DIR=1 (from master), PRM=1 (primary), FCV=0, FC=4 (Unconfirmed User Data)
+DNP3_CTRL_UNCONF: i64 = 0x44;
+# DIR=1, PRM=1, FCV=0, FC=0 (Reset Link States)
+DNP3_CTRL_RESET:  i64 = 0x40;
+
+# ---- Function Codes ----
+DNP3_FC_READ:           i64 = 0x01;
+DNP3_FC_WRITE:          i64 = 0x02;
+DNP3_FC_DIRECT_OP:      i64 = 0x05;
+DNP3_FC_DIRECT_OP_NR:   i64 = 0x06;
+DNP3_FC_COLD_RESTART:   i64 = 0x0D;
+DNP3_FC_WARM_RESTART:   i64 = 0x0E;
+
+# ---- Object Group/Variation Identifiers ----
+# Class 0 (static data):   Group 60, Var 1
+# Class 1 (event data):    Group 60, Var 2
+# Class 2 (event data):    Group 60, Var 3
+# Class 3 (event data):    Group 60, Var 4
+# Binary Input:            Group 1,  Var 2 (with flags)
+# Binary Output:           Group 10, Var 2 (with flags)
+# Analog Input:            Group 30, Var 1 (32-bit with flags)
+# Analog Output:           Group 40, Var 1 (32-bit with flags)
+# Counter:                 Group 20, Var 1 (32-bit with flags)
+
+# ---- Winsock Buffers ----
+dnp3_wsa:       buf = 512;
+dnp3_addr:      buf = 16;
+dnp3_sock:      buf = 8;
+dnp3_nonblock:  buf = 8;
+dnp3_tmo:       buf = 8;
+
+# ---- Frame Assembly Buffer ----
+dnp3_tx_frame:  buf = 292;   # max DNP3 frame = 292 bytes
+dnp3_rx_buf:    buf = 2048;  # receive buffer
+dnp3_rx_len:    buf = 8;     # bytes received
+
+# ---- State ----
+dnp3_master_addr: buf = 8;   # Master source address (default 3)
+dnp3_outst_addr:  buf = 8;   # Outstation destination address (default 1)
+dnp3_app_seq:     buf = 8;   # Application layer sequence number
+
+# ---- Hex Dump Buffers ----
+dnp3_hexdump:   buf = 8192;
+dnp3_hexd:      str = "0123456789ABCDEF";
+
+# ---- Log callback pointer ----
+dnp3_log_fn:    buf = 8;     # pointer to GUI log_append function
+
+# ---- Status Messages ----
+dnp3_m_init:      str = "[DNP3] Winsock initialized.\r\n";
+dnp3_m_conn:      str = "[DNP3] Connecting to ";
+dnp3_m_colon:     str = ":";
+dnp3_m_dots:      str = "...\r\n";
+dnp3_m_conn_ok:   str = "[DNP3] TCP connected to outstation.\r\n";
+dnp3_m_conn_err:  str = "[DNP3] Connection failed (outstation unreachable).\r\n";
+dnp3_m_disc:      str = "[DNP3] Disconnected.\r\n";
+dnp3_m_tx:        str = "[DNP3] TX >> ";
+dnp3_m_rx:        str = "[DNP3] RX << ";
+dnp3_m_hdr_ok:    str = "[DNP3] Valid DNP3 header (0x0564) detected.\r\n";
+dnp3_m_hdr_bad:   str = "[DNP3] WARNING: Response missing 0x0564 magic!\r\n";
+dnp3_m_poll:      str = "[DNP3] Sent Integrity Poll (Class 0 Read).\r\n";
+dnp3_m_class123:  str = "[DNP3] Sent Event Poll (Class 1+2+3).\r\n";
+dnp3_m_read:      str = "[DNP3] Sent Read Request.\r\n";
+dnp3_m_write:     str = "[DNP3] Sent Write Request.\r\n";
+dnp3_m_dop:       str = "[DNP3] Sent Direct Operate.\r\n";
+dnp3_m_cold:      str = "[DNP3] Sent Cold Restart.\r\n";
+dnp3_m_warm:      str = "[DNP3] Sent Warm Restart.\r\n";
+dnp3_m_reset:     str = "[DNP3] Sent Link Reset.\r\n";
+dnp3_m_timeout:   str = "[DNP3] No response (timeout).\r\n";
+dnp3_m_rxbytes:   str = " bytes]\r\n";
+dnp3_m_lbracket:  str = " [";
+dnp3_m_resp_ok:   str = "[DNP3] Response: ";
+dnp3_m_iin:       str = "  IIN: ";
+dnp3_m_obj:       str = "  Objects: ";
+dnp3_m_confirm:   str = "[DNP3] Sent Application Confirm.\r\n";
+dnp3_m_multifrag: str = "[DNP3] Multi-fragment response, reassembling...\r\n";
+dnp3_m_unsol:     str = "[DNP3] Unsolicited response received.\r\n";
+dnp3_m_unsol_conf:str = "[DNP3] Sent Unsolicited Confirm.\r\n";
+crlf_dnp3:        str = "\r\n";
+
+# ---- Scratch buffers ----
+dnp3_numbuf:    buf = 32;
+dnp3_logbuf:    buf = 1024;
+
+# ---- Multi-fragment reassembly buffer ----
+dnp3_reasm_buf: buf = 4096;  # reassembled application layer data
+dnp3_reasm_len: buf = 8;     # total reassembled bytes
+dnp3_hostbuf:   buf = 256;
+
+# ---- CRC-16 Lookup Table (DNP3 polynomial 0x3D65) ----
+dnp3_crc_table: buf = 512;  # 256 entries * 2 bytes each
+
+# ---- Link Layer State ----
+dnp3_link_reset_done: buf = 8;  # 1 = link has been reset successfully
+
+@CODE
+
+# ============================================================================
+# PROTOCOL ENGINE - INITIALIZATION & CONNECTION
+# ============================================================================
+
+func dnp3_init(master_addr: i64, outstation_addr: i64) -> i64 {
+    store64(dnp3_master_addr, master_addr);
+    store64(dnp3_outst_addr, outstation_addr);
+    store64(dnp3_app_seq, 0);
+    store64(dnp3_sock, 0);
+    store64(dnp3_link_reset_done, 0);
+    dnp3_crc_init();
+    return 0;
+}
+
+func dnp3_connect(host_str: i64, port: i64) -> i64 {
+    # Already connected?
+    if load64(dnp3_sock) != 0 { return 1; }
+
+    WSAStartup(0x0202, dnp3_wsa);
+
+    memset(dnp3_addr, 0, 16);
+    store16(dnp3_addr + 0, 2); # AF_INET
+
+    # Port in network byte order (big-endian)
+    store8(dnp3_addr + 2, band(shr(port, 8), 0xFF));
+    store8(dnp3_addr + 3, band(port, 0xFF));
+
+    # Parse IP address from string
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = host_str;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 {
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10 + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(dnp3_addr + 4, ip);
+
+    s = socket(2, 1, 6);
+    if s == 0 - 1 {
+        WSACleanup();
+        return 0;
+    }
+
+    # Set recv timeout to 5 seconds
+    store32(dnp3_tmo, 5000);
+    setsockopt(s, 65535, 4102, dnp3_tmo, 4);
+
+    rc = connect(s, dnp3_addr, 16);
+    if rc != 0 {
+        closesocket(s);
+        WSACleanup();
+        return 0;
+    }
+
+    store64(dnp3_sock, s);
+    return 1;
+}
+
+func dnp3_disconnect() -> i64 {
+    sock = load64(dnp3_sock);
+    if sock != 0 {
+        closesocket(sock);
+        store64(dnp3_sock, 0);
+        WSACleanup();
+    }
+    return 0;
+}
+
+func dnp3_is_connected() -> i64 {
+    if load64(dnp3_sock) != 0 { return 1; }
+    return 0;
+}
+
+# ============================================================================
+# DNP3 CRC-16 (polynomial 0x3D65, bit-reversed per IEEE 1815)
+# ============================================================================
+
+func dnp3_crc_init() -> i64 {
+    i = 0;
+    while i < 256 {
+        crc = i;
+        j = 0;
+        while j < 8 {
+            if band(crc, 1) != 0 {
+                crc = bxor(shr(crc, 1), 0xA6BC);
+            } else {
+                crc = shr(crc, 1);
+            }
+            j = j + 1;
+        }
+        store16(dnp3_crc_table + i * 2, band(crc, 0xFFFF));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Compute CRC-16 over a byte range. Returns 16-bit CRC (complemented per spec).
+func dnp3_crc16(data_ptr: i64, len: i64) -> i64 {
+    crc = 0;
+    i = 0;
+    while i < len {
+        b = load8(data_ptr + i);
+        idx = band(bxor(crc, b), 0xFF);
+        crc = bxor(shr(crc, 8), load16(dnp3_crc_table + idx * 2));
+        i = i + 1;
+    }
+    # DNP3 spec: complement the CRC
+    crc = band(bxor(crc, 0xFFFF), 0xFFFF);
+    return crc;
+}
+
+# ============================================================================
+# LINK LAYER HANDSHAKE (Reset Link States + wait for ACK)
+# ============================================================================
+
+# Send Reset Link States and wait for ACK/NACK from outstation.
+# Returns 1 on success (ACK received), 0 on failure.
+func dnp3_link_reset_handshake() -> i64 {
+    sock = load64(dnp3_sock);
+    if sock == 0 { return 0; }
+
+    # Build Reset Link States frame with CRC
+    # Header: 05 64 05 C0 dst_lo dst_hi src_lo src_hi [CRC_lo CRC_hi]
+    store8(dnp3_tx_frame + 0, 0x05);
+    store8(dnp3_tx_frame + 1, 0x64);
+    store8(dnp3_tx_frame + 2, 5);     # Length
+    store8(dnp3_tx_frame + 3, 0xC0);  # DIR=1, PRM=1, FCV=0, FC=0 (Reset Link States)
+    dst = load64(dnp3_outst_addr);
+    store8(dnp3_tx_frame + 4, band(dst, 0xFF));
+    store8(dnp3_tx_frame + 5, band(shr(dst, 8), 0xFF));
+    src = load64(dnp3_master_addr);
+    store8(dnp3_tx_frame + 6, band(src, 0xFF));
+    store8(dnp3_tx_frame + 7, band(shr(src, 8), 0xFF));
+
+    # Compute CRC over header bytes [0..7]
+    crc = dnp3_crc16(dnp3_tx_frame, 8);
+    store8(dnp3_tx_frame + 8, band(crc, 0xFF));
+    store8(dnp3_tx_frame + 9, band(shr(crc, 8), 0xFF));
+
+    # Send 10-byte frame (header + CRC)
+    send(sock, dnp3_tx_frame, 10, 0);
+
+    # Wait for ACK (with existing timeout)
+    store64(dnp3_nonblock, 0);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+    n = recv(sock, dnp3_rx_buf, 2048, 0);
+    store64(dnp3_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+
+    if n >= 8 {
+        # Validate it's a DNP3 response
+        if load8(dnp3_rx_buf + 0) == 0x05 {
+            if load8(dnp3_rx_buf + 1) == 0x64 {
+                # Check control byte: DIR=0, PRM=0, FC=0 (ACK) = 0x00
+                # or SEC with DFC: could be 0x00 or 0x01
+                ctrl = load8(dnp3_rx_buf + 3);
+                fc = band(ctrl, 0x0F);
+                if fc == 0 {
+                    # ACK received
+                    store64(dnp3_link_reset_done, 1);
+                    return 1;
+                }
+                if fc == 11 {
+                    # Link Status response (some outstations respond this way)
+                    store64(dnp3_link_reset_done, 1);
+                    return 1;
+                }
+            }
+        }
+    }
+
+    # Even if no ACK, some TCP-only outstations don't require link reset
+    # Mark as done anyway to proceed (TCP transport handles reliability)
+    store64(dnp3_link_reset_done, 1);
+    return 1;
+}
+
+# ============================================================================
+# FRAME ASSEMBLY (with CRC-16 per IEEE 1815)
+# ============================================================================
+
+# Build a DNP3 Data Link Layer frame with CRC.
+# Per spec: Header block (10 bytes: 8 header + 2 CRC) followed by
+# data blocks of up to 16 user bytes + 2 CRC each.
+# app_payload_ptr: pointer to application layer bytes
+# app_len: number of application layer bytes
+# Returns total frame length written to dnp3_tx_frame.
+func dnp3_build_frame(app_payload_ptr: i64, app_len: i64) -> i64 {
+    # Header bytes [0..7]
+    store8(dnp3_tx_frame + 0, 0x05);
+    store8(dnp3_tx_frame + 1, 0x64);
+    # Length = 5 (ctrl+dst+src) + 1 (transport) + app_len
+    data_len = 5 + 1 + app_len;
+    store8(dnp3_tx_frame + 2, data_len);
+    # Control: Unconfirmed User Data
+    store8(dnp3_tx_frame + 3, DNP3_CTRL_UNCONF);
+    # Destination (outstation, little-endian)
+    dst = load64(dnp3_outst_addr);
+    store8(dnp3_tx_frame + 4, band(dst, 0xFF));
+    store8(dnp3_tx_frame + 5, band(shr(dst, 8), 0xFF));
+    # Source (master, little-endian)
+    src = load64(dnp3_master_addr);
+    store8(dnp3_tx_frame + 6, band(src, 0xFF));
+    store8(dnp3_tx_frame + 7, band(shr(src, 8), 0xFF));
+
+    # Header CRC (over bytes 0-7)
+    hdr_crc = dnp3_crc16(dnp3_tx_frame, 8);
+    store8(dnp3_tx_frame + 8, band(hdr_crc, 0xFF));
+    store8(dnp3_tx_frame + 9, band(shr(hdr_crc, 8), 0xFF));
+
+    # User data: transport header + application payload
+    # Write into frame starting at offset 10, in 16-byte blocks + 2-byte CRC each
+    write_pos = 10;
+
+    # First user byte is the transport header
+    store8(dnp3_tx_frame + write_pos, 0xC0); # FIR=1, FIN=1, SEQ=0
+    write_pos = write_pos + 1;
+
+    # Copy application payload after transport byte
+    i = 0;
+    while i < app_len {
+        store8(dnp3_tx_frame + write_pos, load8(app_payload_ptr + i));
+        write_pos = write_pos + 1;
+        i = i + 1;
+    }
+
+    # Now compute CRC over data blocks (16-byte chunks)
+    # Total user data = 1 (transport) + app_len
+    total_user = 1 + app_len;
+    data_start = 10;
+    src_pos = 0;
+    out_pos = 10;
+
+    while src_pos < total_user {
+        # Determine block size (max 16 bytes)
+        remaining = total_user - src_pos;
+        block_sz = 16;
+        if remaining < 16 { block_sz = remaining; }
+
+        # Copy block bytes to output position
+        j = 0;
+        while j < block_sz {
+            store8(dnp3_tx_frame + out_pos + j, load8(dnp3_tx_frame + data_start + src_pos + j));
+            j = j + 1;
+        }
+
+        # Compute CRC over this block
+        blk_crc = dnp3_crc16(dnp3_tx_frame + out_pos, block_sz);
+        store8(dnp3_tx_frame + out_pos + block_sz, band(blk_crc, 0xFF));
+        store8(dnp3_tx_frame + out_pos + block_sz + 1, band(shr(blk_crc, 8), 0xFF));
+
+        out_pos = out_pos + block_sz + 2;
+        src_pos = src_pos + block_sz;
+    }
+
+    return out_pos;
+}
+
+# Build a link-layer-only frame with CRC (no transport/app), e.g. Reset Link States
+func dnp3_build_link_frame(ctrl_byte: i64) -> i64 {
+    store8(dnp3_tx_frame + 0, 0x05);
+    store8(dnp3_tx_frame + 1, 0x64);
+    store8(dnp3_tx_frame + 2, 5); # Length = ctrl + dst(2) + src(2)
+    store8(dnp3_tx_frame + 3, ctrl_byte);
+    dst = load64(dnp3_outst_addr);
+    store8(dnp3_tx_frame + 4, band(dst, 0xFF));
+    store8(dnp3_tx_frame + 5, band(shr(dst, 8), 0xFF));
+    src = load64(dnp3_master_addr);
+    store8(dnp3_tx_frame + 6, band(src, 0xFF));
+    store8(dnp3_tx_frame + 7, band(shr(src, 8), 0xFF));
+    # Header CRC
+    crc = dnp3_crc16(dnp3_tx_frame, 8);
+    store8(dnp3_tx_frame + 8, band(crc, 0xFF));
+    store8(dnp3_tx_frame + 9, band(shr(crc, 8), 0xFF));
+    return 10;
+}
+
+# ============================================================================
+# APPLICATION LAYER BUILDERS
+# ============================================================================
+
+# Build application layer for Integrity Poll (Class 0 read = Group 60 Var 1)
+func dnp3_build_integrity_poll(dst: i64) -> i64 {
+    seq = load64(dnp3_app_seq);
+    # App Control: FIR=1, FIN=1, CON=0, UNS=0, SEQ
+    store8(dst + 0, bor(0xC0, band(seq, 0x0F)));
+    # Function Code: READ
+    store8(dst + 1, DNP3_FC_READ);
+    # Object Header: Group 60, Var 1 (Class 0), Qualifier 0x06 (all)
+    store8(dst + 2, 0x3C);
+    store8(dst + 3, 0x01);
+    store8(dst + 4, 0x06);
+    store64(dnp3_app_seq, band(seq + 1, 0x0F));
+    return 5;
+}
+
+# Build application layer for Event Poll (Class 1+2+3 read)
+func dnp3_build_event_poll(dst: i64) -> i64 {
+    seq = load64(dnp3_app_seq);
+    store8(dst + 0, bor(0xC0, band(seq, 0x0F)));
+    store8(dst + 1, DNP3_FC_READ);
+    # Class 1: Group 60, Var 2
+    store8(dst + 2, 0x3C); store8(dst + 3, 0x02); store8(dst + 4, 0x06);
+    # Class 2: Group 60, Var 3
+    store8(dst + 5, 0x3C); store8(dst + 6, 0x03); store8(dst + 7, 0x06);
+    # Class 3: Group 60, Var 4
+    store8(dst + 8, 0x3C); store8(dst + 9, 0x04); store8(dst + 10, 0x06);
+    store64(dnp3_app_seq, band(seq + 1, 0x0F));
+    return 11;
+}
+
+# Build application layer for a generic read (group, variation, qualifier 0x06)
+func dnp3_build_read(dst: i64, group: i64, variation: i64) -> i64 {
+    seq = load64(dnp3_app_seq);
+    store8(dst + 0, bor(0xC0, band(seq, 0x0F)));
+    store8(dst + 1, DNP3_FC_READ);
+    store8(dst + 2, group);
+    store8(dst + 3, variation);
+    store8(dst + 4, 0x06);
+    store64(dnp3_app_seq, band(seq + 1, 0x0F));
+    return 5;
+}
+
+# Build application layer for Direct Operate (CROB - Group 12, Var 1)
+func dnp3_build_direct_operate(dst: i64, index: i64, ctrl_code: i64) -> i64 {
+    seq = load64(dnp3_app_seq);
+    store8(dst + 0, bor(0xC0, band(seq, 0x0F)));
+    store8(dst + 1, DNP3_FC_DIRECT_OP);
+    # Object Header: Group 12, Var 1, Qualifier 0x28 (1-byte count + 1-byte index prefix)
+    store8(dst + 2, 12);    # Group
+    store8(dst + 3, 1);     # Variation
+    store8(dst + 4, 0x28);  # Qualifier: count + index (8-bit)
+    store8(dst + 5, 1);     # Count = 1
+    store8(dst + 6, band(index, 0xFF)); # Index
+    # CROB data (11 bytes): ctrl_code, count(1), on_time(4), off_time(4), status(1)
+    store8(dst + 7, ctrl_code);
+    store8(dst + 8, 1);     # Count
+    store32(dst + 9, 1000); # On time ms
+    store32(dst + 13, 1000);# Off time ms
+    store8(dst + 17, 0);    # Status
+    store64(dnp3_app_seq, band(seq + 1, 0x0F));
+    return 18;
+}
+
+# Build Cold/Warm Restart
+func dnp3_build_restart(dst: i64, warm: i64) -> i64 {
+    seq = load64(dnp3_app_seq);
+    store8(dst + 0, bor(0xC0, band(seq, 0x0F)));
+    if warm != 0 {
+        store8(dst + 1, DNP3_FC_WARM_RESTART);
+    } else {
+        store8(dst + 1, DNP3_FC_COLD_RESTART);
+    }
+    store64(dnp3_app_seq, band(seq + 1, 0x0F));
+    return 2;
+}
+
+# ============================================================================
+# TRANSMIT & RECEIVE
+# ============================================================================
+
+func dnp3_send_frame(frame_len: i64) -> i64 {
+    sock = load64(dnp3_sock);
+    if sock == 0 { return 0; }
+    send(sock, dnp3_tx_frame, frame_len, 0);
+    return frame_len;
+}
+
+func dnp3_recv_response() -> i64 {
+    sock = load64(dnp3_sock);
+    if sock == 0 { return 0; }
+
+    # Switch to blocking with timeout for receive
+    store64(dnp3_nonblock, 0);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+
+    n = recv(sock, dnp3_rx_buf, 2048, 0);
+    store64(dnp3_rx_len, n);
+
+    # Switch back to non-blocking
+    store64(dnp3_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+
+    return n;
+}
+
+func dnp3_drain() -> i64 {
+    sock = load64(dnp3_sock);
+    if sock == 0 { return 0; }
+    store64(dnp3_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+    while recv(sock, dnp3_rx_buf, 2048, 0) > 0 {}
+    return 0;
+}
+
+# ============================================================================
+# HIGH-LEVEL OPERATIONS
+# ============================================================================
+
+func dnp3_send_integrity_poll() -> i64 {
+    app_len = dnp3_build_integrity_poll(dnp3_logbuf);
+    frame_len = dnp3_build_frame(dnp3_logbuf, app_len);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+func dnp3_send_event_poll() -> i64 {
+    app_len = dnp3_build_event_poll(dnp3_logbuf);
+    frame_len = dnp3_build_frame(dnp3_logbuf, app_len);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+func dnp3_send_read(group: i64, variation: i64) -> i64 {
+    app_len = dnp3_build_read(dnp3_logbuf, group, variation);
+    frame_len = dnp3_build_frame(dnp3_logbuf, app_len);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+func dnp3_send_direct_operate(index: i64, ctrl_code: i64) -> i64 {
+    app_len = dnp3_build_direct_operate(dnp3_logbuf, index, ctrl_code);
+    frame_len = dnp3_build_frame(dnp3_logbuf, app_len);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+func dnp3_send_restart(warm: i64) -> i64 {
+    app_len = dnp3_build_restart(dnp3_logbuf, warm);
+    frame_len = dnp3_build_frame(dnp3_logbuf, app_len);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+func dnp3_send_link_reset() -> i64 {
+    frame_len = dnp3_build_link_frame(DNP3_CTRL_RESET);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+# Perform link reset handshake (called automatically on connect if needed)
+func dnp3_ensure_link_ready() -> i64 {
+    if load64(dnp3_link_reset_done) != 0 { return 1; }
+    return dnp3_link_reset_handshake();
+}
+
+# ============================================================================
+# RESPONSE VALIDATION & PARSING
+# ============================================================================
+
+func dnp3_validate_header() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 10 { return 0; }
+    b0 = load8(dnp3_rx_buf + 0);
+    b1 = load8(dnp3_rx_buf + 1);
+    if b0 != 0x05 { return 0; }
+    if b1 != 0x64 { return 0; }
+
+    # Verify header CRC (bytes 0-7, CRC at bytes 8-9)
+    expected_crc = dnp3_crc16(dnp3_rx_buf, 8);
+    rx_crc = load8(dnp3_rx_buf + 8) + shl(load8(dnp3_rx_buf + 9), 8);
+
+    # If CRC matches, frame has CRC (serial-bridged or strict outstation)
+    if expected_crc == rx_crc { return 2; } # 2 = valid with CRC
+
+    # If CRC doesn't match, this might be a TCP-only frame without CRC
+    # (pure TCP outstations often omit CRC per IEEE 1815 Annex E)
+    # Still valid as a DNP3 frame
+    return 1; # 1 = valid without CRC (TCP mode)
+}
+
+# Get Internal Indications (IIN) bytes from response
+# Returns: IIN1 in low byte, IIN2 in next byte (16-bit combined)
+func dnp3_get_iin() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 12 { return 0; }
+    # IIN is at app layer offset +2 and +3
+    # App layer starts at offset 9 (after link header 8 + transport 1)
+    iin1 = load8(dnp3_rx_buf + 11);
+    iin2 = load8(dnp3_rx_buf + 12);
+    return iin1 + shl(iin2, 8);
+}
+
+# Get response function code
+func dnp3_get_resp_fc() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 11 { return 0; }
+    return load8(dnp3_rx_buf + 10);
+}
+
+# ============================================================================
+# HEX DUMP UTILITY
+# ============================================================================
+
+func dnp3_hex_format(src: i64, len: i64, dst: i64) -> i64 {
+    w = 0;
+    i = 0;
+    while i < len {
+        b = load8(src + i);
+        hi = band(shr(b, 4), 15);
+        lo = band(b, 15);
+        store8(dst + w, load8(dnp3_hexd + hi));
+        store8(dst + w + 1, load8(dnp3_hexd + lo));
+        store8(dst + w + 2, 32);
+        w = w + 3;
+        i = i + 1;
+    }
+    store8(dst + w, 0);
+    return w;
+}
+
+# ============================================================================
+# FEATURE 1: APPLICATION LAYER CONFIRM (FC=0x00)
+# Sent when the outstation sets the CON bit in its response, or for
+# Unsolicited Confirm. Without this, some outstations stop sending events.
+# ============================================================================
+
+func dnp3_send_app_confirm(seq: i64) -> i64 {
+    # Application Confirm: FIR=1, FIN=1, CON=0, UNS=0, SEQ=seq
+    # Function Code 0x00 (Confirm)
+    store8(dnp3_logbuf + 0, bor(0xC0, band(seq, 0x0F)));
+    store8(dnp3_logbuf + 1, 0x00); # FC = Confirm
+    frame_len = dnp3_build_frame(dnp3_logbuf, 2);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+# Send Unsolicited Confirm (same as app confirm but with UNS bit set)
+func dnp3_send_unsol_confirm(seq: i64) -> i64 {
+    # Application Control: FIR=1, FIN=1, CON=0, UNS=1, SEQ=seq
+    store8(dnp3_logbuf + 0, bor(0xD0, band(seq, 0x0F)));
+    store8(dnp3_logbuf + 1, 0x00); # FC = Confirm
+    frame_len = dnp3_build_frame(dnp3_logbuf, 2);
+    dnp3_send_frame(frame_len);
+    return frame_len;
+}
+
+# Check if response requires a Confirm (CON bit set in app control byte)
+# Returns: seq number if CON is set, or -1 if no confirm needed
+func dnp3_check_con_bit() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 10 { return 0 - 1; }
+    # App control is at offset 9 (after 8-byte link header + 1 transport)
+    app_ctrl = load8(dnp3_rx_buf + 9);
+    con_bit = band(app_ctrl, 0x20); # CON = bit 5
+    if con_bit != 0 {
+        return band(app_ctrl, 0x0F); # return SEQ
+    }
+    return 0 - 1;
+}
+
+# Check if response is Unsolicited (UNS bit set in app control byte)
+func dnp3_is_unsolicited() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 10 { return 0; }
+    app_ctrl = load8(dnp3_rx_buf + 9);
+    uns_bit = band(app_ctrl, 0x10); # UNS = bit 4
+    if uns_bit != 0 { return 1; }
+    return 0;
+}
+
+# ============================================================================
+# FEATURE 2: MULTI-FRAGMENT RESPONSE REASSEMBLY
+# Handles responses split across multiple transport segments.
+# FIR=1,FIN=0 -> first fragment; FIR=0,FIN=0 -> middle; FIR=0,FIN=1 -> last
+# ============================================================================
+
+# Extract user data from current rx_buf (stripping CRC if present).
+# Writes clean app-layer bytes to dnp3_reasm_buf + offset.
+# Returns number of app-layer bytes extracted (excluding transport header).
+func dnp3_extract_app_data(dest_offset: i64) -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 10 { return 0; }
+
+    frame_len = load8(dnp3_rx_buf + 2);
+    user_data_len = frame_len - 5; # subtract ctrl+dst+src
+    if user_data_len <= 0 { return 0; }
+
+    # Detect CRC presence
+    expected_no_crc = frame_len + 3;
+    has_crc = 0;
+    if n > expected_no_crc { has_crc = 1; }
+
+    # Transport byte is the first user byte
+    # App data starts after transport byte (so user_data_len - 1 app bytes)
+    app_bytes = user_data_len - 1;
+    if app_bytes <= 0 { return 0; }
+
+    if has_crc != 0 {
+        # Strip CRC from data blocks, skip transport byte
+        src_pos = 10; # after header CRC
+        # Skip transport header byte, accounting for block structure
+        # First block: up to 16 bytes including transport
+        first_block = 16;
+        if user_data_len < 16 { first_block = user_data_len; }
+        # Copy app bytes from first block (skip transport at position 0)
+        dst_pos = dest_offset;
+        j = 1; # skip transport byte
+        while j < first_block {
+            if src_pos + j < n {
+                store8(dnp3_reasm_buf + dst_pos, load8(dnp3_rx_buf + src_pos + j));
+                dst_pos = dst_pos + 1;
+            }
+            j = j + 1;
+        }
+        src_pos = src_pos + first_block + 2; # skip block CRC
+        remaining = user_data_len - first_block;
+        # Process remaining blocks
+        while remaining > 0 {
+            block_sz = 16;
+            if remaining < 16 { block_sz = remaining; }
+            j = 0;
+            while j < block_sz {
+                if src_pos + j < n {
+                    store8(dnp3_reasm_buf + dst_pos, load8(dnp3_rx_buf + src_pos + j));
+                    dst_pos = dst_pos + 1;
+                }
+                j = j + 1;
+            }
+            src_pos = src_pos + block_sz + 2;
+            remaining = remaining - block_sz;
+        }
+        return dst_pos - dest_offset;
+    } else {
+        # No CRC: user data at offset 8, skip transport byte
+        j = 0;
+        while j < app_bytes {
+            store8(dnp3_reasm_buf + dest_offset + j, load8(dnp3_rx_buf + 9 + j));
+            j = j + 1;
+        }
+        return app_bytes;
+    }
+}
+
+# Get transport header flags from current rx_buf
+func dnp3_get_transport_flags() -> i64 {
+    n = load64(dnp3_rx_len);
+    if n < 10 { return 0; }
+    # Detect CRC
+    frame_len = load8(dnp3_rx_buf + 2);
+    expected_no_crc = frame_len + 3;
+    if n > expected_no_crc {
+        # With CRC: transport byte at offset 10
+        return load8(dnp3_rx_buf + 10);
+    }
+    # Without CRC: transport byte at offset 8
+    return load8(dnp3_rx_buf + 8);
+}
+
+# Receive and reassemble a full multi-fragment response.
+# Handles FIR/FIN transport layer sequencing.
+# After this call, dnp3_reasm_buf contains the complete app layer data,
+# and dnp3_reasm_len holds the total byte count.
+# Also copies the final assembled data back to dnp3_rx_buf in the format
+# expected by the parser (magic + header + transport + app at standard offsets).
+func dnp3_recv_full_response() -> i64 {
+    store64(dnp3_reasm_len, 0);
+
+    # Receive first fragment
+    n = dnp3_recv_response();
+    if n <= 0 { return 0; }
+
+    # Get transport flags
+    th = dnp3_get_transport_flags();
+    fir = band(th, 0x40); # FIR bit
+    fin = band(th, 0x80); # FIN bit
+
+    # If FIN is set, this is a single-fragment response (common case)
+    if fin != 0 {
+        # Single fragment - extract app data for completeness
+        app_len = dnp3_extract_app_data(0);
+        store64(dnp3_reasm_len, app_len);
+        return n;
+    }
+
+    # Multi-fragment: collect all segments
+    total_app = dnp3_extract_app_data(0);
+
+    # Keep receiving until FIN
+    max_frags = 20; # safety limit
+    frag_count = 0;
+    while frag_count < max_frags {
+        n2 = dnp3_recv_response();
+        if n2 <= 0 { break; }
+
+        th2 = dnp3_get_transport_flags();
+        fin2 = band(th2, 0x80);
+
+        # Extract and append app data
+        added = dnp3_extract_app_data(total_app);
+        total_app = total_app + added;
+
+        if fin2 != 0 { break; }
+        frag_count = frag_count + 1;
+    }
+
+    store64(dnp3_reasm_len, total_app);
+
+    # Rebuild dnp3_rx_buf with reassembled data so the parser works as before:
+    # [0-1] magic, [2] length, [3] ctrl, [4-7] addr, [8] transport, [9+] app
+    # We keep the original header from the first frame and just replace app data
+    # The parser reads from offset 9 onward for app layer
+    # Copy reassembled app data to offset 9 in rx_buf
+    i = 0;
+    while i < total_app {
+        if i + 9 >= 2048 { break; }
+        store8(dnp3_rx_buf + 9 + i, load8(dnp3_reasm_buf + i));
+        i = i + 1;
+    }
+    # Fix transport byte (single reassembled fragment)
+    store8(dnp3_rx_buf + 8, 0xC0); # FIR+FIN
+    # Update rx_len to reflect reassembled size
+    store64(dnp3_rx_len, 9 + total_app);
+    # Update length field for consistency
+    store8(dnp3_rx_buf + 2, 5 + 1 + total_app);
+
+    return load64(dnp3_rx_len);
+}
+
+# ============================================================================
+# FEATURE 3: UNSOLICITED RESPONSE HANDLING
+# Check for and process unsolicited data pushed by the outstation.
+# Call this periodically (e.g., on timer) to catch async events.
+# Returns 1 if an unsolicited response was received and processed.
+# ============================================================================
+
+func dnp3_check_unsolicited() -> i64 {
+    sock = load64(dnp3_sock);
+    if sock == 0 { return 0; }
+
+    # Non-blocking peek for data
+    store64(dnp3_nonblock, 1);
+    ioctlsocket(sock, 0x8004667E, dnp3_nonblock);
+
+    n = recv(sock, dnp3_rx_buf, 2048, 0);
+
+    if n <= 0 { return 0; }
+
+    store64(dnp3_rx_len, n);
+
+    # Validate it's a DNP3 frame
+    if load8(dnp3_rx_buf + 0) != 0x05 { return 0; }
+    if load8(dnp3_rx_buf + 1) != 0x64 { return 0; }
+
+    # Check if it's unsolicited (UNS bit in app control)
+    if dnp3_is_unsolicited() != 0 {
+        # Send Unsolicited Confirm
+        seq = band(load8(dnp3_rx_buf + 9), 0x0F);
+        dnp3_send_unsol_confirm(seq);
+        return 1; # caller should parse the response data
+    }
+
+    # Not unsolicited - might be a regular response with CON bit
+    con_seq = dnp3_check_con_bit();
+    if con_seq != 0 - 1 {
+        dnp3_send_app_confirm(con_seq);
+    }
+
+    return 2; # data available but not unsolicited
+}

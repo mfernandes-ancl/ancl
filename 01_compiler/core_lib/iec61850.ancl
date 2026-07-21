@@ -1,0 +1,1411 @@
+# =============================================================================
+# core_lib/iec61850.ancl  -  Pure-ANCL IEC-61850 (MMS) READ client.  ZERO-DEP.
+# -----------------------------------------------------------------------------
+# Replaces libiec61850.dll with native ANCL: TPKT/COTP (reused from S7) +
+# ISO Session/Presentation/ACSE associate + MMS ASN.1 BER codec.  Phases P0-P2b:
+#   P0  connect + MMS associate (+ optional ACSE password auth, Senvion 'sca.auto')
+#   P1  BER encode/decode primitives (len/tag/int/float/string, nested SEQ/array)
+#   P2  MMS Read of a scalar named variable  -> typed value + quality + timestamp
+#   P2b MMS Read of a dataset (named-variable-list) -> nested STRUCT/ARRAY unpack
+#        (the Senvion alarm array = STRUCT{ ARRAY[N]{ STRUCT{int,bitstr,utctime} } })
+#
+# Every wire byte below is traced to libiec61850-1.6 source (see
+# docs/iec61850_iccp_design.md + scratchpad/iec61850_specs/*.md).  CRT-free: the
+# only externs are ws2_32 (connect/setsockopt) + kernel32 (Sleep); the rest are
+# compiler builtins (socket/recv/send/WSAStartup/htons/closesocket/band/shl/...).
+#
+# This is a LIBRARY (no main): a driver imports it, supplies main(), calls
+# i61850_connect() then i61850_read_scalar()/i61850_read_dataset().  Results of
+# the last scalar read land in the g_res_* globals.
+# =============================================================================
+import "numfmt.ancl";
+
+extern "ws2_32.dll" connect;
+extern "ws2_32.dll" setsockopt;
+extern "ws2_32.dll" ioctlsocket;     # FIONBIO (non-blocking) for the connect timeout
+extern "ws2_32.dll" select;          # writable/except wait with a deadline
+extern "kernel32.dll" Sleep;
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+
+@DATA
+# ---- socket / framing scratch ----
+g_wsa:  buf = 512;
+g_addr: buf = 16;
+g_tmo:  buf = 8;
+g_wset: buf = 32;      # fd_set (write) for the non-blocking connect wait
+g_eset: buf = 32;      # fd_set (except) - a failed connect lands here
+g_tv:   buf = 8;       # timeval { long sec; long usec }
+g_nbmode: buf = 8;     # ioctlsocket FIONBIO argument (1 = non-blocking, 0 = blocking)
+g_tx:   buf = 8192;     # outgoing frame (assembled wrapper + MMS PDU)
+g_rx:   buf = 16384;    # one incoming TPKT/COTP frame (<= negotiated TPDU + headers)
+g_asm:  buf = 66000;    # reassembled COTP TSDU (session+pres+MMS); holds a full maxPDU=65000
+g_mms:  buf = 4096;     # the MMS PDU being built (before wrapping)
+g_pass_buf: buf = 256;  # the ACSE password octet-string (-user#".." -pass#"..")
+
+# ---- configurable ACSE AP-titles / AE-qualifiers (some servers, e.g. Senvion, VALIDATE these) ----
+g_cap_oid: buf = 64;    # called (remote) AP-title OID content bytes
+g_cap_len: buf = 8;
+g_lap_oid: buf = 64;    # calling (local) AP-title OID content bytes
+g_lap_len: buf = 8;
+g_cae: buf = 8;         # called AE-qualifier (int)
+g_lae: buf = 8;         # calling AE-qualifier (int)
+g_ap_set: buf = 8;      # 1 once i61850_set_ap configured them (else libiec61850 defaults)
+g_arcs: buf = 256;      # OID arc scratch (32 arcs)
+g_b128: buf = 16;       # base-128 scratch
+
+# ---- decoder scratch / multi-return ----
+g_dls:  buf = 8;        # # of length bytes consumed by the last ber_rdlen
+g_mms_len: buf = 8;     # length of the MMS PDU located by recv_mms
+g_invoke:  buf = 8;     # MMS invokeID counter
+g_fend:    buf = 8;     # absolute end offset of the current decode region (bound for the walk)
+g_alarm_n: buf = 8;     # count of active alarm slots emitted by the last i61850_read_alarms
+
+# ---- result of the last decoded leaf value ----
+g_res_type:   buf = 8;  # MMS tag of the value (0x85 int / 0x87 float / 0x83 bool / 0x8A str / 0=none)
+g_res_int:    buf = 8;  # decoded integer / boolean / unsigned / access-error code
+g_res_fbits:  buf = 8;  # raw IEEE-754 bit pattern (32 or 64 bit)
+g_res_fwidth: buf = 8;  # 32 or 64
+g_res_err:    buf = 8;  # data-access-error code, or 0-1 if none
+g_res_qual:   buf = 8;  # last bit-string validity (0 Good 1 Invalid 2 Reserved 3 Questionable)
+g_res_utc:    buf = 8;  # last utc-time seconds-since-epoch
+g_res_str:    buf = 512;# decoded visible/mms string, or formatted float text
+g_stage:      buf = 8;  # diagnostic: how far i61850_connect got (see codes below)
+g_diag:       buf = 8;  # diagnostic: last recv'd frame length / aux
+
+# ---- messages ----
+m_struct: str = "STRUCT {";
+m_arr:    str = "ARRAY n=";
+m_end:    str = "}";
+m_int:    str = "int    = ";
+m_uint:   str = "uint   = ";
+m_btrue:  str = "bool   = TRUE";
+m_bfalse: str = "bool   = FALSE";
+m_float:  str = "float  = ";
+m_str:    str = "string = ";
+m_oct:    str = "octets bytes=";
+m_qual:   str = "quality validity=";
+m_utc:    str = "utctime secs=";
+m_err:    str = "<data-access-error code=";
+m_unk:    str = "<unknown tag 0x";
+m_gt:     str = ">";
+m_alarm:  str = "ALARM code=";
+m_at:     str = " ts=";
+m_svcerr: str = "<MMS confirmed-ErrorPDU (service error) - object/dataset not found or not readable>";
+m_reject: str = "<MMS RejectPDU (request rejected by server)>";
+m_badpdu: str = "<unexpected MMS PDU, tag(dec)=";
+e0:  str = "object-invalidated";
+e1:  str = "hardware-fault";
+e2:  str = "temporarily-unavailable";
+e3:  str = "object-access-denied";
+e4:  str = "object-undefined";
+e5:  str = "invalid-address";
+e6:  str = "type-unsupported";
+e7:  str = "type-inconsistent";
+e8:  str = "object-attribute-inconsistent";
+e9:  str = "object-access-unsupported";
+e10: str = "object-non-existent";
+e11: str = "object-value-invalid";
+e12: str = "unknown";
+m_op:  str = " (";
+m_cp:  str = ")";
+vq_good:  str = "Good";
+vq_inv:   str = "Invalid";
+vq_res:   str = "Reserved";
+vq_que:   str = "Questionable";
+sp2:      str = "  ";
+nlx:      str = "\r\n";
+s_dashuser: str = "-user#";
+s_dashpass: str = "-pass#";
+
+# ---- write / control / discovery (P3 + write) scratch ----
+g_item:    buf = 256;    # built MMS item string "LN$FC$DO$..$suffix"
+g_dom:     buf = 256;    # domain split out of an object reference
+g_oper:    buf = 256;    # built control Oper/SBOw Data structure
+g_dval:    buf = 64;     # built scalar Data value (write bool/int/float)
+g_orident: buf = 4;      # empty originator-identifier octet string ("")
+g_ctlnum:  buf = 8;      # control sequence number (ctlNum)
+g_ft:      buf = 16;     # FILETIME scratch for now_secs
+g_nl_buf:  buf = 16384;  # discovery: packed name list (NUL-separated cstrings)
+g_nl_cnt:  buf = 8;      # discovery: number of names collected
+g_nl_more: buf = 8;      # discovery: moreFollows from the last GetNameList page
+g_nl_end:  buf = 8;      # discovery: current append offset into g_nl_buf
+g_nl_last: buf = 8;      # discovery: offset of the last appended name (for continueAfter)
+
+# ---- FC tokens + control-attribute suffixes ----
+fc_co:        str = "CO";
+fc_cf:        str = "CF";
+sfx_oper:     str = "$Oper";
+sfx_sbow:     str = "$SBOw";
+sfx_sbo:      str = "$SBO";
+sfx_cancel:   str = "$Cancel";
+sfx_ctlmodel: str = "$ctlModel";
+
+@CODE
+# ============================ BER primitives (P1) ============================
+
+# determineLengthSize: # of bytes the BER length field will occupy
+func ber_lensize(len: i64) -> i64 {
+    if len < 128 { return 1; }
+    if len < 256 { return 2; }
+    if len < 65536 { return 3; }
+    return 4;
+}
+
+# write a definite BER length at p; return advanced p
+func ber_wrlen(p: i64, len: i64) -> i64 {
+    if len < 128 { store8(p, len); return p + 1; }
+    if len < 256 { store8(p, 0x81); store8(p + 1, len); return p + 2; }
+    if len < 65536 {
+        store8(p, 0x82);
+        store8(p + 1, band(shr(len, 8), 255));
+        store8(p + 2, band(len, 255));
+        return p + 3;
+    }
+    store8(p, 0x83);
+    store8(p + 1, band(shr(len, 16), 255));
+    store8(p + 2, band(shr(len, 8), 255));
+    store8(p + 3, band(len, 255));
+    return p + 4;
+}
+
+# read a definite BER length at p; store #length-bytes in g_dls; return the length
+func ber_rdlen(p: i64) -> i64 {
+    b = load8(p);
+    if b < 128 { store64(g_dls, 1); return b; }
+    n = band(b, 127);
+    v = 0;
+    i = 0;
+    while i < n {
+        v = v * 256 + load8(p + 1 + i);
+        i = i + 1;
+    }
+    store64(g_dls, n + 1);
+    return v;
+}
+
+# write tag + length + raw bytes of C-string s (NOT incl NUL); return advanced p
+func ber_wrstr(p: i64, tag: i64, s: i64) -> i64 {
+    n = strlen(s);
+    store8(p, tag);
+    p = p + 1;
+    p = ber_wrlen(p, n);
+    i = 0;
+    while i < n {
+        store8(p + i, load8(s + i));
+        i = i + 1;
+    }
+    return p + n;
+}
+
+# # of bytes ber_wruint will emit for value val (tag + len + minimal-unsigned bytes)
+func ber_uint_size(val: i64) -> i64 {
+    if val < 128 { return 3; }
+    if val < 32768 { return 4; }
+    return 5;
+}
+
+# write tag + minimal unsigned INTEGER (libiec61850 keeps a leading 0x00 so the
+# high bit never reads as negative); return advanced p
+func ber_wruint(p: i64, tag: i64, val: i64) -> i64 {
+    store8(p, tag);
+    if val < 128 {
+        store8(p + 1, 1);
+        store8(p + 2, val);
+        return p + 3;
+    }
+    if val < 32768 {
+        store8(p + 1, 2);
+        store8(p + 2, band(shr(val, 8), 255));
+        store8(p + 3, band(val, 255));
+        return p + 4;
+    }
+    store8(p + 1, 3);
+    store8(p + 2, 0);
+    store8(p + 3, band(shr(val, 8), 255));
+    store8(p + 4, band(val, 255));
+    return p + 5;
+}
+
+# read an n-byte big-endian two's-complement INTEGER at p (sign-extended)
+func ber_rdint(p: i64, n: i64) -> i64 {
+    v = 0;
+    i = 0;
+    while i < n {
+        v = v * 256 + load8(p + i);
+        i = i + 1;
+    }
+    if n < 8 {
+        if load8(p) >= 128 {
+            v = v - shl(1, 8 * n);
+        }
+    }
+    return v;
+}
+
+# read an n-byte big-endian UNSIGNED integer at p
+func ber_rduint(p: i64, n: i64) -> i64 {
+    v = 0;
+    i = 0;
+    while i < n {
+        v = v * 256 + load8(p + i);
+        i = i + 1;
+    }
+    return v;
+}
+
+# ============================ transport (reused) ============================
+
+func i61850_recv_n(s: i64, dst: i64, n: i64) -> i64 {
+    got = 0;
+    while got < n {
+        r = recv(s, dst + got, n - got, 0);
+        if r <= 0 { return 0 - 1; }
+        got = got + r;
+    }
+    return n;
+}
+
+# read one TPKT frame into g_rx; return total length (>=7) or -1. A single frame that does
+# not fit g_rx is a hard error (do NOT truncate -> that would desync the byte stream).
+func i61850_recv_tpkt(s: i64) -> i64 {
+    if i61850_recv_n(s, g_rx, 4) < 0 { return 0 - 1; }
+    tl = load8(g_rx + 2) * 256 + load8(g_rx + 3);
+    if tl < 7 { return 0 - 1; }
+    if tl > 16384 { return 0 - 1; }
+    if i61850_recv_n(s, g_rx + 4, tl - 4) < 0 { return 0 - 1; }
+    return tl;
+}
+
+# Reassemble one COTP TSDU (a full session+presentation+MMS blob) from one or more COTP DT
+# fragments into g_asm. libiec61850 segments any TSDU larger than the negotiated TPDU size
+# (the server CC may shrink it to e.g. 1024) into multiple DT TPKTs, EOT=0 on all but the last.
+# Returns the reassembled length in g_asm, or -1.
+func i61850_recv_tsdu(s: i64) -> i64 {
+    total = 0;
+    while 1 {
+        tl = i61850_recv_tpkt(s);
+        if tl < 0 { return 0 - 1; }
+        li = load8(g_rx + 4);            # COTP length indicator (2 for a DT TPDU)
+        hdr = 4 + 1 + li;                # TPKT(4) + LI byte(1) + li COTP bytes
+        eot = load8(g_rx + 6);           # DT: byte after 0xF0 carries the EOT flag (0x80 = last)
+        plen = tl - hdr;
+        if plen < 0 { return 0 - 1; }
+        if total + plen > 66000 { return 0 - 1; }
+        i = 0;
+        while i < plen { store8(g_asm + total + i, load8(g_rx + hdr + i)); i = i + 1; }
+        total = total + plen;
+        if band(eot, 0x80) != 0 { break; }
+    }
+    return total;
+}
+
+# COTP Connection-Request -> Connection-Confirm (verify 0xD0). MMS variant:
+# TPKT 03 00 00 16 | CR 11 E0 00 00 00 01 00 | C0 01 0D | C2 02 00 01 | C1 02 00 01
+func i61850_cotp_cr(s: i64) -> i64 {
+    store8(g_tx + 0, 0x03); store8(g_tx + 1, 0x00); store8(g_tx + 2, 0x00); store8(g_tx + 3, 0x16);
+    store8(g_tx + 4, 0x11); store8(g_tx + 5, 0xE0); store8(g_tx + 6, 0x00); store8(g_tx + 7, 0x00);
+    store8(g_tx + 8, 0x00); store8(g_tx + 9, 0x01); store8(g_tx + 10, 0x00);
+    store8(g_tx + 11, 0xC0); store8(g_tx + 12, 0x01); store8(g_tx + 13, 0x0D);
+    store8(g_tx + 14, 0xC2); store8(g_tx + 15, 0x02); store8(g_tx + 16, 0x00); store8(g_tx + 17, 0x01);
+    store8(g_tx + 18, 0xC1); store8(g_tx + 19, 0x02); store8(g_tx + 20, 0x00); store8(g_tx + 21, 0x01);
+    if send(s, g_tx, 22, 0) <= 0 { return 0; }
+    if i61850_recv_tpkt(s) < 0 { return 0; }
+    if load8(g_rx + 5) != 0xD0 { return 0; }
+    return 1;
+}
+
+# ============================ associate (P0) ============================
+
+# write the fixed MMS Initiate-RequestPDU (maxPDU=65000) at p; return its length (40)
+func wr_mms_initiate(p: i64) -> i64 {
+    store8(p + 0, 0xA8); store8(p + 1, 0x26);
+    store8(p + 2, 0x80); store8(p + 3, 0x03); store8(p + 4, 0x00); store8(p + 5, 0xFD); store8(p + 6, 0xE8);
+    store8(p + 7, 0x81); store8(p + 8, 0x01); store8(p + 9, 0x05);
+    store8(p + 10, 0x82); store8(p + 11, 0x01); store8(p + 12, 0x05);
+    store8(p + 13, 0x83); store8(p + 14, 0x01); store8(p + 15, 0x0A);
+    store8(p + 16, 0xA4); store8(p + 17, 0x16);
+    store8(p + 18, 0x80); store8(p + 19, 0x01); store8(p + 20, 0x01);
+    store8(p + 21, 0x81); store8(p + 22, 0x03); store8(p + 23, 0x05); store8(p + 24, 0xF1); store8(p + 25, 0x00);
+    store8(p + 26, 0x82); store8(p + 27, 0x0C); store8(p + 28, 0x03);
+    store8(p + 29, 0xEE); store8(p + 30, 0x1C); store8(p + 31, 0x00); store8(p + 32, 0x00); store8(p + 33, 0x04);
+    store8(p + 34, 0x08); store8(p + 35, 0x00); store8(p + 36, 0x00); store8(p + 37, 0x79); store8(p + 38, 0xEF); store8(p + 39, 0x18);
+    return 40;
+}
+
+# build the "-user#\"<u>\" -pass#\"<p>\"" ACSE password value into g_pass_buf;
+# return its length (quotes via store8(34), space via store8(32) - no escaping)
+func build_acse_pass(u: i64, pw: i64) -> i64 {
+    e = str_copy(g_pass_buf, s_dashuser);
+    store8(e, 34); e = e + 1;
+    e = str_copy(e, u);
+    store8(e, 34); e = e + 1;
+    store8(e, 32); e = e + 1;
+    e = str_copy(e, s_dashpass);
+    store8(e, 34); e = e + 1;
+    e = str_copy(e, pw);
+    store8(e, 34); e = e + 1;
+    return e - g_pass_buf;
+}
+
+# encode an unsigned value as ASN.1 OID base-128 (big-endian, high bit set on all but the last byte)
+func enc_b128(v: i64, out: i64) -> i64 {
+    if v < 128 { store8(out, v); return 1; }
+    n = 0; t = v;
+    while t > 0 { store8(g_b128 + n, band(t, 127)); t = shr(t, 7); n = n + 1; }
+    i = 0;
+    while i < n {
+        b = load8(g_b128 + (n - 1 - i));
+        if i < (n - 1) { b = bor(b, 128); }
+        store8(out + i, b);
+        i = i + 1;
+    }
+    return n;
+}
+
+# encode a dotted/comma OID string ("1.3.9999.33" or "1,3,9999,33") to BER OID content bytes at out;
+# return the content length, or 0 on a malformed (< 2 arc) input.
+func encode_oid(s: i64, out: i64) -> i64 {
+    na = 0; cur = 0; started = 0; i = 0;
+    while 1 {
+        c = load8(s + i);
+        if c == 0 {
+            if started == 1 { if na < 32 { store64(g_arcs + na * 8, cur); na = na + 1; } }
+            break;
+        }
+        if c == 46 { if started == 1 { if na < 32 { store64(g_arcs + na * 8, cur); na = na + 1; } } cur = 0; started = 0; }
+        else { if c == 44 { if started == 1 { if na < 32 { store64(g_arcs + na * 8, cur); na = na + 1; } } cur = 0; started = 0; }
+        else { if c >= 48 { if c <= 57 { cur = cur * 10 + (c - 48); started = 1; } } } }
+        i = i + 1;
+    }
+    if na < 2 { return 0; }
+    store8(out, load64(g_arcs) * 40 + load64(g_arcs + 8));
+    o = 1; k = 2;
+    while k < na { o = o + enc_b128(load64(g_arcs + k * 8), out + o); k = k + 1; }
+    return o;
+}
+
+# configure the ACSE AP-titles + AE-qualifiers (call BEFORE i61850_connect). Dotted/comma OIDs.
+# called* = remote/server (Senvion: "1.3.9999.33"/33); calling* = local/client ("1.1.1.999.1"/12).
+func i61850_set_ap(calledOid: i64, calledAEQ: i64, callingOid: i64, callingAEQ: i64) -> i64 {
+    store64(g_cap_len, encode_oid(calledOid, g_cap_oid));
+    store64(g_lap_len, encode_oid(callingOid, g_lap_oid));
+    store64(g_cae, calledAEQ);
+    store64(g_lae, callingAEQ);
+    store64(g_ap_set, 1);
+    return 0;
+}
+
+# populate the libiec61850 generic AP-title defaults if the caller didn't set_ap
+# (called 1.1.1.999.1/12 -> OID 29 01 87 67 01 ; calling 1.1.1.999/12 -> 29 01 87 67) - byte-identical
+# to the old hardcoded associate, so the no-config path is unchanged.
+func ap_defaults() -> i64 {
+    if load64(g_ap_set) != 0 { return 0; }
+    store8(g_cap_oid + 0, 0x29); store8(g_cap_oid + 1, 0x01); store8(g_cap_oid + 2, 0x87); store8(g_cap_oid + 3, 0x67); store8(g_cap_oid + 4, 0x01);
+    store64(g_cap_len, 5);
+    store8(g_lap_oid + 0, 0x29); store8(g_lap_oid + 1, 0x01); store8(g_lap_oid + 2, 0x87); store8(g_lap_oid + 3, 0x67);
+    store64(g_lap_len, 4);
+    store64(g_cae, 12); store64(g_lae, 12);
+    return 0;
+}
+
+# Build the full associate-request (Session CN + Pres CP + ACSE AARQ [+pw] +
+# MMS Initiate) over COTP DT into g_tx. passLen=0 => no auth. Returns TPKT total.
+func build_associate(passPtr: i64, passLen: i64) -> i64 {
+    ap_defaults();
+    cap_len = load64(g_cap_len); lap_len = load64(g_lap_len);
+    cae = load64(g_cae); lae = load64(g_lae);
+    mmsLen = 40;
+
+    # auth block = 8A 02 04 80 (4) + 8B 03 52 03 01 (5) + AC <Lac> { 80 <plen> <pass> }.
+    # Lac/plen lengths via ber_wrlen so they stay correct for long passwords (not hard 1-byte).
+    authLen = 0;
+    lac = 0;
+    if passLen > 0 {
+        lac = 1 + ber_lensize(passLen) + passLen;        # AC content = 80 TL + pass
+        authLen = 4 + 5 + 1 + ber_lensize(lac) + lac;    # 8A.. + 8B.. + AC TLV
+    }
+
+    # ---- ACSE user-information (wraps MMS Initiate) ----
+    a0mms     = 1 + ber_lensize(mmsLen) + mmsLen;     # A0 <len> <mms>
+    adContent = 3 + a0mms;                             # 02 01 03 + a0mms
+    be28      = 1 + ber_lensize(adContent) + adContent;# 28 <len> ...
+    uiContent = be28;
+    beTotal   = 1 + ber_lensize(uiContent) + uiContent;# BE <len> ...
+
+    # ---- ACSE AARQ ----
+    aarqContent = 9 + (4 + cap_len) + 5 + (4 + lap_len) + 5 + authLen + beTotal;
+    aarqTotal   = 1 + ber_lensize(aarqContent) + aarqContent;
+
+    # ---- presentation user-data (ctxid 1, wraps ACSE) ----
+    acseLen    = aarqTotal;
+    a0acse     = 1 + ber_lensize(acseLen) + acseLen;
+    pdvContent = 3 + a0acse;                            # 02 01 01 + a0acse
+    ud30       = 1 + ber_lensize(pdvContent) + pdvContent;
+    ud61       = 1 + ber_lensize(ud30) + ud30;
+
+    # ---- presentation CP normal-mode ----
+    normalContent = 6 + 6 + 37 + ud61;                  # calling-Psel + called-Psel + PCDL(A4 23+35) + userdata
+    a2normal      = 1 + ber_lensize(normalContent) + normalContent;
+    presContent   = 5 + a2normal;                       # mode-selector(5) + A2 normal-mode
+    presTotal     = 1 + ber_lensize(presContent) + presContent;
+
+    # ---- session CN ----
+    sessLI    = 22 + presTotal;                         # header bytes 2..23 (=22) + presentation payload
+    sessTotal = 2 + sessLI;
+    tpktTotal = 7 + sessTotal;                          # TPKT(4) + COTP DT(3) + session
+
+    # The ISO-8327 session LI and the C1 user-data length are single octets; an over-long credential
+    # would overflow them and corrupt the frame. Refuse rather than emit a bad associate.
+    if sessLI > 254 { return 0; }
+
+    p = g_tx;
+    # TPKT
+    store8(p, 0x03); store8(p + 1, 0x00);
+    store8(p + 2, band(shr(tpktTotal, 8), 255)); store8(p + 3, band(tpktTotal, 255));
+    p = p + 4;
+    # COTP DT
+    store8(p, 0x02); store8(p + 1, 0xF0); store8(p + 2, 0x80); p = p + 3;
+    # Session CONNECT
+    store8(p, 0x0D); store8(p + 1, sessLI); p = p + 2;
+    store8(p, 0x05); store8(p + 1, 0x06); store8(p + 2, 0x13); store8(p + 3, 0x01);
+    store8(p + 4, 0x00); store8(p + 5, 0x16); store8(p + 6, 0x01); store8(p + 7, 0x02); p = p + 8;
+    store8(p, 0x14); store8(p + 1, 0x02); store8(p + 2, 0x00); store8(p + 3, 0x02); p = p + 4;
+    store8(p, 0x33); store8(p + 1, 0x02); store8(p + 2, 0x00); store8(p + 3, 0x01); p = p + 4;
+    store8(p, 0x34); store8(p + 1, 0x02); store8(p + 2, 0x00); store8(p + 3, 0x01); p = p + 4;
+    store8(p, 0xC1); store8(p + 1, presTotal); p = p + 2;
+    # Presentation CP
+    store8(p, 0x31); p = p + 1; p = ber_wrlen(p, presContent);
+    store8(p, 0xA0); store8(p + 1, 0x03); store8(p + 2, 0x80); store8(p + 3, 0x01); store8(p + 4, 0x01); p = p + 5;
+    store8(p, 0xA2); p = p + 1; p = ber_wrlen(p, normalContent);
+    store8(p, 0x81); store8(p + 1, 0x04); store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x01); p = p + 6;
+    store8(p, 0x82); store8(p + 1, 0x04); store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x01); p = p + 6;
+    # PCDL
+    store8(p, 0xA4); store8(p + 1, 0x23); p = p + 2;
+    store8(p, 0x30); store8(p + 1, 0x0F); store8(p + 2, 0x02); store8(p + 3, 0x01); store8(p + 4, 0x01);
+    store8(p + 5, 0x06); store8(p + 6, 0x04); store8(p + 7, 0x52); store8(p + 8, 0x01); store8(p + 9, 0x00); store8(p + 10, 0x01);
+    store8(p + 11, 0x30); store8(p + 12, 0x04); store8(p + 13, 0x06); store8(p + 14, 0x02); store8(p + 15, 0x51); store8(p + 16, 0x01); p = p + 17;
+    store8(p, 0x30); store8(p + 1, 0x10); store8(p + 2, 0x02); store8(p + 3, 0x01); store8(p + 4, 0x03);
+    store8(p + 5, 0x06); store8(p + 6, 0x05); store8(p + 7, 0x28); store8(p + 8, 0xCA); store8(p + 9, 0x22); store8(p + 10, 0x02); store8(p + 11, 0x01);
+    store8(p + 12, 0x30); store8(p + 13, 0x04); store8(p + 14, 0x06); store8(p + 15, 0x02); store8(p + 16, 0x51); store8(p + 17, 0x01); p = p + 18;
+    # user-data (61 wrapping ACSE, ctxid=1)
+    store8(p, 0x61); p = p + 1; p = ber_wrlen(p, ud30);
+    store8(p, 0x30); p = p + 1; p = ber_wrlen(p, pdvContent);
+    store8(p, 0x02); store8(p + 1, 0x01); store8(p + 2, 0x01); p = p + 3;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, acseLen);
+    # ACSE AARQ
+    store8(p, 0x60); p = p + 1; p = ber_wrlen(p, aarqContent);
+    store8(p, 0xA1); store8(p + 1, 0x07); store8(p + 2, 0x06); store8(p + 3, 0x05); store8(p + 4, 0x28); store8(p + 5, 0xCA); store8(p + 6, 0x22); store8(p + 7, 0x02); store8(p + 8, 0x03); p = p + 9;
+    # called (remote) AP-title  A2 <2+cap_len> 06 <cap_len> <oid>   + AE-qualifier  A3 03 02 01 <cae>
+    store8(p, 0xA2); p = p + 1; p = ber_wrlen(p, 2 + cap_len);
+    store8(p, 0x06); p = p + 1; p = ber_wrlen(p, cap_len);
+    i = 0; while i < cap_len { store8(p + i, load8(g_cap_oid + i)); i = i + 1; } p = p + cap_len;
+    store8(p, 0xA3); store8(p + 1, 0x03); store8(p + 2, 0x02); store8(p + 3, 0x01); store8(p + 4, cae); p = p + 5;
+    # calling (local) AP-title  A6 <2+lap_len> 06 <lap_len> <oid>   + AE-qualifier  A7 03 02 01 <lae>
+    store8(p, 0xA6); p = p + 1; p = ber_wrlen(p, 2 + lap_len);
+    store8(p, 0x06); p = p + 1; p = ber_wrlen(p, lap_len);
+    i = 0; while i < lap_len { store8(p + i, load8(g_lap_oid + i)); i = i + 1; } p = p + lap_len;
+    store8(p, 0xA7); store8(p + 1, 0x03); store8(p + 2, 0x02); store8(p + 3, 0x01); store8(p + 4, lae); p = p + 5;
+    # optional auth block
+    if passLen > 0 {
+        store8(p, 0x8A); store8(p + 1, 0x02); store8(p + 2, 0x04); store8(p + 3, 0x80); p = p + 4;
+        store8(p, 0x8B); store8(p + 1, 0x03); store8(p + 2, 0x52); store8(p + 3, 0x03); store8(p + 4, 0x01); p = p + 5;
+        store8(p, 0xAC); p = p + 1; p = ber_wrlen(p, lac);       # authentication-value [12]
+        store8(p, 0x80); p = p + 1; p = ber_wrlen(p, passLen);   # [0] GraphicString password
+        i = 0;
+        while i < passLen { store8(p + i, load8(passPtr + i)); i = i + 1; }
+        p = p + passLen;
+    }
+    # user-information
+    store8(p, 0xBE); p = p + 1; p = ber_wrlen(p, uiContent);
+    store8(p, 0x28); p = p + 1; p = ber_wrlen(p, adContent);
+    store8(p, 0x02); store8(p + 1, 0x01); store8(p + 2, 0x03); p = p + 3;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, mmsLen);
+    wr_mms_initiate(p); p = p + mmsLen;
+    return tpktTotal;
+}
+
+# validate the associate response in g_rx: Session ACCEPT (0x0E) then MMS
+# initiate-Response (0xA9) present (and not initiate-Error 0xAA). 1=ok 0=fail.
+func mms_check_associate() -> i64 {
+    if load8(g_rx + 7) != 0x0E { return 0; }
+    tl = load8(g_rx + 2) * 256 + load8(g_rx + 3);
+    if tl > 16384 { tl = 16384; }                        # never scan past g_rx
+    i = 11;
+    while i < tl {
+        b = load8(g_rx + i);
+        if b == 0xA9 { return 1; }
+        if b == 0xAA { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ============================ data-phase wrap / unwrap ============================
+
+# wrap the MMS PDU (g_mms, length mmsLen) in Pres user-data + Session DT + COTP
+# DT + TPKT into g_tx and send it. Returns bytes sent or -1.
+func send_mms(s: i64, mmsLen: i64) -> i64 {
+    pdvList   = mmsLen + ber_lensize(mmsLen) + 4;       # 02 01 03 (3) + A0 tag (1) + mms
+    presLen   = pdvList + ber_lensize(pdvList) + 1;     # + 30 tag
+    presTotal = presLen + ber_lensize(presLen) + 1;     # + 61 tag
+    sessTotal = 4 + presTotal;                          # session 01 00 01 00
+    tpktTotal = 7 + sessTotal;                          # TPKT(4) + COTP DT(3) + session
+
+    p = g_tx;
+    store8(p, 0x03); store8(p + 1, 0x00);
+    store8(p + 2, band(shr(tpktTotal, 8), 255)); store8(p + 3, band(tpktTotal, 255));
+    p = p + 4;
+    store8(p, 0x02); store8(p + 1, 0xF0); store8(p + 2, 0x80); p = p + 3;
+    store8(p, 0x01); store8(p + 1, 0x00); store8(p + 2, 0x01); store8(p + 3, 0x00); p = p + 4;
+    store8(p, 0x61); p = p + 1; p = ber_wrlen(p, presLen);
+    store8(p, 0x30); p = p + 1; p = ber_wrlen(p, pdvList);
+    store8(p, 0x02); store8(p + 1, 0x01); store8(p + 2, 0x03); p = p + 3;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, mmsLen);
+    i = 0;
+    while i < mmsLen { store8(p + i, load8(g_mms + i)); i = i + 1; }
+    p = p + mmsLen;
+    if send(s, g_tx, tpktTotal, 0) <= 0 { return 0 - 1; }
+    return tpktTotal;
+}
+
+# receive one data-phase PDU; reassemble COTP fragments; strip Session/Presentation;
+# set g_mms_len + g_fend (the MMS PDU end bound); return the offset of the MMS PDU in g_asm, or -1.
+func recv_mms_one(s: i64) -> i64 {
+    n = i61850_recv_tsdu(s);
+    if n < 0 { return 0 - 1; }
+    if n < 11 { return 0 - 1; }
+    if load8(g_asm + 0) != 0x01 { return 0 - 1; }       # session DT (01 00 01 00)
+    p = g_asm + 4;                                       # presentation
+    if load8(p) != 0x61 { return 0 - 1; }
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0x30 { return 0 - 1; }
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0x02 { return 0 - 1; }
+    p = p + 3;                                           # 02 01 ctxid
+    if load8(p) != 0xA0 { return 0 - 1; }
+    p = p + 1;
+    ln = ber_rdlen(p); p = p + load64(g_dls);
+    # bound the MMS PDU to what we actually reassembled
+    if p + ln > g_asm + n { ln = g_asm + n - p; }
+    store64(g_mms_len, ln);
+    store64(g_fend, p + ln);
+    return p;
+}
+
+# Receive a confirmed response, transparently skipping any unsolicited unconfirmed-PDU [3]
+# (tag 0xA3 = InformationReport / the command-termination report that enhanced control models
+# send AFTER the operate response). Without this, that report would desync the next read.
+func recv_mms(s: i64) -> i64 {
+    tries = 0;
+    while tries < 6 {
+        off = recv_mms_one(s);
+        if off < 0 { return 0 - 1; }
+        if load8(off) != 0xA3 { return off; }            # not unconfirmed -> it's our response
+        tries = tries + 1;                               # discard the report, read the next PDU
+    }
+    return 0 - 1;
+}
+
+# ============================ MMS Read request builders ============================
+
+# Read of a scalar domain-specific named variable into g_mms; return length.
+func build_read_scalar(domain: i64, item: i64) -> i64 {
+    inv = load64(g_invoke) + 1; store64(g_invoke, inv);
+    dlen = strlen(domain); ilen = strlen(item);
+
+    dstr = 1 + ber_lensize(dlen) + dlen;
+    istr = 1 + ber_lensize(ilen) + ilen;
+    a1obj = dstr + istr;                                 # objectName.domainspecific content
+    a1objT = 1 + ber_lensize(a1obj) + a1obj;
+    a0name = a1objT; a0nameT = 1 + ber_lensize(a0name) + a0name;
+    seq = a0nameT; seqT = 1 + ber_lensize(seq) + seq;
+    a0lov = seqT; a0lovT = 1 + ber_lensize(a0lov) + a0lov;
+    a1vas = a0lovT; a1vasT = 1 + ber_lensize(a1vas) + a1vas;
+    a4content = a1vasT; a4T = 1 + ber_lensize(a4content) + a4content;
+    invT = ber_uint_size(inv);
+    a0content = invT + a4T;
+
+    p = g_mms;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0content);
+    p = ber_wruint(p, 0x02, inv);
+    store8(p, 0xA4); p = p + 1; p = ber_wrlen(p, a4content);
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1vas);
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0lov);
+    store8(p, 0x30); p = p + 1; p = ber_wrlen(p, seq);
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0name);
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1obj);
+    p = ber_wrstr(p, 0x1A, domain);
+    p = ber_wrstr(p, 0x1A, item);
+    return p - g_mms;
+}
+
+# Read of a domain-specific named-variable-list (dataset) into g_mms; return length.
+func build_read_dataset(domain: i64, listname: i64) -> i64 {
+    inv = load64(g_invoke) + 1; store64(g_invoke, inv);
+    dlen = strlen(domain); llen = strlen(listname);
+
+    # THREE nested A1: variableAccessSpecification [1] EXPLICIT > variableListName [1] EXPLICIT
+    # > ObjectName.domainspecific [1] IMPLICIT SEQ { 1A domainId, 1A listName }. (variableListName is
+    # EXPLICIT, so its [1] wrapper does NOT collapse into the ObjectName's [1] — both are emitted.)
+    dstr = 1 + ber_lensize(dlen) + dlen;
+    lstr = 1 + ber_lensize(llen) + llen;
+    a1ds = dstr + lstr;                                  # ObjectName.domainspecific content
+    a1dsT = 1 + ber_lensize(a1ds) + a1ds;
+    a1vln = a1dsT; a1vlnT = 1 + ber_lensize(a1vln) + a1vln;   # variableListName
+    a1vas = a1vlnT; a1vasT = 1 + ber_lensize(a1vas) + a1vas;  # variableAccessSpecification
+    a4content = a1vasT; a4T = 1 + ber_lensize(a4content) + a4content;
+    invT = ber_uint_size(inv);
+    a0content = invT + a4T;
+
+    p = g_mms;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0content);
+    p = ber_wruint(p, 0x02, inv);
+    store8(p, 0xA4); p = p + 1; p = ber_wrlen(p, a4content);
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1vas);     # variableAccessSpecification [1]
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1vln);     # variableListName [1]
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1ds);      # ObjectName.domainspecific [1]
+    p = ber_wrstr(p, 0x1A, domain);
+    p = ber_wrstr(p, 0x1A, listname);
+    return p - g_mms;
+}
+
+# ============================ MMS value decode (P1 decode / P2 / P2b) ============================
+
+func print_indent(depth: i64) -> i64 {
+    i = 0;
+    while i < depth { syscall 1, sp2; i = i + 1; }
+    return 0;
+}
+
+# print the IEC-61850/MMS data-access-error name for a code (0..11)
+func print_err_name(code: i64) -> i64 {
+    if code == 0 { syscall 1, e0; return 0; }
+    if code == 1 { syscall 1, e1; return 0; }
+    if code == 2 { syscall 1, e2; return 0; }
+    if code == 3 { syscall 1, e3; return 0; }
+    if code == 4 { syscall 1, e4; return 0; }
+    if code == 5 { syscall 1, e5; return 0; }
+    if code == 6 { syscall 1, e6; return 0; }
+    if code == 7 { syscall 1, e7; return 0; }
+    if code == 8 { syscall 1, e8; return 0; }
+    if code == 9 { syscall 1, e9; return 0; }
+    if code == 10 { syscall 1, e10; return 0; }
+    if code == 11 { syscall 1, e11; return 0; }
+    syscall 1, e12;
+    return 0;
+}
+
+# count children of a constructed value whose content is [p, p+total)
+func count_elements(p: i64, total: i64) -> i64 {
+    end = p + total;
+    cnt = 0;
+    while p < end {
+        p = p + 1;                                       # skip tag
+        ln = ber_rdlen(p);                               # sets g_dls
+        p = p + load64(g_dls) + ln;
+        cnt = cnt + 1;
+    }
+    return cnt;
+}
+
+# decode one MMS Data value at p (prints it indented by depth); set g_res_* for
+# scalar leaves; recurse into ARRAY/STRUCTURE. Return offset just past the value.
+func decode_value(p: i64, depth: i64) -> i64 {
+    fend = load64(g_fend);
+    if depth > 24 { return fend; }                       # runaway-nesting guard (no TCO)
+    if p >= fend { return fend; }                        # never read past the frame
+    tag = load8(p);
+    p = p + 1;
+    ln = ber_rdlen(p);
+    p = p + load64(g_dls);                               # p -> content
+    if p + ln > fend { ln = fend - p; }                  # clamp wire length to the frame end
+    if ln < 0 { return fend; }
+
+    if tag == 0xA2 {                                     # STRUCTURE
+        print_indent(depth); syscall 1, m_struct, nlx;
+        end = p + ln;
+        while p < end { p = decode_value(p, depth + 1); }
+        print_indent(depth); syscall 1, m_end, nlx;
+        return p;
+    }
+    if tag == 0xA1 {                                     # ARRAY
+        cnt = count_elements(p, ln);
+        print_indent(depth); syscall 1, m_arr, cnt, nlx;
+        end = p + ln;
+        while p < end { p = decode_value(p, depth + 1); }
+        print_indent(depth); syscall 1, m_end, nlx;
+        return p;
+    }
+    if tag == 0x85 {                                     # INTEGER
+        v = ber_rdint(p, ln);
+        print_indent(depth); syscall 1, m_int, v, nlx;
+        store64(g_res_type, 0x85); store64(g_res_int, v);
+        return p + ln;
+    }
+    if tag == 0x86 {                                     # UNSIGNED
+        v = ber_rduint(p, ln);
+        print_indent(depth); syscall 1, m_uint, v, nlx;
+        store64(g_res_type, 0x86); store64(g_res_int, v);
+        return p + ln;
+    }
+    if tag == 0x83 {                                     # BOOLEAN
+        v = 0; if load8(p) != 0 { v = 1; }
+        print_indent(depth);
+        if v == 1 { syscall 1, m_btrue, nlx; } else { syscall 1, m_bfalse, nlx; }
+        store64(g_res_type, 0x83); store64(g_res_int, v);
+        return p + ln;
+    }
+    if tag == 0x87 {                                     # FLOAT (exp-width byte + BE IEEE754)
+        bits = 0;
+        if ln == 5 {
+            bits = shl(load8(p + 1), 24) + shl(load8(p + 2), 16) + shl(load8(p + 3), 8) + load8(p + 4);
+            nf_ftoa(bits, g_res_str);
+            store64(g_res_fwidth, 32);
+        } else {
+            i = 0;
+            while i < 8 { bits = shl(bits, 8) + load8(p + 1 + i); i = i + 1; }
+            nf_dtoa(bits, g_res_str);
+            store64(g_res_fwidth, 64);
+        }
+        store64(g_res_type, 0x87); store64(g_res_fbits, bits);
+        print_indent(depth); syscall 1, m_float; puts_cstr(g_res_str); syscall 1, nlx;
+        return p + ln;
+    }
+    if tag == 0x8A {                                     # VisibleString
+        cap = ln; if cap > 511 { cap = 511; }            # g_res_str is 512 - clamp the copy
+        i = 0;
+        while i < cap { store8(g_res_str + i, load8(p + i)); i = i + 1; }
+        store8(g_res_str + cap, 0);
+        store64(g_res_type, 0x8A);
+        print_indent(depth); syscall 1, m_str; puts_cstr(g_res_str); syscall 1, nlx;
+        return p + ln;
+    }
+    if tag == 0x90 {                                     # mms-string (UTF-8) - same handling
+        cap = ln; if cap > 511 { cap = 511; }
+        i = 0;
+        while i < cap { store8(g_res_str + i, load8(p + i)); i = i + 1; }
+        store8(g_res_str + cap, 0);
+        store64(g_res_type, 0x90);
+        print_indent(depth); syscall 1, m_str; puts_cstr(g_res_str); syscall 1, nlx;
+        return p + ln;
+    }
+    if tag == 0x84 {                                     # BIT STRING (quality): [pad][bits..]
+        v0 = 0; if ln >= 2 { v0 = load8(p + 1); }
+        bit0 = band(shr(v0, 7), 1);
+        bit1 = band(shr(v0, 6), 1);
+        val = bit0 * 2 + bit1;
+        store64(g_res_qual, val);
+        print_indent(depth); syscall 1, m_qual;
+        if val == 0 { syscall 1, vq_good, nlx; }
+        else { if val == 1 { syscall 1, vq_inv, nlx; }
+        else { if val == 2 { syscall 1, vq_res, nlx; }
+        else { syscall 1, vq_que, nlx; } } }
+        return p + ln;
+    }
+    if tag == 0x91 {                                     # UTC-TIME (8 octets: 4 BE secs + frac + q)
+        secs = shl(load8(p), 24) + shl(load8(p + 1), 16) + shl(load8(p + 2), 8) + load8(p + 3);
+        store64(g_res_utc, secs);
+        print_indent(depth); syscall 1, m_utc, secs, nlx;
+        return p + ln;
+    }
+    if tag == 0x89 {                                     # OCTET STRING
+        print_indent(depth); syscall 1, m_oct, ln, nlx;
+        return p + ln;
+    }
+    if tag == 0x8C {                                     # BINARY TIME
+        print_indent(depth); syscall 1, m_oct, ln, nlx;
+        return p + ln;
+    }
+    if tag == 0x80 {                                     # data-access-error
+        code = ber_rduint(p, ln);
+        store64(g_res_type, 0); store64(g_res_err, code);
+        print_indent(depth); syscall 1, m_err, code, m_op; print_err_name(code); syscall 1, m_cp, nlx;
+        return p + ln;
+    }
+    if tag == 0x00 {                                     # indefinite-length end marker
+        return p;
+    }
+    print_indent(depth); syscall 1, m_unk, tag, m_gt, nlx;  # unknown
+    return p + ln;
+}
+
+# walk a confirmed-ResponsePDU in g_rx at off: descend to listOfAccessResult and
+# return the offset of its content, plus store its end in g_dls-adjacent g_mms_len.
+# Returns the content offset, or -1 on a non-Read / error PDU.
+func locate_access_results(off: i64) -> i64 {
+    p = off;
+    t = load8(p);
+    if t != 0xA1 {                                       # not a confirmed-ResponsePDU [1]
+        if t == 0xA2 { syscall 1, m_svcerr, nlx; }
+        else { if t == 0xA4 { syscall 1, m_reject, nlx; }
+        else { syscall 1, m_badpdu, t, m_gt, nlx; } }
+        return 0 - 1;
+    }
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0x02 { return 0 - 1; }               # invokeID
+    p = p + 1; il = ber_rdlen(p); p = p + load64(g_dls) + il;
+    if load8(p) != 0xA4 { return 0 - 1; }               # read [4]
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) == 0xA0 {                               # optional variableAccessSpecification echo
+        p = p + 1; sk = ber_rdlen(p); p = p + load64(g_dls) + sk;
+    }
+    if load8(p) != 0xA1 { return 0 - 1; }               # listOfAccessResult [1]
+    p = p + 1; ln = ber_rdlen(p); p = p + load64(g_dls);
+    e = p + ln;
+    if e > load64(g_fend) { e = load64(g_fend); }        # never exceed the reassembled frame
+    store64(g_mms_len, e);                               # the listOfAccessResult END offset
+    store64(g_fend, e);                                  # tighten the decode bound
+    return p;
+}
+
+# Non-blocking connect with a deadline (avoids the ~21s Windows SYN timeout on a dead host,
+# which would freeze a caller's UI thread). Returns 0 on connect, 1 on fail/timeout.
+func conn_timeout(s: i64, addr: i64, ms: i64) -> i64 {
+    store32(g_nbmode, 1);
+    ioctlsocket(s, 0x8004667E, g_nbmode);            # FIONBIO = 1 (non-blocking)
+    connect(s, addr, 16);                            # returns immediately (WSAEWOULDBLOCK)
+    store32(g_wset + 0, 1); store64(g_wset + 8, s);  # fd_set{ count=1, [s] } (writable)
+    store32(g_eset + 0, 1); store64(g_eset + 8, s);  # fd_set{ count=1, [s] } (except = failed)
+    store32(g_tv + 0, ms / 1000); store32(g_tv + 4, (ms % 1000) * 1000);   # timeval sec/usec
+    r = select(0, 0, g_wset, g_eset, g_tv);
+    store32(g_nbmode, 0);
+    ioctlsocket(s, 0x8004667E, g_nbmode);            # restore blocking (recv/send stay blocking)
+    if r <= 0 { return 1; }                          # timed out / error
+    if load32(g_eset) != 0 { return 1; }             # socket in the except set -> connect failed
+    if load32(g_wset) != 0 { return 0; }             # writable -> connected
+    return 1;
+}
+
+# ============================ public API ============================
+
+# Open a TCP connection + MMS associate. userPtr/passPtr=0 => no auth.
+# Returns the socket (>0) or 0 on failure.
+# stage codes (g_stage): 3 connect-fail, 5 cotp-fail, 7 send-fail, 8 no-response,
+# 9 associate-rejected, 100 success. g_diag = recv'd associate frame length.
+func i61850_connect(ip0: i64, ip1: i64, ip2: i64, ip3: i64, port: i64, userPtr: i64, passPtr: i64) -> i64 {
+    store64(g_stage, 0); store64(g_diag, 0);
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, htons(port));
+    store32(g_addr + 4, ip0 + shl(ip1, 8) + shl(ip2, 16) + shl(ip3, 24));
+    store64(g_addr + 8, 0);
+    if conn_timeout(s, g_addr, 4000) != 0 { store64(g_stage, 3); closesocket(s); return 0; }   # ~4s cap, not ~21s
+    store32(g_tmo, 5000);
+    setsockopt(s, 65535, 4102, g_tmo, 4);
+    if i61850_cotp_cr(s) == 0 { store64(g_stage, 5); closesocket(s); return 0; }
+    plen = 0;
+    if userPtr != 0 { plen = build_acse_pass(userPtr, passPtr); }
+    alen = build_associate(g_pass_buf, plen);
+    if alen == 0 { store64(g_stage, 6); closesocket(s); return 0; }   # credential too long
+    if send(s, g_tx, alen, 0) <= 0 { store64(g_stage, 7); closesocket(s); return 0; }
+    rt = i61850_recv_tpkt(s);
+    if rt < 0 { store64(g_stage, 8); closesocket(s); return 0; }
+    store64(g_diag, rt);
+    if mms_check_associate() == 0 { store64(g_stage, 9); closesocket(s); return 0; }
+    store64(g_stage, 100);
+    store64(g_invoke, 0);
+    return s;
+}
+
+# Read one scalar variable (domain + MMS item "LN$FC$DO$DA"). Prints the value.
+# Returns the MMS type tag of the value (0x87 float / 0x85 int / 0x83 bool / ...),
+# or 0 on failure. Decoded value also in g_res_*.
+func i61850_read_scalar(s: i64, domain: i64, item: i64) -> i64 {
+    mlen = build_read_scalar(domain, item);
+    if send_mms(s, mlen) < 0 { return 0; }
+    off = recv_mms(s);
+    if off < 0 { return 0; }
+    car = locate_access_results(off);
+    if car < 0 { return 0; }
+    store64(g_res_type, 0); store64(g_res_err, 0 - 1);
+    decode_value(car, 0);
+    return load64(g_res_type);
+}
+
+# Read a dataset (named-variable-list). Prints each member (recursing into
+# nested STRUCT/ARRAY). Returns the number of top-level AccessResults, or 0.
+func i61850_read_dataset(s: i64, domain: i64, listname: i64) -> i64 {
+    mlen = build_read_dataset(domain, listname);
+    if send_mms(s, mlen) < 0 { return 0; }
+    off = recv_mms(s);
+    if off < 0 { return 0; }
+    car = locate_access_results(off);
+    if car < 0 { return 0; }
+    endoff = load64(g_mms_len);
+    p = car;
+    cnt = 0;
+    while p < endoff {
+        p = decode_value(p, 0);
+        cnt = cnt + 1;
+    }
+    return cnt;
+}
+
+# ---- Senvion alarm dataset: filtered ACTIVE-slot read (P2b crux) ----
+# Decode ONE alarm-array element STRUCT{ stVal:int, q:bitstring, t:utctime } and emit it ONLY when
+# it is an ACTIVE slot: quality validity == Good (00) AND timestamp > the 1970 epoch placeholder.
+# Empty Senvion slots are validity=Reserved + ts=1970, which this drops. Returns the next offset.
+func dec_alarm_slot(p: i64) -> i64 {
+    fend = load64(g_fend);
+    if p >= fend { return fend; }
+    if load8(p) != 0xA2 { return fend; }
+    p = p + 1;
+    slen = ber_rdlen(p); p = p + load64(g_dls);
+    end = p + slen;
+    if end > fend { end = fend; }
+    code = 0; qual = 3; utc = 0;
+    while p < end {
+        t = load8(p); p = p + 1;
+        l = ber_rdlen(p); p = p + load64(g_dls);
+        if p + l > end { l = end - p; }
+        if t == 0x85 { code = ber_rdint(p, l); }
+        if t == 0x86 { code = ber_rduint(p, l); }
+        if t == 0x83 { code = 0; if load8(p) != 0 { code = 1; } }
+        if t == 0x84 {
+            v0 = 0; if l >= 2 { v0 = load8(p + 1); }
+            qual = band(shr(v0, 7), 1) * 2 + band(shr(v0, 6), 1);
+        }
+        if t == 0x91 { utc = shl(load8(p), 24) + shl(load8(p + 1), 16) + shl(load8(p + 2), 8) + load8(p + 3); }
+        p = p + l;
+    }
+    if qual == 0 {
+        if utc > 0 {
+            syscall 1, m_alarm, code, m_at, utc, nlx;
+            store64(g_alarm_n, load64(g_alarm_n) + 1);
+        }
+    }
+    return p;
+}
+
+# Walk the Senvion alarm value STRUCT{ ARRAY[N]{ slot } } and emit only ACTIVE slots.
+# Returns the number of active slots emitted. Caller must have g_fend set (recv_mms does).
+func decode_alarms(p: i64) -> i64 {
+    store64(g_alarm_n, 0);
+    fend = load64(g_fend);
+    if p >= fend { return 0; }
+    if load8(p) != 0xA2 { return 0; }                    # outer STRUCTURE (size 1)
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0xA1 { return 0; }                    # ARRAY[N]
+    p = p + 1; alen = ber_rdlen(p); p = p + load64(g_dls);
+    end = p + alen;
+    if end > fend { end = fend; }
+    while p < end {
+        if load8(p) != 0xA2 { return load64(g_alarm_n); }
+        p = dec_alarm_slot(p);
+    }
+    return load64(g_alarm_n);
+}
+
+# Read the Senvion alarm dataset (e.g. "SampleLD/LLN0$AlarmArray") and emit only the
+# ACTIVE alarm slots (filtered). Returns the active-slot count, or 0 on a failed read.
+func i61850_read_alarms(s: i64, domain: i64, listName: i64) -> i64 {
+    mlen = build_read_dataset(domain, listName);
+    if send_mms(s, mlen) < 0 { return 0; }
+    off = recv_mms(s);
+    if off < 0 { return 0; }
+    car = locate_access_results(off);
+    if car < 0 { return 0; }
+    return decode_alarms(car);
+}
+
+# ============================================================================
+# ===  WRITE / CONTROL / DISCOVERY  - the pure-ANCL iec61850.dll replacement ==
+# ===  (MMS Write [5], ControlObjectClient ops, GetNameList [1])             ==
+# ============================================================================
+
+# ---------------------- MMS Data CHOICE value encoders ----------------------
+# (Data tags mirror the decoder: 0x83 bool, 0x84 bitstr, 0x85 int, 0x86 unsigned,
+#  0x87 float, 0x89 octets, 0x91 utc-time, 0xA2 structure.)
+
+# minimal byte count to hold v as a two's-complement INTEGER (libiec61850-minimal)
+func mms_int_bytes(v: i64) -> i64 {
+    if v >= 0 {
+        if v < 128 { return 1; }
+        if v < 32768 { return 2; }
+        if v < 8388608 { return 3; }
+        if v < 2147483648 { return 4; }
+        return 8;
+    }
+    if v >= (0 - 128) { return 1; }
+    if v >= (0 - 32768) { return 2; }
+    if v >= (0 - 8388608) { return 3; }
+    if v >= (0 - 2147483648) { return 4; }
+    return 8;
+}
+
+# Data integer [5]: 85 <len> <BE two's-complement>
+func wr_data_int(p: i64, v: i64) -> i64 {
+    n = mms_int_bytes(v);
+    store8(p, 0x85); store8(p + 1, n);
+    i = 0;
+    while i < n { store8(p + 2 + i, band(shr(v, 8 * (n - 1 - i)), 255)); i = i + 1; }
+    return p + 2 + n;
+}
+
+# Data boolean [3]: 83 01 <v>
+func wr_data_bool(p: i64, v: i64) -> i64 {
+    store8(p, 0x83); store8(p + 1, 1);
+    bb = 0; if v != 0 { bb = 1; }
+    store8(p + 2, bb);
+    return p + 3;
+}
+
+# Data floating-point [7]: 87 05 08 <4 IEEE-754 BE bytes> (08 = exponent-width octet)
+func wr_data_float(p: i64, bits32: i64) -> i64 {
+    store8(p, 0x87); store8(p + 1, 5); store8(p + 2, 8);
+    store8(p + 3, band(shr(bits32, 24), 255));
+    store8(p + 4, band(shr(bits32, 16), 255));
+    store8(p + 5, band(shr(bits32, 8), 255));
+    store8(p + 6, band(bits32, 255));
+    return p + 7;
+}
+
+# Data octet-string [9]: 89 <len> <bytes>
+func wr_data_octets(p: i64, src: i64, n: i64) -> i64 {
+    store8(p, 0x89); p = p + 1; p = ber_wrlen(p, n);
+    i = 0; while i < n { store8(p + i, load8(src + i)); i = i + 1; }
+    return p + n;
+}
+
+# Data utc-time [17]: 91 08 <4 BE secs><3 frac=0><1 quality=0>
+func wr_data_utc(p: i64, secs: i64) -> i64 {
+    store8(p, 0x91); store8(p + 1, 8);
+    store8(p + 2, band(shr(secs, 24), 255));
+    store8(p + 3, band(shr(secs, 16), 255));
+    store8(p + 4, band(shr(secs, 8), 255));
+    store8(p + 5, band(secs, 255));
+    store8(p + 6, 0); store8(p + 7, 0); store8(p + 8, 0); store8(p + 9, 0);
+    return p + 10;
+}
+
+# current wall-clock as seconds-since-1970 (kernel32 FILETIME -> unix), CRT-free
+func now_secs() -> i64 {
+    GetSystemTimeAsFileTime(g_ft);
+    ft = load64(g_ft);                                       # 100ns intervals since 1601-01-01
+    return ft / 10000000 - 11644473600;
+}
+
+# ------------------------------- MMS Write [5] ------------------------------
+
+# Build a Write-RequestPDU for one domain variable carrying a pre-encoded Data value
+# (dataPtr,dataLen) into g_mms; return its length. Structure (write has NO [1] EXPLICIT
+# wrapper around variableAccessSpecification, unlike read):
+#   A5{ A0[listOfVariable]{ 30{ A0[name]{ A1[domainspec]{ 1A dom, 1A item }}}}, A0[listOfData]{ data } }
+func build_write(domain: i64, item: i64, dataPtr: i64, dataLen: i64) -> i64 {
+    inv = load64(g_invoke) + 1; store64(g_invoke, inv);
+    dlen = strlen(domain); ilen = strlen(item);
+
+    dstr = 1 + ber_lensize(dlen) + dlen;
+    istr = 1 + ber_lensize(ilen) + ilen;
+    a1obj = dstr + istr;                                     # ObjectName.domainspecific [1]
+    a1objT = 1 + ber_lensize(a1obj) + a1obj;
+    a0name = a1objT; a0nameT = 1 + ber_lensize(a0name) + a0name;     # name [0]
+    seq = a0nameT; seqT = 1 + ber_lensize(seq) + seq;               # ListOfVariableSeq SEQ
+    a0lov = seqT; a0lovT = 1 + ber_lensize(a0lov) + a0lov;          # listOfVariable [0]
+    a0dataT = 1 + ber_lensize(dataLen) + dataLen;                   # listOfData [0]
+    a5content = a0lovT + a0dataT;
+    a5T = 1 + ber_lensize(a5content) + a5content;
+    invT = ber_uint_size(inv);
+    a0content = invT + a5T;
+
+    p = g_mms;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0content);   # confirmed-RequestPDU [0]
+    p = ber_wruint(p, 0x02, inv);                             # invokeID
+    store8(p, 0xA5); p = p + 1; p = ber_wrlen(p, a5content);  # write [5]
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0lov);     # variableAccessSpec.listOfVariable [0]
+    store8(p, 0x30); p = p + 1; p = ber_wrlen(p, seq);       # ListOfVariableSeq
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0name);    # name [0]
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, a1obj);     # domain-specific [1]
+    p = ber_wrstr(p, 0x1A, domain);
+    p = ber_wrstr(p, 0x1A, item);
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, dataLen);   # listOfData [0]
+    i = 0; while i < dataLen { store8(p + i, load8(dataPtr + i)); i = i + 1; }
+    return (p + dataLen) - g_mms;
+}
+
+# Parse a Write-ResponsePDU at off (the confirmed-ResponsePDU). 1=success, 0=fail
+# (g_res_err = data-access-error code, else -1). Mirrors mmsClient_parseWriteResponse.
+func i61850_parse_write_response(off: i64) -> i64 {
+    store64(g_res_err, 0 - 1);
+    p = off;
+    t = load8(p);
+    if t != 0xA1 {
+        if t == 0xA2 { syscall 1, m_svcerr, nlx; }
+        else { if t == 0xA4 { syscall 1, m_reject, nlx; }
+        else { syscall 1, m_badpdu, t, m_gt, nlx; } }
+        return 0;
+    }
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);          # into Confirmed-ResponsePDU
+    if load8(p) != 0x02 { return 0; }                        # invokeID
+    p = p + 1; il = ber_rdlen(p); p = p + load64(g_dls) + il;
+    if load8(p) != 0xA5 { return 0; }                        # write-response [5]
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);          # into SEQ OF Write-Response
+    t = load8(p); p = p + 1;
+    l = ber_rdlen(p); p = p + load64(g_dls);
+    if t == 0x81 { return 1; }                               # success [1] NULL
+    if t == 0x80 { store64(g_res_err, ber_rduint(p, l)); return 0; }   # failure [0] error code
+    return 0;
+}
+
+# Write a pre-encoded Data value to domain/item. 1=success, 0=fail.
+func i61850_write_data(s: i64, domain: i64, item: i64, dataPtr: i64, dataLen: i64) -> i64 {
+    mlen = build_write(domain, item, dataPtr, dataLen);
+    if send_mms(s, mlen) < 0 { return 0; }
+    off = recv_mms(s);
+    if off < 0 { return 0; }
+    return i61850_parse_write_response(off);
+}
+
+# Scalar write convenience wrappers (item = "LN$FC$DO$DA"). Return 1/0.
+func i61850_write_bool(s: i64, domain: i64, item: i64, v: i64) -> i64 {
+    dl = wr_data_bool(g_dval, v) - g_dval;
+    return i61850_write_data(s, domain, item, g_dval, dl);
+}
+func i61850_write_int(s: i64, domain: i64, item: i64, v: i64) -> i64 {
+    dl = wr_data_int(g_dval, v) - g_dval;
+    return i61850_write_data(s, domain, item, g_dval, dl);
+}
+func i61850_write_float(s: i64, domain: i64, item: i64, bits32: i64) -> i64 {
+    dl = wr_data_float(g_dval, bits32) - g_dval;
+    return i61850_write_data(s, domain, item, g_dval, dl);
+}
+
+# ----------------- IEC-61850 control (SBO + Direct Operate) -----------------
+
+# Split "domain/LN.DO[..]": copy the domain into g_dom (NUL-terminated); return a
+# pointer to the object part after '/', or 0 if there is no '/'.
+func split_objref(objref: i64) -> i64 {
+    i = 0;
+    while load8(objref + i) != 0 {
+        if load8(objref + i) == 47 {                         # '/'
+            j = 0;
+            while j < i { store8(g_dom + j, load8(objref + j)); j = j + 1; }
+            store8(g_dom + i, 0);
+            return objref + i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Build the MMS item for a control attribute: doref "LN.DO[.SDO..]" + 2-char FC + suffix
+# -> "LN$<FC>$DO[$SDO..]<suffix>" into out. ("GGIO1.SPCSO1","CO","$Oper") -> GGIO1$CO$SPCSO1$Oper
+func build_ctl_item(out: i64, doref: i64, fc: i64, suffix: i64) -> i64 {
+    e = out; i = 0; dots = 0;
+    while load8(doref + i) != 0 {
+        c = load8(doref + i);
+        if c == 46 {                                         # '.'
+            if dots == 0 {
+                store8(e, 36); store8(e + 1, load8(fc)); store8(e + 2, load8(fc + 1)); store8(e + 3, 36);
+                e = e + 4;
+            } else { store8(e, 36); e = e + 1; }
+            dots = dots + 1;
+        } else { store8(e, c); e = e + 1; }
+        i = i + 1;
+    }
+    j = 0;
+    while load8(suffix + j) != 0 { store8(e, load8(suffix + j)); e = e + 1; j = j + 1; }
+    store8(e, 0);
+    return e - out;
+}
+
+# Build the control Oper/SBOw Data structure into out; return its length.
+#   A2{ <ctlVal>, A2{ 85 orCat, 89 orIdent("") }, 86 ctlNum, 91 T, 83 Test, [84 Check] }
+# ctlTag: 0x83 bool / 0x85 int / 0x87 float (ctlInt for bool/int, ctlBits for float).
+# isCancel=1 omits Check (Cancel params have 5 elements, no Check). Whole struct < 128 bytes.
+func build_oper(out: i64, ctlTag: i64, ctlInt: i64, ctlBits: i64, orCat: i64, ctlNum: i64, secs: i64, isCancel: i64) -> i64 {
+    c = out + 2;                                             # leave room for A2 + 1 len byte
+    if ctlTag == 0x83 { c = wr_data_bool(c, ctlInt); }
+    else { if ctlTag == 0x85 { c = wr_data_int(c, ctlInt); }
+    else { c = wr_data_float(c, ctlBits); } }
+    # origin  A2{ 85 orCat, 89 orIdent("") }
+    oc = c + 2;
+    oc = wr_data_int(oc, orCat);
+    oc = wr_data_octets(oc, g_orident, 0);
+    olen = oc - (c + 2);
+    store8(c, 0xA2); store8(c + 1, olen); c = c + 2 + olen;
+    c = ber_wruint(c, 0x86, ctlNum);                        # ctlNum  86 <unsigned>
+    c = wr_data_utc(c, secs);                               # T       91 08 <utc>
+    c = wr_data_bool(c, 0);                                 # Test    83 01 00
+    if isCancel == 0 {
+        store8(c, 0x84); store8(c + 1, 2); store8(c + 2, 6); store8(c + 3, 0); c = c + 4;  # Check
+    }
+    clen = c - (out + 2);
+    store8(out, 0xA2); store8(out + 1, clen);
+    return clen + 2;
+}
+
+# Read a control object's ctlModel. objref = "domain/LN.DO". Returns 0 status-only,
+# 1 direct-normal, 2 sbo-normal, 3 direct-enhanced, 4 sbo-enhanced, or -1 on read fail.
+func i61850_ctl_model(s: i64, objref: i64) -> i64 {
+    obj = split_objref(objref);
+    if obj == 0 { return 0 - 1; }
+    build_ctl_item(g_item, obj, fc_cf, sfx_ctlmodel);
+    tag = i61850_read_scalar(s, g_dom, g_item);
+    if tag == 0 { return 0 - 1; }
+    return load64(g_res_int);
+}
+
+# OPERATE a boolean control (Direct-Operate, or the operate step of SBO). objref =
+# "domain/LN.DO". ctlModel drives ctlNum handling (SBO models reuse the select's ctlNum).
+# Returns 1/0 (failure code in g_res_err).
+func i61850_operate_bool(s: i64, objref: i64, ctlVal: i64, ctlModel: i64) -> i64 {
+    obj = split_objref(objref);
+    if obj == 0 { return 0; }
+    if ctlModel != 2 { if ctlModel != 4 { store64(g_ctlnum, load64(g_ctlnum) + 1); } }
+    dl = build_oper(g_oper, 0x83, ctlVal, 0, 3, load64(g_ctlnum), now_secs(), 0);
+    build_ctl_item(g_item, obj, fc_co, sfx_oper);
+    return i61850_write_data(s, g_dom, g_item, g_oper, dl);
+}
+
+# SBO-normal SELECT: read "$SBO" (a non-empty VisibleString reply = selected). Returns 1/0.
+func i61850_select(s: i64, objref: i64) -> i64 {
+    obj = split_objref(objref);
+    if obj == 0 { return 0; }
+    store64(g_ctlnum, load64(g_ctlnum) + 1);
+    build_ctl_item(g_item, obj, fc_co, sfx_sbo);
+    store64(g_res_type, 0); store8(g_res_str, 0);
+    tag = i61850_read_scalar(s, g_dom, g_item);
+    if tag == 0x8A { if load8(g_res_str) != 0 { return 1; } }
+    return 0;
+}
+
+# SBO-enhanced SELECT-WITH-VALUE (boolean): write the Oper structure to "$SBOw". Returns 1/0.
+func i61850_select_with_value_bool(s: i64, objref: i64, ctlVal: i64) -> i64 {
+    obj = split_objref(objref);
+    if obj == 0 { return 0; }
+    store64(g_ctlnum, load64(g_ctlnum) + 1);
+    dl = build_oper(g_oper, 0x83, ctlVal, 0, 3, load64(g_ctlnum), now_secs(), 0);
+    build_ctl_item(g_item, obj, fc_co, sfx_sbow);
+    return i61850_write_data(s, g_dom, g_item, g_oper, dl);
+}
+
+# CANCEL an outstanding select/operate (writes "$Cancel" with the 5-element params). Returns 1/0.
+func i61850_cancel_bool(s: i64, objref: i64, ctlVal: i64) -> i64 {
+    obj = split_objref(objref);
+    if obj == 0 { return 0; }
+    dl = build_oper(g_oper, 0x83, ctlVal, 0, 3, load64(g_ctlnum), now_secs(), 1);
+    build_ctl_item(g_item, obj, fc_co, sfx_cancel);
+    return i61850_write_data(s, g_dom, g_item, g_oper, dl);
+}
+
+# ------------------- MMS GetNameList (directory discovery) -------------------
+
+# Build a GetNameList request into g_mms.
+#   objClass: 9 domain / 0 namedVariable / 2 namedVariableList
+#   scope: 0 vmd-specific / 1 domain-specific (uses domain)
+#   contAfter: 0 or a cstring to page after
+func build_get_namelist(objClass: i64, scope: i64, domain: i64, contAfter: i64) -> i64 {
+    inv = load64(g_invoke) + 1; store64(g_invoke, inv);
+
+    ocT = 5;                                                 # A0 03 80 01 <class>
+    if scope == 0 { osInner = 2; }                          # 80 00  (vmd-specific NULL)
+    else {
+        dl = strlen(domain);
+        osInner = 1 + ber_lensize(dl) + dl;                # 81 <len> <domain>
+    }
+    osT = 1 + ber_lensize(osInner) + osInner;              # A1 <len> ...
+    caT = 0;
+    if contAfter != 0 {
+        cl = strlen(contAfter);
+        caT = 1 + ber_lensize(cl) + cl;                    # 82 <len> <name>
+    }
+    gnl = ocT + osT + caT;
+    gnlT = 1 + ber_lensize(gnl) + gnl;
+    invT = ber_uint_size(inv);
+    a0content = invT + gnlT;
+
+    p = g_mms;
+    store8(p, 0xA0); p = p + 1; p = ber_wrlen(p, a0content);   # confirmed-RequestPDU
+    p = ber_wruint(p, 0x02, inv);                             # invokeID
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, gnl);        # getNameList [1]
+    store8(p, 0xA0); store8(p + 1, 3); store8(p + 2, 0x80); store8(p + 3, 1); store8(p + 4, objClass); p = p + 5;
+    store8(p, 0xA1); p = p + 1; p = ber_wrlen(p, osInner);    # objectScope [1] EXPLICIT
+    if scope == 0 { store8(p, 0x80); store8(p + 1, 0); p = p + 2; }
+    else { p = ber_wrstr(p, 0x81, domain); }
+    if contAfter != 0 { p = ber_wrstr(p, 0x82, contAfter); }
+    return p - g_mms;
+}
+
+# Parse a GetNameList response at off; append each identifier (1A) to g_nl_buf as a
+# NUL-separated cstring; set g_nl_more / g_nl_last. Returns 1 ok, 0 on a bad/error PDU.
+func parse_namelist(off: i64) -> i64 {
+    p = off;
+    t = load8(p);
+    if t != 0xA1 {
+        if t == 0xA2 { syscall 1, m_svcerr, nlx; }
+        else { syscall 1, m_badpdu, t, m_gt, nlx; }
+        return 0;
+    }
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0x02 { return 0; }                       # invokeID
+    p = p + 1; il = ber_rdlen(p); p = p + load64(g_dls) + il;
+    if load8(p) != 0xA1 { return 0; }                       # getNameList-response [1]
+    p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+    if load8(p) != 0xA0 { return 0; }                       # listOfIdentifier [0]
+    p = p + 1; llen = ber_rdlen(p); p = p + load64(g_dls);
+    fend = load64(g_fend);
+    listend = p + llen; if listend > fend { listend = fend; }
+    while p < listend {
+        if load8(p) != 0x1A { break; }                     # VisibleString identifier
+        p = p + 1; nlen = ber_rdlen(p); p = p + load64(g_dls);
+        if p + nlen > listend { nlen = listend - p; }
+        e = load64(g_nl_end);
+        if e + nlen + 1 < 16384 {
+            store64(g_nl_last, e);
+            i = 0; while i < nlen { store8(g_nl_buf + e + i, load8(p + i)); i = i + 1; }
+            store8(g_nl_buf + e + nlen, 0);
+            store64(g_nl_end, e + nlen + 1);
+            store64(g_nl_cnt, load64(g_nl_cnt) + 1);
+        }
+        p = p + nlen;
+    }
+    more = 0;
+    if p < fend {
+        if load8(p) == 0x81 {                              # moreFollows [1] BOOLEAN
+            p = p + 1; ber_rdlen(p); p = p + load64(g_dls);
+            if load8(p) > 0 { more = 1; }
+        }
+    }
+    store64(g_nl_more, more);
+    return 1;
+}
+
+# Generic discovery driver: page GetNameList until done. Names land in g_nl_buf
+# (NUL-separated, g_nl_cnt entries). Returns the count.
+func i61850_get_names(s: i64, objClass: i64, scope: i64, domain: i64) -> i64 {
+    store64(g_nl_cnt, 0); store64(g_nl_end, 0); store64(g_nl_last, 0);
+    cont = 0;
+    while 1 {
+        mlen = build_get_namelist(objClass, scope, domain, cont);
+        if send_mms(s, mlen) < 0 { return load64(g_nl_cnt); }
+        off = recv_mms(s);
+        if off < 0 { return load64(g_nl_cnt); }
+        before = load64(g_nl_cnt);
+        if parse_namelist(off) == 0 { return load64(g_nl_cnt); }
+        if load64(g_nl_more) == 0 { return load64(g_nl_cnt); }
+        if load64(g_nl_cnt) == before { return load64(g_nl_cnt); }   # no progress -> stop
+        cont = g_nl_buf + load64(g_nl_last);
+    }
+    return load64(g_nl_cnt);
+}
+
+# getLogicalDeviceList: enumerate MMS domains (= Logical Devices) into g_nl_buf. Returns count.
+func i61850_get_devices(s: i64) -> i64 {
+    return i61850_get_names(s, 9, 0, 0);
+}
+
+# getLogicalDeviceVariables: enumerate a domain's variable names into g_nl_buf. Returns count.
+func i61850_get_variables(s: i64, domain: i64) -> i64 {
+    return i61850_get_names(s, 0, 1, domain);
+}
+
+# Pointer to the idx-th collected name in g_nl_buf (0-based), or 0 if out of range.
+func i61850_name_at(idx: i64) -> i64 {
+    if idx < 0 { return 0; }
+    if idx >= load64(g_nl_cnt) { return 0; }
+    p = g_nl_buf; k = 0;
+    while k < idx { while load8(p) != 0 { p = p + 1; } p = p + 1; k = k + 1; }
+    return p;
+}

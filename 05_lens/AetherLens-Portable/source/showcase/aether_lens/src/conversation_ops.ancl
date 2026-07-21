@@ -1,0 +1,105 @@
+# =====================================================================
+# conversation_ops.ancl - portable transcript boundary primitives.
+#
+# Aether Lens stores chats as readable role-labelled text. These helpers
+# deliberately depend on no UI, network, model, or filesystem state so R4
+# edit/regenerate/delete/branch preparation can be tested in isolation.
+# =====================================================================
+
+@DATA
+lco_user: str = "User: ";
+lco_assistant: str = "Assistant: ";
+lco_lens: str = "[lens] ";
+
+@CODE
+func lco_match_at(src: i64, pos: i64, ndl: i64) -> i64 {
+    j = 0;
+    while 1 {
+        c = load8(ndl + j);
+        if c == 0 { return 1; }
+        if load8(src + pos + j) != c { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+
+func lco_line_start(src: i64, pos: i64) -> i64 {
+    if pos == 0 { return 1; }
+    if load8(src + pos - 1) == 10 { return 1; }
+    return 0;
+}
+
+func lco_role_at(src: i64, pos: i64) -> i64 {
+    if lco_line_start(src, pos) == 0 { return 0; }
+    if lco_match_at(src, pos, lco_user) == 1 { return 1; }
+    if lco_match_at(src, pos, lco_assistant) == 1 { return 2; }
+    if lco_match_at(src, pos, lco_lens) == 1 { return 3; }
+    return 0;
+}
+
+func lco_next_turn(src: i64, pos: i64) -> i64 {
+    i = pos;
+    while load8(src + i) != 0 {
+        if lco_role_at(src, i) != 0 { return i; }
+        i = i + 1;
+    }
+    return i;
+}
+
+func lco_last_user_start(src: i64) -> i64 {
+    last = 0 - 1;
+    i = 0;
+    while load8(src + i) != 0 {
+        role = lco_role_at(src, i);
+        if role == 0 { i = i + 1; }
+        else {
+            next = lco_next_turn(src, i + 1);
+            if role == 1 { last = i; }
+            i = next;
+        }
+    }
+    return last;
+}
+
+func lco_user_end(src: i64, start: i64) -> i64 {
+    if start < 0 { return 0 - 1; }
+    content = start + strlen(lco_user);
+    last = lco_next_turn(src, content);
+    while last > content {
+        c = load8(src + last - 1);
+        if c != 13 { if c != 10 { break; } }
+        last = last - 1;
+    }
+    return last;
+}
+
+# Return an answer only when it is the last conversational role. Lens notes
+# after an answer do not invalidate it; a later unanswered User turn does.
+func lco_last_answer_start(src: i64) -> i64 {
+    last = 0 - 1;
+    conversation_role = 0;
+    i = 0;
+    while load8(src + i) != 0 {
+        role = lco_role_at(src, i);
+        if role == 0 { i = i + 1; }
+        else {
+            next = lco_next_turn(src, i + 1);
+            if role == 1 { conversation_role = 1; }
+            if role == 2 { last = i; conversation_role = 2; }
+            i = next;
+        }
+    }
+    if conversation_role != 2 { return 0 - 1; }
+    return last;
+}
+
+func lco_range_contains(src: i64, first: i64, last: i64, ndl: i64) -> i64 {
+    n = strlen(ndl);
+    if n <= 0 { return 0; }
+    i = first;
+    while i + n <= last {
+        if lco_match_at(src, i, ndl) == 1 { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}

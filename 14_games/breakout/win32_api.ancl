@@ -1,0 +1,98 @@
+# =====================================================================
+#  win32_api.ancl  -  Centralized Win32 FFI mappings  (core_lib)
+#
+#  Dynamic-FFI (`extern`) declarations for Kernel32 / Ws2_32 APIs that
+#  live OUTSIDE anclc's built-in import table.  The built-in table already
+#  resolves the common calls (WSAStartup, socket, bind, listen, accept,
+#  recv, send, closesocket, ioctlsocket, htons, WriteFile, ReadFile,
+#  GetStdHandle, ExitProcess, GetModuleHandleA, GetTickCount,
+#  GetProcessHeap, HeapAlloc/Free, Sleep, plus the user32 GUI set);
+#  this module adds the EXTRA entry points the agent + Phase 6 tooling use.
+#
+#  `-> ptr` / `-> i64` marks a true 64-bit return (HANDLE / pointer) so the
+#  value is NOT sign-truncated from 32 bits on the way back from the call.
+#
+#  Unused declarations cost nothing: an `extern` only maps name -> dll; an
+#  import-table slot is allocated lazily, on the first actual call.  So a
+#  program that imports this module but never calls CreateProcessA does not
+#  carry a CreateProcessA import.
+# =====================================================================
+
+# ---- Kernel32: files & handles -------------------------------------
+extern "kernel32.dll" CreateFileA -> ptr;       # HANDLE CreateFileA(name, access, share, sa, disp, flags, tmpl)
+extern "kernel32.dll" CloseHandle;              # BOOL   CloseHandle(HANDLE)
+extern "kernel32.dll" GetCommandLineA -> ptr;   # LPSTR  GetCommandLineA(void)
+extern "kernel32.dll" GetModuleFileNameA;       # DWORD  GetModuleFileNameA(hModule, lpFilename, nSize)
+
+# ---- Kernel32: directory enumeration (Aether Studio IDE file tree) --
+extern "kernel32.dll" FindFirstFileA -> ptr;    # HANDLE FindFirstFileA(lpFileName, &WIN32_FIND_DATAA)  (-1 on failure)
+extern "kernel32.dll" FindNextFileA;            # BOOL   FindNextFileA(hFind, &WIN32_FIND_DATAA)        (0 when exhausted)
+extern "kernel32.dll" FindClose;                # BOOL   FindClose(hFind)
+extern "kernel32.dll" CreateDirectoryA;         # BOOL   CreateDirectoryA(lpPathName, lpSecurityAttributes)
+extern "kernel32.dll" LoadLibraryA -> ptr;      # HMODULE LoadLibraryA(lpLibFileName)  (Aether Studio: load msftedit.dll for the RichEdit syntax editor)
+extern "kernel32.dll" GetEnvironmentVariableA;  # DWORD GetEnvironmentVariableA(name, buf, size)  (Aether Studio: read ANTHROPIC_API_KEY)
+
+# ---- Kernel32: process spawning (Phase 6 compiler-caller) ----------
+extern "kernel32.dll" CreateProcessA;           # BOOL   CreateProcessA(app, cmdline, ..., &si, &pi)
+extern "kernel32.dll" WaitForSingleObject;      # DWORD  WaitForSingleObject(HANDLE, ms)
+extern "kernel32.dll" GetExitCodeProcess;       # BOOL   GetExitCodeProcess(HANDLE, LPDWORD)  (Phase 6.4 synth-success check)
+extern "kernel32.dll" GetFileAttributesA;       # DWORD  GetFileAttributesA(name)  -> 0xFFFFFFFF if absent (synth output-exe check)
+extern "kernel32.dll" CopyFileA;                # BOOL   CopyFileA(src, dst, bFailIfExists)  (Aether Studio: seed the starter file)
+extern "kernel32.dll" CreatePipe;               # BOOL   CreatePipe(&hRead, &hWrite, &SECURITY_ATTRIBUTES, nSize)  (Aether Studio compile-capture)
+extern "kernel32.dll" SetHandleInformation;     # BOOL   SetHandleInformation(hObject, dwMask, dwFlags)  (make parent read-end non-inheritable)
+
+# ---- Ws2_32: raw-socket promiscuous control ------------------------
+extern "ws2_32.dll"   WSAIoctl;                 # int    WSAIoctl(s, code, in, cbin, out, cbout, &ret, ovl, cr)
+
+# ---- User32: GUI extras NOT in the built-in table ------------------
+# (the built-in table already resolves RegisterClassExA, CreateWindowExA,
+#  ShowWindow, UpdateWindow, GetMessageA, TranslateMessage, DispatchMessageA,
+#  DefWindowProcA, SetWindowTextA, GetWindowTextA, PostQuitMessage,
+#  LoadCursorA, SetTimer, KillTimer, MessageBoxA, GetModuleHandleA.)
+extern "user32.dll"   SendMessageA -> i64;      # LRESULT SendMessageA(hwnd, msg, wParam, lParam)
+extern "user32.dll"   GetFocus -> ptr;          # HWND    GetFocus(void)
+extern "user32.dll"   BeginPaint -> ptr;        # HDC     BeginPaint(hwnd, &PAINTSTRUCT)
+extern "user32.dll"   EndPaint;                 # BOOL    EndPaint(hwnd, &PAINTSTRUCT)
+extern "user32.dll"   FillRect;                 # int     FillRect(hdc, &RECT, hbr)
+extern "user32.dll"   GetKeyState;              # SHORT   GetKeyState(int nVirtKey)  (Aether Studio Ctrl+S / Ctrl+B; key-down = band(.,0x8000))
+
+# ---- GDI32: solid colour brushes + device-context colours ----------
+extern "gdi32.dll"    CreateSolidBrush -> ptr;  # HBRUSH  CreateSolidBrush(COLORREF)
+extern "gdi32.dll"    SetTextColor;             # COLORREF SetTextColor(hdc, COLORREF)
+extern "gdi32.dll"    SetBkColor;               # COLORREF SetBkColor(hdc, COLORREF)
+extern "gdi32.dll"    DeleteObject;             # BOOL    DeleteObject(hgdiobj)
+
+# ---- Phase 6.4: unified workbench extras ---------------------------
+# IPHLPAPI: adapter enumeration + ARP probing (Pane A network SLD)
+extern "iphlpapi.dll" GetAdaptersInfo;          # DWORD  GetAdaptersInfo(pAdapterInfo, pOutBufLen)
+extern "iphlpapi.dll" SendARP;                  # DWORD  SendARP(DestIP, SrcIP, pMacAddr, pPhyAddrLen)
+extern "iphlpapi.dll" GetIpNetTable;            # DWORD  GetIpNetTable(pIpNetTable, pdwSize, bOrder)  (Phase 6.6 fast ARP-cache pass)
+
+# Kernel32: background subnet-scan worker thread (keeps the UI fluid)
+extern "kernel32.dll" CreateThread -> ptr;      # HANDLE CreateThread(sa, stack, &start, param, flags, &tid)
+
+# User32: client-rect query + repaint request (GDI canvas in Pane A)
+extern "user32.dll"   GetClientRect;            # BOOL   GetClientRect(hwnd, &RECT)
+extern "user32.dll"   InvalidateRect;           # BOOL   InvalidateRect(hwnd, &RECT, bErase)
+extern "user32.dll"   MoveWindow;               # BOOL   MoveWindow(hwnd, X, Y, W, H, bRepaint)  (Phase 6.6 WM_SIZE reflow)
+extern "user32.dll"   EnableWindow;             # BOOL   EnableWindow(hwnd, bEnable)  (Phase 6.10 grey out unused Target Port)
+
+# GDI32: pens + drawing primitives for the single-line diagram
+extern "gdi32.dll"    CreatePen -> ptr;         # HPEN    CreatePen(style, width, COLORREF)
+extern "gdi32.dll"    SelectObject -> ptr;      # HGDIOBJ SelectObject(hdc, hgdiobj)
+extern "gdi32.dll"    MoveToEx;                 # BOOL    MoveToEx(hdc, x, y, &POINT)
+extern "gdi32.dll"    LineTo;                   # BOOL    LineTo(hdc, x, y)
+extern "gdi32.dll"    Rectangle;               # BOOL    Rectangle(hdc, l, t, r, b)
+extern "gdi32.dll"    Ellipse;                  # BOOL    Ellipse(hdc, l, t, r, b)
+extern "gdi32.dll"    TextOutA;                 # BOOL    TextOutA(hdc, x, y, lpString, cch)
+extern "gdi32.dll"    SetBkMode;                # int     SetBkMode(hdc, mode)
+
+# GDI32: off-screen double-buffering (Phase 6.9 flicker-free WM_PAINT)
+extern "gdi32.dll"    CreateCompatibleDC -> ptr;     # HDC     CreateCompatibleDC(hdc)
+extern "gdi32.dll"    CreateCompatibleBitmap -> ptr; # HBITMAP CreateCompatibleBitmap(hdc, w, h)
+extern "gdi32.dll"    BitBlt;                        # BOOL    BitBlt(hdcDst, x, y, w, h, hdcSrc, x1, y1, rop)
+extern "gdi32.dll"    DeleteDC;                      # BOOL    DeleteDC(hdc)
+
+# ---- Shell32: shell operations (help guide launch) -----------------
+extern "shell32.dll"  ShellExecuteA -> ptr;     # HINSTANCE ShellExecuteA(hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd)
+

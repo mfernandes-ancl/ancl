@@ -1,0 +1,160 @@
+# =====================================================================
+#  mqtt.ancl - MQTT publish helpers for Windows ANCL edge tools.
+# =====================================================================
+import "cstring.ancl";
+import "process.ancl";
+
+extern "ws2_32.dll" WSAStartup -> i32;
+extern "ws2_32.dll" socket -> ptr;
+extern "ws2_32.dll" htons -> i16;
+extern "ws2_32.dll" inet_addr -> i32;
+extern "ws2_32.dll" connect -> i32;
+extern "ws2_32.dll" send -> i32;
+extern "ws2_32.dll" recv -> i32;
+extern "ws2_32.dll" closesocket -> i32;
+extern "ws2_32.dll" WSACleanup -> i32;
+
+@DATA
+mqtt_wsa:    buf = 512;
+mqtt_sa:     buf = 16;
+mqtt_pkt:    buf = 512;
+mqtt_ack:    buf = 8;
+mqtt_cmd:    buf = 1536;
+mqtt_exit:   buf = 8;
+
+mqtt_arg_h:      str = " -h ";
+mqtt_arg_p:      str = " -p ";
+mqtt_arg_t:      str = " -t ";
+mqtt_arg_m:      str = " -m ";
+mqtt_arg_osca:   str = " --tls-use-os-certs";
+mqtt_arg_cafile: str = " --cafile ";
+mqtt_arg_user:   str = " -u ";
+mqtt_arg_pass:   str = " -P ";
+
+@CODE
+
+func mqtt_send_all(sock: i64, data: ptr, count: i64) -> i64 {
+    sent = 0;
+    while sent < count {
+        n = send(sock, data + sent, count - sent, 0);
+        if n <= 0 { return 0; }
+        sent = sent + n;
+    }
+    return 1;
+}
+
+# Plain MQTT 3.1.1 CONNECT + QoS0 PUBLISH over TCP.
+# Returns 1 on success; negative values identify setup/connect/send/size failures.
+func mqtt_publish_qos0(host: str, port: i64, topic: str, payload: str) -> i64 {
+    if port <= 0 { port = 1883; }
+    if port > 65535 { port = 1883; }
+
+    t_len = strlen(topic);
+    p_len = strlen(payload);
+    rem_len = 2 + t_len + p_len;
+    if rem_len + 5 > 512 { return 0 - 6; }
+
+    if WSAStartup(0x0202, mqtt_wsa) != 0 { return 0 - 2; }
+
+    s = socket(2, 1, 6);
+    if s == 0 - 1 {
+        WSACleanup();
+        return 0 - 3;
+    }
+
+    store16(mqtt_sa + 0, 2);
+    store16(mqtt_sa + 2, htons(port));
+    store32(mqtt_sa + 4, inet_addr(host));
+
+    if connect(s, mqtt_sa, 16) < 0 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 4;
+    }
+
+    pkt: *i8 = mqtt_pkt;
+    pkt[0] = 0x10; pkt[1] = 12; pkt[2] = 0; pkt[3] = 4;
+    pkt[4] = 77;   pkt[5] = 81; pkt[6] = 84; pkt[7] = 84;
+    pkt[8] = 4;    pkt[9] = 2;  pkt[10] = 0; pkt[11] = 60;
+    pkt[12] = 0;   pkt[13] = 0;
+    if mqtt_send_all(s, mqtt_pkt, 14) == 0 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 5;
+    }
+    ack_n = recv(s, mqtt_ack, 4, 0);
+    if ack_n < 4 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 5;
+    }
+    if load8(mqtt_ack + 0) != 0x20 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 5;
+    }
+    if load8(mqtt_ack + 3) != 0 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 5;
+    }
+
+    pkt[0] = 0x30;
+    rem = rem_len;
+    idx = 1;
+    enc_go = 1;
+    while enc_go == 1 {
+        enc = rem % 128;
+        rem = rem / 128;
+        if rem > 0 { enc = bor(enc, 128); }
+        pkt[idx] = enc;
+        idx = idx + 1;
+        if rem == 0 { enc_go = 0; }
+    }
+
+    pkt[idx] = band(shr(t_len, 8), 255); idx = idx + 1;
+    pkt[idx] = band(t_len, 255);         idx = idx + 1;
+    ti = 0; t_src: *i8 = topic;
+    while ti < t_len { pkt[idx] = t_src[ti]; idx = idx + 1; ti = ti + 1; }
+
+    pi = 0; p_src: *i8 = payload;
+    while pi < p_len { pkt[idx] = p_src[pi]; idx = idx + 1; pi = pi + 1; }
+
+    if mqtt_send_all(s, mqtt_pkt, idx) == 0 {
+        closesocket(s);
+        WSACleanup();
+        return 0 - 5;
+    }
+
+    closesocket(s);
+    WSACleanup();
+    return 1;
+}
+
+# TLS publish through Mosquitto CLI. pub_exe must be an unquoted path.
+# Returns 1 on success, -7 for launch/wait failure, -8 for non-zero child exit.
+func mqtt_publish_tls_cli(pub_exe: str, host: str, port_str: str, topic: str, payload: str, ca_file: str, user: str, password: str) -> i64 {
+    memset(mqtt_cmd, 0, 1536);
+    p = cstr_append_quoted(mqtt_cmd, pub_exe);
+    p = str_copy(p, mqtt_arg_h); p = cstr_append_quoted(p, host);
+    p = str_copy(p, mqtt_arg_p); p = str_copy(p, port_str);
+    p = str_copy(p, mqtt_arg_t); p = cstr_append_quoted(p, topic);
+    p = str_copy(p, mqtt_arg_m); p = cstr_append_quoted(p, payload);
+    if strlen(ca_file) > 0 {
+        p = str_copy(p, mqtt_arg_cafile); p = cstr_append_quoted(p, ca_file);
+    } else {
+        p = str_copy(p, mqtt_arg_osca);
+    }
+    if strlen(user) > 0 {
+        p = str_copy(p, mqtt_arg_user); p = cstr_append_quoted(p, user);
+    }
+    if strlen(password) > 0 {
+        p = str_copy(p, mqtt_arg_pass); p = cstr_append_quoted(p, password);
+    }
+
+    store64(mqtt_exit, 999);
+    rc = proc_run_hidden_wait(mqtt_cmd, 30000, mqtt_exit);
+    if rc != 1 { return 0 - 7; }
+    if load64(mqtt_exit) != 0 { return 0 - 8; }
+    return 1;
+}

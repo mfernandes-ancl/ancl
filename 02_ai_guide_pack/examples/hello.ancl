@@ -1,0 +1,14 @@
+# hello.ancl - baseline ANCL validation app
+# Prints a header string to the console, then exits cleanly.
+
+@DATA
+banner: str = "==============================\n";
+msg:    str = " Hello from ANCL v1.0.0!\n Native x86-64 Windows PE binary.\n No VM, no interpreter, no CRT.\n";
+
+@CODE
+func main() -> i32 {
+    syscall 1, banner;
+    syscall 1, msg;
+    syscall 1, banner;
+    return 0;
+}

@@ -1,0 +1,665 @@
+# ==============================================================================
+# ANCL Configurable Cyberpunk SQL-to-MQTT Edge Console
+# Zero-Dependency Win32 Native UI Dashboard with Live Dynamic Inputs
+# ==============================================================================
+
+struct WNDCLASSEXA {
+    cbSize:        i32;
+    style:         i32;
+    lpfnWndProc:   ptr;
+    cbClsExtra:    i32;
+    cbWndExtra:    i32;
+    hInstance:     ptr;
+    hIcon:         ptr;
+    hCursor:       ptr;
+    hbrBackground: ptr;
+    lpszMenuName:  str;
+    lpszClassName: str;
+    hIconSm:       ptr;
+}
+
+struct RECT {
+    left:   i32;
+    top:    i32;
+    right:  i32;
+    bottom: i32;
+}
+
+struct POINT {
+    x: i32;
+    y: i32;
+}
+
+struct MSG {
+    hwnd:    ptr;
+    message: i32;
+    wParam:  i64;
+    lParam:  i64;
+    time:    i32;
+    pt:      POINT;
+}
+
+import "sqlite.ancl";
+import "mqtt.ancl";
+
+# --- Win32 GUI & GDI Imports ---
+extern "user32.dll" RegisterClassExA -> i16;
+extern "user32.dll" CreateWindowExA -> ptr;
+extern "user32.dll" ShowWindow -> i32;
+extern "user32.dll" UpdateWindow -> i32;
+extern "user32.dll" GetMessageA -> i32;
+extern "user32.dll" TranslateMessage -> i32;
+extern "user32.dll" DispatchMessageA -> i32;
+extern "user32.dll" PostQuitMessage;
+extern "user32.dll" DestroyWindow -> i32;
+extern "user32.dll" DefWindowProcA -> i64;
+extern "user32.dll" BeginPaint -> ptr;
+extern "user32.dll" EndPaint;
+extern "user32.dll" GetClientRect -> i32;
+extern "user32.dll" GetWindowRect -> i32;
+extern "user32.dll" DrawTextA -> i32;
+extern "user32.dll" InvalidateRect -> i32;
+extern "user32.dll" GetWindowTextA -> i32;
+extern "user32.dll" SetWindowTextA -> i32;
+extern "user32.dll" SendMessageA -> i64;
+extern "user32.dll" FillRect -> i32;
+extern "gdi32.dll"  CreateSolidBrush -> ptr;
+extern "gdi32.dll"  CreatePen -> ptr;
+extern "gdi32.dll"  Rectangle -> i32;
+extern "gdi32.dll"  SetTextColor -> i32;
+extern "gdi32.dll"  SetBkMode -> i32;
+extern "gdi32.dll"  SetBkColor -> i32;
+extern "gdi32.dll"  SelectObject -> ptr;
+extern "gdi32.dll"  CreateFontA -> ptr;
+
+# --- Window subclassing / owner-draw button + module bootstrap (were missing) ---
+extern "user32.dll"   SetWindowLongA -> i64;
+extern "user32.dll"   GetWindowLongA -> i64;
+extern "user32.dll"   TrackMouseEvent;
+extern "user32.dll"   SetCapture;
+extern "user32.dll"   ReleaseCapture;
+extern "user32.dll"   GetParent -> ptr;
+extern "user32.dll"   LoadCursorA -> ptr;
+extern "gdi32.dll"    RoundRect -> i32;
+extern "gdi32.dll"    MoveToEx -> i32;
+extern "gdi32.dll"    LineTo -> i32;
+extern "gdi32.dll"    Polygon;
+extern "gdi32.dll"    GetStockObject -> ptr;
+extern "kernel32.dll" GetModuleHandleA -> ptr;
+extern "kernel32.dll" CreateFileA -> ptr;
+extern "kernel32.dll" WriteFile -> i32;
+extern "kernel32.dll" CloseHandle -> i32;
+
+@DATA
+# System Window Classes
+cls_name:     str = "ANCL_CONFIG_CONSOLE";
+cls_edit:     str = "EDIT";
+cls_static:   str = "STATIC";
+cls_glow_btn: str = "ANCL_GLOW_BUTTON";
+face_mono:    str = "Consolas";
+
+# Interface Copy Banners & Default Form Values
+win_title:    str = "ANCL | SQL to MQTT Tester";
+btn_text:     str = "PUSH DATA TO CLOUD";
+btn_min:      str = "-";
+btn_close:    str = "X";
+def_ip:       str = "127.0.0.1";
+def_port:     str = "1883";
+def_topic:    str = "ancl/edge/telemetry";
+def_db:       str = "industrial_metrics.db";
+def_query:    str = "SELECT tag_value FROM live_cache WHERE status='ALARM' LIMIT 1;";
+def_tls:      str = "0";
+def_empty:    str = "";
+
+# Configuration Labels
+lbl_ip:       str = "Broker IP:";
+lbl_port:     str = "Broker Port:";
+lbl_topic:    str = "MQTT Topic:";
+lbl_db:       str = "SQLite File:";
+lbl_query:    str = "SQL Query:";
+lbl_tls:      str = "TLS (0/1):";
+lbl_user:     str = "Username:";
+lbl_pass:     str = "Password:";
+lbl_ca:       str = "CA File:";
+
+# Operational Logs
+status_idle:  str = "SYSTEM READY - Waiting for dispatch...";
+status_run:   str = "PROCESSING - Reading DB and building frames...";
+status_fail:  str = "ERROR - Cloud pipeline failed. Check logs.";
+status_ok:    str = "SUCCESS - Telemetry routed to MQTT target!";
+status_fail_db:   str = "ERROR - Cannot open SQLite database.";
+status_fail_net:  str = "ERROR - Network/socket initialization failed.";
+status_fail_conn: str = "ERROR - Could not connect to MQTT broker.";
+log_idle:     str = "Ready. Click PUSH DATA TO CLOUD.";
+log_click:    str = "Dispatch clicked.";
+log_inputs:   str = "Inputs read from window controls.";
+log_db_open:  str = "SQLite database opened.";
+log_db_exec:  str = "SQL query executed.";
+log_db_close: str = "SQLite database closed.";
+log_fallback: str = "No SQL row returned; using fallback value.";
+log_wsa:      str = "WinSock initialized.";
+log_socket:   str = "TCP socket created.";
+log_connect:  str = "Connected to MQTT broker.";
+log_mqtt_c:   str = "MQTT CONNECT frame sent.";
+log_mqtt_p:   str = "MQTT PUBLISH frame sent.";
+log_done:     str = "Pipeline complete.";
+log_db_fail:  str = "FAIL: SQLite open failed.";
+log_wsa_fail: str = "FAIL: WinSock startup failed.";
+log_sock_fail:str = "FAIL: Socket creation failed.";
+log_conn_fail:str = "FAIL: Broker TCP connect failed.";
+log_tls_mode: str = "TLS mode: spawning mosquitto_pub.";
+log_tls_ok:   str = "mosquitto_pub TLS publish completed.";
+log_tls_fail: str = "FAIL: mosquitto_pub publish failed.";
+debug_path:   str = "pipeline_debug.log";
+crlf:         str = "\r\n";
+mosq_pub:     str = "C:\\Program Files\\mosquitto\\mosquitto_pub.exe";
+
+# BGR Aesthetic Palette Definitions
+COLOR_BG_DEEP:     i64 = 0x1C1008; # #08101C Deep Blue
+COLOR_BG_PANEL:    i64 = 0x060402; # #020406 Accent Panel Dark
+COLOR_BG_INPUT:    i64 = 0x080604; # #040608 Textured field background
+COLOR_NEON_ORANGE: i64 = 0x3C92FB; # #FB923C Active Primary Accent
+COLOR_TEXT_PRIMARY:i64 = 0xAB9687; # #8796AB Muted Text
+COLOR_TEXT_BRIGHT: i64 = 0xFFFFFF; # #FFFFFF Primary Text
+COLOR_BORDER:      i64 = 0x7C6543; # #43657C Element Frames
+
+# Window and command IDs
+ID_BTN_PUSH:  i64 = 101;
+ID_BTN_MIN:   i64 = 102;
+ID_BTN_CLOSE: i64 = 103;
+
+# Dynamic UI Field Window Handles
+h_ip_edit:    buf = 8;
+h_port_edit:  buf = 8;
+h_topic_edit: buf = 8;
+h_db_edit:    buf = 8;
+h_query_edit: buf = 8;
+h_tls_edit:   buf = 8;
+h_user_edit:  buf = 8;
+h_pass_edit:  buf = 8;
+h_ca_edit:    buf = 8;
+
+# GDI Visual Resource Allocations
+h_brush_deep:  buf = 8;
+h_brush_panel: buf = 8;
+h_brush_input: buf = 8;
+h_brush_neon:  buf = 8;
+h_pen_border:  buf = 8;
+h_pen_neon:    buf = 8;   # neon accent PEN (divider line + active button border)
+h_font:        buf = 8;
+h_font_hdr:    buf = 8;
+g_hinst:       buf = 8;   # module instance handle (for child-window creation)
+g_main_hwnd:   buf = 8;
+g_track_mouse: buf = 24;  # TRACKMOUSEEVENT struct (drives WM_MOUSELEAVE)
+
+# Processing State & Buffer Arenas
+g_wndclass:     buf = 80;
+g_wndclass_btn: buf = 80;
+g_msg:          buf = 48;
+g_rect:         buf = 16;
+g_ps:           buf = 72;
+g_wsa:          buf = 512;
+g_play_tri:     buf = 24;
+db_handle:      buf = 8;
+stmt_handle:    buf = 8;
+g_status_text:  buf = 128;
+g_temp_text:    buf = 256;
+g_log0:         buf = 96;
+g_log1:         buf = 96;
+g_log2:         buf = 96;
+g_log3:         buf = 96;
+g_log4:         buf = 96;
+g_log5:         buf = 96;
+g_io:           buf = 8;
+
+# Active Extraction Buffers
+buf_ip:         buf = 64;
+buf_port:       buf = 16;
+buf_topic:      buf = 128;
+buf_db:         buf = 128;
+buf_query:      buf = 256;
+buf_tls:        buf = 8;
+buf_user:       buf = 128;
+buf_pass:       buf = 128;
+buf_ca:         buf = 260;
+extracted_val:  buf = 128;
+
+@CODE
+
+# Fill a WNDCLASSEXA and register it (shared GUI helper used by the showcase apps)
+func register_class(wndclass: ptr, clsname_arg: str, wndproc_fn: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    store32(wndclass + 0,  80);          # cbSize
+    store32(wndclass + 4,  3);           # style = CS_HREDRAW|CS_VREDRAW
+    store64(wndclass + 8,  wndproc_fn);  # lpfnWndProc
+    store32(wndclass + 16, 0);           # cbClsExtra
+    store32(wndclass + 20, 0);           # cbWndExtra
+    store64(wndclass + 24, hinst);       # hInstance
+    store64(wndclass + 32, 0);           # hIcon
+    store64(wndclass + 40, cursor);      # hCursor
+    store64(wndclass + 48, brush);       # hbrBackground
+    store64(wndclass + 56, 0);           # lpszMenuName
+    store64(wndclass + 64, clsname_arg); # lpszClassName
+    store64(wndclass + 72, 0);           # hIconSm
+    return RegisterClassExA(wndclass);
+}
+
+func log_step(line: str) -> i64 {
+    hlog = CreateFileA(debug_path, 0x4, 1, 0, 4, 128, 0);
+    if hlog != 0 - 1 {
+        WriteFile(hlog, line, strlen(line), g_io, 0);
+        WriteFile(hlog, crlf, 2, g_io, 0);
+        CloseHandle(hlog);
+    }
+    str_copy(g_log5, g_log4);
+    str_copy(g_log4, g_log3);
+    str_copy(g_log3, g_log2);
+    str_copy(g_log2, g_log1);
+    str_copy(g_log1, g_log0);
+    str_copy(g_log0, line);
+    hwnd = load64(g_main_hwnd);
+    if hwnd != 0 {
+        InvalidateRect(hwnd, 0, 1);
+        UpdateWindow(hwnd);
+    }
+    return 0;
+}
+
+func clear_debug_log() -> i64 {
+    hlog = CreateFileA(debug_path, 0x40000000, 1, 0, 2, 128, 0);
+    if hlog != 0 - 1 { CloseHandle(hlog); }
+    return 0;
+}
+
+# The fully dynamic pipeline executor
+func execute_configurable_pipeline() -> i64 {
+    # 1. Zero out previous cache states
+    memset(extracted_val, 0, 128);
+
+    # 2. Extract active configuration variables from input HWND controls
+    GetWindowTextA(load64(h_ip_edit), buf_ip, 64);
+    GetWindowTextA(load64(h_port_edit), buf_port, 16);
+    GetWindowTextA(load64(h_topic_edit), buf_topic, 128);
+    GetWindowTextA(load64(h_db_edit), buf_db, 128);
+    GetWindowTextA(load64(h_query_edit), buf_query, 256);
+    GetWindowTextA(load64(h_tls_edit), buf_tls, 8);
+    GetWindowTextA(load64(h_user_edit), buf_user, 128);
+    GetWindowTextA(load64(h_pass_edit), buf_pass, 128);
+    GetWindowTextA(load64(h_ca_edit), buf_ca, 260);
+    log_step(log_inputs);
+
+    # 3. Open dynamic user-defined database file and fire query
+    qrc = sqlite_query_first_text(buf_db, buf_query, extracted_val, 128);
+    if qrc < 0 {
+        log_step(log_db_fail);
+        return 0 - 1;
+    }
+    log_step(log_db_open);
+    log_step(log_db_exec);
+    log_step(log_db_close);
+
+    # Check if a database result was safely gathered
+    if strlen(extracted_val) == 0 {
+        str_copy(extracted_val, "0.00 (MOCK_CACHE_FALLBACK)");
+        log_step(log_fallback);
+    }
+
+    if cstr_truthy(buf_tls) == 1 {
+        log_step(log_tls_mode);
+        trc = mqtt_publish_tls_cli(mosq_pub, buf_ip, buf_port, buf_topic, extracted_val, buf_ca, buf_user, buf_pass);
+        if trc == 1 {
+            log_step(log_tls_ok);
+            log_step(log_done);
+            return 1;
+        }
+        log_step(log_tls_fail);
+        return 0 - 5;
+    }
+
+    # 4. Publish over the reusable raw MQTT helper
+    mrc = mqtt_publish_qos0(buf_ip, str_to_int(buf_port), buf_topic, extracted_val);
+    if mrc == 1 {
+        log_step(log_wsa);
+        log_step(log_socket);
+        log_step(log_connect);
+        log_step(log_mqtt_c);
+        log_step(log_mqtt_p);
+        log_step(log_done);
+        return 1;
+    }
+    if mrc == 0 - 2 {
+        log_step(log_wsa_fail);
+        return 0 - 2;
+    }
+    if mrc == 0 - 3 {
+        log_step(log_sock_fail);
+        return 0 - 3;
+    }
+    if mrc == 0 - 4 {
+        log_step(log_conn_fail);
+        return 0 - 4;
+    }
+    log_step(log_sock_fail);
+    return 0 - 3;
+}
+
+# Subclassed GlowButton Window Procedure pattern matching your tracker rules
+func GlowButtonWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { SetWindowLongA(hwnd, 0 - 21, 0); return 0; }
+    if msg == 512 { # WM_MOUSEMOVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        if band(state, 1) == 0 {
+            SetWindowLongA(hwnd, 0 - 21, bor(band(state, 2), 1)); # Set hover state
+            InvalidateRect(hwnd, 0, 1);
+            store32(g_track_mouse + 0, 24); store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd); store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 { # WM_MOUSELEAVE
+        state = GetWindowLongA(hwnd, 0 - 21);
+        SetWindowLongA(hwnd, 0 - 21, band(state, 2)); # Kill hover
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 { # WM_LBUTTONDOWN
+        state = GetWindowLongA(hwnd, 0 - 21);
+        SetWindowLongA(hwnd, 0 - 21, bor(band(state, 1), 2)); # Set pressed
+        SetCapture(hwnd); InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 { # WM_LBUTTONUP
+        state = GetWindowLongA(hwnd, 0 - 21);
+        if band(state, 2) == 2 {
+            ReleaseCapture();
+            SetWindowLongA(hwnd, 0 - 21, band(state, 1));
+            InvalidateRect(hwnd, 0, 1);
+            if band(state, 1) == 1 { # Click confirmed
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd); # Route up via WM_COMMAND
+            }
+        }
+        return 0;
+    }
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps); GetClientRect(hwnd, g_rect);
+        l = load32(g_rect + 0); t = load32(g_rect + 4); r = load32(g_rect + 8); b = load32(g_rect + 12);
+        state = GetWindowLongA(hwnd, 0 - 21);
+        br = load64(h_brush_panel);
+        if band(state, 2) == 2 { br = load64(h_brush_input); }
+        else if band(state, 1) == 1 { br = load64(h_brush_deep); }
+        old_br = SelectObject(hdc, br);
+        pen = load64(h_pen_border);
+        if band(state, 1) == 1 { pen = load64(h_pen_neon); } # hover -> neon accent border
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, l, t, r, b, 6, 6);
+        id = GetWindowLongA(hwnd, 0 - 12);
+        if id == ID_BTN_PUSH {
+            mid = (t + b) / 2;
+            store32(g_play_tri + 0, l + 76); store32(g_play_tri + 4, mid - 7);
+            store32(g_play_tri + 8, l + 76); store32(g_play_tri + 12, mid + 7);
+            store32(g_play_tri + 16, l + 90); store32(g_play_tri + 20, mid);
+            SelectObject(hdc, load64(h_brush_neon));
+            SelectObject(hdc, load64(h_pen_neon));
+            Polygon(hdc, g_play_tri, 3);
+        }
+        SetBkMode(hdc, 1); SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        SelectObject(hdc, load64(h_font));
+        GetWindowTextA(hwnd, g_temp_text, 128);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+        SelectObject(hdc, old_br); SelectObject(hdc, old_pen); EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# The Dashboard System Windows Callback Procedure
+func MainWndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        store64(g_main_hwnd, hwnd);
+        clear_debug_log();
+        str_copy(g_status_text, status_idle);
+        str_copy(g_log0, log_idle);
+        str_copy(g_log1, "");
+        str_copy(g_log2, "");
+        str_copy(g_log3, "");
+        str_copy(g_log4, "");
+        str_copy(g_log5, "");
+        hinst = load64(g_hinst); # module handle stashed by main() (NOT the paint struct)
+
+        # Custom title bar buttons
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 754, 8, 26, 26, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 784, 8, 26, 26, hwnd, ID_BTN_CLOSE, hinst, 0);
+
+        # Instantiate Labels & Config Input Fields using our sequential spacing pattern
+        # Column Layout Left: Labels at X=25, Inputs at X=140
+        CreateWindowExA(0, cls_static, lbl_ip, 0x50000000, 25, 74, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_ip, 0x50010080, 140, 72, 220, 24, hwnd, 201, hinst, 0);
+        store64(h_ip_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_port, 0x50000000, 25, 114, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_port, 0x50010080, 140, 112, 90, 24, hwnd, 205, hinst, 0);
+        store64(h_port_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_topic, 0x50000000, 25, 154, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_topic, 0x50010080, 140, 152, 220, 24, hwnd, 202, hinst, 0);
+        store64(h_topic_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_db, 0x50000000, 25, 194, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_db, 0x50010080, 140, 192, 220, 24, hwnd, 203, hinst, 0);
+        store64(h_db_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_query, 0x50000000, 25, 234, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_query, 0x500100c4, 140, 232, 220, 60, hwnd, 204, hinst, 0); # Multiline style ES_MULTILINE
+        store64(h_query_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_tls, 0x50000000, 25, 314, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_tls, 0x50010080, 140, 312, 45, 24, hwnd, 206, hinst, 0);
+        store64(h_tls_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_user, 0x50000000, 25, 354, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_empty, 0x50010080, 140, 352, 220, 24, hwnd, 207, hinst, 0);
+        store64(h_user_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_pass, 0x50000000, 25, 394, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_empty, 0x500100a0, 140, 392, 220, 24, hwnd, 208, hinst, 0);
+        store64(h_pass_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        CreateWindowExA(0, cls_static, lbl_ca, 0x50000000, 25, 434, 100, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_empty, 0x50010080, 140, 432, 220, 24, hwnd, 209, hinst, 0);
+        store64(h_ca_edit, h); SendMessageA(h, 48, load64(h_font), 1);
+
+        # Deploy Owner-Drawn GlowButton
+        CreateWindowExA(0, cls_glow_btn, btn_text, 0x50000000, 25, 475, 335, 45, hwnd, ID_BTN_PUSH, hinst, 0);
+        return 0;
+    }
+
+    if msg == 132 { # WM_NCHITTEST Borderless Drag Mapping
+        GetWindowRect(hwnd, g_rect);
+        cx = band(lp, 65535) - load32(g_rect + 0);
+        cy = shr(lp, 16) - load32(g_rect + 4);
+        if cy < 42 {
+            if cx >= 754 {
+                if cx < 780 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; }
+                    }
+                }
+            }
+            if cx >= 784 {
+                if cx < 810 {
+                    if cy >= 8 {
+                        if cy < 34 { return 1; }
+                    }
+                }
+            }
+            return 2; # Over top banner title bar height -> HTCAPTION
+        }
+        return 1; # HTCLIENT
+    }
+
+    if msg == 273 { # WM_COMMAND
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_MIN { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        if cmd_id == ID_BTN_PUSH { # Intercept action dispatch click
+            str_copy(g_status_text, status_run);
+            log_step(log_click);
+            InvalidateRect(hwnd, 0, 1);
+
+            # Execute background pipeline operations
+            rc = execute_configurable_pipeline();
+            if rc == 1 { str_copy(g_status_text, status_ok); }
+            else if rc == 0 - 1 { str_copy(g_status_text, status_fail_db); }    # sqlite3_open failed
+            else if rc == 0 - 4 { str_copy(g_status_text, status_fail_conn); }  # connect() failed
+            else { str_copy(g_status_text, status_fail_net); }                  # WSAStartup / socket failed
+
+            InvalidateRect(hwnd, 0, 1);
+        }
+        return 0;
+    }
+
+    if msg == 312 || msg == 307 { # WM_CTLCOLORSTATIC & WM_CTLCOLOREDIT theme painting
+        SetTextColor(wp, COLOR_TEXT_PRIMARY);
+        if msg == 307 {
+            SetBkColor(wp, COLOR_BG_INPUT);
+            return load64(h_brush_input);
+        }
+        SetBkColor(wp, COLOR_BG_DEEP);
+        return load64(h_brush_deep);
+    }
+
+    if msg == 15 { # WM_PAINT Rendering Engine
+        hdc = BeginPaint(hwnd, g_ps); GetClientRect(hwnd, g_rect);
+        w_right = load32(g_rect + 8); w_bottom = load32(g_rect + 12);
+
+        # 1. Background Fill
+        SelectObject(hdc, load64(h_brush_deep));
+        store32(g_rect + 4, 42); FillRect(hdc, g_rect, load64(h_brush_deep));
+
+        # 2. Top Title Panel Strip
+        store32(g_rect + 4, 0); store32(g_rect + 12, 42);
+        FillRect(hdc, g_rect, load64(h_brush_panel));
+
+        # 3. Render Custom Accent Divider Line
+        SelectObject(hdc, load64(h_pen_neon));
+        MoveToEx(hdc, 0, 42, 0); LineTo(hdc, w_right, 42);
+
+        # 4. Print Title Typography
+        SetBkMode(hdc, 1); SetTextColor(hdc, COLOR_NEON_ORANGE);
+        SelectObject(hdc, load64(h_font_hdr));
+        store32(g_rect + 0, 15); store32(g_rect + 4, 12);
+        DrawTextA(hdc, win_title, 0 - 1, g_rect, 0);
+
+        # 5. Partition Divider separating configuration inputs from data stream monitoring
+        SelectObject(hdc, load64(h_pen_border));
+        MoveToEx(hdc, 390, 42, 0); LineTo(hdc, 390, w_bottom);
+
+        # 6. Paint Real-Time Data Status Monitoring Streams on Right Side Panel
+        store32(g_rect + 8, w_right); store32(g_rect + 12, w_bottom);
+        SetTextColor(hdc, COLOR_NEON_ORANGE);
+        store32(g_rect + 0, 415); store32(g_rect + 4, 72);
+        DrawTextA(hdc, "MONITOR LOG TRANSMISSION:", 0 - 1, g_rect, 0);
+
+        SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        store32(g_rect + 4, 105);
+        DrawTextA(hdc, g_status_text, 0 - 1, g_rect, 0);
+
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        store32(g_rect + 4, 145);
+        DrawTextA(hdc, "PIPELINE LOG:", 0 - 1, g_rect, 0);
+
+        SetTextColor(hdc, COLOR_TEXT_BRIGHT);
+        store32(g_rect + 4, 168);
+        DrawTextA(hdc, g_log0, 0 - 1, g_rect, 0);
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        store32(g_rect + 4, 191);
+        DrawTextA(hdc, g_log1, 0 - 1, g_rect, 0);
+        store32(g_rect + 4, 214);
+        DrawTextA(hdc, g_log2, 0 - 1, g_rect, 0);
+        store32(g_rect + 4, 237);
+        DrawTextA(hdc, g_log3, 0 - 1, g_rect, 0);
+        store32(g_rect + 4, 260);
+        DrawTextA(hdc, g_log4, 0 - 1, g_rect, 0);
+        store32(g_rect + 4, 283);
+        DrawTextA(hdc, g_log5, 0 - 1, g_rect, 0);
+
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        store32(g_rect + 4, 330);
+        DrawTextA(hdc, "LAST CACHED VALUE RETRIEVED FROM TARGET SQL ROW:", 0 - 1, g_rect, 0);
+
+        SetTextColor(hdc, COLOR_NEON_ORANGE);
+        store32(g_rect + 4, 360);
+        DrawTextA(hdc, extracted_val, 0 - 1, g_rect, 0);
+
+        # 7. Field Border Outlines
+        SelectObject(hdc, GetStockObject(5)); SelectObject(hdc, load64(h_pen_border));
+        Rectangle(hdc, 139, 71, 361, 97); # IP Input field outline frame
+        Rectangle(hdc, 139, 111, 231, 137); # Port Field
+        Rectangle(hdc, 139, 151, 361, 177); # Topic Field
+        Rectangle(hdc, 139, 191, 361, 217); # File Path field frame
+        Rectangle(hdc, 139, 231, 361, 293); # SQL Query Field box
+        Rectangle(hdc, 139, 311, 186, 337); # TLS flag
+        Rectangle(hdc, 139, 351, 361, 377); # Username
+        Rectangle(hdc, 139, 391, 361, 417); # Password
+        Rectangle(hdc, 139, 431, 361, 457); # CA file
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func main() -> i32 {
+    # Generate core structural theme assets
+    store64(h_brush_deep, CreateSolidBrush(COLOR_BG_DEEP));
+    store64(h_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(h_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(h_brush_neon, CreateSolidBrush(COLOR_NEON_ORANGE));
+    store64(h_pen_border, CreatePen(0, 1, COLOR_BORDER));
+    store64(h_pen_neon, CreatePen(0, 2, COLOR_NEON_ORANGE)); # neon accent pen (divider + active border)
+
+    # Initialize systematic fonts matching font-face guidelines
+    store64(h_font, CreateFontA(0 - 13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 49, face_mono));
+    store64(h_font_hdr, CreateFontA(0 - 15, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 49, face_mono));
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);                # stash for child-window creation in WM_CREATE
+    cursor = LoadCursorA(0, 32512);
+
+    # Register Custom Button Class
+    register_class(&g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(h_brush_panel));
+
+    # Setup core Window Configuration parameters
+    wc: *WNDCLASSEXA = g_wndclass;
+    wc.cbSize = 80;
+    wc.style = 3;
+    wc.lpfnWndProc = &MainWndProc;
+    wc.lpszClassName = cls_name;
+    wc.hInstance = hinst;
+    wc.hCursor = cursor;
+    wc.hbrBackground = load64(h_brush_deep);
+    RegisterClassExA(wc);
+
+    # Create Borderless Form via WS_POPUP (0x80000000)
+    hwnd = CreateWindowExA(0, cls_name, win_title, 0x80000000, 150, 150, 820, 570, 0, 0, hinst, 0);
+    if hwnd == 0 { return 0 - 1; }
+
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    # Enter central application loop execution frame
+    msg_ptr: *MSG = g_msg;
+    while GetMessageA(msg_ptr, 0, 0, 0) != 0 {
+        TranslateMessage(msg_ptr);
+        DispatchMessageA(msg_ptr);
+    }
+
+    return 0;
+}

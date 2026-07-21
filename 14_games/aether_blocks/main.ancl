@@ -1,0 +1,325 @@
+# =====================================================================
+#  main.ancl  -  Aether-Craft 3D Voxel Sandbox Entrypoint
+#  Format: Bare-Metal ANCL V6, Zero-CRT
+# =====================================================================
+import "win32_api.ancl";
+import "voxel_world.ancl";
+import "renderer_3d.ancl";
+
+extern "user32.dll" GetAsyncKeyState;
+extern "user32.dll" DestroyWindow;
+
+@DATA
+clsname:          str = "AETHERCRAFTWND";
+title:            str = "Aether-Craft - 3D Voxel Sandbox (ANCL Engine)";
+
+# Selection state
+g_selected_block: buf = 8;
+
+# UI buffers
+g_active_str:     buf = 128;
+g_result_str:     buf = 128;
+
+# Win32 structures
+g_hinst:          buf = 8;
+g_hwnd:           buf = 8;
+g_wndclass:       buf = 96;
+g_msg:            buf = 64;
+g_ps:             buf = 72;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Draw coordinates, selected block, and game controls helper
+# ---------------------------------------------------------------------
+func draw_game_ui(hdc: i64) -> i64 {
+    SetTextColor(hdc, 0x00FFFFFF);
+    SetBkMode(hdc, 1);
+    
+    # 1. Player Coordinates
+    px = load64(g_player_x) / 100;
+    py = load64(g_player_y) / 100;
+    pz = load64(g_player_z) / 100;
+    
+    str_copy(g_active_str, "Pos: X: ");
+    p = g_active_str + strlen(g_active_str);
+    int_to_str(p, px); p = p + strlen(p);
+    str_copy(p, " Y: "); p = p + strlen(p);
+    int_to_str(p, py); p = p + strlen(p);
+    str_copy(p, " Z: "); p = p + strlen(p);
+    int_to_str(p, pz);
+    
+    TextOutA(hdc, 15, 15, g_active_str, strlen(g_active_str));
+    
+    # 2. Selected Block type
+    sb = load64(g_selected_block);
+    str_copy(g_result_str, "Build Item: ");
+    p = g_result_str + strlen(g_result_str);
+    if sb == BLOCK_GRASS { str_copy(p, "Grass (Key 1)"); }
+    if sb == BLOCK_DIRT  { str_copy(p, "Dirt (Key 2)"); }
+    if sb == BLOCK_STONE { str_copy(p, "Stone (Key 3)"); }
+    if sb == BLOCK_WOOD  { str_copy(p, "Wood (Key 4)"); }
+    if sb == BLOCK_LEAVES{ str_copy(p, "Leaves (Key 5)"); }
+    
+    TextOutA(hdc, 15, 35, g_result_str, strlen(g_result_str));
+    
+    # 3. Instruction Help HUD
+    txt_help: str = "Controls: WASD (Move), Space (Jump), Arrows (Look), Left-Click (Mine), Right-Click (Build), V/F5 (View), Esc (Quit)";
+    TextOutA(hdc, 15, VIEW_HEIGHT - 35, txt_help, strlen(txt_help));
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Capture WASD movement and Arrow key look directions
+# ---------------------------------------------------------------------
+func update_player_movement() -> i64 {
+    yaw = load64(g_player_yaw);
+    cosY = load64(g_cos + yaw * 8);
+    sinY = load64(g_sin + yaw * 8);
+    
+    speed = 10; # Move speed per frame
+    
+    dx = 0;
+    dy = 0;
+    
+    # W Key (0x57) -> Forward
+    if band(GetAsyncKeyState(0x57), 0x8000) != 0 {
+        dx = dx + sinY;
+        dy = dy + cosY;
+    }
+    # S Key (0x53) -> Backward
+    if band(GetAsyncKeyState(0x53), 0x8000) != 0 {
+        dx = dx - sinY;
+        dy = dy - cosY;
+    }
+    # A Key (0x41) -> Strafe Left
+    if band(GetAsyncKeyState(0x41), 0x8000) != 0 {
+        dx = dx - cosY;
+        dy = dy + sinY;
+    }
+    # D Key (0x44) -> Strafe Right
+    if band(GetAsyncKeyState(0x44), 0x8000) != 0 {
+        dx = dx + cosY;
+        dy = dy - sinY;
+    }
+    
+    # Apply Horizontal Displacement
+    if dx != 0 {
+        new_x = load64(g_player_x) + (dx * speed) / 65536;
+        if new_x > 50 {
+            if new_x < (WORLD_W - 1) * 100 {
+                store64(g_player_x, new_x);
+            }
+        }
+    }
+    if dy != 0 {
+        new_y = load64(g_player_y) + (dy * speed) / 65536;
+        if new_y > 50 {
+            if new_y < (WORLD_L - 1) * 100 {
+                store64(g_player_y, new_y);
+            }
+        }
+    }
+    
+    # Camera View Rotation
+    # Left Arrow (0x25) -> Look Left
+    if band(GetAsyncKeyState(0x25), 0x8000) != 0 {
+        store64(g_player_yaw, band(load64(g_player_yaw) - 10, 1023));
+    }
+    # Right Arrow (0x27) -> Look Right
+    if band(GetAsyncKeyState(0x27), 0x8000) != 0 {
+        store64(g_player_yaw, band(load64(g_player_yaw) + 10, 1023));
+    }
+    # Up Arrow (0x26) -> Look Up
+    if band(GetAsyncKeyState(0x26), 0x8000) != 0 {
+        pitch = load64(g_player_pitch) + 8;
+        if pitch > 180 { pitch = 180; }
+        store64(g_player_pitch, pitch);
+    }
+    # Down Arrow (0x28) -> Look Down
+    if band(GetAsyncKeyState(0x28), 0x8000) != 0 {
+        pitch = load64(g_player_pitch) - 8;
+        if pitch < 0 - 180 { pitch = 0 - 180; }
+        store64(g_player_pitch, pitch);
+    }
+    
+    # Space (0x20) -> Jump
+    if band(GetAsyncKeyState(0x20), 0x8000) != 0 {
+        perform_jump();
+    }
+    
+    # Update walking animation timer
+    is_moving = 0;
+    if dx != 0 { is_moving = 1; }
+    if dy != 0 { is_moving = 1; }
+    
+    if is_moving == 1 {
+        walk_t = load64(g_walk_time) + 60; # Cycle speed (higher means faster swing)
+        if walk_t >= 1024 { walk_t = walk_t - 1024; }
+        store64(g_walk_time, walk_t);
+    } else {
+        # Gradually return to standing straight (walk_time -> 0)
+        walk_t = load64(g_walk_time);
+        if walk_t != 0 {
+            if walk_t < 512 {
+                walk_t = walk_t - 40;
+                if walk_t < 0 { walk_t = 0; }
+            } else {
+                walk_t = walk_t + 40;
+                if walk_t >= 1024 { walk_t = 0; }
+            }
+            store64(g_walk_time, walk_t);
+        }
+    }
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Window Procedure (WndProc)
+# ---------------------------------------------------------------------
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetTimer(hwnd, 1, 16, 0); # Physics & animation timer (~60 FPS)
+        return 0;
+    }
+    
+    if msg == 256 { # WM_KEYDOWN
+        key = wParam;
+        # Map number keys 1 to 5 to block types
+        if key == 0x31 { store64(g_selected_block, BLOCK_GRASS); }
+        if key == 0x32 { store64(g_selected_block, BLOCK_DIRT); }
+        if key == 0x33 { store64(g_selected_block, BLOCK_STONE); }
+        if key == 0x34 { store64(g_selected_block, BLOCK_WOOD); }
+        if key == 0x35 { store64(g_selected_block, BLOCK_LEAVES); }
+        
+        # Toggle 3rd person views: 1st person (0) -> 3rd person behind (1) -> 3rd person front (2)
+        if key == 0x56 {
+            tp = load64(g_third_person) + 1;
+            if tp > 2 { tp = 0; }
+            store64(g_third_person, tp);
+        }
+        if key == 0x74 {
+            tp = load64(g_third_person) + 1;
+            if tp > 2 { tp = 0; }
+            store64(g_third_person, tp);
+        }
+        
+        # Exit game with Escape (0x1B)
+        if key == 0x1B { DestroyWindow(hwnd); }
+        return 0;
+    }
+    
+    if msg == 513 { # WM_LBUTTONDOWN -> Mine block
+        interact_block(1, 0);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 516 { # WM_RBUTTONDOWN -> Place block
+        interact_block(2, load64(g_selected_block));
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Update motion physics & day/night timer
+        update_player_movement();
+        update_player_physics();
+        
+        # Advance day/night cycle (slower increment: +1, max 20000)
+        time = load64(g_day_time) + 1;
+        if time >= 20000 { time = 0; }
+        store64(g_day_time, time);
+        
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        # GDI Double-Buffering
+        hdc = BeginPaint(hwnd, g_ps);
+        hdcMem = CreateCompatibleDC(hdc);
+        hbmMem = CreateCompatibleBitmap(hdc, VIEW_WIDTH, VIEW_HEIGHT);
+        hbmOld = SelectObject(hdcMem, hbmMem);
+        
+        # Draw 3D scene & UI elements on memory buffer
+        draw_world_scene(hdcMem);
+        draw_game_ui(hdcMem);
+        
+        # BitBlt to screen (SRCCOPY = 0x00CC0020)
+        BitBlt(hdc, 0, 0, VIEW_WIDTH, VIEW_HEIGHT, hdcMem, 0, 0, 13369376);
+        
+        # Release handles
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbmMem);
+        DeleteDC(hdcMem);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Windows main Entry point
+# ---------------------------------------------------------------------
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # 1. Initialize LUT tables
+    init_lut();
+    
+    # 2. Setup initial player states
+    store64(g_player_x, 1600);      # Start in center (16 * 100)
+    store64(g_player_y, 1600);
+    store64(g_player_z, 1400);      # Start high in the air
+    store64(g_player_yaw, 0);       # Facing South
+    store64(g_player_pitch, 0);     # Looking forward
+    store64(g_selected_block, BLOCK_STONE); # Default selected block
+    store64(g_day_time, 10000);      # Mid-day (out of 20000)
+    store64(g_third_person, 0);      # Default to 1st person view
+    
+    # 3. Procedurally generate terrain
+    generate_terrain();
+    
+    # 4. Window Registration & Creation
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3); # CS_HREDRAW | CS_VREDRAW
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, 0); # Managed backgrounds
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # Create non-resizable window matching 800x480 resolution (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX = 0x10C00000)
+    # Plus WS_VISIBLE (0x10000000) = 0x20C00000
+    hwnd = CreateWindowExA(0, clsname, title, 549453824, 100, 100, 816, 519, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

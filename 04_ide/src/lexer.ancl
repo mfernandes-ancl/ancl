@@ -1,0 +1,138 @@
+# =====================================================================
+#  lexer.ancl  -  Aether Studio ANCL syntax tokenizer (M6).
+#
+#  Pure, zero-Win32, byte-level. `lex_next(src,pos)` returns the length of
+#  the token starting at pos and writes its KIND into g_tok_kind. The IDE
+#  walks the buffer token-by-token and colors each run via lex_color(kind).
+#  Headless-tested by tests/test_lexer.ancl.
+#
+#  Kinds:  0 default (idents/numbers/punctuation)
+#          1 structural tag (@DATA / @CODE)
+#          2 keyword (func/if/else/loop/while/break/continue/return/
+#                     syscall/struct/import/extern)
+#          3 type    (i8/i16/i32/i64/f32/f64/ptr/str + cosmetic u32/u64/HWND)
+#          4 builtin (load/store/shl/shr/band.../alloc/free/callp/sizeof/...)
+#          5 string literal / # comment
+# =====================================================================
+
+@DATA
+lx_kw: str = " func if else loop while break continue return syscall struct import extern ";
+lx_ty: str = " i8 i16 i32 i64 f32 f64 ptr str u32 u64 HWND ";
+lx_bi: str = " load8 load16 load32 load64 store8 store16 store32 store64 shl shr band bor bxor strlen strcmp memcpy memset str_copy str_to_int puts_cstr int_to_str alloc free read_int read_char callp sizeof ";
+lx_word: buf = 256;     # scratch " <ident> " for the space-delimited list lookup
+g_tok_kind: buf = 8;
+
+@CODE
+func lx_is_alpha(c: i64) -> i64 {
+    if c == 95 { return 1; }                  # _
+    if c >= 65 { if c <= 90 { return 1; } }   # A-Z
+    if c >= 97 { if c <= 122 { return 1; } }  # a-z
+    return 0;
+}
+func lx_is_digit(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return 1; } }
+    return 0;
+}
+func lx_is_alnum(c: i64) -> i64 {
+    if lx_is_alpha(c) == 1 { return 1; }
+    if lx_is_digit(c) == 1 { return 1; }
+    return 0;
+}
+func lx_is_ws(c: i64) -> i64 {
+    if c == 32 { return 1; }
+    if c == 9 { return 1; }
+    if c == 13 { return 1; }
+    if c == 10 { return 1; }
+    return 0;
+}
+
+# 1 if C-string hay contains C-string ndl
+func lx_contains(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0; }
+        j = 0;
+        matched = 1;
+        while matched == 1 {
+            cn = load8(ndl + j);
+            if cn == 0 { return 1; }
+            if load8(hay + i + j) != cn { matched = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# classify identifier slice [src+pos, len): 2 keyword / 3 type / 4 builtin / 0 default
+func lx_classify(src: i64, pos: i64, len: i64) -> i64 {
+    store8(lx_word, 32);                      # leading space
+    k = 0;
+    while k < len { store8(lx_word + 1 + k, load8(src + pos + k)); k = k + 1; }
+    store8(lx_word + 1 + len, 32);            # trailing space
+    store8(lx_word + 2 + len, 0);
+    if lx_contains(lx_kw, lx_word) == 1 { return 2; }
+    if lx_contains(lx_ty, lx_word) == 1 { return 3; }
+    if lx_contains(lx_bi, lx_word) == 1 { return 4; }
+    return 0;
+}
+
+# Token at src+pos. Writes kind into g_tok_kind; returns length (0 at NUL).
+func lex_next(src: i64, pos: i64) -> i64 {
+    c = load8(src + pos);
+    if c == 0 { store64(g_tok_kind, 0); return 0; }
+
+    if lx_is_ws(c) == 1 {                      # whitespace run
+        n = 0;
+        while lx_is_ws(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(g_tok_kind, 0);
+        return n;
+    }
+    if c == 35 {                              # '#' comment to end of line (\n OR \r terminated)
+        n = 0;
+        while 1 { d = load8(src + pos + n); if d == 0 { break; } if d == 10 { break; } if d == 13 { break; } n = n + 1; }
+        store64(g_tok_kind, 5);
+        return n;
+    }
+    if c == 34 {                              # "..." string literal (\" escape aware)
+        n = 1;
+        while 1 {
+            d = load8(src + pos + n);
+            if d == 0 { break; }
+            if d == 34 { n = n + 1; break; }
+            if d == 92 { n = n + 2; } else { n = n + 1; }
+        }
+        store64(g_tok_kind, 5);
+        return n;
+    }
+    if c == 64 {                              # '@' structural tag (@DATA / @CODE)
+        n = 1;
+        while lx_is_alpha(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(g_tok_kind, 1);
+        return n;
+    }
+    if lx_is_digit(c) == 1 {                  # number (decimal / 0x hex)
+        n = 1;
+        while lx_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(g_tok_kind, 0);
+        return n;
+    }
+    if lx_is_alpha(c) == 1 {                  # identifier / keyword / type / builtin
+        n = 1;
+        while lx_is_alnum(load8(src + pos + n)) == 1 { n = n + 1; }
+        store64(g_tok_kind, lx_classify(src, pos, n));
+        return n;
+    }
+    store64(g_tok_kind, 0);                    # punctuation
+    return 1;
+}
+
+# COLORREF (0x00BBGGRR) per kind - the NexusEdge neon scheme (pops on deep navy).
+func lex_color(kind: i64) -> i64 {
+    if kind == 1 { return 0x0024BFFB; }       # @DATA/@CODE  gold      (#FBBF24)
+    if kind == 2 { return 0x00FFFF29; }       # keywords     neon cyan (#29FFFF)
+    if kind == 3 { return 0x00C0A06C; }       # types        steel blue(#6CA0C0)
+    if kind == 4 { return 0x00EA92C7; }       # builtins     violet    (#C792EA)
+    if kind == 5 { return 0x0070B070; }       # string/#cmt  green     (#70B070)
+    return 0x00C8C8C8;                          # default      light slate
+}

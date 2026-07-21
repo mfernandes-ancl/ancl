@@ -1,0 +1,30 @@
+# =====================================================================
+#  gdi_v2.ancl - small geometry/layout helpers for GDI UIs.
+# =====================================================================
+
+@CODE
+
+func gdi_rect_width2(rect: ptr) -> i64 {
+    return load32(rect + 8) - load32(rect + 0);
+}
+
+func gdi_rect_height2(rect: ptr) -> i64 {
+    return load32(rect + 12) - load32(rect + 4);
+}
+
+func gdi_rect_offset2(rect: ptr, dx: i64, dy: i64) -> ptr {
+    store32(rect + 0, load32(rect + 0) + dx);
+    store32(rect + 4, load32(rect + 4) + dy);
+    store32(rect + 8, load32(rect + 8) + dx);
+    store32(rect + 12, load32(rect + 12) + dy);
+    return rect;
+}
+
+func gdi_rect_inset2(rect: ptr, dx: i64, dy: i64) -> ptr {
+    store32(rect + 0, load32(rect + 0) + dx);
+    store32(rect + 4, load32(rect + 4) + dy);
+    store32(rect + 8, load32(rect + 8) - dx);
+    store32(rect + 12, load32(rect + 12) - dy);
+    return rect;
+}
+

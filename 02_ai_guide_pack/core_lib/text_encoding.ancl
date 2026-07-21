@@ -1,0 +1,114 @@
+# =====================================================================
+#  Text encoding and line-ending helpers.
+#  Internal editor text is UTF-8 without a BOM.
+# =====================================================================
+
+extern "kernel32.dll" MultiByteToWideChar -> i32;
+extern "kernel32.dll" WideCharToMultiByte -> i32;
+
+@DATA
+TEXT_ENC_ANSI:     i64 = 0;
+TEXT_ENC_UTF8:     i64 = 1;
+TEXT_ENC_UTF8_BOM: i64 = 2;
+TEXT_ENC_UTF16_LE: i64 = 3;
+
+TEXT_EOL_CRLF: i64 = 0;
+TEXT_EOL_LF:   i64 = 1;
+TEXT_EOL_CR:   i64 = 2;
+
+TEXT_CP_ACP:  i64 = 0;
+TEXT_CP_UTF8: i64 = 65001;
+
+@CODE
+func text_utf8_valid(src: i64, n: i64) -> i64 {
+    if n <= 0 { return 1; }
+    if MultiByteToWideChar(TEXT_CP_UTF8, 8, src, n, 0, 0) > 0 { return 1; }
+    return 0;
+}
+
+func text_detect_encoding(src: i64, n: i64) -> i64 {
+    if n >= 3 {
+        if load8(src) == 0xEF { if load8(src + 1) == 0xBB { if load8(src + 2) == 0xBF { return TEXT_ENC_UTF8_BOM; } } }
+    }
+    if n >= 2 { if load8(src) == 0xFF { if load8(src + 1) == 0xFE { return TEXT_ENC_UTF16_LE; } } }
+    if text_utf8_valid(src, n) != 0 { return TEXT_ENC_UTF8; }
+    return TEXT_ENC_ANSI;
+}
+
+func text_detect_eol(src: i64) -> i64 {
+    crlf = 0; lf = 0; cr = 0; i = 0;
+    while load8(src + i) != 0 {
+        c = load8(src + i);
+        if c == 13 {
+            if load8(src + i + 1) == 10 { crlf = crlf + 1; i = i + 1; } else { cr = cr + 1; }
+        } else { if c == 10 { lf = lf + 1; } }
+        i = i + 1;
+    }
+    if lf > crlf { if lf >= cr { return TEXT_EOL_LF; } }
+    if cr > crlf { if cr > lf { return TEXT_EOL_CR; } }
+    return TEXT_EOL_CRLF;
+}
+
+func text_decode_to_utf8(src: i64, n: i64, enc: i64, dst: i64, cap: i64, wide: i64, wide_cap: i64) -> i64 {
+    if cap <= 0 { return 0 - 1; }
+    if n <= 0 { store8(dst, 0); return 0; }
+    if enc == TEXT_ENC_UTF8 || enc == TEXT_ENC_UTF8_BOM {
+        off = 0; if enc == TEXT_ENC_UTF8_BOM { off = 3; }
+        count = n - off; if count >= cap { return 0 - 1; }
+        memcpy(dst, src + off, count); store8(dst + count, 0); return count;
+    }
+    if enc == TEXT_ENC_UTF16_LE {
+        if n < 2 { store8(dst, 0); return 0; }
+        wcount = (n - 2) / 2; if wcount > wide_cap { return 0 - 1; }
+        count = WideCharToMultiByte(TEXT_CP_UTF8, 0, src + 2, wcount, dst, cap - 1, 0, 0);
+        if count <= 0 { return 0 - 1; } store8(dst + count, 0); return count;
+    }
+    wcount = MultiByteToWideChar(TEXT_CP_ACP, 0, src, n, wide, wide_cap);
+    if wcount <= 0 { return 0 - 1; }
+    count = WideCharToMultiByte(TEXT_CP_UTF8, 0, wide, wcount, dst, cap - 1, 0, 0);
+    if count <= 0 { return 0 - 1; } store8(dst + count, 0); return count;
+}
+
+func text_normalize_eol(src: i64, dst: i64, cap: i64, eol: i64) -> i64 {
+    i = 0; j = 0;
+    while load8(src + i) != 0 {
+        c = load8(src + i);
+        if c == 13 || c == 10 {
+            if c == 13 { if load8(src + i + 1) == 10 { i = i + 1; } }
+            if eol == TEXT_EOL_CRLF {
+                if j + 2 >= cap { return 0 - 1; } store8(dst + j, 13); store8(dst + j + 1, 10); j = j + 2;
+            } else {
+                if j + 1 >= cap { return 0 - 1; }
+                if eol == TEXT_EOL_LF { store8(dst + j, 10); } else { store8(dst + j, 13); }
+                j = j + 1;
+            }
+        } else {
+            if j + 1 >= cap { return 0 - 1; } store8(dst + j, c); j = j + 1;
+        }
+        i = i + 1;
+    }
+    store8(dst + j, 0); return j;
+}
+
+func text_encode_from_utf8(src: i64, n: i64, enc: i64, dst: i64, cap: i64, wide: i64, wide_cap: i64) -> i64 {
+    if cap <= 0 { return 0 - 1; }
+    if enc == TEXT_ENC_UTF8 || enc == TEXT_ENC_UTF8_BOM {
+        off = 0;
+        if enc == TEXT_ENC_UTF8_BOM {
+            if cap < 4 { return 0 - 1; } store8(dst, 0xEF); store8(dst + 1, 0xBB); store8(dst + 2, 0xBF); off = 3;
+        }
+        if n + off >= cap { return 0 - 1; }
+        memcpy(dst + off, src, n); store8(dst + off + n, 0); return off + n;
+    }
+    wcount = MultiByteToWideChar(TEXT_CP_UTF8, 8, src, n, wide, wide_cap);
+    if n == 0 { wcount = 0; }
+    if n > 0 { if wcount <= 0 { return 0 - 1; } }
+    if enc == TEXT_ENC_UTF16_LE {
+        bytes = wcount * 2; if bytes + 2 >= cap { return 0 - 1; }
+        store8(dst, 0xFF); store8(dst + 1, 0xFE); memcpy(dst + 2, wide, bytes); store8(dst + 2 + bytes, 0); store8(dst + 3 + bytes, 0); return bytes + 2;
+    }
+    count = WideCharToMultiByte(TEXT_CP_ACP, 0, wide, wcount, dst, cap - 1, 0, 0);
+    if n == 0 { count = 0; }
+    if n > 0 { if count <= 0 { return 0 - 1; } }
+    store8(dst + count, 0); return count;
+}

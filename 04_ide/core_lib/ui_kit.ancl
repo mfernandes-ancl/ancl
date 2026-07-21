@@ -1,0 +1,272 @@
+# =====================================================================
+#  ui_kit.ancl  -  Reusable themed Win32 widgets (core_lib).
+#
+#  Theme-agnostic building blocks that read the active palette from
+#  ui_theme.ancl: an owner-drawn GlowButton (rounded, hover, optional
+#  accent fill), card / panel / status-dot painters, small text helpers,
+#  and a themed ListView (report grid). Used by AetherEdge and reusable
+#  by any future native ANCL app (dark or light, per ui_theme).
+# =====================================================================
+import "ui_theme.ancl";
+
+extern "gdi32.dll"  RoundRect;
+extern "gdi32.dll"  GetStockObject -> ptr;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowLongPtrA -> i64;
+extern "user32.dll" SetWindowLongPtrA -> i64;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" TrackMouseEvent;
+extern "user32.dll" GetParent -> ptr;
+
+@DATA
+nad_cls_glow: str = "AetherGlowBtn";
+nad_cls_lv:   str = "SysListView32";
+nad_empty:    str = "";
+nad_glow_reg: buf = 8;
+nad_glow_wc:  buf = 88;
+nad_ps:       buf = 72;      # PAINTSTRUCT
+nad_rc:       buf = 16;      # RECT scratch (glow paint)
+nad_rc2:      buf = 16;      # RECT scratch (fills / cards / text)
+nad_track:    buf = 24;      # TRACKMOUSEEVENT
+nad_btntext:  buf = 128;     # GetWindowTextA scratch
+nad_lvcol:    buf = 64;      # LVCOLUMN
+nad_lvitem:   buf = 64;      # LVITEM
+nad_numbuf:   buf = 32;
+
+@CODE
+# ---- small string helpers -----------------------------------------
+func nad_strlen(s: i64) -> i64 { n = 0; while load8(s + n) != 0 { n = n + 1; } return n; }
+func nad_strcpy(dst: i64, src: i64) -> i64 {
+    d = dst; s = src;
+    while load8(s) != 0 { store8(d, load8(s)); d = d + 1; s = s + 1; }
+    store8(d, 0);
+    return d;
+}
+# unsigned int -> decimal string in dst; returns end ptr.
+func nad_itoa(v: i64, dst: i64) -> i64 {
+    if v == 0 { store8(dst, 48); store8(dst + 1, 0); return dst + 1; }
+    tmp = nad_numbuf; n = 0; x = v;
+    while x > 0 { store8(tmp + n, 48 + x - x / 10 * 10); x = x / 10; n = n + 1; }
+    i = 0;
+    while i < n { store8(dst + i, load8(tmp + n - 1 - i)); i = i + 1; }
+    store8(dst + n, 0);
+    return dst + n;
+}
+
+# ---- drawing primitives -------------------------------------------
+# Fill a rectangle (l,t,r,b) with an HBRUSH.
+func nad_fill(hdc: i64, l: i64, t: i64, r: i64, b: i64, brush: i64) -> i64 {
+    store32(nad_rc2 + 0, l); store32(nad_rc2 + 4, t);
+    store32(nad_rc2 + 8, r); store32(nad_rc2 + 12, b);
+    FillRect(hdc, nad_rc2, brush);
+    return 0;
+}
+# White rounded card with a soft border (l,t,r,b).
+func nad_card(hdc: i64, l: i64, t: i64, r: i64, b: i64) -> i64 {
+    ob = SelectObject(hdc, load64(nad_b_card));
+    op = SelectObject(hdc, load64(nad_p_border));
+    RoundRect(hdc, l, t, r, b, 8, 8);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    return 0;
+}
+# Filled status dot (circle) of `brush`, centred at (cx,cy), radius rad.
+func nad_dot(hdc: i64, cx: i64, cy: i64, rad: i64, brush: i64) -> i64 {
+    ob = SelectObject(hdc, brush);                     # solid colour fill
+    op = SelectObject(hdc, GetStockObject(8));         # NULL_PEN (no outline)
+    Ellipse(hdc, cx - rad, cy - rad, cx + rad, cy + rad);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    return 0;
+}
+# Text at (x,y): color + font, transparent background.
+func nad_text(hdc: i64, x: i64, y: i64, s: i64, color: i64, font: i64) -> i64 {
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, color);
+    of = SelectObject(hdc, font);
+    TextOutA(hdc, x, y, s, nad_strlen(s));
+    SelectObject(hdc, of);
+    return 0;
+}
+# Text drawn into a rect (l,t,r,b) with DrawTextA flags (e.g. 0x25 = center|vcenter|singleline).
+func nad_text_rc(hdc: i64, l: i64, t: i64, r: i64, b: i64, s: i64, color: i64, font: i64, flags: i64) -> i64 {
+    store32(nad_rc2 + 0, l); store32(nad_rc2 + 4, t);
+    store32(nad_rc2 + 8, r); store32(nad_rc2 + 12, b);
+    SetBkMode(hdc, 1);
+    SetTextColor(hdc, color);
+    of = SelectObject(hdc, font);
+    DrawTextA(hdc, s, 0 - 1, nad_rc2, flags);
+    SelectObject(hdc, of);
+    return 0;
+}
+
+# ---- GlowButton ----------------------------------------------------
+# Window extra layout: [0]=accent COLORREF, [8]=filled flag (0/1).
+# State in GWLP_USERDATA (-21): bit0=hover, bit1=pressed.
+func nad_draw_button(hdc: i64, l: i64, t: i64, r: i64, b: i64, label: i64, state: i64, accent: i64, filled: i64) -> i64 {
+    hover = band(state, 1);
+    pressed = band(state, 2);
+    tmpbr = 0;
+    if filled != 0 {
+        col = accent;
+        if pressed != 0 { col = load64(nad_c_sel); }
+        tmpbr = CreateSolidBrush(col);
+        ob = SelectObject(hdc, tmpbr);
+        op = SelectObject(hdc, load64(nad_p_border));
+        RoundRect(hdc, l, t, r, b, 6, 6);
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        nad_text_rc(hdc, l, t, r, b, label, load64(nad_c_onbar), load64(nad_f_ui), 0x25);
+        DeleteObject(tmpbr);
+        return 0;
+    }
+    # outlined: white/hover fill, accent text, accent border on hover
+    br = load64(nad_b_card);
+    if hover != 0 { br = load64(nad_b_hover); }
+    tmppen = CreatePen(0, 1, accent);
+    pen = load64(nad_p_border);
+    if hover != 0 { pen = tmppen; }
+    ob = SelectObject(hdc, br);
+    op = SelectObject(hdc, pen);
+    RoundRect(hdc, l, t, r, b, 6, 6);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    nad_text_rc(hdc, l, t, r, b, label, accent, load64(nad_f_ui), 0x25);
+    DeleteObject(tmppen);
+    return 0;
+}
+
+func NadGlowProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 { SetWindowLongPtrA(hwnd, 0 - 21, 0); return 0; }        # WM_CREATE
+    if msg == 512 {                                                     # WM_MOUSEMOVE
+        st = GetWindowLongPtrA(hwnd, 0 - 21);
+        if band(st, 1) == 0 {
+            SetWindowLongPtrA(hwnd, 0 - 21, bor(st, 1));
+            InvalidateRect(hwnd, 0, 1);
+            store32(nad_track + 0, 24); store32(nad_track + 4, 2);
+            store64(nad_track + 8, hwnd); store64(nad_track + 16, 0);
+            TrackMouseEvent(nad_track);
+        }
+        return 0;
+    }
+    if msg == 675 {                                                     # WM_MOUSELEAVE
+        st = GetWindowLongPtrA(hwnd, 0 - 21);
+        SetWindowLongPtrA(hwnd, 0 - 21, band(st, 2));
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {                                                     # WM_LBUTTONDOWN
+        st = GetWindowLongPtrA(hwnd, 0 - 21);
+        SetWindowLongPtrA(hwnd, 0 - 21, bor(st, 2));
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 {                                                     # WM_LBUTTONUP
+        st = GetWindowLongPtrA(hwnd, 0 - 21);
+        if band(st, 2) != 0 {
+            ReleaseCapture();
+            SetWindowLongPtrA(hwnd, 0 - 21, band(st, 1));
+            InvalidateRect(hwnd, 0, 1);
+            GetClientRect(hwnd, nad_rc);
+            ux = band(lp, 65535);
+            uy = band(shr(lp, 16), 65535);
+            if ux < load32(nad_rc + 8) { if uy < load32(nad_rc + 12) {
+                SendMessageA(GetParent(hwnd), 273, GetWindowLongPtrA(hwnd, 0 - 12), hwnd);
+            } }
+        }
+        return 0;
+    }
+    if msg == 15 {                                                     # WM_PAINT
+        hdc = BeginPaint(hwnd, nad_ps);
+        GetClientRect(hwnd, nad_rc);
+        st = GetWindowLongPtrA(hwnd, 0 - 21);
+        ds = 0;
+        if band(st, 2) != 0 { ds = bor(ds, 2); }
+        if band(st, 1) != 0 { ds = bor(ds, 1); }
+        accent = GetWindowLongPtrA(hwnd, 0);
+        filled = GetWindowLongPtrA(hwnd, 8);
+        GetWindowTextA(hwnd, nad_btntext, 128);
+        nad_draw_button(hdc, 0, 0, load32(nad_rc + 8), load32(nad_rc + 12), nad_btntext, ds, accent, filled);
+        EndPaint(hwnd, nad_ps);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+func nad_register_glowbtn(hinst: i64) -> i64 {
+    if load64(nad_glow_reg) == 1 { return 0; }
+    cur = LoadCursorA(0, 32512);
+    store32(nad_glow_wc + 0, 80);                # cbSize
+    store32(nad_glow_wc + 4, 3);                 # CS_HREDRAW|CS_VREDRAW
+    store64(nad_glow_wc + 8, &NadGlowProc);
+    store32(nad_glow_wc + 16, 0);                # cbClsExtra
+    store32(nad_glow_wc + 20, 24);               # cbWndExtra (accent@0, filled@8, spare@16)
+    store64(nad_glow_wc + 24, hinst);
+    store64(nad_glow_wc + 32, 0);                # hIcon
+    store64(nad_glow_wc + 40, cur);
+    store64(nad_glow_wc + 48, 0);                # hbrBackground (we own paint)
+    store64(nad_glow_wc + 56, 0);                # menu
+    store64(nad_glow_wc + 64, nad_cls_glow);
+    store64(nad_glow_wc + 72, 0);                # hIconSm
+    RegisterClassExA(nad_glow_wc);
+    store64(nad_glow_reg, 1);
+    return 0;
+}
+
+# Create a themed button child. filled=1 => solid accent fill + white text
+# (primary actions); filled=0 => outlined, accent-coloured text.
+func nad_make_button(parent: i64, id: i64, text: i64, x: i64, y: i64, w: i64, h: i64, accent: i64, filled: i64, hinst: i64) -> i64 {
+    hb = CreateWindowExA(0, nad_cls_glow, text, 0x50000000, x, y, w, h, parent, id, hinst, 0);
+    SetWindowLongPtrA(hb, 0, accent);
+    SetWindowLongPtrA(hb, 8, filled);
+    SendMessageA(hb, 48, load64(nad_f_ui), 1);   # WM_SETFONT
+    return hb;
+}
+
+# Apply the UI font to any control.
+func nad_theme_control(ctrl: i64) -> i64 {
+    if ctrl != 0 { SendMessageA(ctrl, 48, load64(nad_f_ui), 1); }
+    return 0;
+}
+
+# ---- themed ListView (report grid) --------------------------------
+func nad_make_listview(parent: i64, id: i64, x: i64, y: i64, w: i64, h: i64, hinst: i64) -> i64 {
+    # WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SHOWSELALWAYS = 0x50000009
+    hlv = CreateWindowExA(0, nad_cls_lv, nad_empty, 0x50000009, x, y, w, h, parent, id, hinst, 0);
+    SendMessageA(hlv, 4150, 0x21, 0x21);            # LVM_SETEXTENDEDLISTVIEWSTYLE: FULLROWSELECT|GRIDLINES
+    SendMessageA(hlv, 4097, 0, load64(nad_c_card)); # LVM_SETBKCOLOR
+    SendMessageA(hlv, 4132, 0, load64(nad_c_text)); # LVM_SETTEXTCOLOR
+    SendMessageA(hlv, 4134, 0, load64(nad_c_card)); # LVM_SETTEXTBKCOLOR
+    SendMessageA(hlv, 48, load64(nad_f_ui), 1);     # WM_SETFONT
+    return hlv;
+}
+func nad_lv_col(hlv: i64, idx: i64, width: i64, title: i64) -> i64 {
+    store32(nad_lvcol + 0, 15);                     # LVCF_FMT|WIDTH|TEXT|SUBITEM
+    store32(nad_lvcol + 4, 0);                      # LVCFMT_LEFT
+    store32(nad_lvcol + 8, width);
+    store64(nad_lvcol + 16, title);                 # pszText
+    store32(nad_lvcol + 28, idx);                   # iSubItem
+    SendMessageA(hlv, 4123, idx, nad_lvcol);        # LVM_INSERTCOLUMNA
+    return 0;
+}
+func nad_lv_setcell(hlv: i64, row: i64, col: i64, text: i64) -> i64 {
+    store32(nad_lvitem + 0, 1);                     # LVIF_TEXT
+    store32(nad_lvitem + 4, row);
+    store32(nad_lvitem + 8, col);
+    store64(nad_lvitem + 24, text);
+    SendMessageA(hlv, 4142, row, nad_lvitem);       # LVM_SETITEMTEXTA
+    return 0;
+}
+# Insert a 6-column row; returns the new row index.
+func nad_lv_row(hlv: i64, c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64) -> i64 {
+    count = SendMessageA(hlv, 4100, 0, 0);          # LVM_GETITEMCOUNT
+    store32(nad_lvitem + 0, 1);
+    store32(nad_lvitem + 4, count);
+    store32(nad_lvitem + 8, 0);
+    store64(nad_lvitem + 24, c0);
+    SendMessageA(hlv, 4103, 0, nad_lvitem);         # LVM_INSERTITEMA
+    if c1 != 0 { nad_lv_setcell(hlv, count, 1, c1); }
+    if c2 != 0 { nad_lv_setcell(hlv, count, 2, c2); }
+    if c3 != 0 { nad_lv_setcell(hlv, count, 3, c3); }
+    if c4 != 0 { nad_lv_setcell(hlv, count, 4, c4); }
+    if c5 != 0 { nad_lv_setcell(hlv, count, 5, c5); }
+    return count;
+}

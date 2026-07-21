@@ -1,0 +1,77 @@
+# =====================================================================
+#  win32_com.ancl  -  Minimal COM (OLE) runtime bindings for ANCL (core_lib)
+#
+#  Phase 6.11. Built on the `callp(fnptr, args...)` indirect-call primitive
+#  added to anclc.cpp: COM interface methods are dispatched through the
+#  object's vtable (method = *(*obj + idx*8)), which requires calling a
+#  RUNTIME pointer -- exactly what `callp` provides.
+#
+#  This is what makes a real OPC DA (COM/DCOM) client expressible in ANCL.
+#  No global @DATA here; this is a pure-function library module (like
+#  std.ancl / win32_api.ancl). GUID/CLSID/IID blobs live in the caller.
+#
+#  ABI note: on x64 there is ONE calling convention, so COM "thiscall"
+#  methods take `this` in RCX exactly like every other call -- callp just
+#  passes `obj` as the first argument. HRESULTs are 32-bit, and callp
+#  sign-extends the return, so FAILED(hr) is simply `hr < 0` (or `hr != 0`).
+# =====================================================================
+
+# ---- ole32: COM bootstrap (HRESULT returns are 32-bit -> default extern) --
+extern "ole32.dll" CoInitializeEx;     # HRESULT CoInitializeEx(pvReserved, dwCoInit)
+extern "ole32.dll" CoUninitialize;     # void    CoUninitialize(void)
+extern "ole32.dll" CoCreateInstance;   # HRESULT CoCreateInstance(rclsid, pUnkOuter, dwClsCtx, riid, ppv)
+extern "ole32.dll" CoCreateInstanceEx; # HRESULT CoCreateInstanceEx(rclsid, pUnkOuter, dwClsCtx, COSERVERINFO*, cmq, MULTI_QI*) -- remote DCOM
+extern "ole32.dll" CLSIDFromProgID;    # HRESULT CLSIDFromProgID(lpszProgID(LPCWSTR), pclsid)
+extern "ole32.dll" CLSIDFromString;    # HRESULT CLSIDFromString(lpsz(LPCWSTR "{guid}"), pclsid) -- for legacy servers w/o usable ProgID
+extern "ole32.dll" CoTaskMemFree;      # void    CoTaskMemFree(pv)   -- frees server-allocated [out] arrays
+
+# COINIT / CLSCTX constants are passed as plain integers by callers:
+#   COINIT_APARTMENTTHREADED=0x2  COINIT_MULTITHREADED=0x0
+#   CLSCTX_INPROC_SERVER=0x1      CLSCTX_LOCAL_SERVER=0x4   (OPC DA servers are usually out-of-proc)
+
+# ---- vtable dispatch -------------------------------------------------------
+# Method pointer for vtable slot `idx` of any COM object:  *(*obj + idx*8)
+func vmeth(obj: ptr, idx: i64) -> ptr {
+    return load64(load64(obj) + idx * 8);
+}
+
+# ---- IUnknown (slots 0/1/2 of EVERY COM interface) -------------------------
+func com_qi(obj: ptr, iid: ptr, ppOut: ptr) -> i64 {
+    return callp(vmeth(obj, 0), obj, iid, ppOut);   # QueryInterface(this, riid, ppv)
+}
+func com_addref(obj: ptr) -> i64 {
+    return callp(vmeth(obj, 1), obj);               # AddRef(this)
+}
+func com_release(obj: ptr) -> i64 {
+    if obj == 0 { return 0; }
+    return callp(vmeth(obj, 2), obj);               # Release(this)
+}
+
+# ---- ASCII -> UTF-16LE widening -------------------------------------------
+# COM string args (ProgID, OPC item/group names) are LPCWSTR. Widen an ASCII
+# C-string `src` into `dst` (each byte -> a 16-bit code unit) incl. the NUL
+# terminator. `dst` must hold (strlen(src)+1)*2 bytes. Returns dst.
+func a2w(dst: ptr, src: ptr) -> ptr {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store16(dst + i * 2, c);
+        if c == 0 { break; }
+        i = i + 1;
+    }
+    return dst;
+}
+
+# UTF-16LE (wide) -> ASCII. Narrows each 16-bit code unit to its low byte
+# (fine for ProgIDs / ASCII item IDs and BSTR values). `dst` needs strlen+1
+# bytes. Used to display COM-returned LPWSTR/BSTR strings. Returns dst.
+func w2a(dst: ptr, src: ptr) -> ptr {
+    i = 0;
+    while 1 {
+        c = load16(src + i * 2);
+        store8(dst + i, band(c, 255));
+        if c == 0 { break; }
+        i = i + 1;
+    }
+    return dst;
+}

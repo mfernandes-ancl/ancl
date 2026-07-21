@@ -1,0 +1,579 @@
+# =====================================================================
+#  lexer.ancl  -  ANCL tokenizer for anclc2 (self-hosting compiler)
+#
+#  Converts raw source bytes into a flat parallel token array.
+#  All token text (identifiers, string values) is stored in g_str_pool.
+#  Call lex_init(src_ptr, src_len) -> token_count (0 on error).
+# =====================================================================
+
+@DATA
+
+# --- Token kind constants ---
+TOK_END:        i64 = 0;
+TOK_IDENT:      i64 = 1;
+TOK_INT:        i64 = 2;
+TOK_STR:        i64 = 3;
+TOK_KWFUNC:     i64 = 4;
+TOK_KWIF:       i64 = 5;
+TOK_KWELSE:     i64 = 6;
+TOK_KWWHILE:    i64 = 7;
+TOK_KWRETURN:   i64 = 8;
+TOK_KWBREAK:    i64 = 9;
+TOK_KWCONTINUE: i64 = 10;
+TOK_KWSYSCALL:  i64 = 11;
+TOK_KWSTRUCT:   i64 = 12;
+TOK_KWIMPORT:   i64 = 13;
+TOK_KWEXTERN:   i64 = 14;
+TOK_KWDATA:     i64 = 15;
+TOK_KWCODE:     i64 = 16;
+TOK_KWLOOP:     i64 = 17;
+TOK_LPAREN:     i64 = 18;
+TOK_RPAREN:     i64 = 19;
+TOK_LBRACE:     i64 = 20;
+TOK_RBRACE:     i64 = 21;
+TOK_LBRACKET:   i64 = 22;
+TOK_RBRACKET:   i64 = 23;
+TOK_COLON:      i64 = 24;
+TOK_SEMI:       i64 = 25;
+TOK_COMMA:      i64 = 26;
+TOK_ARROW:      i64 = 27;
+TOK_ASSIGN:     i64 = 28;
+TOK_DOT:        i64 = 29;
+TOK_PLUS:       i64 = 30;
+TOK_MINUS:      i64 = 31;
+TOK_STAR:       i64 = 32;
+TOK_SLASH:      i64 = 33;
+TOK_PERCENT:    i64 = 34;
+TOK_EQEQ:       i64 = 35;
+TOK_NE:         i64 = 36;
+TOK_LT:         i64 = 37;
+TOK_LE:         i64 = 38;
+TOK_GT:         i64 = 39;
+TOK_GE:         i64 = 40;
+TOK_AMP:        i64 = 41;
+TOK_ANDAND:     i64 = 42;
+TOK_OROR:       i64 = 43;
+TOK_BANG:       i64 = 44;
+TOK_PIPE:       i64 = 45;    # |   bitwise or
+TOK_CARET:      i64 = 46;    # ^   bitwise xor
+TOK_SHL:        i64 = 47;    # <<  shift left
+TOK_SHR:        i64 = 48;    # >>  shift right
+TOK_KWTOOL:     i64 = 49;    # tool  (LLM-callable fn + JSON-Schema descriptor)
+TOK_FATARROW:   i64 = 50;    # =>    match arm (feature #5)
+TOK_FLOAT:      i64 = 51;    # f64 literal; g_tok_ival holds the raw IEEE-754 bits
+
+# --- Parallel token arrays (65536 tokens * 8 bytes each = 524288) ---
+g_tok_kind:  buf = 524288;
+g_tok_ival:  buf = 524288;
+g_tok_toff:  buf = 524288;
+g_tok_tlen:  buf = 524288;
+g_tok_line:  buf = 524288;
+g_tok_srcoff: buf = 524288;   # F1/F2: source byte offset where each token STARTS in g_src (--fix splice point)
+g_tok_count: buf = 8;
+
+# --- String / identifier text pool (256KB) ---
+g_str_pool:     buf = 262144;
+g_str_pool_off: buf = 8;
+
+# --- Error strings ---
+lex_err_over: str = "[lex] too many tokens\n";
+lex_err_pool: str = "[lex] string pool overflow\n";
+lex_err_str:  str = "[lex] unterminated string\n";
+
+@CODE
+
+# ----------------------------------------------------------------
+#  Character classification helpers
+# ----------------------------------------------------------------
+func lex_isident_start(c: i64) -> i64 {
+    if c == 64  { return 1; }    # '@'
+    if c == 95  { return 1; }    # '_'
+    if c >= 65  { if c <= 90  { return 1; } }   # A-Z
+    if c >= 97  { if c <= 122 { return 1; } }   # a-z
+    return 0;
+}
+
+func lex_isalnum(c: i64) -> i64 {
+    if c == 95  { return 1; }    # '_'
+    if c >= 48  { if c <= 57  { return 1; } }   # 0-9
+    if c >= 65  { if c <= 90  { return 1; } }   # A-Z
+    if c >= 97  { if c <= 122 { return 1; } }   # a-z
+    return 0;
+}
+
+func lex_isdigit(c: i64) -> i64 {
+    if c >= 48 { if c <= 57 { return 1; } }
+    return 0;
+}
+
+func lex_ishex(c: i64) -> i64 {
+    if c >= 48 { if c <= 57  { return 1; } }
+    if c >= 65 { if c <= 70  { return 1; } }
+    if c >= 97 { if c <= 102 { return 1; } }
+    return 0;
+}
+
+func lex_hexval(c: i64) -> i64 {
+    if c >= 48 { if c <= 57  { return c - 48; } }
+    if c >= 65 { if c <= 70  { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  lex_f64_bits(m, decexp) -> raw IEEE-754 bits of  m * 10^decexp
+#  This is the ONLY place the compiler uses f64 itself: it dogfoods
+#  the float support being added.  Clinger fast-path -- exact for
+#  m < 2^53 and |decexp| <= 22 (every literal a human writes), and
+#  graceful (one extra rounding) past that.  The result is the same
+#  i64 bit-pattern strtod would yield, so g_tok_ival carries it.
+# ----------------------------------------------------------------
+func lex_f64_bits(m: i64, decexp: i64) -> i64 {
+    f = itof(m);          # mantissa as a double
+    p = 1.0;              # 10^|decexp|
+    n = decexp;
+    if n < 0 { n = 0 - n; }
+    i = 0;
+    while i < n {
+        p = p * 10.0;
+        i = i + 1;
+    }
+    if decexp >= 0 { f = f * p; }
+    if decexp <  0 { f = f / p; }
+    return fbits(f);
+}
+
+# ----------------------------------------------------------------
+#  Pool helper: append one byte
+# ----------------------------------------------------------------
+func lex_pool_putc(ch: i64) -> i64 {
+    off = load64(g_str_pool_off);
+    if off >= 262142 { syscall 1, lex_err_pool; return 0 - 1; }
+    store8(g_str_pool + off, ch);
+    store64(g_str_pool_off, off + 1);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  lex_escape(ch) -> decoded escape character value
+# ----------------------------------------------------------------
+func lex_escape(ch: i64) -> i64 {
+    if ch == 110 { return 10; }    # \n -> LF
+    if ch == 116 { return 9;  }    # \t -> TAB
+    if ch == 114 { return 13; }    # \r -> CR
+    if ch == 48  { return 0;  }    # \0 -> NUL
+    if ch == 92  { return 92; }    # \\ -> backslash
+    if ch == 34  { return 34; }    # \" -> quote
+    if ch == 39  { return 39; }    # \' -> apostrophe
+    return ch;
+}
+
+# ----------------------------------------------------------------
+#  lex_iskw(pool_off, len) -> keyword TOK kind or TOK_IDENT
+# ----------------------------------------------------------------
+func lex_iskw(p: i64, len: i64) -> i64 {
+    c0 = 0; c1 = 0; c2 = 0; c3 = 0; c4 = 0; c5 = 0; c6 = 0; c7 = 0;
+    if len >= 1 { c0 = load8(g_str_pool + p + 0); }
+    if len >= 2 { c1 = load8(g_str_pool + p + 1); }
+    if len >= 3 { c2 = load8(g_str_pool + p + 2); }
+    if len >= 4 { c3 = load8(g_str_pool + p + 3); }
+    if len >= 5 { c4 = load8(g_str_pool + p + 4); }
+    if len >= 6 { c5 = load8(g_str_pool + p + 5); }
+    if len >= 7 { c6 = load8(g_str_pool + p + 6); }
+    if len >= 8 { c7 = load8(g_str_pool + p + 7); }
+
+    # "if" (2)
+    if len == 2 {
+        if c0 == 105 { if c1 == 102 { return TOK_KWIF; } }
+    }
+    # len == 4
+    if len == 4 {
+        # "func"  f=102 u=117 n=110 c=99
+        if c0 == 102 { if c1 == 117 { if c2 == 110 { if c3 == 99  { return TOK_KWFUNC; } } } }
+        # "else"  e=101 l=108 s=115 e=101
+        if c0 == 101 { if c1 == 108 { if c2 == 115 { if c3 == 101 { return TOK_KWELSE; } } } }
+        # "loop"  l=108 o=111 o=111 p=112
+        if c0 == 108 { if c1 == 111 { if c2 == 111 { if c3 == 112 { return TOK_KWLOOP; } } } }
+        # "tool"  t=116 o=111 o=111 l=108
+        if c0 == 116 { if c1 == 111 { if c2 == 111 { if c3 == 108 { return TOK_KWTOOL; } } } }
+    }
+    # len == 5
+    if len == 5 {
+        # "while" w=119 h=104 i=105 l=108 e=101
+        if c0 == 119 { if c1 == 104 { if c2 == 105 { if c3 == 108 { if c4 == 101 { return TOK_KWWHILE; } } } } }
+        # "break" b=98 r=114 e=101 a=97 k=107
+        if c0 == 98  { if c1 == 114 { if c2 == 101 { if c3 == 97  { if c4 == 107 { return TOK_KWBREAK; } } } } }
+        # @DATA   @=64 D=68 A=65 T=84 A=65
+        if c0 == 64  { if c1 == 68  { if c2 == 65  { if c3 == 84  { if c4 == 65  { return TOK_KWDATA; } } } } }
+        # @CODE   @=64 C=67 O=79 D=68 E=69
+        if c0 == 64  { if c1 == 67  { if c2 == 79  { if c3 == 68  { if c4 == 69  { return TOK_KWCODE; } } } } }
+    }
+    # len == 6
+    if len == 6 {
+        # "return" r=114 e=101 t=116 u=117 r=114 n=110
+        if c0 == 114 { if c1 == 101 { if c2 == 116 { if c3 == 117 { if c4 == 114 { if c5 == 110 { return TOK_KWRETURN; } } } } } }
+        # "struct" s=115 t=116 r=114 u=117 c=99  t=116
+        if c0 == 115 { if c1 == 116 { if c2 == 114 { if c3 == 117 { if c4 == 99  { if c5 == 116 { return TOK_KWSTRUCT; } } } } } }
+        # "import" i=105 m=109 p=112 o=111 r=114 t=116
+        if c0 == 105 { if c1 == 109 { if c2 == 112 { if c3 == 111 { if c4 == 114 { if c5 == 116 { return TOK_KWIMPORT; } } } } } }
+        # "extern" e=101 x=120 t=116 e=101 r=114 n=110
+        if c0 == 101 { if c1 == 120 { if c2 == 116 { if c3 == 101 { if c4 == 114 { if c5 == 110 { return TOK_KWEXTERN; } } } } } }
+    }
+    # len == 7
+    if len == 7 {
+        # "syscall" s=115 y=121 s=115 c=99 a=97 l=108 l=108
+        if c0 == 115 { if c1 == 121 { if c2 == 115 { if c3 == 99 { if c4 == 97 { if c5 == 108 { if c6 == 108 { return TOK_KWSYSCALL; } } } } } } }
+    }
+    # len == 8
+    if len == 8 {
+        # "continue" c=99 o=111 n=110 t=116 i=105 n=110 u=117 e=101
+        if c0 == 99 { if c1 == 111 { if c2 == 110 { if c3 == 116 { if c4 == 105 { if c5 == 110 { if c6 == 117 { if c7 == 101 { return TOK_KWCONTINUE; } } } } } } } }
+    }
+    return TOK_IDENT;
+}
+
+# ----------------------------------------------------------------
+#  lex_tok_set: store one token into parallel arrays at index idx
+# ----------------------------------------------------------------
+func lex_tok_set(idx: i64, kind: i64, ival: i64, toff: i64, tlen: i64, line: i64) -> i64 {
+    base = idx * 8;
+    store64(g_tok_kind + base, kind);
+    store64(g_tok_ival + base, ival);
+    store64(g_tok_toff + base, toff);
+    store64(g_tok_tlen + base, tlen);
+    store64(g_tok_line + base, line);
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  lex_init(src, src_len) -> token count  (0 on error)
+#
+#  Single-pass tokenizer.  Uses global g_str_pool for all text.
+# ----------------------------------------------------------------
+func lex_init(src: i64, src_len: i64) -> i64 {
+    store64(g_tok_count, 0);
+    store64(g_str_pool_off, 0);
+
+    pos  = 0;
+    line = 1;
+    ntok = 0;
+
+    while pos < src_len {
+
+        # ---- skip whitespace and # comments ----
+        do_skip = 1;
+        while do_skip == 1 {
+            do_skip = 0;
+            if pos < src_len {
+                sc = load8(src + pos);
+                if sc == 32  { pos = pos + 1; do_skip = 1; }
+                if sc == 9   { pos = pos + 1; do_skip = 1; }
+                if sc == 13  { pos = pos + 1; do_skip = 1; }
+                if sc == 10  { line = line + 1; pos = pos + 1; do_skip = 1; }
+                if sc == 35  {
+                    pos = pos + 1;
+                    in_cmt = 1;
+                    while in_cmt == 1 {
+                        if pos >= src_len { in_cmt = 0; }
+                        if in_cmt == 1 {
+                            cc = load8(src + pos);
+                            pos = pos + 1;
+                            if cc == 10 { line = line + 1; in_cmt = 0; }
+                        }
+                    }
+                    do_skip = 1;
+                }
+            }
+        }
+
+        if pos >= src_len { pos = src_len; }
+
+        if pos < src_len {
+            c = load8(src + pos);
+
+            # guard max tokens
+            if ntok >= 65534 { syscall 1, lex_err_over; return 0; }
+
+            # F1/F2: record this token's START byte offset in the source (the --fix
+            # splice point for a missing token that should appear before it). `pos`
+            # is the token start here (post whitespace/comment skip); `ntok` is the
+            # index every branch below assigns via lex_tok_set(ntok, ...). Written but
+            # never read unless --fix recovery runs -> inert for the normal compile.
+            store64(g_tok_srcoff + ntok * 8, pos);
+
+            # ============================================================
+            # IDENTIFIER / KEYWORD  (alpha, '_', or '@DATA'/'@CODE')
+            # ============================================================
+            if lex_isident_start(c) == 1 {
+                tstart = load64(g_str_pool_off);
+                tlen2  = 0;
+                # Always consume the first character (including '@')
+                lex_pool_putc(c);
+                tlen2 = 1;
+                pos   = pos + 1;
+                going  = 1;
+                while going == 1 {
+                    if pos >= src_len { going = 0; }
+                    if going == 1 {
+                        ch2 = load8(src + pos);
+                        if lex_isalnum(ch2) == 1 {
+                            lex_pool_putc(ch2);
+                            tlen2 = tlen2 + 1;
+                            pos   = pos + 1;
+                        }
+                        if lex_isalnum(ch2) == 0 { going = 0; }
+                    }
+                }
+                kind2 = lex_iskw(tstart, tlen2);
+                lex_tok_set(ntok, kind2, 0, tstart, tlen2, line);
+                ntok = ntok + 1;
+            }
+
+            # ============================================================
+            # INTEGER / HEX LITERAL
+            # ============================================================
+            if lex_isdigit(c) == 1 {
+                ival2  = 0;
+                is_hex = 0;
+                fl_is  = 0;       # 1 if this literal turns out to be an f64
+                fl_de  = 0;       # base-10 exponent to apply (fraction + e-notation)
+                # check 0x prefix
+                if c == 48 {
+                    if pos + 1 < src_len {
+                        nc = load8(src + pos + 1);
+                        if nc == 120 { is_hex = 1; pos = pos + 2; }
+                        if nc == 88  { is_hex = 1; pos = pos + 2; }
+                    }
+                }
+                if is_hex == 1 {
+                    going = 1;
+                    while going == 1 {
+                        if pos >= src_len { going = 0; }
+                        if going == 1 {
+                            hc = load8(src + pos);
+                            if lex_ishex(hc) == 1 {
+                                ival2 = ival2 * 16 + lex_hexval(hc);
+                                pos   = pos + 1;
+                            }
+                            if lex_ishex(hc) == 0 { going = 0; }
+                        }
+                    }
+                }
+                if is_hex == 0 {
+                    going = 1;
+                    while going == 1 {
+                        if pos >= src_len { going = 0; }
+                        if going == 1 {
+                            dc = load8(src + pos);
+                            if lex_isdigit(dc) == 1 {
+                                ival2 = ival2 * 10 + (dc - 48);
+                                pos   = pos + 1;
+                            }
+                            if lex_isdigit(dc) == 0 { going = 0; }
+                        }
+                    }
+                    # ---- fraction: '.' immediately followed by a digit ----
+                    # (so "<int>.field" stays TOK_INT + TOK_DOT, matching the bootstrap)
+                    fl_p0 = 0; if pos     < src_len { fl_p0 = load8(src + pos);     }
+                    fl_p1 = 0; if pos + 1 < src_len { fl_p1 = load8(src + pos + 1); }
+                    if fl_p0 == 46 {
+                        if lex_isdigit(fl_p1) == 1 {
+                            fl_is = 1;
+                            pos   = pos + 1;                 # consume '.'
+                            going = 1;
+                            while going == 1 {
+                                if pos >= src_len { going = 0; }
+                                if going == 1 {
+                                    fl_fc = load8(src + pos);
+                                    if lex_isdigit(fl_fc) == 1 { ival2 = ival2 * 10 + (fl_fc - 48); fl_de = fl_de - 1; pos = pos + 1; }
+                                    if lex_isdigit(fl_fc) == 0 { going = 0; }
+                                }
+                            }
+                        }
+                    }
+                    # ---- exponent: e/E [ +/- ] digits  (1.5e3, 2e10, 2E-5) ----
+                    fl_p0 = 0; if pos     < src_len { fl_p0 = load8(src + pos);     }
+                    fl_p1 = 0; if pos + 1 < src_len { fl_p1 = load8(src + pos + 1); }
+                    fl_p2 = 0; if pos + 2 < src_len { fl_p2 = load8(src + pos + 2); }
+                    fl_ise = 0;
+                    if fl_p0 == 101 { fl_ise = 1; }          # 'e'
+                    if fl_p0 == 69  { fl_ise = 1; }          # 'E'
+                    if fl_ise == 1 {
+                        fl_ok = 0;
+                        if lex_isdigit(fl_p1) == 1 { fl_ok = 1; }
+                        if fl_p1 == 43 { if lex_isdigit(fl_p2) == 1 { fl_ok = 1; } }   # '+'
+                        if fl_p1 == 45 { if lex_isdigit(fl_p2) == 1 { fl_ok = 1; } }   # '-'
+                        if fl_ok == 1 {
+                            fl_is = 1;
+                            pos   = pos + 1;                 # consume 'e'/'E'
+                            fl_es = 1;
+                            if pos < src_len { if load8(src + pos) == 43 { pos = pos + 1; } }
+                            if pos < src_len { if load8(src + pos) == 45 { fl_es = 0 - 1; pos = pos + 1; } }
+                            fl_ev = 0;
+                            going = 1;
+                            while going == 1 {
+                                if pos >= src_len { going = 0; }
+                                if going == 1 {
+                                    fl_xc = load8(src + pos);
+                                    if lex_isdigit(fl_xc) == 1 { fl_ev = fl_ev * 10 + (fl_xc - 48); pos = pos + 1; }
+                                    if lex_isdigit(fl_xc) == 0 { going = 0; }
+                                }
+                            }
+                            fl_de = fl_de + fl_es * fl_ev;
+                        }
+                    }
+                }
+                if fl_is == 1 { lex_tok_set(ntok, TOK_FLOAT, lex_f64_bits(ival2, fl_de), 0, 0, line); }
+                if fl_is == 0 { lex_tok_set(ntok, TOK_INT,   ival2,                     0, 0, line); }
+                ntok = ntok + 1;
+            }
+
+            # ============================================================
+            # CHAR LITERAL  'x'
+            # ============================================================
+            if c == 39 {
+                pos  = pos + 1;
+                cval = 0;
+                if pos < src_len {
+                    cval = load8(src + pos);
+                    pos  = pos + 1;
+                    if cval == 92 {
+                        if pos < src_len {
+                            cval = lex_escape(load8(src + pos));
+                            pos  = pos + 1;
+                        }
+                    }
+                    if pos < src_len {
+                        if load8(src + pos) == 39 { pos = pos + 1; }
+                    }
+                }
+                lex_tok_set(ntok, TOK_INT, cval, 0, 0, line);
+                ntok = ntok + 1;
+            }
+
+            # ============================================================
+            # STRING LITERAL  "..."
+            # ============================================================
+            if c == 34 {
+                pos    = pos + 1;
+                tstart = load64(g_str_pool_off);
+                tlen2  = 0;
+                going  = 1;
+                while going == 1 {
+                    if pos >= src_len { syscall 1, lex_err_str; return 0; }
+                    sch = load8(src + pos);
+                    if sch == 34 {
+                        pos   = pos + 1;
+                        going = 0;
+                    }
+                    if going == 1 {
+                        pos = pos + 1;
+                        if sch == 92 {
+                            if pos < src_len {
+                                sch = lex_escape(load8(src + pos));
+                                pos = pos + 1;
+                            }
+                        }
+                        lex_pool_putc(sch);
+                        tlen2 = tlen2 + 1;
+                    }
+                }
+                lex_tok_set(ntok, TOK_STR, 0, tstart, tlen2, line);
+                ntok = ntok + 1;
+            }
+
+            # ============================================================
+            # SINGLE-CHAR PUNCTUATION
+            # ============================================================
+            if c == 40  { lex_tok_set(ntok, TOK_LPAREN,   0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 41  { lex_tok_set(ntok, TOK_RPAREN,   0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 123 { lex_tok_set(ntok, TOK_LBRACE,   0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 125 { lex_tok_set(ntok, TOK_RBRACE,   0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 91  { lex_tok_set(ntok, TOK_LBRACKET, 0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 93  { lex_tok_set(ntok, TOK_RBRACKET, 0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 46  { lex_tok_set(ntok, TOK_DOT,      0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 58  { lex_tok_set(ntok, TOK_COLON,    0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 59  { lex_tok_set(ntok, TOK_SEMI,     0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 44  { lex_tok_set(ntok, TOK_COMMA,    0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 43  { lex_tok_set(ntok, TOK_PLUS,     0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 42  { lex_tok_set(ntok, TOK_STAR,     0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 47  { lex_tok_set(ntok, TOK_SLASH,    0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 37  { lex_tok_set(ntok, TOK_PERCENT,  0,0,0,line); ntok=ntok+1; pos=pos+1; }
+            if c == 94  { lex_tok_set(ntok, TOK_CARET,    0,0,0,line); ntok=ntok+1; pos=pos+1; }
+
+            # ============================================================
+            # MULTI-CHAR OPERATORS
+            # ============================================================
+            if c == 38 {
+                pos = pos + 1;
+                kind2 = TOK_AMP;
+                if pos < src_len {
+                    if load8(src + pos) == 38 { kind2 = TOK_ANDAND; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 124 {
+                pos = pos + 1;
+                kind2 = TOK_PIPE;
+                if pos < src_len {
+                    if load8(src + pos) == 124 { kind2 = TOK_OROR; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 33 {
+                pos = pos + 1;
+                kind2 = TOK_BANG;
+                if pos < src_len {
+                    if load8(src + pos) == 61 { kind2 = TOK_NE; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 61 {
+                pos = pos + 1;
+                kind2 = TOK_ASSIGN;
+                if pos < src_len {
+                    if load8(src + pos) == 61 { kind2 = TOK_EQEQ; pos = pos + 1; }
+                    if kind2 == TOK_ASSIGN {                                              # only if '==' didn't fire
+                        if load8(src + pos) == 62 { kind2 = TOK_FATARROW; pos = pos + 1; }   # '=>' (feature #5)
+                    }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 60 {
+                pos = pos + 1;
+                kind2 = TOK_LT;
+                if pos < src_len {
+                    nc = load8(src + pos);
+                    if nc == 61 { kind2 = TOK_LE;  pos = pos + 1; }
+                    if nc == 60 { kind2 = TOK_SHL; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 62 {
+                pos = pos + 1;
+                kind2 = TOK_GT;
+                if pos < src_len {
+                    nc = load8(src + pos);
+                    if nc == 61 { kind2 = TOK_GE;  pos = pos + 1; }
+                    if nc == 62 { kind2 = TOK_SHR; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+            if c == 45 {
+                pos = pos + 1;
+                kind2 = TOK_MINUS;
+                if pos < src_len {
+                    if load8(src + pos) == 62 { kind2 = TOK_ARROW; pos = pos + 1; }
+                }
+                lex_tok_set(ntok, kind2, 0,0,0,line); ntok=ntok+1;
+            }
+        }
+    }
+
+    # sentinel TOK_END
+    store64(g_tok_srcoff + ntok * 8, src_len);   # F1/F2: a missing token at EOF splices at end-of-source
+    lex_tok_set(ntok, TOK_END, 0, 0, 0, line);
+
+    store64(g_tok_count, ntok);
+    return ntok;
+}

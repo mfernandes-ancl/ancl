@@ -1,0 +1,201 @@
+# =====================================================================
+#  gui_v2.ancl - Win32 GUI convenience helpers for native ANCL apps.
+# =====================================================================
+import "gui.ancl";
+import "cstring.ancl";
+
+extern "user32.dll"   CreatePopupMenu -> ptr;
+extern "user32.dll"   CreateMenu -> ptr;
+extern "user32.dll"   AppendMenuA -> i32;
+extern "user32.dll"   EnableMenuItem -> i32;
+extern "user32.dll"   TrackPopupMenu -> i32;
+extern "user32.dll"   SetMenu -> i32;
+extern "user32.dll"   DrawMenuBar -> i32;
+extern "user32.dll"   GetWindowRect -> i32;
+extern "user32.dll"   SetFocus -> ptr;
+extern "comdlg32.dll" GetOpenFileNameA -> i32;
+extern "comdlg32.dll" GetSaveFileNameA -> i32;
+extern "user32.dll"   OpenClipboard -> i32;
+extern "user32.dll"   CloseClipboard -> i32;
+extern "user32.dll"   EmptyClipboard -> i32;
+extern "user32.dll"   SetClipboardData -> ptr;
+extern "user32.dll"   GetClipboardData -> ptr;
+extern "kernel32.dll" GlobalAlloc -> ptr;
+extern "kernel32.dll" GlobalLock -> ptr;
+extern "kernel32.dll" GlobalUnlock -> i32;
+
+@CODE
+
+func gui_menu_create() -> ptr {
+    return CreatePopupMenu();
+}
+
+func gui_menu_bar_create() -> ptr {
+    return CreateMenu();
+}
+
+func gui_menu_bar_popup(menu: i64, popup: i64, label: str) -> i64 {
+    AppendMenuA(menu, 0x10, popup, label); # MF_POPUP
+    return 0;
+}
+
+func gui_menu_popup(menu: i64, popup: i64, label: str) -> i64 {
+    AppendMenuA(menu, 0x10, popup, label); # MF_POPUP
+    return 0;
+}
+
+func gui_set_menu(hwnd: i64, menu: i64) -> i64 {
+    SetMenu(hwnd, menu);
+    DrawMenuBar(hwnd);
+    return 0;
+}
+
+func gui_menu_item(menu: i64, id: i64, label: str) -> i64 {
+    AppendMenuA(menu, 0, id, label);
+    return 0;
+}
+
+func gui_menu_sep(menu: i64) -> i64 {
+    AppendMenuA(menu, 0x800, 0, 0);
+    return 0;
+}
+
+func gui_menu_enable(menu: i64, id: i64, enabled: i64) -> i64 {
+    flags = 0; # MF_BYCOMMAND | MF_ENABLED
+    if enabled == 0 { flags = 1; } # MF_BYCOMMAND | MF_GRAYED
+    EnableMenuItem(menu, id, flags);
+    return 0;
+}
+
+func gui_menu_drop(owner: i64, button: i64, menu: i64, rect: ptr) -> i64 {
+    GetWindowRect(button, rect);
+    TrackPopupMenu(menu, 0, load32(rect + 0), load32(rect + 12), 0, owner, 0);
+    return 0;
+}
+
+func gui_msg_is_keydown(msgbuf: ptr) -> i64 {
+    return load32(msgbuf + 8) == 256;
+}
+
+func gui_msg_vk(msgbuf: ptr) -> i64 {
+    return load64(msgbuf + 16);
+}
+
+func gui_key_down(vkey: i64) -> i64 {
+    return band(GetKeyState(vkey), 0x8000);
+}
+
+func gui_edit_select_all(hwnd: i64) -> i64 {
+    SendMessageA(hwnd, 177, 0, 0 - 1); # EM_SETSEL
+    return hwnd;
+}
+
+func gui_notify_is_click(code: i64) -> i64 {
+    return band(code, 4294967295) == 4294967294; # NM_CLICK
+}
+
+func gui_notify_is_dblclk(code: i64) -> i64 {
+    return band(code, 4294967295) == 4294967293; # NM_DBLCLK
+}
+
+func gui_file_filter_first(dst: ptr, label: str, pattern: str) -> ptr {
+    p = str_copy(dst, label);
+    return str_copy(p + 1, pattern);
+}
+
+func gui_file_filter_add(p: ptr, label: str, pattern: str) -> ptr {
+    p = str_copy(p + 1, label);
+    return str_copy(p + 1, pattern);
+}
+
+func gui_file_filter_done(p: ptr) -> ptr {
+    store8(p + 1, 0);
+    return p + 1;
+}
+
+func gui_ofn_prepare(ofn: ptr, owner: i64, filter: ptr, filebuf: ptr, cap: i64, initial_dir: ptr, title: str, flags: i64, defext: str) -> ptr {
+    memset(ofn, 0, 152);
+    store32(ofn + 0, 152);
+    store64(ofn + 8, owner);
+    store64(ofn + 24, filter);
+    store32(ofn + 44, 1);
+    store64(ofn + 48, filebuf);
+    store32(ofn + 56, cap);
+    if initial_dir != 0 { store64(ofn + 80, initial_dir); }
+    store64(ofn + 88, title);
+    store32(ofn + 96, flags);
+    if defext != 0 { store64(ofn + 104, defext); }
+    return ofn;
+}
+
+func gui_open_file_dialog(ofn: ptr, owner: i64, filter: ptr, filebuf: ptr, cap: i64, initial_dir: ptr, title: str, flags: i64) -> i64 {
+    gui_ofn_prepare(ofn, owner, filter, filebuf, cap, initial_dir, title, flags, 0);
+    return GetOpenFileNameA(ofn);
+}
+
+func gui_save_file_dialog(ofn: ptr, owner: i64, filter: ptr, filebuf: ptr, cap: i64, initial_dir: ptr, title: str, defext: str, flags: i64) -> i64 {
+    gui_ofn_prepare(ofn, owner, filter, filebuf, cap, initial_dir, title, flags, defext);
+    return GetSaveFileNameA(ofn);
+}
+
+func gui_clip_write_text(owner: i64, src: ptr, n: i64) -> i64 {
+    if OpenClipboard(owner) == 0 { return 0; }
+    EmptyClipboard();
+    h = GlobalAlloc(2, n + 1);
+    if h == 0 { CloseClipboard(); return 0; }
+    p = GlobalLock(h);
+    if p == 0 { CloseClipboard(); return 0; }
+    memcpy(p, src, n);
+    store8(p + n, 0);
+    GlobalUnlock(h);
+    SetClipboardData(1, h);
+    CloseClipboard();
+    return 1;
+}
+
+func gui_clip_read_text(owner: i64, dst: ptr, cap: i64) -> i64 {
+    if OpenClipboard(owner) == 0 { return 0; }
+    h = GetClipboardData(1);
+    if h == 0 { CloseClipboard(); return 0; }
+    p = GlobalLock(h);
+    if p == 0 { CloseClipboard(); return 0; }
+    cstr_copy_n(dst, p, cap);
+    GlobalUnlock(h);
+    CloseClipboard();
+    return strlen(dst);
+}
+
+func gui_grid_prepare_subitem_rect(rect: ptr, sub: i64) -> ptr {
+    store32(rect + 0, 0);   # LVIR_BOUNDS
+    store32(rect + 4, sub);
+    store32(rect + 8, 0);
+    store32(rect + 12, 0);
+    return rect;
+}
+
+func gui_grid_get_subitem_rect(hlv: i64, row: i64, sub: i64, rect: ptr) -> i64 {
+    gui_grid_prepare_subitem_rect(rect, sub);
+    return SendMessageA(hlv, 4152, row, rect); # LVM_GETSUBITEMRECT
+}
+
+func gui_grid_show_cell_editor(hlv: i64, edit: i64, grid_x: i64, grid_y: i64, row: i64, sub: i64, text: str, rect: ptr) -> i64 {
+    if sub <= 0 { return 0; }
+    if gui_grid_get_subitem_rect(hlv, row, sub, rect) == 0 { return 0; }
+    x = grid_x + load32(rect + 0) + 1;
+    y = grid_y + load32(rect + 4) + 1;
+    w = load32(rect + 8) - load32(rect + 0) - 2;
+    h = load32(rect + 12) - load32(rect + 4) - 2;
+    if w < 24 { w = 24; }
+    if h < 20 { h = 22; }
+    SetWindowTextA(edit, text);
+    MoveWindow(edit, x, y, w, h, 1);
+    ShowWindow(edit, 1);
+    SetFocus(edit);
+    gui_edit_select_all(edit);
+    return 1;
+}
+
+func gui_grid_hide_cell_editor(edit: i64) -> i64 {
+    if edit != 0 { ShowWindow(edit, 0); }
+    return 0;
+}

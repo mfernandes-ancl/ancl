@@ -1,0 +1,1024 @@
+# =====================================================================
+#  agent.ancl  -  the native agentic tool-use loop, adapted for the IDE.
+#
+#  Lifted from showcase/ancl_agent/ancl_agent.ancl: native tools declared
+#  with feature #2 `tool` (-> tools_json registry), an OpenAI-format
+#  request builder, a tool_calls parser, and a multi-turn loop. Adapted
+#  for the GUI:
+#    - NO console prints (a GUI app has no stdout). Each step appends to
+#      g_chat_log + PostMessage(WM_APP+3) so the UI refreshes the transcript.
+#    - runs on a worker thread spawned by main.ancl.
+#    - the backend (Ollama vs OpenAI-compat) is chosen from settings.ancl.
+#    - tools: read_file, compile_file, list_dir, create_file (create-only).
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+import "UI_controls.ancl";
+import "transport.ancl";
+import "settings.ancl";
+import "engine_host.ancl";
+
+extern "user32.dll" PostMessageA;       # merges with main.ancl's identical decl
+
+@DATA
+# The system prompt is re-prefilled on EVERY turn (no KV prefix cache yet), and
+# the engine's prefill is ~0.1 s/token, so a lean prompt = a fast first token.
+# This concise ANCL primer keeps every load-bearing rule; the old verbose
+# version (with a worked example) tripled prefill time on a local 7B.
+sys_prompt: str = "You are the ANCL coding assistant in Aether Studio. ANCL compiles to native Windows x64 (no runtime). Program: a @DATA section (globals) then a @CODE section (functions); entry func main() -> i32. Types i8 i16 i32 i64 ptr str; global `name: type = value;`; zeroed buffer `name: buf = N;`; string `s: str = \"text\";` (\\n \\t escapes). Print with `syscall 1, x;` (an int prints decimal, a str prints text) -- there is NO printf/format/interpolation and '$' is invalid. Control flow: if / else if / else, while (cond) { }, break, continue -- NO for-loops. Operators + - * / %, == != < <= > >=, && || !, and builtins band bor bxor shl shr. Functions: `func f(a: i64) -> i64 { return a; }`; locals need no declaration (first assignment creates them). ONE assignment per statement (no `a, b = 1, 2`). Builtins: alloc/free, load8/load16/load32/load64, store8/store16/store32/store64, memcpy, memset, strlen, strcmp, str_copy, int_to_str, str_to_int. Structs: `struct P { x: i32; }` gives sizeof(P) and P.x offsets (store32(p + P.x, v)). Be concise.";
+
+# system-prompt TAIL, picked per turn: tool-capable backends get the tool
+# contract; tool-less turns (explain-error / Anthropic single-shot) get an
+# honest no-tools instruction instead of a broken promise. Both kept lean.
+sys_tools: str = "\n\nTOOLS: read_file(path), list_dir(path), compile_file(path), create_file(path,content) [new files only], write_file(path,content) [overwrites]. Paths are relative to the project. To write or fix code: emit the COMPLETE file with create_file/write_file, then compile_file to verify; fix any error and recompile before answering. 'The open file' path + contents are provided when relevant.";
+sys_notools: str = "\n\nNo tools this session -- answer directly; when you write or fix code give the COMPLETE program. 'The open file' path + contents are provided when relevant. Be brief.";
+# FAST chat mode (default for the local engine): a tiny prompt + no tools, so
+# the first token comes back quickly (the engine re-prefills every turn at
+# ~0.1 s/token). Agent tools (the full primer above) are a one-click opt-in.
+sys_chat: str = "You are the Aether Studio assistant, a concise, friendly helper. You know the ANCL language (a native Windows systems language) and can discuss and write code. Keep answers short unless asked for detail.";
+
+g_model:   buf = 256;
+
+# work buffers (g_messages/g_req enlarged to hold an inlined base64 image)
+g_tool_result: buf = 196608;
+g_messages:    buf = 3500000;    # sys + user + inline base64 image (2MB raw cap -> ~2.7MB b64)
+g_history:     buf = 131072;     # rolling conversation memory: prior {user}{assistant} turns, trimmed to fit
+g_req:         buf = 4194304;    # 4MB (model + messages incl. inline base64 image)
+g_resp:        buf = 524288;
+
+# ---- vision: attach an image to the next message (Phase D) ----
+g_has_image:  buf = 8;           # 1 = an image is attached for the next send
+g_img_raw:    buf = 2097152;     # raw image file bytes (cap 2MB)
+g_img_b64:    buf = 2800000;     # base64 of the image (JSON-safe, no escaping) ~ 4/3 * 2MB
+g_img_nread:  buf = 8;           # ReadFile sink
+g_img_mime:   buf = 32;          # "image/png" etc.
+b64tab: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+# Ollama: content string + an images array.  OpenAI: content is a text+image_url array.
+m_img_oll1: str = "\",\"images\":[\"";
+m_img_oll2: str = "\"]}";
+m_img_oai1: str = "\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:";
+m_img_oai2: str = ";base64,";
+m_img_oai3: str = "\"}}]}";
+g_tools_oai:   buf = 16384;
+g_name:        buf = 256;
+g_a1:          buf = 131072;
+g_a2:          buf = 131072;
+g_tcraw:       buf = 262144;    # raw tool_calls echo; must hold an escaped full-file content arg
+g_final:       buf = 131072;
+g_wpath:       buf = 1024;      # resolved path of the last successful write/create (editor apply)
+
+# GUI transcript + state
+g_chat_log:   buf = 131072;
+g_user_msg:   buf = 131072;     # also holds the "explain error" prompt (output + source)
+g_agent_busy: buf = 8;
+g_agent_done: buf = 8;
+g_chat_hwnd:  buf = 8;
+g_suppress_tools: buf = 8;      # 1 = omit the tools array (focused single-shot, e.g. explain-error)
+g_agent_cancel:   buf = 8;      # 1 = Stop requested -> the loop bails after the current turn
+g_agent_stream:   buf = 8;      # 1 = stream this turn's reply into the transcript live (backend 5)
+g_chat_mode:      buf = 8;      # 1 = fast chat (tiny sys_chat prompt, no tools); 0 = full agent
+
+# compiler paths
+g_anclc:    buf = 700;
+g_tmpout:   buf = 700;
+ag_dir:     buf = 600;
+ag_compiler: str = "\\ancl_compiler.exe";
+ag_tmpout:   str = "\\_agent_tmp.exe";
+g_agent_root: buf = 700;        # the project/workspace folder (relative file ops root)
+g_apath:      buf = 1024;       # resolved absolute path scratch
+ag_sep:       str = "\\";
+
+# OpenAI-compat target scratch
+oai_host:    buf = 256;
+oai_port:    buf = 8;
+oai_sec:     buf = 8;
+oai_pathpfx: buf = 256;
+oai_path:    buf = 512;
+oai_key:     buf = 512;
+env_openai_key: str = "OPENAI_API_KEY";
+oai_chat_suffix: str = "/chat/completions";
+
+# compile-capture scratch (Phase-0-verified offsets)
+c_sa:  buf = 24;
+c_si:  buf = 104;
+c_pi:  buf = 24;
+c_hrd: buf = 8;
+c_hwr: buf = 8;
+c_nrd: buf = 8;
+c_cmd: buf = 4096;
+
+# list_dir scratch
+ld_pat:    buf = 700;
+ld_fd:     buf = 320;
+ld_star:   str = "\\*";
+ld_dirpfx: str = "[dir] ";
+
+# literals
+dq:    str = "\"";
+qsq:   str = "\" \"";
+e_pipe:   str = "[compile_file] CreatePipe failed";
+e_spawn:  str = "[compile_file] CreateProcessA failed (ancl_compiler.exe missing?)";
+e_open:   str = "[read_file] cannot open: ";
+e_nodir:  str = "[list_dir] cannot open directory: ";
+e_exists: str = "[create_file] refused: file already exists (or invalid path): ";
+m_created:str = "[create_file] created: ";
+e_wfail:  str = "[write_file] cannot write: ";
+m_wrote:  str = "[write_file] wrote: ";
+e_unk:    str = "[dispatch] unknown tool";
+
+# request framing (OpenAI /api/chat)
+rq1: str = "{\"model\":\"";
+rq2: str = "\",\"messages\":[";
+rq3: str = "],\"tools\":[";
+rq4: str = "],\"stream\":false}";
+# engine options tail, composed from the settings menu (num_predict + optional
+# temperature). rq_opts_a opens the object after the stream bool.
+rq_stream_false: str = "],\"stream\":false";
+rq_stream_true:  str = "],\"stream\":true";
+rq_opts_np:   str = ",\"options\":{\"num_predict\":";
+rq_opts_temp: str = ",\"temperature\":";
+rq_opts_end:  str = "}}";
+g_npbuf:      buf = 16;
+# streaming tool-call markup (qwen emits this as text in stream mode, with
+# spaces after colons: {"name": "list_dir", "arguments": {"path": "."}})
+mk_tc_open:  str = "<tool_call>";
+qk_name:     str = "\"name\"";
+qk_args:     str = "\"arguments\"";
+qk_path:     str = "\"path\"";
+qk_content:  str = "\"content\"";
+tc_pre:  str = "[{\"function\":{\"name\":\"";
+tc_mid:  str = "\",\"arguments\":";
+tc_post: str = "}}]";
+g_stream_mark:  buf = 8;      # g_chat_log length before the streamed reply (rollback on a tool call)
+g_stream_post:  buf = 8;      # GetTickCount of the last transcript refresh (throttle)
+g_tcargs:       buf = 131072; # raw arguments object from a streamed tool call
+m_sys: str = "{\"role\":\"system\",\"content\":\"";
+m_su:  str = "\"},{\"role\":\"user\",\"content\":\"";
+m_q:   str = "\"}";
+m_asst: str = ",{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":";
+# conversation-memory fragments (open a message with a LEADING comma; system is closed first)
+m_user_open:     str = ",{\"role\":\"user\",\"content\":\"";
+m_user_oai_open: str = ",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
+m_asst_open:     str = "\"},{\"role\":\"assistant\",\"content\":\"";
+m_tool: str = "},{\"role\":\"tool\",\"content\":\"";
+
+# OpenAI tool entry framing
+oai_pre: str = "{\"type\":\"function\",\"function\":";
+q_inp:   str = "\"input_schema\"";
+q_par:   str = "\"parameters\"";
+
+# response markers
+mk_toolcalls: str = "\"tool_calls\"";
+mk_name:      str = "\"name\":\"";
+mk_path:      str = "\"path\":\"";
+mk_content:   str = "\"content\":\"";
+
+# tool names
+t_read:   str = "read_file";
+t_comp:   str = "compile_file";
+t_list:   str = "list_dir";
+t_create: str = "create_file";
+t_write:  str = "write_file";
+
+# transcript labels
+lbl_you_a: str = "you: ";
+lbl_asst:  str = "\nassistant: ";
+L_step:    str = "\n-> ";
+L_res:     str = "\n   result: ";
+L_lim:     str = "\n[agent] step limit reached.";
+L_stop:    str = "\n[agent] stopped.";
+nl:        str = "\n";
+sp:        str = " ";
+
+# Aether Engine backend (5) transcript lines
+L_eng_boot:    str = "\n[engine] starting aether_engine.exe serve ";
+L_eng_ready:   str = " -- ready.";
+L_eng_first:   str = "[engine] first response loads the model (~20s); after that, chat is fast.\n";
+L_eng_using:   str = "\n[engine] server already running; using its model: ";
+L_eng_noexe:   str = "[engine] aether_engine.exe not found beside the IDE. Copy it into the bin folder (and pull a model: aether_engine.exe models pull gemma3:270m).";
+L_eng_spawn:   str = "[engine] could not start aether_engine.exe.";
+L_eng_died:    str = "[engine] the engine exited during startup -- is the model pulled? (aether_engine.exe models list)";
+L_eng_died_a:  str = "[engine] this model couldn't start. Engine says: ";
+L_eng_died_gen: str = "unsupported or metadata-only model";
+L_eng_died_b:  str = ". The download was fine -- this is an engine limitation. The engine runs llama, mistral, llama3, qwen2, qwen3, gemma3 and dense gemma4; newer Gemma-3n (e2b/e4b), MoE and multimodal models aren't supported yet. Pick one of those in Settings.";
+g_eng_msg:     buf = 1024;
+L_eng_timeout: str = "[engine] server did not come up in time (large models can take minutes on first load -- try Send again).";
+L_eng_noimg:   str = "\n[engine] images are not supported on this backend -- sending the text only.";
+
+@CODE
+# ---------- string helpers (offset-based) ----------
+func sapp(dst: i64, d: i64, lit: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(lit + i);
+        if c == 0 { return d + i; }
+        store8(dst + d + i, c);
+        i = i + 1;
+    }
+    return d;
+}
+func find_after(hay: i64, ndl: i64) -> i64 {
+    i = 0;
+    while 1 {
+        if load8(hay + i) == 0 { return 0 - 1; }
+        j = 0;
+        matched = 1;
+        while matched == 1 {
+            cn = load8(ndl + j);
+            if cn == 0 { return i + j; }
+            if load8(hay + i + j) != cn { matched = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+func contains(hay: i64, ndl: i64) -> i64 {
+    if find_after(hay, ndl) >= 0 { return 1; }
+    return 0;
+}
+func match_at(s: i64, pos: i64, pat: i64) -> i64 {
+    j = 0;
+    while 1 {
+        pc = load8(pat + j);
+        if pc == 0 { return 1; }
+        if load8(s + pos + j) != pc { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+func json_esc(dst: i64, d0: i64, src: i64) -> i64 {
+    d = d0; i = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { return d; }
+        if c == 34 { store8(dst+d, 92); store8(dst+d+1, 34);  d = d+2; }
+        if c == 92 { store8(dst+d, 92); store8(dst+d+1, 92);  d = d+2; }
+        if c == 10 { store8(dst+d, 92); store8(dst+d+1, 110); d = d+2; }
+        if c == 13 { store8(dst+d, 92); store8(dst+d+1, 114); d = d+2; }
+        if c == 9  { store8(dst+d, 92); store8(dst+d+1, 116); d = d+2; }
+        if c != 34 { if c != 92 { if c != 10 { if c != 13 { if c != 9 {
+            store8(dst+d, c); d = d+1;
+        } } } } }
+        i = i + 1;
+    }
+    return d;
+}
+func agt_hexdig(c: i64) -> i64 {        # one hex char -> 0..15
+    if c >= 48 { if c <= 57  { return c - 48; } }
+    if c >= 65 { if c <= 70  { return c - 55; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    return 0;
+}
+func agt_emitu(dst: i64, j: i64, cp: i64) -> i64 {   # codepoint -> UTF-8, return new j
+    if cp < 128 { store8(dst + j, cp); return j + 1; }
+    if cp < 2048 {
+        store8(dst + j,     bor(192, shr(cp, 6)));
+        store8(dst + j + 1, bor(128, band(cp, 63)));
+        return j + 2;
+    }
+    store8(dst + j,     bor(224, shr(cp, 12)));
+    store8(dst + j + 1, bor(128, band(shr(cp, 6), 63)));
+    store8(dst + j + 2, bor(128, band(cp, 63)));
+    return j + 3;
+}
+func json_unesc(src: i64, s: i64, dst: i64) -> i64 {
+    i = s; j = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0  { store8(dst+j, 0); return j; }
+        if c == 34 { store8(dst+j, 0); return j; }
+        if c == 92 {
+            d = load8(src + i + 1);
+            if d == 110 { store8(dst+j, 10); j=j+1; i=i+2; }
+            if d == 116 { store8(dst+j, 9);  j=j+1; i=i+2; }
+            if d == 114 { store8(dst+j, 13); j=j+1; i=i+2; }
+            if d == 117 {                                  # \uXXXX -> UTF-8
+                cp = shl(agt_hexdig(load8(src+i+2)), 12) + shl(agt_hexdig(load8(src+i+3)), 8) + shl(agt_hexdig(load8(src+i+4)), 4) + agt_hexdig(load8(src+i+5));
+                j = agt_emitu(dst, j, cp); i = i + 6;
+            }
+            if d != 110 { if d != 116 { if d != 114 { if d != 117 {
+                store8(dst+j, d); j=j+1; i=i+2;
+            } } } }
+        }
+        if c != 34 { if c != 92 { store8(dst+j, c); j=j+1; i=i+1; } }
+    }
+    return j;
+}
+# copy a balanced [...] starting at/after s into dst; returns length.
+func copy_bracket(src: i64, s: i64, dst: i64) -> i64 {
+    i = s;
+    going = 1;
+    while going == 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst, 0); return 0; }
+        if c == 91 { going = 0; }
+        if going == 1 { i = i + 1; }
+    }
+    depth = 0; j = 0; instr = 0; esc = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { store8(dst+j, 0); return j; }
+        store8(dst+j, c); j = j + 1; i = i + 1;
+        if esc == 1 { esc = 0; }
+        else {
+            wasinstr = instr;
+            if wasinstr == 1 {
+                if c == 92 { esc = 1; }
+                if c == 34 { instr = 0; }
+            }
+            if wasinstr == 0 {
+                if c == 34 { instr = 1; }
+                if c == 91 { depth = depth + 1; }
+                if c == 93 {
+                    depth = depth - 1;
+                    if depth == 0 { store8(dst+j, 0); return j; }
+                }
+            }
+        }
+    }
+    return j;
+}
+
+# ---------- path resolution (root relative paths at the workspace) ----------
+func ag_is_abs(path: i64) -> i64 {
+    c0 = load8(path);
+    if c0 == 0 { return 0; }
+    if c0 == 92 { return 1; }                  # \ (rooted / UNC)
+    if c0 == 47 { return 1; }                  # /
+    if load8(path + 1) == 58 { return 1; }     # X: drive-qualified
+    return 0;
+}
+func ag_resolve(path: i64) -> i64 {
+    if ag_is_abs(path) == 1 { return path; }
+    if load8(g_agent_root) == 0 { return path; }
+    e = str_copy(g_apath, g_agent_root);
+    e = str_copy(e, ag_sep);
+    str_copy(e, path);
+    return g_apath;
+}
+
+# ---------- native tools (feature #2) ----------
+tool read_file(path: str) -> i64 "Read a UTF-8 text file and return its full contents." {
+    p = ag_resolve(path);
+    h = CreateFileA(p, 0x80000000, 1, 0, 3, 0x80, 0);   # GENERIC_READ, OPEN_EXISTING
+    if h == 0 - 1 { e = str_copy(g_tool_result, e_open); str_copy(e, p); return 0 - 1; }
+    total = 0;
+    while 1 {
+        r = ReadFile(h, g_tool_result + total, 65536, c_nrd, 0);
+        if r == 0 { break; }
+        n = load32(c_nrd);
+        if n == 0 { break; }
+        total = total + n;
+        if total > 131072 { break; }
+    }
+    store8(g_tool_result + total, 0);
+    CloseHandle(h);
+    return total;
+}
+tool list_dir(path: str) -> i64 "List the entries of a directory, one per line ([dir] marks subdirectories)." {
+    p = ag_resolve(path);
+    c = str_copy(ld_pat, p);
+    str_copy(c, ld_star);
+    h = FindFirstFileA(ld_pat, ld_fd);
+    if h == 0 - 1 { e = str_copy(g_tool_result, e_nodir); str_copy(e, p); return 0 - 1; }
+    d = 0;
+    cont = 1;
+    while cont == 1 {
+        nm = ld_fd + 44;
+        skip = 0;
+        if load8(nm) == 46 {
+            if load8(nm + 1) == 0 { skip = 1; }
+            if load8(nm + 1) == 46 { if load8(nm + 2) == 0 { skip = 1; } }
+        }
+        if skip == 0 {
+            if band(load32(ld_fd + 0), 16) != 0 { d = sapp(g_tool_result, d, ld_dirpfx); }
+            d = sapp(g_tool_result, d, nm);
+            store8(g_tool_result + d, 10); d = d + 1;
+        }
+        if FindNextFileA(h, ld_fd) == 0 { cont = 0; }
+    }
+    FindClose(h);
+    store8(g_tool_result + d, 0);
+    return d;
+}
+tool create_file(path: str, content: str) -> i64 "Create a NEW text file with the given contents. Fails if the file already exists (never overwrites)." {
+    p = ag_resolve(path);
+    h = CreateFileA(p, 0x40000000, 0, 0, 1, 0x80, 0);   # GENERIC_WRITE, CREATE_NEW
+    if h == 0 - 1 { e = str_copy(g_tool_result, e_exists); str_copy(e, p); return 0 - 1; }
+    WriteFile(h, content, strlen(content), c_nrd, 0);
+    CloseHandle(h);
+    str_copy(g_wpath, p);
+    e = str_copy(g_tool_result, m_created); str_copy(e, p);
+    return 0;
+}
+tool write_file(path: str, content: str) -> i64 "Overwrite a text file with the given contents (creates it if missing). To edit a file: read_file it, then write_file the COMPLETE updated text." {
+    p = ag_resolve(path);
+    h = CreateFileA(p, 0x40000000, 0, 0, 2, 0x80, 0);   # GENERIC_WRITE, CREATE_ALWAYS
+    if h == 0 - 1 { e = str_copy(g_tool_result, e_wfail); str_copy(e, p); return 0 - 1; }
+    WriteFile(h, content, strlen(content), c_nrd, 0);
+    CloseHandle(h);
+    str_copy(g_wpath, p);
+    e = str_copy(g_tool_result, m_wrote); str_copy(e, p);
+    return 0;
+}
+tool compile_file(path: str) -> i64 "Compile an .ancl file with the IDE's ANCL compiler; returns the compiler output (errors or the success banner)." {
+    p = ag_resolve(path);
+    c = str_copy(c_cmd, dq);
+    c = str_copy(c, g_anclc);
+    c = str_copy(c, qsq);
+    c = str_copy(c, p);
+    c = str_copy(c, qsq);
+    c = str_copy(c, g_tmpout);
+    str_copy(c, dq);
+
+    memset(c_sa, 0, 24);
+    store32(c_sa + 0, 24);
+    store32(c_sa + 16, 1);
+    if CreatePipe(c_hrd, c_hwr, c_sa, 0) == 0 { str_copy(g_tool_result, e_pipe); return 0 - 1; }
+    SetHandleInformation(load64(c_hrd), 1, 0);
+    memset(c_si, 0, 104);
+    store32(c_si + 0, 104);
+    store32(c_si + 60, 0x100);
+    store64(c_si + 88, load64(c_hwr));
+    store64(c_si + 96, load64(c_hwr));
+    memset(c_pi, 0, 24);
+    ok = CreateProcessA(0, c_cmd, 0, 0, 1, 0, 0, 0, c_si, c_pi);
+    if ok == 0 { CloseHandle(load64(c_hrd)); CloseHandle(load64(c_hwr)); str_copy(g_tool_result, e_spawn); return 0 - 2; }
+    CloseHandle(load64(c_hwr));
+    total = 0;
+    while 1 {
+        r = ReadFile(load64(c_hrd), g_tool_result + total, 65536, c_nrd, 0);
+        if r == 0 { break; }
+        n = load32(c_nrd);
+        if n == 0 { break; }
+        total = total + n;
+        if total > 131072 { break; }
+    }
+    store8(g_tool_result + total, 0);
+    CloseHandle(load64(c_hrd));
+    WaitForSingleObject(load64(c_pi + 0), 0 - 1);
+    CloseHandle(load64(c_pi + 0));
+    CloseHandle(load64(c_pi + 8));
+    return total;
+}
+
+# ---------- OpenAI tools array (transform the feature #2 registry) ----------
+func emit_schema_as_params(src: i64, d0: i64) -> i64 {
+    d = d0; i = 0;
+    while 1 {
+        c = load8(src + i);
+        if c == 0 { return d; }
+        adv = 1;
+        if match_at(src, i, q_inp) == 1 {
+            d = sapp(g_tools_oai, d, q_par);
+            i = i + 14;                       # length of "input_schema" incl. both quotes
+            adv = 0;
+        }
+        if adv == 1 { store8(g_tools_oai + d, c); d = d + 1; i = i + 1; }
+    }
+    return d;
+}
+func build_openai_tools() -> i64 {
+    n = tool_count();
+    d = 0; i = 0;
+    while i < n {
+        if i > 0 { store8(g_tools_oai + d, 44); d = d + 1; }
+        d = sapp(g_tools_oai, d, oai_pre);
+        d = emit_schema_as_params(tool_schema(i), d);
+        store8(g_tools_oai + d, 125); d = d + 1;        # }
+        i = i + 1;
+    }
+    store8(g_tools_oai + d, 0);
+    return d;
+}
+
+# ---------- base64 (image -> JSON-safe ascii) ----------
+func b64_encode(src: i64, srclen: i64, dst: i64) -> i64 {
+    i = 0; o = 0;
+    while i + 3 <= srclen {
+        b0 = load8(src + i); b1 = load8(src + i + 1); b2 = load8(src + i + 2);
+        store8(dst + o,     load8(b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(b64tab + bor(shl(band(b0, 3), 4), shr(b1, 4))));
+        store8(dst + o + 2, load8(b64tab + bor(shl(band(b1, 15), 2), shr(b2, 6))));
+        store8(dst + o + 3, load8(b64tab + band(b2, 63)));
+        i = i + 3; o = o + 4;
+    }
+    rem = srclen - i;
+    if rem == 1 {
+        b0 = load8(src + i);
+        store8(dst + o,     load8(b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(b64tab + shl(band(b0, 3), 4)));
+        store8(dst + o + 2, 61); store8(dst + o + 3, 61);          # ==
+        o = o + 4;
+    }
+    if rem == 2 {
+        b0 = load8(src + i); b1 = load8(src + i + 1);
+        store8(dst + o,     load8(b64tab + shr(b0, 2)));
+        store8(dst + o + 1, load8(b64tab + bor(shl(band(b0, 3), 4), shr(b1, 4))));
+        store8(dst + o + 2, load8(b64tab + shl(band(b1, 15), 2)));
+        store8(dst + o + 3, 61);                                   # =
+        o = o + 4;
+    }
+    store8(dst + o, 0);
+    return o;
+}
+
+# ---------- request building ----------
+func msgs_init(user: i64) -> i64 {
+    d = 0;
+    d = sapp(g_messages, d, m_sys);
+    if load64(g_chat_mode) == 1 {
+        d = json_esc(g_messages, d, sys_chat);              # fast chat: tiny prompt, no tool contract
+    } else {
+        d = json_esc(g_messages, d, sys_prompt);
+        if load64(g_suppress_tools) == 0 { d = json_esc(g_messages, d, sys_tools); }
+        else { d = json_esc(g_messages, d, sys_notools); }
+    }
+    d = sapp(g_messages, d, m_q);                           # close the system message
+    if strlen(g_history) > 0 { d = sapp(g_messages, d, g_history); }   # replay prior conversation turns
+    if load64(g_has_image) == 1 {
+        if load64(set_backend) == 1 {                       # OpenAI-compat: content = text+image_url array
+            d = sapp(g_messages, d, m_user_oai_open);
+            d = json_esc(g_messages, d, user);
+            d = sapp(g_messages, d, m_img_oai1);            # ...image_url{url:"data:
+            d = sapp(g_messages, d, g_img_mime);            # image/png
+            d = sapp(g_messages, d, m_img_oai2);            # ;base64,
+            d = sapp(g_messages, d, g_img_b64);
+            d = sapp(g_messages, d, m_img_oai3);            # "}}]}
+        } else {                                            # Ollama: content string + images[] (raw b64)
+            d = sapp(g_messages, d, m_user_open);
+            d = json_esc(g_messages, d, user);
+            d = sapp(g_messages, d, m_img_oll1);            # ","images":["
+            d = sapp(g_messages, d, g_img_b64);
+            d = sapp(g_messages, d, m_img_oll2);            # "]}
+        }
+    } else {
+        d = sapp(g_messages, d, m_user_open);
+        d = json_esc(g_messages, d, user);
+        d = sapp(g_messages, d, m_q);
+    }
+    store8(g_messages + d, 0);
+    return d;
+}
+# Drop the oldest {user}{assistant} pair(s) until history fits the budget. A pair
+# starts with  ,{"role":"u  (the comma+brace, then 'u' at offset 10); assistant
+# objects start with "}, so they never false-match.
+func hist_trim() -> i64 {
+    # the model re-prefills ALL replayed history every turn (no KV prefix cache).
+    # Cloud backends prefill instantly (40KB fine); the local engine is
+    # ~0.1s/token, so keep its replayed history SHORT (last few turns) or every
+    # turn gets slower. The on-screen transcript (g_chat_log) keeps everything.
+    budget = 40000;
+    if load64(set_backend) == 5 { budget = 3000; }
+    going = 1;
+    while going == 1 {
+        if strlen(g_history) <= budget { going = 0; }
+        if going == 1 {
+            i = 1; p = 0 - 1; scanning = 1;
+            while scanning == 1 {
+                c = load8(g_history + i);
+                if c == 0 { scanning = 0; }
+                if scanning == 1 {
+                    if c == 44 { if load8(g_history+i+1) == 123 { if load8(g_history+i+10) == 117 { p = i; scanning = 0; } } }
+                    if scanning == 1 { i = i + 1; }
+                }
+            }
+            if p < 0 { store8(g_history, 0); going = 0; }     # only one pair left; clearing won't help -> stop
+            if p > 0 {
+                j = 0;
+                while load8(g_history + p + j) != 0 { store8(g_history + j, load8(g_history + p + j)); j = j + 1; }
+                store8(g_history + j, 0);
+            }
+        }
+    }
+    return 0;
+}
+# Append this completed turn (raw user prompt + final assistant answer) to memory.
+func msgs_remember(u: i64, a: i64) -> i64 {
+    d = strlen(g_history);
+    d = sapp(g_history, d, m_user_open);
+    d = json_esc(g_history, d, u);
+    d = sapp(g_history, d, m_asst_open);
+    d = json_esc(g_history, d, a);
+    d = sapp(g_history, d, m_q);
+    store8(g_history + d, 0);
+    hist_trim();
+    return 0;
+}
+func msgs_append_tool(result: i64) -> i64 {
+    d = strlen(g_messages);
+    d = sapp(g_messages, d, m_asst);
+    d = sapp(g_messages, d, g_tcraw);
+    d = sapp(g_messages, d, m_tool);
+    d = json_esc(g_messages, d, result);
+    d = sapp(g_messages, d, m_q);
+    store8(g_messages + d, 0);
+    return d;
+}
+func build_request() -> i64 {
+    build_openai_tools();
+    d = 0;
+    d = sapp(g_req, d, rq1);
+    d = sapp(g_req, d, g_model);
+    d = sapp(g_req, d, rq2);
+    d = sapp(g_req, d, g_messages);
+    d = sapp(g_req, d, rq3);
+    if load64(g_suppress_tools) == 0 { d = sapp(g_req, d, g_tools_oai); }
+    if load64(set_backend) == 5 {
+        # options composed from the Options menu (Reply length -> num_predict,
+        # Style -> temperature; greedy omits temperature)
+        if load64(g_agent_stream) == 1 { d = sapp(g_req, d, rq_stream_true); }
+        else { d = sapp(g_req, d, rq_stream_false); }
+        d = sapp(g_req, d, rq_opts_np);
+        int_to_str(g_npbuf, load64(set_np));
+        d = sapp(g_req, d, g_npbuf);
+        if load8(set_temp_str) != 0 {                    # not greedy -> send temperature
+            d = sapp(g_req, d, rq_opts_temp);
+            d = sapp(g_req, d, set_temp_str);
+        }
+        d = sapp(g_req, d, rq_opts_end);
+    } else { d = sapp(g_req, d, rq4); }
+    store8(g_req + d, 0);
+    return d;
+}
+
+# ---------- response parsing + dispatch ----------
+func parse_response() -> i64 {
+    if contains(g_resp, mk_toolcalls) == 1 {
+        ts = find_after(g_resp, mk_toolcalls);          # index just after "tool_calls"
+        copy_bracket(g_resp, ts, g_tcraw);
+        ns = find_after(g_resp + ts, mk_name);
+        if ns >= 0 { json_unesc(g_resp, ts + ns, g_name); }
+        ps = find_after(g_resp + ts, mk_path);
+        if ps >= 0 { json_unesc(g_resp, ts + ps, g_a1); }
+        store8(g_a2, 0);
+        needc = 0;
+        if strcmp(g_name, t_create) == 0 { needc = 1; }
+        if strcmp(g_name, t_write)  == 0 { needc = 1; }
+        if needc == 1 {
+            cs = find_after(g_resp + ts, mk_content);
+            if cs >= 0 { json_unesc(g_resp, ts + cs, g_a2); }
+        }
+        return 1;
+    }
+    cs = find_after(g_resp, mk_content);
+    if cs >= 0 { json_unesc(g_resp, cs, g_final); }
+    return 0;
+}
+func dispatch_named() -> i64 {
+    if strcmp(g_name, t_read) == 0 { return read_file(g_a1); }
+    if strcmp(g_name, t_list) == 0 { return list_dir(g_a1); }
+    if strcmp(g_name, t_create) == 0 { return create_file(g_a1, g_a2); }
+    if strcmp(g_name, t_write) == 0 { return write_file(g_a1, g_a2); }
+    if strcmp(g_name, t_comp) == 0 { return compile_file(g_a1); }
+    str_copy(g_tool_result, e_unk);
+    return 0 - 1;
+}
+
+# ---------- backend dispatch (settings-driven) ----------
+func backend_chat(req: i64, resp: i64) -> i64 {
+    if load64(set_backend) == 1 {                          # OpenAI-compatible
+        url_split(set_openai_url, oai_host, oai_port, oai_sec, oai_pathpfx);
+        e = str_copy(oai_path, oai_pathpfx);
+        str_copy(e, oai_chat_suffix);
+        store8(oai_key, 0);
+        GetEnvironmentVariableA(env_openai_key, oai_key, 512);
+        return oai_chat(oai_host, load64(oai_port), load64(oai_sec), oai_path, oai_key, req, resp);
+    }
+    return ollama_chat(req, resp);                         # 0/3 -> local Ollama loop
+}
+
+# ---------- GUI transcript ----------
+func ag_log(s: i64) -> i64 {
+    d = strlen(g_chat_log);
+    i = 0;
+    while 1 {
+        c = load8(s + i);
+        if c == 0 { break; }
+        if d >= 130560 { break; }
+        store8(g_chat_log + d, c); d = d + 1; i = i + 1;
+    }
+    store8(g_chat_log + d, 0);
+    return d;
+}
+func ag_log_trunc(s: i64, maxn: i64) -> i64 {
+    d = strlen(g_chat_log);
+    i = 0;
+    while i < maxn {
+        c = load8(s + i);
+        if c == 0 { break; }
+        if d >= 130560 { break; }
+        store8(g_chat_log + d, c); d = d + 1; i = i + 1;
+    }
+    store8(g_chat_log + d, 0);
+    return d;
+}
+func ag_post() -> i64 {
+    PostMessageA(load64(g_chat_hwnd), 0x8003, 0, 0);       # WM_APP+3: transcript ready
+    return 0;
+}
+func ag_reset() -> i64 { store8(g_chat_log, 0); return 0; }   # full clear (New Chat)
+# Keep the transcript from overflowing its buffer: once large, drop the oldest
+# ~45KB at a line boundary so the on-screen conversation stays bounded but long.
+func ag_trim() -> i64 {
+    n = strlen(g_chat_log);
+    if n <= 110000 { return 0; }
+    cut = 45000;
+    while cut < n { c = load8(g_chat_log + cut); cut = cut + 1; if c == 10 { break; } }
+    j = 0;
+    while cut < n { store8(g_chat_log + j, load8(g_chat_log + cut)); j = j + 1; cut = cut + 1; }
+    store8(g_chat_log + j, 0);
+    return 0;
+}
+# Echo a new user turn. The transcript now ACCUMULATES across turns (the whole
+# conversation stays visible, like Lens) -- a blank line separates turns.
+func ag_echo_user(msg: i64) -> i64 {
+    ag_trim();
+    if strlen(g_chat_log) > 0 { ag_log(nl); }
+    ag_log(lbl_you_a);
+    ag_log(msg);
+    ag_log(nl);
+    return 0;
+}
+# append a final assistant line and mark the turn done (used by the single-shot path).
+func ag_assistant(s: i64) -> i64 {
+    ag_log(lbl_asst);
+    ag_log(s);
+    ag_log(nl);
+    store64(g_has_image, 0);                              # image is one-shot
+    store64(g_agent_done, 1);
+    ag_post();
+    return 0;
+}
+
+# set the post target + resolve the bundled compiler path (main calls this once).
+func agent_init(hwnd: i64) -> i64 {
+    store64(g_chat_hwnd, hwnd);
+    ui_exedir(ag_dir);
+    ui_join(g_anclc, ag_dir, ag_compiler);
+    ui_join(g_tmpout, ag_dir, ag_tmpout);
+    str_copy(g_agent_root, ag_dir);               # ...\bin
+    rb = uic_last_bs(g_agent_root);               # strip "\bin" -> the workspace folder
+    if rb > 0 { store8(g_agent_root + rb, 0); }
+    return 0;
+}
+
+# Backend 5: make sure the Aether Engine is serving before the first request.
+# Runs on the worker thread (spawn + ready-poll block). 1 = go, 0 = turn over
+# (the transcript already says why).
+func agent_engine_up() -> i64 {
+    # tools stay ON: the engine's /api/chat renders the tools array into the
+    # qwen chat template and answers tool_calls (Ollama-shaped) since the
+    # 2026-07-14 engine tools rung -- the FULL agent loop runs on backend 5.
+    if load64(g_has_image) == 1 {                        # no vision: a base64 image would blow the
+        store64(g_has_image, 0);                         # engine's 256KB request cap -- drop it honestly
+        ag_log(L_eng_noimg); ag_post();
+    }
+    er = eng_ensure(set_aether_model, g_agent_cancel);
+    if er == 2 {
+        # just spawned -> the FIRST message pays the one-time model load (~20s
+        # on a 7B); every message after is fast. A static hint (no warmup
+        # request -- a /api/generate warmup corrupts the next /api/chat on the
+        # engine, an upstream serve bug) so the wait isn't a mystery.
+        ag_log(L_eng_boot); ag_log(set_aether_model); ag_log(L_eng_ready); ag_log(nl);
+        ag_log(L_eng_first); ag_post();
+        return 1;
+    }
+    if er == 1 {
+        if load64(eng_owned) == 0 { if load8(eng_ldname) != 0 {
+            if strcmp(eng_ldname, set_aether_model) != 0 {
+                str_copy(g_model, eng_ldname);           # foreign server: report what it actually serves
+                ag_log(L_eng_using); ag_log(eng_ldname); ag_log(nl); ag_post();
+            }
+        } }
+        return 1;
+    }
+    if er == 0 - 1 { ag_assistant(L_eng_noexe); return 0; }
+    if er == 0 - 2 { ag_assistant(L_eng_spawn); return 0; }
+    if er == 0 - 3 {
+        # the engine exited during load -> show the REAL reason from its log
+        # (usually an unsupported architecture), and clarify the pull was fine
+        e = str_copy(g_eng_msg, L_eng_died_a);
+        if eng_fail_reason(eng_reason) == 1 { e = str_copy(e, eng_reason); }
+        else { e = str_copy(e, L_eng_died_gen); }
+        str_copy(e, L_eng_died_b);
+        ag_assistant(g_eng_msg);
+        return 0;
+    }
+    if er == 0 - 5 { ag_log(L_stop); store64(g_has_image, 0); store64(g_agent_done, 1); ag_post(); return 0; }
+    ag_assistant(L_eng_timeout);
+    return 0;
+}
+
+# ---------- streaming (backend 5): tokens land in the transcript live ----------
+# sink called by the transport per NDJSON token: append + throttled refresh.
+func ag_stream_piece(piece: i64) -> i64 {
+    d = strlen(g_chat_log);
+    i = 0;
+    while 1 {
+        c = load8(piece + i);
+        if c == 0 { break; }
+        if d >= 130560 { break; }
+        store8(g_chat_log + d, c); d = d + 1; i = i + 1;
+    }
+    store8(g_chat_log + d, 0);
+    now = GetTickCount();
+    if now - load64(g_stream_post) >= 80 {          # ~12 fps: smooth without thrashing the RichEdit
+        store64(g_stream_post, now);
+        ag_post();
+    }
+    return 0;
+}
+
+# brace-matched span of the object/value starting at hay+at (string-aware) into
+# dst; at must point at '{'. Returns bytes copied, or -1.
+func ag_copy_obj(hay: i64, at: i64, dst: i64) -> i64 {
+    if load8(hay + at) != 123 { return 0 - 1; }
+    depth = 0; instr = 0; i = at; o = 0;
+    while 1 {
+        c = load8(hay + i);
+        if c == 0 { return 0 - 1; }
+        store8(dst + o, c); o = o + 1;
+        if instr == 1 {
+            if c == 92 { store8(dst + o, load8(hay + i + 1)); o = o + 1; i = i + 1; }
+            else { if c == 34 { instr = 0; } }
+        } else {
+            if c == 34 { instr = 1; }
+            if c == 123 { depth = depth + 1; }
+            if c == 125 { depth = depth - 1; if depth == 0 { store8(dst + o, 0); return o; } }
+        }
+        i = i + 1;
+        if o >= 131000 { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+# locate a JSON string value: find "key", skip : and whitespace and the opening
+# quote, return the index (relative to hay) of the first value char, or -1.
+# Tolerates spaces after the colon (the model emits `"name": "x"`).
+func jval_pos(hay: i64, qkey: i64) -> i64 {
+    ks = find_after(hay, qkey);              # index just after the key's closing quote
+    if ks < 0 { return 0 - 1; }
+    i = ks;
+    while 1 {
+        c = load8(hay + i);
+        if c == 0 { return 0 - 1; }
+        if c == 58 { i = i + 1; break; }     # ':'
+        if c != 32 { if c != 9 { if c != 10 { if c != 13 { return 0 - 1; } } } }
+        i = i + 1;
+    }
+    while 1 {
+        c = load8(hay + i);
+        if c == 0 { return 0 - 1; }
+        if c == 34 { return i + 1; }          # opening quote -> value starts next
+        if c != 32 { if c != 9 { if c != 10 { if c != 13 { return 0 - 1; } } } }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+# locate a JSON object value: find "key", skip : and whitespace, return the '{'
+# index (relative to hay), or -1.
+func jobj_pos(hay: i64, qkey: i64) -> i64 {
+    ks = find_after(hay, qkey);
+    if ks < 0 { return 0 - 1; }
+    i = ks;
+    while 1 {
+        c = load8(hay + i);
+        if c == 0 { return 0 - 1; }
+        if c == 58 { i = i + 1; break; }     # ':'
+        if c != 32 { if c != 9 { if c != 10 { if c != 13 { return 0 - 1; } } } }
+        i = i + 1;
+    }
+    while 1 {
+        c = load8(hay + i);
+        if c == 0 { return 0 - 1; }
+        if c == 123 { return i; }             # '{'
+        if c != 32 { if c != 9 { if c != 10 { if c != 13 { return 0 - 1; } } } }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# parse a <tool_call> from the accumulated streamed text (g_resp). Fills g_name,
+# g_a1 (path), g_a2 (content), and g_tcraw (the tool_calls array for history).
+# Whitespace-tolerant: the model streams `{"name": "x", "arguments": {...}}`.
+# Returns 1 if a valid tool call was found, else 0.
+func parse_stream_toolcall() -> i64 {
+    ts = find_after(g_resp, mk_tc_open);
+    if ts < 0 { return 0; }
+    ob = ts;
+    while 1 { c = load8(g_resp + ob); if c == 0 { return 0; } if c == 123 { break; } ob = ob + 1; }
+    ns = jval_pos(g_resp + ob, qk_name);
+    if ns < 0 { return 0; }
+    json_unesc(g_resp, ob + ns, g_name);
+    aj = jobj_pos(g_resp + ob, qk_args);
+    if aj < 0 { return 0; }
+    if ag_copy_obj(g_resp, ob + aj, g_tcargs) < 0 { return 0; }
+    # pull path/content from the arguments object (also whitespace-tolerant)
+    store8(g_a1, 0); store8(g_a2, 0);
+    ps = jval_pos(g_tcargs, qk_path);
+    if ps >= 0 { json_unesc(g_tcargs, ps, g_a1); }
+    needc = 0;
+    if strcmp(g_name, t_create) == 0 { needc = 1; }
+    if strcmp(g_name, t_write)  == 0 { needc = 1; }
+    if needc == 1 {
+        cs = jval_pos(g_tcargs, qk_content);
+        if cs >= 0 { json_unesc(g_tcargs, cs, g_a2); }
+    }
+    # rebuild g_tcraw = [{"function":{"name":"<name>","arguments":<args>}}] for the
+    # conversation history (msgs_append_tool renders it back into the next request)
+    d = sapp(g_tcraw, 0, tc_pre);
+    d = json_esc(g_tcraw, d, g_name);
+    d = sapp(g_tcraw, d, tc_mid);
+    d = sapp(g_tcraw, d, g_tcargs);
+    d = sapp(g_tcraw, d, tc_post);
+    store8(g_tcraw + d, 0);
+    return 1;
+}
+
+# one streamed turn. Returns 1 = a tool ran (loop again), 0 = final answer (done).
+func agent_stream_turn() -> i64 {
+    store64(g_stream_mark, strlen(g_chat_log));
+    ag_log(lbl_asst);                                    # "\nassistant: "
+    store64(g_stream_post, 0);
+    store64(tr_stream_cb, &ag_stream_piece);             # arm the per-token sink
+    ollama_chat_stream(g_req, g_resp);                   # blocks; g_resp = whole reply
+    store64(tr_stream_cb, 0);
+    if parse_stream_toolcall() == 1 {
+        store8(g_chat_log + load64(g_stream_mark), 0);   # roll back the raw <tool_call> markup
+        ag_log(L_step); ag_log(g_name); ag_log(sp); ag_log(g_a1); ag_post();
+        rv = dispatch_named();
+        ag_log(L_res); ag_log_trunc(g_tool_result, 200); ag_post();
+        if rv >= 0 {
+            wrote = 0;
+            if strcmp(g_name, t_write)  == 0 { wrote = 1; }
+            if strcmp(g_name, t_create) == 0 { wrote = 1; }
+            if wrote == 1 { PostMessageA(load64(g_chat_hwnd), 0x8004, 0, 0); }
+        }
+        msgs_append_tool(g_tool_result);
+        return 1;
+    }
+    ag_log(nl); ag_post();                               # close the streamed answer line
+    str_copy(g_final, g_resp);                           # remember it for conversation memory
+    return 0;
+}
+
+# ---------- the agent loop (worker thread) ----------
+func agent_run_gui(user: i64) -> i64 {
+    if load64(set_backend) == 1 { str_copy(g_model, set_openai_model); }
+    else if load64(set_backend) == 5 { str_copy(g_model, set_aether_model); }
+    else { str_copy(g_model, set_ollama_model); }
+    store64(g_agent_cancel, 0);                          # clear any stale Stop
+    if load64(set_backend) == 5 { if agent_engine_up() == 0 { return 0; } }
+    # backend 5 streams tokens into the transcript live (Lens-style); the
+    # non-streaming path stays for Ollama/OpenAI (their transports don't stream here)
+    store64(g_agent_stream, 0);
+    if load64(set_backend) == 5 { store64(g_agent_stream, 1); }
+    msgs_init(user);
+    iter = 0;
+    going = 1;
+    while going == 1 {
+        build_request();
+        if load64(g_agent_stream) == 1 {
+            rtool = agent_stream_turn();
+            if load64(g_agent_cancel) == 1 { ag_log(L_stop); going = 0; }
+            if going == 1 {
+                if rtool == 1 { iter = iter + 1; if iter > 6 { ag_log(L_lim); going = 0; } }
+                else { going = 0; }                      # final answer already streamed
+            }
+            continue;
+        }
+        backend_chat(g_req, g_resp);
+        if load64(g_agent_cancel) == 1 { ag_log(L_stop); going = 0; }   # Stop pressed (aborts the call)
+        if going == 1 {
+            if parse_response() == 1 {
+                ag_log(L_step); ag_log(g_name); ag_log(sp); ag_log(g_a1); ag_post();
+                rv = dispatch_named();
+                # chat = a concise activity log (the FULL result still goes to the model via
+                # msgs_append_tool; proposed CODE goes to the OUTPUT pane). Cap hard so read_file
+                # doesn't paste the whole file into the conversation.
+                ag_log(L_res); ag_log_trunc(g_tool_result, 200); ag_post();
+                if rv >= 0 {                                 # a file landed on disk ->
+                    wrote = 0;                               #  let the UI apply it to the editor
+                    if strcmp(g_name, t_write)  == 0 { wrote = 1; }
+                    if strcmp(g_name, t_create) == 0 { wrote = 1; }
+                    if wrote == 1 { PostMessageA(load64(g_chat_hwnd), 0x8004, 0, 0); }
+                }
+                msgs_append_tool(g_tool_result);
+                iter = iter + 1;
+                if iter > 6 { ag_log(L_lim); going = 0; }
+            }
+            if going == 1 {
+                if contains(g_resp, mk_toolcalls) == 0 {
+                    ag_log(lbl_asst); ag_log(g_final); ag_log(nl);
+                    going = 0;
+                }
+            }
+        }
+    }
+    store64(g_has_image, 0);                              # image is one-shot (this turn only)
+    if load64(g_agent_cancel) == 0 { if load8(g_final) != 0 { msgs_remember(g_user_msg, g_final); } }  # commit this turn to conversation memory
+    store64(g_agent_done, 1);
+    ag_post();
+    return 0;
+}

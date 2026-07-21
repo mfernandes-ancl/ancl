@@ -1,0 +1,323 @@
+# =====================================================================
+#  wireframe_3d.ancl  -  Pure Win32 Spinning 3D Wireframe Cube
+#
+#  Open-Source Showcase Engine (ANCL-3D)
+#  100% CRT-free, native 3D vector-projected wireframe engine.
+#  Uses fixed-point integer math and Win32 GDI drawing calls.
+# =====================================================================
+import "win32_api.ancl";
+
+@DATA
+clsname:   str = "ANCL3DWIREFRAMEWND";
+title:     str = "ANCL-3D wireframe spinning cube showcase";
+
+# Trigonometry LUT Buffers (1024 divisions * 8 bytes each = 8192 bytes)
+g_sin: buf = 8192;
+g_cos: buf = 8192;
+
+# Vertices buffer (8 vertices * 3 coordinates * 8 bytes = 192 bytes)
+g_vertices: buf = 192;
+
+# Projected buffer (8 vertices * 2 coordinates * 8 bytes = 128 bytes)
+g_projected: buf = 128;
+
+# Edge indices buffer (12 edges * 2 indices * 8 bytes = 192 bytes)
+g_edges: buf = 192;
+
+# Angles for rotation
+g_angleX: buf = 8;
+g_angleY: buf = 8;
+g_angleZ: buf = 8;
+
+# Win32 structures & brushes
+g_hinst:      buf = 8;
+g_hwnd:       buf = 8;
+g_brush_bg:   buf = 8;
+g_wndclass:   buf = 96;
+g_msg:        buf = 64;
+g_ps:         buf = 72;
+g_rect:       buf = 16;
+
+@CODE
+
+# ---------------------------------------------------------------------
+# Bhaskara I's Sine Approximation
+# Approximates sin(theta) for theta in [0, 1024) using integer math.
+# Scaled to 65536 amplitude (1.0 = 65536).
+# ---------------------------------------------------------------------
+func init_lut() -> i64 {
+    theta = 0;
+    while theta < 1024 {
+        # bhaskara formula for sin(x) where x is in [0, pi] mapped to [0, 512]
+        if theta < 512 {
+            N = theta * (512 - theta);
+            val = (1048576 * N) / (1310720 - 4 * N);
+        } else {
+            t2 = theta - 512;
+            N = t2 * (512 - t2);
+            val = 0 - ((1048576 * N) / (1310720 - 4 * N));
+        }
+        store64(g_sin + theta * 8, val);
+        theta = theta + 1;
+    }
+    
+    # Cosine is Sine shifted by 90 degrees (256 units)
+    theta = 0;
+    while theta < 1024 {
+        sin_idx = band(theta + 256, 1023);
+        val = load64(g_sin + sin_idx * 8);
+        store64(g_cos + theta * 8, val);
+        theta = theta + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Initializes 8 Cube Corners and 12 Connecting Edges
+# ---------------------------------------------------------------------
+func init_geometry() -> i64 {
+    # Vertex coordinates: X, Y, Z (Vertices: -50 to 50)
+    # V0: (-50, -50, -50)
+    store64(g_vertices + 0, 0 - 50);
+    store64(g_vertices + 8, 0 - 50);
+    store64(g_vertices + 16, 0 - 50);
+    
+    # V1: (50, -50, -50)
+    store64(g_vertices + 24, 50);
+    store64(g_vertices + 32, 0 - 50);
+    store64(g_vertices + 40, 0 - 50);
+    
+    # V2: (50, 50, -50)
+    store64(g_vertices + 48, 50);
+    store64(g_vertices + 56, 50);
+    store64(g_vertices + 64, 0 - 50);
+    
+    # V3: (-50, 50, -50)
+    store64(g_vertices + 72, 0 - 50);
+    store64(g_vertices + 80, 50);
+    store64(g_vertices + 88, 0 - 50);
+    
+    # V4: (-50, -50, 50)
+    store64(g_vertices + 96, 0 - 50);
+    store64(g_vertices + 104, 0 - 50);
+    store64(g_vertices + 112, 50);
+    
+    # V5: (50, -50, 50)
+    store64(g_vertices + 120, 50);
+    store64(g_vertices + 128, 0 - 50);
+    store64(g_vertices + 136, 50);
+    
+    # V6: (50, 50, 50)
+    store64(g_vertices + 144, 50);
+    store64(g_vertices + 152, 50);
+    store64(g_vertices + 160, 50);
+    
+    # V7: (-50, 50, 50)
+    store64(g_vertices + 168, 0 - 50);
+    store64(g_vertices + 176, 50);
+    store64(g_vertices + 184, 50);
+    
+    # Edge connectivity indices (start_idx, end_idx)
+    # Edge 0: 0 -> 1
+    store64(g_edges + 0, 0); store64(g_edges + 8, 1);
+    # Edge 1: 1 -> 2
+    store64(g_edges + 16, 1); store64(g_edges + 24, 2);
+    # Edge 2: 2 -> 3
+    store64(g_edges + 32, 2); store64(g_edges + 40, 3);
+    # Edge 3: 3 -> 0
+    store64(g_edges + 48, 3); store64(g_edges + 56, 0);
+    
+    # Edge 4: 4 -> 5
+    store64(g_edges + 64, 4); store64(g_edges + 72, 5);
+    # Edge 5: 5 -> 6
+    store64(g_edges + 80, 5); store64(g_edges + 88, 6);
+    # Edge 6: 6 -> 7
+    store64(g_edges + 96, 6); store64(g_edges + 104, 7);
+    # Edge 7: 7 -> 4
+    store64(g_edges + 112, 7); store64(g_edges + 120, 4);
+    
+    # Edge 8: 0 -> 4
+    store64(g_edges + 128, 0); store64(g_edges + 136, 4);
+    # Edge 9: 1 -> 5
+    store64(g_edges + 144, 1); store64(g_edges + 152, 5);
+    # Edge 10: 2 -> 6
+    store64(g_edges + 160, 2); store64(g_edges + 168, 6);
+    # Edge 11: 3 -> 7
+    store64(g_edges + 176, 3); store64(g_edges + 184, 7);
+    
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Rotate 3D vertices using fixed-point matrices and project to 2D
+# ---------------------------------------------------------------------
+func rotate_and_project(centerX: i64, centerY: i64) -> i64 {
+    ax = load64(g_angleX);
+    ay = load64(g_angleY);
+    az = load64(g_angleZ);
+    
+    cosX = load64(g_cos + ax * 8);
+    sinX = load64(g_sin + ax * 8);
+    
+    cosY = load64(g_cos + ay * 8);
+    sinY = load64(g_sin + ay * 8);
+    
+    cosZ = load64(g_cos + az * 8);
+    sinZ = load64(g_sin + az * 8);
+    
+    i = 0;
+    while i < 8 {
+        x = load64(g_vertices + i * 24);
+        y = load64(g_vertices + i * 24 + 8);
+        z = load64(g_vertices + i * 24 + 16);
+        
+        # 1. Rotate around X axis
+        y1 = (y * cosX - z * sinX) / 65536;
+        z1 = (y * sinX + z * cosX) / 65536;
+        x1 = x;
+        
+        # 2. Rotate around Y axis
+        x2 = (x1 * cosY + z1 * sinY) / 65536;
+        z2 = (0 - x1 * sinY + z1 * cosY) / 65536;
+        y2 = y1;
+        
+        # 3. Rotate around Z axis
+        x3 = (x2 * cosZ - y2 * sinZ) / 65536;
+        y3 = (x2 * sinZ + y2 * cosZ) / 65536;
+        z3 = z2;
+        
+        # 4. Perspective Projection
+        # ScaleFactor = 256
+        # DistanceOffset = 150
+        denom = z3 + 150;
+        if denom < 1 { denom = 1; }
+        
+        projX = centerX + (x3 * 256) / denom;
+        projY = centerY + (y3 * 256) / denom;
+        
+        store64(g_projected + i * 16, projX);
+        store64(g_projected + i * 16 + 8, projY);
+        
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Win32 Window Procedure
+# ---------------------------------------------------------------------
+func WndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { # WM_CREATE
+        SetTimer(hwnd, 1, 16, 0); # ~60 FPS update
+        return 0;
+    }
+    
+    if msg == 275 { # WM_TIMER
+        # Update spin angles
+        store64(g_angleX, band(load64(g_angleX) + 4, 1023));
+        store64(g_angleY, band(load64(g_angleY) + 6, 1023));
+        store64(g_angleZ, band(load64(g_angleZ) + 2, 1023));
+        
+        # Force repaint (erasing background using window background brush)
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    
+    if msg == 15 { # WM_PAINT
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        w = load32(g_rect + 8);
+        h = load32(g_rect + 12);
+        
+        centerX = w / 2;
+        centerY = h / 2;
+        
+        # Calculate 3D rotations & projects
+        rotate_and_project(centerX, centerY);
+        
+        # Draw wireframe using Win32 GDI pens
+        hPen = CreatePen(0, 2, 0x00FFFF00); # Cyan pen, width 2
+        oldPen = SelectObject(hdc, hPen);
+        
+        i = 0;
+        while i < 12 {
+            idxStart = load64(g_edges + i * 16);
+            idxEnd = load64(g_edges + i * 16 + 8);
+            
+            startX = load64(g_projected + idxStart * 16);
+            startY = load64(g_projected + idxStart * 16 + 8);
+            endX = load64(g_projected + idxEnd * 16);
+            endY = load64(g_projected + idxEnd * 16 + 8);
+            
+            MoveToEx(hdc, startX, startY, 0);
+            LineTo(hdc, endX, endY);
+            
+            i = i + 1;
+        }
+        
+        SelectObject(hdc, oldPen);
+        DeleteObject(hPen);
+        
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        KillTimer(hwnd, 1);
+        DeleteObject(load64(g_brush_bg));
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ---------------------------------------------------------------------
+# Main Initialization and Windows Loop
+# ---------------------------------------------------------------------
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize lookup tables and geometry
+    init_lut();
+    init_geometry();
+    
+    # Initialize angles to 0
+    store64(g_angleX, 0);
+    store64(g_angleY, 0);
+    store64(g_angleZ, 0);
+    
+    # Register Window Class
+    store64(g_brush_bg, CreateSolidBrush(0x000F0F0F)); # Solid dark background
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, load64(g_brush_bg));
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, clsname);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+    
+    # CreateWindowExA
+    # WS_OVERLAPPEDWINDOW | WS_VISIBLE = 0x10CF0000 = 282001408
+    hwnd = CreateWindowExA(0, clsname, title, 282001408, 150, 150, 640, 480, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    
+    # Message Loop
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}

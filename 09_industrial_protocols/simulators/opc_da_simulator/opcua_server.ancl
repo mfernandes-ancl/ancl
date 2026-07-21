@@ -1,0 +1,877 @@
+# ANCL Native OPC UA Binary Protocol Server (GUI)
+#
+# OPC UA server with Win32 GUI.  Implements HELLO/ACK, OpenSecureChannel,
+# GetEndpoints, CreateSession, ActivateSession, Browse, Read, Write.
+# Serves 3 simulation tags: Temperature (Double), Pressure (Float), Status (Int32).
+# Runs a real-time data pump that oscillates tag values.
+#
+# Compile: bin\anclc.exe opcua_server.ancl opcua_server.exe
+# Run:     opcua_server.exe
+# Connect: opc.tcp://127.0.0.1:<port>  (SecurityMode=None, Anonymous)
+
+import "../../core_lib/std.ancl";
+import "../../core_lib/win32_api.ancl";
+
+@DATA
+
+# ---- Buffers ----------------------------------------------------------
+rxbuf:  buf = 16384;
+txbuf:  buf = 16384;
+ft_buf: buf = 8;
+saddr:  buf = 16;
+
+# ---- Socket state -----------------------------------------------------
+srv_sock: buf = 8;
+cli_sock: buf = 8;
+
+# ---- OPC UA session state --------------------------------------------
+seq_num:  buf = 8;
+sc_id:    buf = 8;
+tok_id:   buf = 8;
+auth_tok: buf = 32;
+auth_len: buf = 8;
+sess_act: buf = 8;
+
+# ---- Tag data (simulation) --------------------------------------------
+tag_temp:  buf = 8;
+tag_press: buf = 8;
+tag_stat:  buf = 8;
+
+# ---- Constants --------------------------------------------------------
+TAG_NS: i64 = 1;
+NID_OBJS:  i64 = 85;
+NID_ORG:   i64 = 35;
+NID_BASEV: i64 = 63;
+
+# ---- Console strings --------------------------------------------------
+s_start: str = "[srv] OPC UA server starting\n";
+s_ok:    str = "[srv] listening\n";
+s_conn:  str = "[srv] client connected\n";
+s_disc:  str = "[srv] disconnected\n";
+s_hel:   str = "[srv] HELLO\n";
+s_opn:   str = "[srv] OPNF\n";
+s_sc:    str = "[srv]   ch=";
+s_tok:   str = " tok=";
+s_gep:   str = "[srv] GetEndpoints\n";
+s_cs:    str = "[srv] CreateSession\n";
+s_sid:   str = "[srv]   sid=1\n";
+s_as:    str = "[srv] ActivateSession\n";
+s_brw:   str = "[srv] Browse 3 refs\n";
+s_rd:    str = "[srv] Read: ";
+s_wr:    str = "[srv] Write: ";
+s_wrok:  str = " OK\n";
+s_unk:   str = "[srv] unknown msg\n";
+s_pump:  str = "[srv] T=";
+s_pump2: str = " P=";
+s_pump3: str = " S=";
+s_nl:    str = "\n";
+s_connl: str = "client connected\n";
+s_hel_ok:str = "HELLO\n";
+s_gep_ok:str = "GetEndpoints\n";
+s_cs_ok: str = "CreateSession\n";
+s_as_ok: str = "ActivateSession\n";
+s_brw_ok:str = "Browse 3 refs\n";
+s_rd_f:  str = "Read: ";
+s_wr_f:  str = "Write: ";
+s_wr_ok: str = " OK\n";
+
+wsa_buf: buf = 512;
+iomode:  buf = 4;
+
+SEC_NONE:  str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+APP_URI:   str = "urn:ancl:opcua:server";
+APP_NAME:  str = "ANCL OPC UA Server";
+EP_URL:    str = "opc.tcp://127.0.0.1:4840";
+TRANSPROF: str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
+ANON:      str = "anonymous";
+LOC:       str = "en";
+
+TN_TEMP: str = "Temperature";
+TN_PR:   str = "Pressure";
+TN_STAT: str = "Status";
+
+# ---- GUI data ---------------------------------------------------------
+cls_main:  str = "ANCLOPCUASRV";
+cls_stat:  str = "STATIC";
+cls_btn:   str = "BUTTON";
+cls_edit:  str = "EDIT";
+
+win_title: str = "ANCL OPC UA Server";
+lbl_port:  str = "Port:";
+def_port:  str = "4840";
+btn_start: str = "Start Server";
+btn_stop:  str = "Stop Server";
+st_idle:   str = "Status: Idle";
+st_run:    str = "Status: LISTENING on port ";
+st_err:    str = "Status: Error";
+
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_hedit:    buf = 8;
+g_hstatus:  buf = 8;
+g_hlog:     buf = 8;
+g_wndclass: buf = 96;
+g_msg:      buf = 64;
+g_tmpbuf:   buf = 512;
+svr_run:    buf = 4;
+p_cycle:    buf = 8;
+p_ctr:      buf = 8;
+
+ID_EDIT_PORT:  i64 = 100;
+ID_BTN_START:  i64 = 101;
+ID_BTN_STOP:   i64 = 102;
+ID_TIMER_POLL: i64 = 1;
+
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+
+@CODE
+
+# =====================================================================
+#  UA Binary serialisation helpers
+# =====================================================================
+
+func u8(b: i64, o: i64, v: i64) -> i64 {
+    store8(b + o, band(v, 0xFF)); return o + 1;
+}
+func u16(b: i64, o: i64, v: i64) -> i64 {
+    store16(b + o, band(v, 0xFFFF)); return o + 2;
+}
+func u32(b: i64, o: i64, v: i64) -> i64 {
+    store32(b + o, v); return o + 4;
+}
+func i64w(b: i64, o: i64, v: i64) -> i64 {
+    store64(b + o, v); return o + 8;
+}
+
+func s_str(b: i64, o: i64, s: i64, n: i64) -> i64 {
+    if s == 0 || n == 0 {
+        store32(b + o, 0xFFFFFFFF); return o + 4;
+    }
+    store32(b + o, n); memcpy(b + o + 4, s, n); return o + 4 + n;
+}
+
+func s_null_bs(b: i64, o: i64) -> i64 {
+    store32(b + o, 0xFFFFFFFF); return o + 4;
+}
+func s_null_arr(b: i64, o: i64) -> i64 {
+    store32(b + o, 0xFFFFFFFF); return o + 4;
+}
+
+func nid_2b(b: i64, o: i64, id: i64) -> i64 {
+    store8(b+o, 0); store8(b+o+1, band(id,0xFF)); return o + 2;
+}
+func nid_4b(b: i64, o: i64, ns: i64, id: i64) -> i64 {
+    store8(b+o, 1); store8(b+o+1, band(ns,0xFF));
+    store16(b+o+2, band(id,0xFFFF)); return o + 4;
+}
+func nid_num(b: i64, o: i64, ns: i64, id: i64) -> i64 {
+    store8(b+o, 2); store16(b+o+1, band(ns,0xFFFF));
+    store32(b+o+3, id); return o + 7;
+}
+func nid_str(b: i64, o: i64, ns: i64, s: i64, n: i64) -> i64 {
+    store8(b+o, 3); store16(b+o+1, band(ns,0xFFFF));
+    store32(b+o+3, n); memcpy(b+o+7, s, n); return o + 7 + n;
+}
+
+func enid_str(b: i64, o: i64, ns: i64, s: i64, n: i64) -> i64 {
+    store8(b+o, 3); store16(b+o+1, band(ns,0xFFFF));
+    store32(b+o+3, n); memcpy(b+o+7, s, n); return o + 7 + n;
+}
+func enid_num(b: i64, o: i64, ns: i64, id: i64) -> i64 {
+    store8(b+o, 2); store16(b+o+1, band(ns,0xFFFF));
+    store32(b+o+3, id); return o + 7;
+}
+
+func qname(b: i64, o: i64, ns: i64, s: i64, n: i64) -> i64 {
+    o = u16(b, o, ns); o = s_str(b, o, s, n); return o;
+}
+func ltext(b: i64, o: i64, s: i64, n: i64) -> i64 {
+    if s == 0 || n == 0 { store8(b+o, 0); return o + 1; }
+    store8(b+o, 2); o = o + 1; o = s_str(b, o, s, n); return o;
+}
+func ltext_full(b: i64, o: i64, loc: i64, ln: i64, txt: i64, tn: i64) -> i64 {
+    store8(b+o, 3); o = o + 1; o = s_str(b, o, loc, ln);
+    o = s_str(b, o, txt, tn); return o;
+}
+
+func s_dt(b: i64, o: i64) -> i64 {
+    store64(b+o, 0); return o + 8;
+}
+
+func rsp_hdr(b: i64, o: i64, hdl: i64, st: i64) -> i64 {
+    o = s_dt(b, o);
+    o = u32(b, o, hdl);
+    o = u32(b, o, st);
+    store8(b+o, 0); o = o + 1;
+    o = u32(b, o, 0);
+    store8(b+o, 0); store8(b+o+1, 0); store8(b+o+2, 0); o = o + 3;
+    return o;
+}
+
+func seq_hdr(b: i64, o: i64, seq: i64, rid: i64) -> i64 {
+    o = u32(b, o, seq); o = u32(b, o, rid); return o;
+}
+
+func begin_msg(b: i64, cid: i64, tok: i64, seq: i64, rid: i64) -> i64 {
+    store8(b+0, 77); store8(b+1, 83); store8(b+2, 71); store8(b+3, 70);
+    o = 8;
+    o = u32(b, o, cid);
+    o = u32(b, o, tok);
+    o = seq_hdr(b, o, seq, rid);
+    return o;
+}
+func fin_msg(b: i64, end: i64) -> i64 {
+    store32(b+4, end); return end;
+}
+
+func begin_opnf(b: i64, cid: i64, seq: i64, rid: i64) -> i64 {
+    store8(b+0, 79); store8(b+1, 80); store8(b+2, 78); store8(b+3, 70);
+    o = 8;
+    o = u32(b, o, cid);
+    o = s_str(b, o, SEC_NONE, strlen(SEC_NONE));
+    o = s_null_bs(b, o);
+    o = s_null_bs(b, o);
+    o = seq_hdr(b, o, seq, rid);
+    return o;
+}
+
+func ser_app(b: i64, o: i64) -> i64 {
+    o = s_str(b, o, APP_URI, strlen(APP_URI));
+    o = s_str(b, o, 0, 0);
+    o = ltext_full(b, o, LOC, strlen(LOC), APP_NAME, strlen(APP_NAME));
+    o = u32(b, o, 0);
+    o = s_str(b, o, 0, 0);
+    o = s_str(b, o, 0, 0);
+    o = s_null_arr(b, o);
+    return o;
+}
+
+func ser_ep(b: i64, o: i64) -> i64 {
+    o = s_str(b, o, EP_URL, strlen(EP_URL));
+    o = ser_app(b, o);
+    o = s_null_bs(b, o);
+    o = u32(b, o, 1);
+    o = s_str(b, o, SEC_NONE, strlen(SEC_NONE));
+    o = u32(b, o, 1);
+    o = s_str(b, o, ANON, strlen(ANON));
+    o = u32(b, o, 0);
+    o = s_str(b, o, 0, 0);
+    o = s_str(b, o, 0, 0);
+    o = s_str(b, o, 0, 0);
+    o = s_str(b, o, TRANSPROF, strlen(TRANSPROF));
+    o = u8(b, o, 0);
+    return o;
+}
+
+func ser_ref(b: i64, o: i64, ns: i64, name: i64, nlen: i64) -> i64 {
+    o = nid_2b(b, o, NID_ORG);
+    o = u8(b, o, 1);
+    o = enid_str(b, o, ns, name, nlen);
+    o = qname(b, o, 0, name, nlen);
+    o = ltext(b, o, name, nlen);
+    o = u32(b, o, 2);
+    o = enid_num(b, o, 0, NID_BASEV);
+    return o;
+}
+
+# =====================================================================
+#  Message type detection
+# =====================================================================
+
+func msgtype() -> i64 {
+    t0 = load8(rxbuf+0); t1 = load8(rxbuf+1);
+    t2 = load8(rxbuf+2); t3 = load8(rxbuf+3);
+    if t0 == 72 && t1 == 69 && t2 == 76 && t3 == 70 { return 1; }
+    if t0 == 79 && t1 == 80 && t2 == 78 && t3 == 70 { return 2; }
+    if t0 == 77 && t1 == 83 && t2 == 71 && t3 == 70 { return 3; }
+    return 0;
+}
+
+# =====================================================================
+#  GUI log helper
+# =====================================================================
+
+func gui_log(s: i64) -> i64 {
+    hl = load64(g_hlog);
+    if hl == 0 { return 0; }
+    len = SendMessageA(hl, 14, 0, 0);
+    SendMessageA(hl, 177, len, len);
+    SendMessageA(hl, 194, 0, s);
+    return 0;
+}
+
+# =====================================================================
+#  Handler: HELLO -> ACK
+# =====================================================================
+
+func h_hello() -> i64 {
+    syscall 1, s_hel;
+    gui_log(s_hel_ok);
+    store8(txbuf+0, 65); store8(txbuf+1, 67);
+    store8(txbuf+2, 75); store8(txbuf+3, 70);
+    store32(txbuf+4, 28);
+    store32(txbuf+8, 0);
+    store32(txbuf+12, 65535);
+    store32(txbuf+16, 65535);
+    store32(txbuf+20, 0);
+    store32(txbuf+24, 0);
+    send(load64(cli_sock), txbuf, 28, 0);
+    return 1;
+}
+
+# =====================================================================
+#  Handler: OpenSecureChannel (OPNF)
+# =====================================================================
+
+func h_opnf() -> i64 {
+    syscall 1, s_opn;
+    sc = GetTickCount(); sc = band(sc, 0x7FFFFFFF);
+    store64(sc_id, sc); store64(tok_id, 1);
+
+    roff = 12;
+    spl = load32(rxbuf+roff); roff = roff + 4;
+    if spl > 0 && spl < 2000 { roff = roff + spl; }
+    scl = load32(rxbuf+roff); roff = roff + 4;
+    if scl > 0 && scl < 1000000 { roff = roff + scl; }
+    rtl = load32(rxbuf+roff); roff = roff + 4;
+    if rtl > 0 && rtl < 1000000 { roff = roff + rtl; }
+
+    rseq = load32(rxbuf+roff); rrid = load32(rxbuf+roff+4); roff = roff + 8;
+
+    aenc = load8(rxbuf+roff);
+    if aenc == 0 { roff = roff + 2; }
+    else if aenc == 1 { roff = roff + 4; }
+    else if aenc == 2 { roff = roff + 7; }
+    else if aenc == 3 { sl = load32(rxbuf+roff+3); roff = roff + 7 + sl; }
+    else if aenc == 4 { roff = roff + 19; }
+    else { roff = roff + 2; }
+
+    roff = roff + 8;
+    rh = load32(rxbuf+roff);
+
+    o = begin_opnf(txbuf, sc, 1, rrid);
+    o = nid_4b(txbuf, o, 0, 447);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = u32(txbuf, o, 0);
+    o = u32(txbuf, o, sc);
+    o = u32(txbuf, o, 1);
+    o = s_dt(txbuf, o);
+    o = u32(txbuf, o, 3600000);
+    o = s_null_bs(txbuf, o);
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  Handler: MSG service dispatch
+# =====================================================================
+
+func h_msg() -> i64 {
+    cid = load32(rxbuf+8); tok = load32(rxbuf+12);
+    rseq = load32(rxbuf+16); rrid = load32(rxbuf+20);
+
+    roff = 24;
+    enc = load8(rxbuf+roff); svc_id = 0;
+    if enc == 0 { svc_id = load8(rxbuf+roff+1); roff = roff + 2; }
+    else if enc == 1 { svc_id = load16(rxbuf+roff+2); roff = roff + 4; }
+    else if enc == 2 { svc_id = load32(rxbuf+roff+3); roff = roff + 7; }
+
+    aenc = load8(rxbuf+roff);
+    if aenc == 0 { roff = roff + 2; }
+    else if aenc == 1 { roff = roff + 4; }
+    else if aenc == 2 { roff = roff + 7; }
+    else if aenc == 3 { sl = load32(rxbuf+roff+3); roff = roff + 7 + sl; }
+    else if aenc == 4 { roff = roff + 19; }
+    else { roff = roff + 2; }
+    roff = roff + 8;
+    req_h = load32(rxbuf+roff);
+    roff = roff + 4 + 4 + 4 + 3;
+
+    if svc_id == 428 { return h_gep(rrid, req_h); }
+    if svc_id == 461 { return h_cs(rrid, req_h); }
+    if svc_id == 467 { return h_as(rrid, req_h); }
+    if svc_id == 527 { return h_brw(rrid, req_h); }
+    if svc_id == 631 { return h_rd(rrid, req_h, roff); }
+    if svc_id == 673 { return h_wr(rrid, req_h, roff); }
+    syscall 1, s_unk;
+    return 1;
+}
+
+# =====================================================================
+#  GetEndpoints (428)
+# =====================================================================
+
+func h_gep(rid: i64, rh: i64) -> i64 {
+    syscall 1, s_gep;
+    gui_log(s_gep_ok);
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 429);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = u32(txbuf, o, 1);
+    o = ser_ep(txbuf, o);
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  CreateSession (461)
+# =====================================================================
+
+func h_cs(rid: i64, rh: i64) -> i64 {
+    syscall 1, s_cs;
+    gui_log(s_cs_ok);
+    store8(auth_tok+0, 0); store8(auth_tok+1, 2);
+    store64(auth_len, 2);
+
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 462);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = nid_2b(txbuf, o, 1);
+    o = nid_2b(txbuf, o, 2);
+    o = i64w(txbuf, o, fbits(itof(3600000)));
+    o = s_null_bs(txbuf, o);
+    o = s_null_bs(txbuf, o);
+    o = u32(txbuf, o, 1);
+    o = ser_ep(txbuf, o);
+    o = u32(txbuf, o, 0);
+    o = s_str(txbuf, o, 0, 0);
+    o = s_null_bs(txbuf, o);
+    o = u32(txbuf, o, 0);
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    syscall 1, s_sid;
+    return 1;
+}
+
+# =====================================================================
+#  ActivateSession (467)
+# =====================================================================
+
+func h_as(rid: i64, rh: i64) -> i64 {
+    syscall 1, s_as;
+    gui_log(s_as_ok);
+    store64(sess_act, 1);
+
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 468);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = s_null_bs(txbuf, o);
+    o = u32(txbuf, o, 0);
+    o = u32(txbuf, o, 0);
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  Browse (527)
+# =====================================================================
+
+func h_brw(rid: i64, rh: i64) -> i64 {
+    syscall 1, s_brw;
+    gui_log(s_brw_ok);
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 528);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = u32(txbuf, o, 1);
+    o = u32(txbuf, o, 0);
+    o = s_null_bs(txbuf, o);
+    o = u32(txbuf, o, 3);
+    o = ser_ref(txbuf, o, TAG_NS, TN_TEMP, strlen(TN_TEMP));
+    o = ser_ref(txbuf, o, TAG_NS, TN_PR, strlen(TN_PR));
+    o = ser_ref(txbuf, o, TAG_NS, TN_STAT, strlen(TN_STAT));
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  memcmp + find_tag
+# =====================================================================
+
+func memcmp(a: i64, b: i64, n: i64) -> i64 {
+    i = 0;
+    while i < n {
+        if load8(a + i) != load8(b + i) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func find_tag(name: i64, nlen: i64) -> i64 {
+    if nlen == strlen(TN_TEMP) && memcmp(name, TN_TEMP, nlen) == 0 { return 0; }
+    if nlen == strlen(TN_PR) && memcmp(name, TN_PR, nlen) == 0 { return 1; }
+    if nlen == strlen(TN_STAT) && memcmp(name, TN_STAT, nlen) == 0 { return 2; }
+    return 0 - 1;
+}
+
+# =====================================================================
+#  f64 -> f32 bits conversion
+# =====================================================================
+
+func f64_to_f32(raw64: i64) -> i64 {
+    sign = band(shr(raw64, 63), 1);
+    exp = band(shr(raw64, 52), 0x7FF);
+    mant = band(raw64, 0xFFFFFFFFFFFFF);
+    if exp == 0 { return shl(sign, 31); }
+    if exp == 0x7FF {
+        fe = 0xFF; fm = 0;
+        if mant != 0 { fm = 1; }
+        return shl(sign, 31) + shl(fe, 23) + fm;
+    }
+    fe = exp - 1023 + 127;
+    if fe <= 0 { return shl(sign, 31); }
+    if fe >= 0xFF { return shl(sign, 31) + shl(0xFF, 23); }
+    fm = shr(mant, 29);
+    return shl(sign, 31) + shl(fe, 23) + fm;
+}
+
+# =====================================================================
+#  Read (631)
+# =====================================================================
+
+func h_rd(rid: i64, rh: i64, roff: i64) -> i64 {
+    skip = roff + 8 + 4;
+    cnt = load32(rxbuf+skip); skip = skip + 4;
+
+    renc = load8(rxbuf+skip);
+    is_str = 0; str_p = 0; str_l = 0; num_id = 0; rns = 0;
+    if renc == 0 { num_id = load8(rxbuf+skip+1); skip = skip + 2; }
+    else if renc == 1 { num_id = load16(rxbuf+skip+2); skip = skip + 4; }
+    else if renc == 2 { rns = load16(rxbuf+skip+1); num_id = load32(rxbuf+skip+3); skip = skip + 7; }
+    else if renc == 3 {
+        rns = load16(rxbuf+skip+1); str_l = load32(rxbuf+skip+3);
+        str_p = rxbuf+skip+7; skip = skip + 7 + str_l; is_str = 1;
+    } else { skip = skip + 2; }
+
+    ti = 0 - 1;
+    if is_str == 1 { ti = find_tag(str_p, str_l); }
+
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 632);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = u32(txbuf, o, 1);
+
+    if ti == 0 {
+        syscall 1, s_rd, TN_TEMP, s_nl;
+        gui_log(s_rd_f); gui_log(TN_TEMP); gui_log(s_nl);
+        store8(txbuf+o, 1); o = o + 1;
+        store8(txbuf+o, 11); o = o + 1;
+        store64(txbuf+o, load64(tag_temp)); o = o + 8;
+    } else if ti == 1 {
+        syscall 1, s_rd, TN_PR, s_nl;
+        gui_log(s_rd_f); gui_log(TN_PR); gui_log(s_nl);
+        store8(txbuf+o, 1); o = o + 1;
+        store8(txbuf+o, 10); o = o + 1;
+        store32(txbuf+o, load32(tag_press)); o = o + 4;
+    } else if ti == 2 {
+        syscall 1, s_rd, TN_STAT, s_nl;
+        gui_log(s_rd_f); gui_log(TN_STAT); gui_log(s_nl);
+        store8(txbuf+o, 1); o = o + 1;
+        store8(txbuf+o, 6); o = o + 1;
+        store32(txbuf+o, load32(tag_stat)); o = o + 4;
+    } else {
+        syscall 1, s_rd, "unknown", s_nl;
+        store8(txbuf+o, 0); o = o + 1;
+    }
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  Write (673)
+# =====================================================================
+
+func h_wr(rid: i64, rh: i64, roff: i64) -> i64 {
+    skip = roff;
+    cnt = load32(rxbuf+skip); skip = skip + 4;
+
+    wenc = load8(rxbuf+skip); wns=0; wstr=0; wslen=0; wid=0;
+    if wenc == 0 { wid = load8(rxbuf+skip+1); skip = skip + 2; }
+    else if wenc == 1 { wid = load16(rxbuf+skip+2); skip = skip + 4; }
+    else if wenc == 2 { wns = load16(rxbuf+skip+1); wid = load32(rxbuf+skip+3); skip = skip + 7; }
+    else if wenc == 3 {
+        wns = load16(rxbuf+skip+1); wslen = load32(rxbuf+skip+3);
+        wstr = rxbuf+skip+7; skip = skip + 7 + wslen;
+    } else { skip = skip + 2; }
+
+    skip = skip + 4;
+    ir = load32(rxbuf+skip); skip = skip + 4;
+    if ir > 0 && ir < 10000 { skip = skip + ir; }
+
+    dv = load8(rxbuf+skip); skip = skip + 1;
+
+    ti = 0 - 1;
+    if wstr != 0 && wslen > 0 { ti = find_tag(wstr, wslen); }
+
+    if band(dv, 1) != 0 && ti >= 0 {
+        vt = load8(rxbuf+skip); skip = skip + 1;
+        vtype = band(vt, 0x3F);
+        if ti == 0 && vtype == 11 {
+            store64(tag_temp, load64(rxbuf+skip));
+            syscall 1, s_wr, TN_TEMP, s_wrok;
+            gui_log(s_wr_f); gui_log(TN_TEMP); gui_log(s_wr_ok);
+        } else if ti == 1 && vtype == 10 {
+            store32(tag_press, load32(rxbuf+skip));
+            syscall 1, s_wr, TN_PR, s_wrok;
+            gui_log(s_wr_f); gui_log(TN_PR); gui_log(s_wr_ok);
+        } else if ti == 2 && vtype == 6 {
+            store32(tag_stat, load32(rxbuf+skip));
+            syscall 1, s_wr, TN_STAT, s_wrok;
+            gui_log(s_wr_f); gui_log(TN_STAT); gui_log(s_wr_ok);
+        }
+    }
+
+    o = begin_msg(txbuf, load64(sc_id), load64(tok_id), 1, rid);
+    o = nid_4b(txbuf, o, 0, 674);
+    o = rsp_hdr(txbuf, o, rh, 0);
+    o = u32(txbuf, o, 1);
+    o = u32(txbuf, o, 0);
+    fin_msg(txbuf, o);
+    send(load64(cli_sock), txbuf, o, 0);
+    return 1;
+}
+
+# =====================================================================
+#  Data pump
+# =====================================================================
+
+func run_pump(cycle: i64, ctr: i64) -> i64 {
+    t = 0;
+    fi = 2250 + ctr * 2;
+    if ctr > 100 {
+        t = ctr - 100;
+        fi = 2650 - t * 2;
+    }
+    vi = 100325 + ctr * 10;
+    if ctr > 100 {
+        t = ctr - 100;
+        vi = 102325 - t * 10;
+    }
+
+    t64 = itof(fi) / itof(100);
+    store64(tag_temp, fbits(t64));
+
+    p64 = itof(vi) / itof(100);
+    p32 = f64_to_f32(fbits(p64));
+    store32(tag_press, p32);
+
+    if cycle % 4 == 0 { store32(tag_stat, 1); }
+    else if cycle % 4 == 1 { store32(tag_stat, 2); }
+    else if cycle % 4 == 2 { store32(tag_stat, 4); }
+    else { store32(tag_stat, 8); }
+
+    syscall 1, s_pump, fi, s_pump2, load32(tag_press), s_pump3, load32(tag_stat), s_nl;
+    return 0;
+}
+
+# =====================================================================
+#  Server lifecycle
+# =====================================================================
+
+func stop_server() -> i64 {
+    cli = load64(cli_sock);
+    if cli != 0 { closesocket(cli); store64(cli_sock, 0); }
+    s = load64(srv_sock);
+    if s != 0 { closesocket(s); store64(srv_sock, 0); }
+    store32(svr_run, 0);
+    syscall 1, "[srv] stopped\n";
+    return 0;
+}
+
+func start_server(port: i64) -> i64 {
+    s = socket(2, 1, 6);
+    if s < 0 { return 0 - 1; }
+    store64(srv_sock, s);
+
+    store16(saddr+0, 2);
+    store16(saddr+2, htons(port));
+    store32(saddr+4, 0);
+    store64(saddr+8, 0);
+    rc = bind(s, saddr, 16);
+    if rc != 0 { closesocket(s); store64(srv_sock, 0); return 0 - 2; }
+
+    rc = listen(s, 5);
+    if rc != 0 { closesocket(s); store64(srv_sock, 0); return 0 - 3; }
+
+    store32(iomode, 1);
+    ioctlsocket(s, 0x8004667E, iomode);
+
+    store64(cli_sock, 0);
+    store64(sc_id, 0);
+    store64(tok_id, 0);
+    store64(seq_num, 0);
+    store64(auth_len, 0);
+    store64(sess_act, 0);
+
+    t0 = itof(2450) / itof(100);
+    store64(tag_temp, fbits(t0));
+    p0 = itof(101325) / itof(100);
+    store32(tag_press, f64_to_f32(fbits(p0)));
+    store32(tag_stat, 1);
+
+    store64(p_cycle, 0);
+    store64(p_ctr, 0);
+    store32(svr_run, 1);
+    syscall 1, s_ok;
+    return 0;
+}
+
+# =====================================================================
+#  Timer tick (called from WM_TIMER)
+# =====================================================================
+
+func timer_tick() -> i64 {
+    if load32(svr_run) == 0 { return 0; }
+
+    s = load64(srv_sock);
+    if s == 0 { return 0; }
+
+    if load64(cli_sock) == 0 {
+        cli = accept(s, 0, 0);
+        if cli != (0 - 1) {
+            store64(cli_sock, cli);
+            store32(iomode, 1);
+            ioctlsocket(cli, 0x8004667E, iomode);
+            syscall 1, s_conn;
+            gui_log(s_connl);
+            store64(sc_id, 0); store64(tok_id, 0);
+            store64(auth_len, 0); store64(sess_act, 0);
+        }
+    }
+
+    cli = load64(cli_sock);
+    if cli != 0 {
+        n = recv(cli, rxbuf, 16000, 0);
+        if n > 0 {
+            mt = msgtype();
+            if mt == 1 { h_hello(); }
+            else if mt == 2 { h_opnf(); }
+            else if mt == 3 { h_msg(); }
+            else { syscall 1, s_unk; }
+        } else if n == 0 {
+            closesocket(cli);
+            store64(cli_sock, 0);
+            syscall 1, s_disc;
+            gui_log(s_disc);
+        }
+    }
+
+    run_pump(load64(p_cycle), load64(p_ctr));
+    store64(p_ctr, load64(p_ctr) + 1);
+    if load64(p_ctr) > 200 { store64(p_ctr, 0); store64(p_cycle, load64(p_cycle) + 1); }
+
+    return 0;
+}
+
+# =====================================================================
+#  Window Procedure
+# =====================================================================
+
+func WndProc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        hinst = load64(g_hinst);
+        CreateWindowExA(0, cls_stat, lbl_port, 1342177280, 16, 12, 40, 20, hwnd, 0, hinst, 0);
+        ed = CreateWindowExA(0, cls_edit, def_port, 1350565888, 60, 10, 60, 22, hwnd, ID_EDIT_PORT, hinst, 0);
+        store64(g_hedit, ed);
+        CreateWindowExA(0, cls_btn, btn_start, 1342177280, 140, 9, 90, 26, hwnd, ID_BTN_START, hinst, 0);
+        CreateWindowExA(0, cls_btn, btn_stop, 1342177280, 240, 9, 90, 26, hwnd, ID_BTN_STOP, hinst, 0);
+        hs = CreateWindowExA(0, cls_stat, st_idle, 1342177280, 16, 44, 360, 20, hwnd, 0, hinst, 0);
+        store64(g_hstatus, hs);
+        hl = CreateWindowExA(0, cls_edit, 0, 0x50200044, 16, 66, 540, 260, hwnd, 0, hinst, 0);
+        store64(g_hlog, hl);
+        return 0;
+    }
+    if msg == 273 {
+        id = band(wp, 65535);
+        if id == ID_BTN_START {
+            if load32(svr_run) == 0 {
+                GetWindowTextA(load64(g_hedit), g_tmpbuf, 32);
+                port = str_to_int(g_tmpbuf);
+                if port < 1 { port = 4840; }
+                if port > 65535 { port = 4840; }
+                rc = start_server(port);
+                if rc != 0 {
+                    SetWindowTextA(load64(g_hstatus), st_err);
+                    gui_log("bind/listen failed\n");
+                } else {
+                    e = str_copy(g_tmpbuf, st_run);
+                    int_to_str(e, port);
+                    SetWindowTextA(load64(g_hstatus), g_tmpbuf);
+                    gui_log("Server started\n");
+                }
+            }
+            return 0;
+        }
+        if id == ID_BTN_STOP {
+            if load32(svr_run) != 0 {
+                stop_server();
+                SetWindowTextA(load64(g_hstatus), st_idle);
+                gui_log("Server stopped\n");
+            }
+            return 0;
+        }
+        return 0;
+    }
+    if msg == 275 {
+        if wp == ID_TIMER_POLL { timer_tick(); }
+        return 0;
+    }
+    if msg == 2 {
+        if load32(svr_run) != 0 { stop_server(); }
+        PostQuitMessage(0);
+        return 0;
+    }
+    r = DefWindowProcA(hwnd, msg, wp, lp);
+    return r;
+}
+
+# =====================================================================
+#  MAIN
+# =====================================================================
+
+func main() -> i32 {
+    rc = WSAStartup(514, wsa_buf);
+    if rc != 0 { return 1; }
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    store32(g_wndclass + 0,  80);
+    store32(g_wndclass + 4,  3);
+    store64(g_wndclass + 8,  &WndProc);
+    store32(g_wndclass + 16, 0);
+    store32(g_wndclass + 20, 0);
+    store64(g_wndclass + 24, hinst);
+    store64(g_wndclass + 32, 0);
+    store64(g_wndclass + 40, cursor);
+    store64(g_wndclass + 48, 6);
+    store64(g_wndclass + 56, 0);
+    store64(g_wndclass + 64, cls_main);
+    store64(g_wndclass + 72, 0);
+    RegisterClassExA(g_wndclass);
+
+    store32(svr_run, 0);
+    store64(g_hlog, 0);
+
+    hwnd = CreateWindowExA(0, cls_main, win_title, 282001408, 180, 120, 580, 370, 0, 0, hinst, 0);
+    store64(g_hwnd, hwnd);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, ID_TIMER_POLL, 100, 0);
+
+    syscall 1, s_start;
+
+    while 1 {
+        r = GetMessageA(g_msg, 0, 0, 0);
+        if r == 0 { return 0; }
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+
+    return 0;
+}

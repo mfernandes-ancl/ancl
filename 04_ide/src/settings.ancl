@@ -1,0 +1,729 @@
+# =====================================================================
+#  settings.ancl  -  Aether Studio "LLM Settings" panel + config store.
+#
+#  Owns:
+#    - the LLM settings STATE (backend choice + per-backend url/model)
+#    - a tiny key=value config file next to the exe (NON-SECRET only;
+#      API keys are read from env vars at request time, never stored)
+#    - the dark "LLM Settings" popup window (own class + WndProc), with a
+#      backend dropdown, base-URL field, an editable model combo, and a
+#      "Refresh models" button that lists installed Ollama models
+#      (transport.ancl::ollama_tags -> GET /api/tags).
+#
+#  Backend codes: 0 Ollama (local) / 1 OpenAI-compatible / 2 Anthropic /
+#  3 ANCL agent (the local agentic loop) / 4 Local Brain (ANCL) /
+#  5 Aether Engine (local) -- the pure-ANCL LLM engine, Ollama-compatible
+#    wire, server lifecycle owned by engine_host.ancl.
+# =====================================================================
+import "../../../core_lib/win32_api.ancl";
+import "UI_controls.ancl";
+import "transport.ancl";
+import "engine_host.ancl";
+import "theme.ancl";
+
+extern "gdi32.dll"  CreateFontA -> ptr;        # merges with main.ancl's identical decl
+extern "dwmapi.dll" DwmSetWindowAttribute;     # immersive dark title bar
+extern "user32.dll" CreatePopupMenu -> ptr;    # Lens-style grouped options menu (merges w/ main)
+extern "user32.dll" AppendMenuA;
+extern "user32.dll" TrackPopupMenu;
+extern "user32.dll" DestroyMenu;
+extern "user32.dll" GetCursorPos;
+extern "user32.dll" GetWindowRect;             # center the dialog on the Studio window (merges w/ main)
+extern "user32.dll" SetWindowPos;
+
+@DATA
+# ---- settings state -------------------------------------------------
+set_backend:         buf = 8;       # 0/1/2/3/4/5
+set_ollama_url:      buf = 256;
+set_ollama_model:    buf = 256;
+set_openai_url:      buf = 256;
+set_openai_model:    buf = 256;
+set_anthropic_model: buf = 256;
+set_aether_url:      buf = 256;
+set_aether_model:    buf = 256;
+set_aether_flags:    buf = 256;
+# Lens-style grouped engine options (source of truth; compose into flags + request opts)
+set_eng_hw:    buf = 8;      # 0 Full GPU / 1 Conservative GPU / 2 CPU reference
+set_eng_out:   buf = 8;      # 0 All languages / 1 ASCII only / 2 Digits only
+set_eng_style: buf = 8;      # 0 Precise (greedy) / 1 Balanced / 2 Creative
+set_eng_len:   buf = 8;      # 0 Short 64 / 1 Standard 128 / 2 Long 256 / 3 Maximum 512
+set_eng_spec:  buf = 8;      # 0 Speculation On / 1 Off
+set_eng_time:  buf = 8;      # 0 GPU timing Off / 1 On
+set_eng_tools: buf = 8;      # 0 Agent tools OFF (fast chat) / 1 ON (read/write/compile)
+set_np:        buf = 8;      # composed num_predict
+set_temp_str:  buf = 16;     # composed temperature ("" = greedy)
+
+# defaults
+d_ollama_url:    str = "http://127.0.0.1:11434";
+d_ollama_model:  str = "qwen2.5:14b-instruct";
+d_openai_url:    str = "https://api.openai.com/v1";
+d_openai_model:  str = "gpt-4o-mini";
+d_anthropic_model: str = "claude-haiku-4-5-20251001";
+d_aether_url:    str = "http://127.0.0.1:11435";
+d_aether_model:  str = "gemma3:270m";
+
+# config keys (each ends with '=')
+k_backend:         str = "backend=";
+k_ollama_url:      str = "ollama_url=";
+k_ollama_model:    str = "ollama_model=";
+k_openai_url:      str = "openai_url=";
+k_openai_model:    str = "openai_model=";
+k_anthropic_model: str = "anthropic_model=";
+k_aether_url:      str = "aether_url=";
+k_aether_model:    str = "aether_model=";
+cfg_suffix:        str = "\\aether.cfg";
+set_nl:            str = "\n";
+set_comma:         str = ",";
+
+set_cfgdir:  buf = 600;
+set_cfgpath: buf = 700;
+set_cfgbuf:  buf = 8192;
+set_resp:    buf = 262144;     # ollama_tags response sink
+set_tmp:     buf = 256;        # model-name extract
+
+# ---- popup window ---------------------------------------------------
+set_clsname: str = "AetherSettingsWnd";
+set_title:   str = "LLM Settings";
+set_face:    str = "Segoe UI";
+set_empty:   str = "";
+set_cls_static: str = "STATIC";
+set_cls_edit:   str = "EDIT";
+set_cls_btn:    str = "BUTTON";
+set_cls_combo:  str = "COMBOBOX";
+
+lbl_backend: str = "Backend:";
+lbl_url:     str = "Base URL:";
+lbl_model:   str = "Model:";
+lbl_refresh: str = "Refresh models";
+lbl_flags:   str = "Options:";
+lbl_pull:    str = "Pull model";
+lbl_options: str = "Options...";
+lbl_save:    str = "Save";
+lbl_close:   str = "Close";
+d_aether_flags: str = "gpu";
+k_aether_flags: str = "aether_flags=";
+k_aether_opts:  str = "aether_opts=";       # "hw,out,style,len,spec,time"
+# composed serve-flag fragments
+ef_gpu:      str = "gpu";
+ef_gpufinal: str = "gpufinal";
+ef_ascii:    str = " restrict=ascii";
+ef_digits:   str = " restrict=digits";
+ef_nospec:   str = " nospec";
+ef_gputime:  str = " gputime";
+et_balanced: str = "0.4";
+et_creative: str = "0.8";
+# grouped-menu labels (the Lens-style engine options)
+gm_hw_full:  str = "Hardware: Full GPU (recommended)";
+gm_hw_cons:  str = "Hardware: Conservative GPU";
+gm_hw_cpu:   str = "Hardware: CPU reference";
+gm_out_all:  str = "Output: All languages / Unicode";
+gm_out_asc:  str = "Output: ASCII characters only";
+gm_out_dig:  str = "Output: Digits only";
+gm_st_prec:  str = "Style: Precise (greedy)";
+gm_st_bal:   str = "Style: Balanced";
+gm_st_cre:   str = "Style: Creative";
+gm_len_s:    str = "Reply length: Short (64 tokens)";
+gm_len_std:  str = "Reply length: Standard (128 tokens)";
+gm_len_l:    str = "Reply length: Long (256 tokens)";
+gm_len_max:  str = "Reply length: Maximum (512 tokens)";
+gm_spec_on:  str = "Speculation: On (faster repeated text)";
+gm_spec_off: str = "Speculation: Off";
+gm_time_off: str = "GPU timing: Off";
+gm_time_on:  str = "GPU timing: On (diagnostics)";
+gm_tools_off: str = "Agent tools: Off (fast chat)";
+gm_tools_on:  str = "Agent tools: On (read/write/compile files)";
+set_pull_pfx:   str = "Pulling ";
+set_pull_sfx:   str = " - watch the console window; click Refresh when it finishes.";
+set_pull_nomodel: str = "Type a model name (e.g. qwen2.5:7b-instruct) in the Model box first.";
+
+it_ollama:    str = "Ollama (local)";
+it_openai:    str = "OpenAI-compatible";
+it_anthropic: str = "Anthropic";
+it_agent:     str = "ANCL agent";
+it_brain:     str = "Local Brain (ANCL)";
+it_aether:    str = "Aether Engine (local)";
+
+note_ollama:    str = "Local Ollama - no API key needed. Pick a model or Refresh to list installed ones.";
+note_openai:    str = "OpenAI-compatible endpoint. Set OPENAI_API_KEY in your environment (never stored).";
+note_anthropic: str = "Anthropic Claude (single-shot). Set ANTHROPIC_API_KEY in your environment (never stored).";
+note_brain:     str = "Local ANCL neural net - fully offline (no key/URL). Type in chat, then Send to complete the open file from the caret.";
+note_aether:    str = "Pure-ANCL LLM engine - no key, fully local. Refresh lists your models (shared + Ollama); type a name + Pull to download. Options... = friendly settings. Default = fast chat; turn on Agent tools there for read/write/compile (slower on big prompts). The IDE runs the server for you.";
+
+set_nm_ndl: str = "\"name\":\"";       # model name needle in /api/tags JSON
+
+set_registered: buf = 8;
+set_hwnd:       buf = 8;
+set_hinst:      buf = 8;
+set_brush:      buf = 8;
+set_font:       buf = 8;
+set_dwm_one:    buf = 8;
+set_disp_backend: buf = 8;             # backend currently shown in the dialog
+set_wc:         buf = 80;
+
+# control handles
+set_h_backend: buf = 8;
+set_h_urllbl:  buf = 8;
+set_h_url:     buf = 8;
+set_h_model:   buf = 8;
+set_h_refresh: buf = 8;
+set_h_note:    buf = 8;
+set_h_flagslbl: buf = 8;
+set_h_flags:    buf = 8;      # composed-flags display (read-only, backend 5)
+set_h_options:  buf = 8;      # "Options..." grouped-menu button (backend 5)
+set_h_pull:     buf = 8;      # "Pull model" button (backend 5)
+set_statusbuf:  buf = 512;    # live engine status line scratch
+set_curpos:     buf = 8;      # GetCursorPos POINT (x@0, y@4)
+set_prect:      buf = 16;     # parent window RECT (left@0 top@4 right@8 bottom@12)
+
+@CODE
+# ---- config state ---------------------------------------------------
+# Compose set_aether_flags (serve flags) + set_np/set_temp_str (request options)
+# from the six friendly engine-option enums. Called whenever an enum changes.
+func settings_compose_engine() -> i64 {
+    store8(set_aether_flags, 0);                            # start empty (CPU + no extras => "")
+    e = set_aether_flags;
+    hw = load64(set_eng_hw);
+    if hw == 0 { e = str_copy(e, ef_gpu); }
+    else { if hw == 1 { e = str_copy(e, ef_gpufinal); } }   # hw==2 CPU -> no gpu flag
+    out = load64(set_eng_out);
+    if out == 1 { e = str_copy(e, ef_ascii); }
+    else { if out == 2 { e = str_copy(e, ef_digits); } }
+    if load64(set_eng_spec) == 1 { e = str_copy(e, ef_nospec); }
+    if load64(set_eng_time) == 1 { e = str_copy(e, ef_gputime); }
+    # CPU hardware writes no leading token, so a restrict/nospec fragment can
+    # leave a leading space -> shift it off (eng_flags_eff also tolerates it)
+    if load8(set_aether_flags) == 32 {
+        si = 0;
+        while 1 { c = load8(set_aether_flags + si + 1); store8(set_aether_flags + si, c); if c == 0 { break; } si = si + 1; }
+    }
+    # request options
+    ln = load64(set_eng_len);
+    np = 512;
+    if ln == 0 { np = 64; }
+    if ln == 1 { np = 128; }
+    if ln == 2 { np = 256; }
+    store64(set_np, np);
+    st = load64(set_eng_style);
+    if st == 1 { str_copy(set_temp_str, et_balanced); }
+    else { if st == 2 { str_copy(set_temp_str, et_creative); } else { store8(set_temp_str, 0); } }
+    return 0;
+}
+
+func settings_defaults() -> i64 {
+    store64(set_backend, 0);
+    str_copy(set_ollama_url, d_ollama_url);
+    str_copy(set_ollama_model, d_ollama_model);
+    str_copy(set_openai_url, d_openai_url);
+    str_copy(set_openai_model, d_openai_model);
+    str_copy(set_anthropic_model, d_anthropic_model);
+    str_copy(set_aether_url, d_aether_url);
+    str_copy(set_aether_model, d_aether_model);
+    # default engine options: Full GPU, All languages, Precise, Maximum 512, Spec on, timing off
+    store64(set_eng_hw, 0); store64(set_eng_out, 0); store64(set_eng_style, 0);
+    store64(set_eng_len, 3); store64(set_eng_spec, 0); store64(set_eng_time, 0);
+    store64(set_eng_tools, 0);                    # default: fast chat (tools opt-in)
+    settings_compose_engine();
+    store64(set_backend, 5);                     # default to the pure-ANCL engine (saved cfg overrides)
+    return 0;
+}
+
+# point transport's local target at the active backend's base URL
+# (backend 5 = the Aether Engine; everything else = Ollama) + hand the engine
+# host the configured serve flags.
+func settings_apply_target() -> i64 {
+    if load64(set_backend) == 5 {
+        url_split(set_aether_url, ol_cur_host, ol_cur_port, ol_cur_sec, set_tmp);
+        str_copy(eng_flags, set_aether_flags);      # engine_host uses these on spawn
+    } else {
+        url_split(set_ollama_url, ol_cur_host, ol_cur_port, ol_cur_sec, set_tmp);   # set_tmp = (ignored) path
+    }
+    return 0;
+}
+
+func cfg_at_key(buf: i64, i: i64, key: i64) -> i64 {
+    j = 0;
+    while 1 {
+        kc = load8(key + j);
+        if kc == 0 { return 1; }
+        if load8(buf + i + j) != kc { return 0; }
+        j = j + 1;
+    }
+    return 0;
+}
+# copy the value at buf+from up to \r/\n/NUL into dst (NUL-term).
+func cfg_copy_val(buf: i64, from: i64, dst: i64) -> i64 {
+    i = from;
+    j = 0;
+    while 1 {
+        c = load8(buf + i);
+        if c == 0  { store8(dst + j, 0); return i; }
+        if c == 10 { store8(dst + j, 0); return i; }
+        if c == 13 { store8(dst + j, 0); return i; }
+        store8(dst + j, c); j = j + 1; i = i + 1;
+    }
+    return i;
+}
+
+# parse "hw,out,style,len,spec,time" into the six enum bufs, then recompose.
+func settings_parse_opts(s: i64) -> i64 {
+    p = s; k = 0;
+    while k < 7 {
+        v = 0;
+        while 1 {
+            c = load8(p);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            v = v * 10 + (c - 48);
+            p = p + 1;
+        }
+        if k == 0 { store64(set_eng_hw, v); }
+        if k == 1 { store64(set_eng_out, v); }
+        if k == 2 { store64(set_eng_style, v); }
+        if k == 3 { store64(set_eng_len, v); }
+        if k == 4 { store64(set_eng_spec, v); }
+        if k == 5 { store64(set_eng_time, v); }
+        if k == 6 { store64(set_eng_tools, v); }
+        if load8(p) == 44 { p = p + 1; }         # skip comma
+        k = k + 1;
+    }
+    settings_compose_engine();
+    return 0;
+}
+
+func settings_load() -> i64 {
+    settings_defaults();
+    ol_target_init();
+    ui_exedir(set_cfgdir);
+    ui_join(set_cfgpath, set_cfgdir, cfg_suffix);
+    n = ui_read_file(set_cfgpath, set_cfgbuf, 8192);
+    if n < 0 { settings_apply_target(); return 0; }
+    i = 0;
+    while 1 {
+        if load8(set_cfgbuf + i) == 0 { break; }
+        if cfg_at_key(set_cfgbuf, i, k_backend) == 1 {
+            store64(set_backend, str_to_int(set_cfgbuf + i + strlen(k_backend)));
+        }
+        if cfg_at_key(set_cfgbuf, i, k_ollama_url) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_ollama_url), set_ollama_url); }
+        if cfg_at_key(set_cfgbuf, i, k_ollama_model) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_ollama_model), set_ollama_model); }
+        if cfg_at_key(set_cfgbuf, i, k_openai_url) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_openai_url), set_openai_url); }
+        if cfg_at_key(set_cfgbuf, i, k_openai_model) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_openai_model), set_openai_model); }
+        if cfg_at_key(set_cfgbuf, i, k_anthropic_model) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_anthropic_model), set_anthropic_model); }
+        if cfg_at_key(set_cfgbuf, i, k_aether_url) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_aether_url), set_aether_url); }
+        if cfg_at_key(set_cfgbuf, i, k_aether_model) == 1 { cfg_copy_val(set_cfgbuf, i + strlen(k_aether_model), set_aether_model); }
+        if cfg_at_key(set_cfgbuf, i, k_aether_opts) == 1 { settings_parse_opts(set_cfgbuf + i + strlen(k_aether_opts)); }
+        # advance to the next line
+        while 1 {
+            c = load8(set_cfgbuf + i);
+            if c == 0 { break; }
+            i = i + 1;
+            if c == 10 { break; }
+        }
+    }
+    settings_apply_target();
+    return 0;
+}
+
+func settings_save() -> i64 {
+    ui_exedir(set_cfgdir);
+    ui_join(set_cfgpath, set_cfgdir, cfg_suffix);
+    e = str_copy(set_cfgbuf, k_backend);
+    int_to_str(e, load64(set_backend));
+    e = e + strlen(e);
+    e = str_copy(e, set_nl);
+    e = str_copy(e, k_ollama_url);      e = str_copy(e, set_ollama_url);      e = str_copy(e, set_nl);
+    e = str_copy(e, k_ollama_model);    e = str_copy(e, set_ollama_model);    e = str_copy(e, set_nl);
+    e = str_copy(e, k_openai_url);      e = str_copy(e, set_openai_url);      e = str_copy(e, set_nl);
+    e = str_copy(e, k_openai_model);    e = str_copy(e, set_openai_model);    e = str_copy(e, set_nl);
+    e = str_copy(e, k_anthropic_model); e = str_copy(e, set_anthropic_model); e = str_copy(e, set_nl);
+    e = str_copy(e, k_aether_url);      e = str_copy(e, set_aether_url);      e = str_copy(e, set_nl);
+    e = str_copy(e, k_aether_model);    e = str_copy(e, set_aether_model);    e = str_copy(e, set_nl);
+    e = str_copy(e, k_aether_opts);
+    int_to_str(e, load64(set_eng_hw));   e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_out));  e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_style)); e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_len));  e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_spec)); e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_time)); e = e + strlen(e); e = str_copy(e, set_comma);
+    int_to_str(e, load64(set_eng_tools)); e = e + strlen(e); e = str_copy(e, set_nl);
+    ui_write_file(set_cfgpath, set_cfgbuf, strlen(set_cfgbuf));
+    return 0;
+}
+
+# ---- the popup window ----------------------------------------------
+func set_mkfont() -> i64 {
+    f = CreateFontA(0 - 14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, set_face);
+    store64(set_font, f);
+    return f;
+}
+
+# show/hide + (re)populate the per-backend fields from set_disp_backend.
+func settings_sync_fields() -> i64 {
+    b = load64(set_disp_backend);
+    showurl = 5;
+    if b == 2 { showurl = 0; }                       # Anthropic: host is fixed -> hide URL
+    if b == 4 { showurl = 0; }                       # Local Brain: offline -> no URL
+    ShowWindow(load64(set_h_urllbl), showurl);
+    ShowWindow(load64(set_h_url), showurl);
+
+    # engine-only row: flags display + Options + Pull (backend 5)
+    showeng = 0;
+    if b == 5 { showeng = 5; }
+    ShowWindow(load64(set_h_flagslbl), showeng);
+    ShowWindow(load64(set_h_flags), showeng);
+    ShowWindow(load64(set_h_options), showeng);
+    ShowWindow(load64(set_h_pull), showeng);
+    if b == 5 { SetWindowTextA(load64(set_h_flags), set_aether_flags); }
+
+    isoll = 0;
+    if b == 0 { isoll = 1; }
+    if b == 3 { isoll = 1; }
+    if isoll == 1 {
+        SetWindowTextA(load64(set_h_url), set_ollama_url);
+        SetWindowTextA(load64(set_h_model), set_ollama_model);
+        SetWindowTextA(load64(set_h_note), note_ollama);
+        EnableWindow(load64(set_h_refresh), 1);
+    }
+    if b == 1 {
+        SetWindowTextA(load64(set_h_url), set_openai_url);
+        SetWindowTextA(load64(set_h_model), set_openai_model);
+        SetWindowTextA(load64(set_h_note), note_openai);
+        EnableWindow(load64(set_h_refresh), 0);
+    }
+    if b == 2 {
+        SetWindowTextA(load64(set_h_model), set_anthropic_model);
+        SetWindowTextA(load64(set_h_note), note_anthropic);
+        EnableWindow(load64(set_h_refresh), 0);
+    }
+    if b == 4 {                                      # Local Brain: offline, no model list
+        SetWindowTextA(load64(set_h_note), note_brain);
+        EnableWindow(load64(set_h_refresh), 0);
+    }
+    if b == 5 {                                      # Aether Engine: local server, store-backed model list
+        SetWindowTextA(load64(set_h_url), set_aether_url);
+        SetWindowTextA(load64(set_h_model), set_aether_model);
+        # live status line if a server is up, else the intro note
+        if eng_status_line(set_statusbuf) == 1 { SetWindowTextA(load64(set_h_note), set_statusbuf); }
+        else { SetWindowTextA(load64(set_h_note), note_aether); }
+        EnableWindow(load64(set_h_refresh), 1);
+    }
+    return 0;
+}
+
+# read the visible URL/model fields back into backend b's buffers.
+func settings_harvest(b: i64) -> i64 {
+    if b == 4 { return 0; }                          # Local Brain: offline, nothing to harvest
+    if b == 2 {
+        GetWindowTextA(load64(set_h_model), set_anthropic_model, 256);
+        return 0;
+    }
+    if b == 1 {
+        GetWindowTextA(load64(set_h_url), set_openai_url, 256);
+        GetWindowTextA(load64(set_h_model), set_openai_model, 256);
+        return 0;
+    }
+    if b == 5 {
+        GetWindowTextA(load64(set_h_url), set_aether_url, 256);
+        GetWindowTextA(load64(set_h_model), set_aether_model, 256);
+        # flags are composed from the Options menu (read-only field) -> not harvested
+        return 0;
+    }
+    GetWindowTextA(load64(set_h_url), set_ollama_url, 256);
+    GetWindowTextA(load64(set_h_model), set_ollama_model, 256);
+    return 0;
+}
+
+# Refresh the model combo: backend 5 lists the engine's local store (offline,
+# no server needed); everything else asks the live /api/tags endpoint.
+func settings_refresh_models() -> i64 {
+    if load64(set_disp_backend) == 5 { eng_fill_combo(load64(set_h_model)); return 0; }
+    ollama_tags(set_resp);
+    SendMessageA(load64(set_h_model), 331, 0, 0);        # CB_RESETCONTENT
+    i = 0;
+    while 1 {
+        if load8(set_resp + i) == 0 { break; }
+        # match the "name":" needle at i
+        j = 0;
+        hit = 0 - 1;
+        ok = 1;
+        while ok == 1 {
+            nc = load8(set_nm_ndl + j);
+            if nc == 0 { hit = i + j; ok = 0; }
+            else {
+                if load8(set_resp + i + j) != nc { ok = 0 - 2; }
+                j = j + 1;
+            }
+        }
+        if hit >= 0 {
+            # copy until closing quote
+            k = 0;
+            while 1 {
+                c = load8(set_resp + hit + k);
+                if c == 0  { break; }
+                if c == 34 { break; }
+                store8(set_tmp + k, c); k = k + 1;
+            }
+            store8(set_tmp + k, 0);
+            if k > 0 { SendMessageA(load64(set_h_model), 323, 0, set_tmp); }   # CB_ADDSTRING
+            i = hit + k;
+        } else {
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+func settings_create_controls(hwnd: i64) -> i64 {
+    hinst = load64(set_hinst);
+    theme_init();
+    fnt = load64(thm_f_ui);
+
+    CreateWindowExA(0, set_cls_static, lbl_backend, 0x50000000, 16, 18, 84, 20, hwnd, 0, hinst, 0);
+    cb = CreateWindowExA(0, set_cls_combo, set_empty, 0x50200003, 108, 14, 350, 240, hwnd, 3001, hinst, 0);
+    store64(set_h_backend, cb);
+    thm_combo_subclass(cb);                      # dark dropdown + custom dark drop-arrow (DROPDOWNLIST)
+
+    ul = CreateWindowExA(0, set_cls_static, lbl_url, 0x50000000, 16, 60, 84, 20, hwnd, 0, hinst, 0);
+    store64(set_h_urllbl, ul);
+    ue = CreateWindowExA(0, set_cls_edit, set_empty, 0x50800080, 108, 58, 350, 24, hwnd, 3002, hinst, 0);
+    store64(set_h_url, ue);
+
+    CreateWindowExA(0, set_cls_static, lbl_model, 0x50000000, 16, 102, 84, 20, hwnd, 0, hinst, 0);
+    mc = CreateWindowExA(0, set_cls_combo, set_empty, 0x50200002, 108, 98, 238, 240, hwnd, 3003, hinst, 0);
+    store64(set_h_model, mc);
+    thm_ecombo_subclass(mc);                     # editable: dark drop-arrow overpaint
+    rb = CreateWindowExA(0, thm_cls_glow, lbl_refresh, 0x50000000, 352, 98, 120, 24, hwnd, 3004, hinst, 0);
+    store64(set_h_refresh, rb);
+
+    # engine options row (backend 5 only; shown/hidden by settings_sync_fields):
+    # a read-only composed-flags display + the Lens-style Options menu + Pull
+    fl = CreateWindowExA(0, set_cls_static, lbl_flags, 0x50000000, 16, 142, 84, 20, hwnd, 0, hinst, 0);
+    store64(set_h_flagslbl, fl);
+    fe = CreateWindowExA(0, set_cls_edit, set_empty, 0x50800880, 108, 140, 150, 24, hwnd, 3007, hinst, 0);   # ES_READONLY
+    store64(set_h_flags, fe);
+    ob = CreateWindowExA(0, thm_cls_glow, lbl_options, 0x50000000, 264, 140, 88, 24, hwnd, 3009, hinst, 0);
+    store64(set_h_options, ob);
+    pb = CreateWindowExA(0, thm_cls_glow, lbl_pull, 0x50000000, 356, 140, 116, 24, hwnd, 3008, hinst, 0);
+    store64(set_h_pull, pb);
+
+    nt = CreateWindowExA(0, set_cls_static, set_empty, 0x50000000, 16, 182, 456, 84, hwnd, 0, hinst, 0);
+    store64(set_h_note, nt);
+
+    CreateWindowExA(0, thm_cls_glow, lbl_save,  0x50000000, 276, 336, 84, 30, hwnd, 3005, hinst, 0);
+    CreateWindowExA(0, thm_cls_glow, lbl_close, 0x50000000, 368, 336, 84, 30, hwnd, 3006, hinst, 0);
+
+    # font on every control
+    SendMessageA(load64(set_h_backend), 48, fnt, 1);
+    SendMessageA(load64(set_h_urllbl), 48, fnt, 1);
+    SendMessageA(load64(set_h_url), 48, fnt, 1);
+    SendMessageA(load64(set_h_model), 48, fnt, 1);
+    SendMessageA(load64(set_h_refresh), 48, fnt, 1);
+    SendMessageA(load64(set_h_flagslbl), 48, fnt, 1);
+    SendMessageA(load64(set_h_flags), 48, fnt, 1);
+    SendMessageA(load64(set_h_note), 48, fnt, 1);
+
+    # backend dropdown items + current selection
+    SendMessageA(cb, 323, 0, it_ollama);            # CB_ADDSTRING (index 0)
+    SendMessageA(cb, 323, 0, it_openai);            # 1
+    SendMessageA(cb, 323, 0, it_anthropic);         # 2
+    SendMessageA(cb, 323, 0, it_agent);             # 3
+    SendMessageA(cb, 323, 0, it_brain);             # 4 (Local Brain - ANCL, offline)
+    SendMessageA(cb, 323, 0, it_aether);            # 5 (Aether Engine - pure-ANCL local LLM server)
+    SendMessageA(cb, 334, load64(set_backend), 0);  # CB_SETCURSEL
+
+    store64(set_disp_backend, load64(set_backend));
+    settings_sync_fields();
+    return 0;
+}
+
+func set_btn_label(id: i64) -> i64 {
+    if id == 3004 { return lbl_refresh; }
+    if id == 3005 { return lbl_save; }
+    if id == 3006 { return lbl_close; }
+    if id == 3008 { return lbl_pull; }
+    if id == 3009 { return lbl_options; }
+    return set_empty;
+}
+
+# append a checkable menu item: checked when `sel` matches this item's `val`.
+func gm_item(h: i64, id: i64, label: i64, sel: i64, val: i64) -> i64 {
+    fl = 0;                                          # MF_STRING
+    if sel == val { fl = 8; }                        # MF_CHECKED
+    AppendMenuA(h, fl, id, label);
+    return 0;
+}
+# Build + track the Lens-style grouped engine-options menu at the cursor. The
+# items post WM_COMMAND (ids 3100..3151) back to the settings window.
+func settings_open_options(hwnd: i64) -> i64 {
+    m = CreatePopupMenu();
+    hw = load64(set_eng_hw);
+    gm_item(m, 3100, gm_hw_full, hw, 0);
+    gm_item(m, 3101, gm_hw_cons, hw, 1);
+    gm_item(m, 3102, gm_hw_cpu,  hw, 2);
+    AppendMenuA(m, 0x800, 0, 0);                     # MF_SEPARATOR
+    out = load64(set_eng_out);
+    gm_item(m, 3110, gm_out_all, out, 0);
+    gm_item(m, 3111, gm_out_asc, out, 1);
+    gm_item(m, 3112, gm_out_dig, out, 2);
+    AppendMenuA(m, 0x800, 0, 0);
+    st = load64(set_eng_style);
+    gm_item(m, 3120, gm_st_prec, st, 0);
+    gm_item(m, 3121, gm_st_bal,  st, 1);
+    gm_item(m, 3122, gm_st_cre,  st, 2);
+    AppendMenuA(m, 0x800, 0, 0);
+    ln = load64(set_eng_len);
+    gm_item(m, 3130, gm_len_s,   ln, 0);
+    gm_item(m, 3131, gm_len_std, ln, 1);
+    gm_item(m, 3132, gm_len_l,   ln, 2);
+    gm_item(m, 3133, gm_len_max, ln, 3);
+    AppendMenuA(m, 0x800, 0, 0);
+    sp = load64(set_eng_spec);
+    gm_item(m, 3140, gm_spec_on,  sp, 0);
+    gm_item(m, 3141, gm_spec_off, sp, 1);
+    AppendMenuA(m, 0x800, 0, 0);
+    tm = load64(set_eng_time);
+    gm_item(m, 3150, gm_time_off, tm, 0);
+    gm_item(m, 3151, gm_time_on,  tm, 1);
+    AppendMenuA(m, 0x800, 0, 0);
+    tl = load64(set_eng_tools);
+    gm_item(m, 3160, gm_tools_off, tl, 0);
+    gm_item(m, 3161, gm_tools_on,  tl, 1);
+    GetCursorPos(set_curpos);
+    TrackPopupMenu(m, 0, load32(set_curpos), load32(set_curpos + 4), 0, hwnd, 0);
+    DestroyMenu(m);
+    return 0;
+}
+# apply a menu selection (id 3100..3151) to its enum, recompose, refresh the field.
+func settings_apply_option(id: i64) -> i64 {
+    if id >= 3100 { if id <= 3102 { store64(set_eng_hw, id - 3100); } }
+    if id >= 3110 { if id <= 3112 { store64(set_eng_out, id - 3110); } }
+    if id >= 3120 { if id <= 3122 { store64(set_eng_style, id - 3120); } }
+    if id >= 3130 { if id <= 3133 { store64(set_eng_len, id - 3130); } }
+    if id >= 3140 { if id <= 3141 { store64(set_eng_spec, id - 3140); } }
+    if id >= 3150 { if id <= 3151 { store64(set_eng_time, id - 3150); } }
+    if id >= 3160 { if id <= 3161 { store64(set_eng_tools, id - 3160); } }
+    settings_compose_engine();
+    SetWindowTextA(load64(set_h_flags), set_aether_flags);
+    return 0;
+}
+
+# "Pull model": spawn `aether_engine.exe models pull <model>` in a console so
+# the user watches the download; the note reports what's happening.
+func settings_pull_model() -> i64 {
+    GetWindowTextA(load64(set_h_model), set_aether_model, 256);
+    if load8(set_aether_model) == 0 { SetWindowTextA(load64(set_h_note), set_pull_nomodel); return 0; }
+    if eng_pull_start(set_aether_model) == 0 { SetWindowTextA(load64(set_h_note), note_aether); return 0; }
+    e = str_copy(set_statusbuf, set_pull_pfx);
+    e = str_copy(e, set_aether_model);
+    str_copy(e, set_pull_sfx);
+    SetWindowTextA(load64(set_h_note), set_statusbuf);
+    return 0;
+}
+
+func SettingsProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 { settings_create_controls(hwnd); return 0; }     # WM_CREATE
+
+    if msg == 43 {                                               # WM_DRAWITEM (glow buttons)
+        lp = lParam;
+        istate = load32(lp + 16);
+        st = 0;
+        if band(istate, 1) != 0 { st = bor(st, 1); }
+        if band(istate, 0x40) != 0 { st = bor(st, 2); }
+        thm_draw_button(load64(lp + 32), lp + 40, set_btn_label(load32(lp + 4)), st);
+        return 1;
+    }
+
+    if msg == 273 {                                              # WM_COMMAND
+        id = band(wParam, 65535);
+        note = band(shr(wParam, 16), 65535);
+        if id == 3001 {
+            if note == 1 {                                       # CBN_SELCHANGE
+                settings_harvest(load64(set_disp_backend));
+                nb = SendMessageA(load64(set_h_backend), 327, 0, 0);   # CB_GETCURSEL
+                store64(set_disp_backend, nb);
+                settings_sync_fields();
+            }
+        }
+        if id == 3004 { settings_refresh_models(); }
+        if id == 3008 { settings_pull_model(); }
+        if id == 3009 { settings_open_options(hwnd); }
+        if id >= 3100 { if id <= 3161 { settings_apply_option(id); } }   # grouped-menu picks
+        if id == 3005 {
+            settings_harvest(load64(set_disp_backend));
+            store64(set_backend, load64(set_disp_backend));
+            settings_save();
+            settings_apply_target();
+            # serve-time flags (Hardware/Output/Speculation/timing) changed -> drop the
+            # owned engine so the next Send respawns it with the new flags + model
+            if load64(set_backend) == 5 { eng_stop(); }
+            ShowWindow(hwnd, 0);
+        }
+        if id == 3006 { ShowWindow(hwnd, 0); }
+        return 0;
+    }
+
+    if msg == 16 { ShowWindow(hwnd, 0); return 0; }              # WM_CLOSE -> hide (lazy reuse)
+
+    if msg == 312 {                                             # WM_CTLCOLORSTATIC
+        SetBkMode(wParam, 1); SetBkColor(wParam, TH_BG_PANEL);
+        if lParam == load64(set_h_note) { SetTextColor(wParam, TH_GOLD); } else { SetTextColor(wParam, TH_TEXT); }
+        return load64(thm_b_panel);
+    }
+    if msg == 307 { SetTextColor(wParam, TH_TEXT); SetBkColor(wParam, TH_BG_INPUT); SetBkMode(wParam, 1); return load64(thm_b_input); }  # WM_CTLCOLOREDIT
+    if msg == 308 { SetTextColor(wParam, TH_TEXT); SetBkColor(wParam, TH_BG_CARD);  SetBkMode(wParam, 1); return load64(thm_b_card); }   # WM_CTLCOLORLISTBOX
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+func set_register(hinst: i64) -> i64 {
+    if load64(set_registered) == 1 { return 0; }
+    store64(set_brush, load64(thm_b_panel));
+    cursor = LoadCursorA(0, 32512);
+    store32(set_wc + 0,  80);
+    store32(set_wc + 4,  3);
+    store64(set_wc + 8,  &SettingsProc);
+    store32(set_wc + 16, 0);
+    store32(set_wc + 20, 0);
+    store64(set_wc + 24, hinst);
+    store64(set_wc + 32, 0);
+    store64(set_wc + 40, cursor);
+    store64(set_wc + 48, load64(set_brush));
+    store64(set_wc + 56, 0);
+    store64(set_wc + 64, set_clsname);
+    store64(set_wc + 72, 0);
+    RegisterClassExA(set_wc);
+    store64(set_registered, 1);
+    return 0;
+}
+
+# open (or re-show) the settings popup, owned by `parent`, CENTERED on it (a
+# WS_POPUP window takes screen coords, so compute from the parent's rect --
+# otherwise it always lands at a fixed screen spot).
+func settings_open(parent: i64) -> i64 {
+    theme_init();
+    hinst = GetModuleHandleA(0);
+    store64(set_hinst, hinst);
+    set_register(hinst);
+    thm_register_glowbtn(hinst);
+    px = 120; py = 80;                                     # fallback if no parent rect
+    if parent != 0 {
+        GetWindowRect(parent, set_prect);
+        pw = load32(set_prect + 8) - load32(set_prect + 0);
+        ph = load32(set_prect + 12) - load32(set_prect + 4);
+        px = load32(set_prect + 0) + (pw - 492) / 2;
+        py = load32(set_prect + 4) + (ph - 440) / 2;
+        if px < 0 { px = 0; }
+        if py < 0 { py = 0; }
+    }
+    h = load64(set_hwnd);
+    if h != 0 {
+        SetWindowPos(h, 0, px, py, 0, 0, 5);               # SWP_NOSIZE|SWP_NOZORDER: reposition, keep size
+        ShowWindow(h, 5);
+        return 0;
+    }
+    h = CreateWindowExA(0, set_clsname, set_title, 0x10C80000, px, py, 492, 440, parent, 0, hinst, 0);
+    store64(set_hwnd, h);
+    store32(set_dwm_one, 1);
+    DwmSetWindowAttribute(h, 20, set_dwm_one, 4);
+    ShowWindow(h, 5);
+    return 0;
+}

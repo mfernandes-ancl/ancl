@@ -1,0 +1,58 @@
+# modbus_client.ancl - Modbus/TCP FC03 read-holding-registers STARTER. 100% CRT-free, zero-dep.
+# A complete, compilable client: edit the CONFIG block, COMPILE, RUN. Then extend it
+# (FC06/FC16 write, polling) - Ctrl+Space (the op-brain) knows the ANCL idioms.
+# Loaded by Aether Studio when your intent is to build a Modbus tool.
+extern "ws2_32.dll" connect;
+
+@DATA
+# ==== CONFIG - edit these ====
+CFG_IP0:   i64 = 127;     # target IP, octet 1
+CFG_IP1:   i64 = 0;       #   octet 2
+CFG_IP2:   i64 = 0;       #   octet 3
+CFG_IP3:   i64 = 1;       #   octet 4   (127.0.0.1 = localhost)
+CFG_PORT:  i64 = 502;     # Modbus/TCP port (standard 502)
+CFG_UNIT:  i64 = 1;       # Modbus unit id
+CFG_ADDR:  i64 = 0;       # first holding register, 0-based (40001 -> 0)
+CFG_COUNT: i64 = 4;       # how many registers to read
+# =============================
+mInfo: str = "[modbus] FC03 read-holding-registers client (ANCL starter)\n";
+mConn: str = "[modbus] connect failed - check IP / port / cable.\n";
+mReg:  str = "[modbus] register ";
+mEq:   str = " = ";
+mNo:   str = "[modbus] no / short reply.\n";
+nl:    str = "\n";
+g_wsa:  buf = 512;
+g_addr: buf = 16;
+g_req:  buf = 16;
+g_buf:  buf = 512;
+
+@CODE
+func main() -> i32 {
+    syscall 1, mInfo;
+    WSAStartup(514, g_wsa);
+    s = socket(2, 1, 6);                          # AF_INET, SOCK_STREAM, TCP
+    store16(g_addr+0, 2);
+    store16(g_addr+2, htons(CFG_PORT));
+    store32(g_addr+4, CFG_IP0 + shl(CFG_IP1,8) + shl(CFG_IP2,16) + shl(CFG_IP3,24));
+    store64(g_addr+8, 0);
+    if connect(s, g_addr, 16) != 0 { syscall 1, mConn; closesocket(s); return 1; }
+    # MBAP header + FC03 PDU
+    store8(g_req+0,0); store8(g_req+1,1);          # transaction id
+    store8(g_req+2,0); store8(g_req+3,0);          # protocol id = 0
+    store8(g_req+4,0); store8(g_req+5,6);          # length = 6
+    store8(g_req+6, CFG_UNIT); store8(g_req+7, 3); # unit, function code 03
+    store8(g_req+8, band(shr(CFG_ADDR,8),255)); store8(g_req+9, band(CFG_ADDR,255));
+    store8(g_req+10, band(shr(CFG_COUNT,8),255)); store8(g_req+11, band(CFG_COUNT,255));
+    send(s, g_req, 12, 0);
+    n = recv(s, g_buf, 512, 0);
+    if n < 9 { syscall 1, mNo; closesocket(s); return 0; }
+    nr = load8(g_buf+8) / 2;                        # byte count / 2 = number of registers
+    i = 0;
+    while i < nr {
+        v = load8(g_buf+9+i*2)*256 + load8(g_buf+10+i*2);
+        syscall 1, mReg, (40001 + CFG_ADDR + i), mEq, v, nl;
+        i = i + 1;
+    }
+    closesocket(s);
+    return 0;
+}

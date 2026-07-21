@@ -1,0 +1,513 @@
+# Neon Snake - A Native Win32 Game in ANCL
+# Bypasses .NET, Python, and the CRT. Zero dependencies.
+
+import "win32_api.ancl";
+import "numfmt.ancl";
+extern "gdi32.dll"  DeleteDC;
+extern "gdi32.dll"  SetTextAlign;
+
+extern "user32.dll" PeekMessageA -> i32;
+extern "gdi32.dll" CreateFontA -> ptr;
+
+@DATA
+class_name: str = "NeonSnake";
+window_title: str = "Neon Snake - ANCL Native Showcase";
+g_hinst: buf = 8;
+hwnd: buf = 8;
+
+# Brushes and Fonts
+bg_brush: buf = 8;
+hud_brush: buf = 8;
+board_brush: buf = 8;
+border_brush: buf = 8;
+head_brush: buf = 8;
+snake_brush: buf = 8;
+food_brush: buf = 8;
+title_font: buf = 8;
+hud_font: buf = 8;
+small_font: buf = 8;
+
+# Buffers for Windows structures
+wc_buf: buf = 80;
+msg_buf: buf = 48;
+ps_buf: buf = 64;
+client_rect: buf = 16;
+cell_rect: buf = 16;
+hud_str: buf = 64;
+
+# Game state
+game_state: buf = 8;
+score: buf = 8;
+high_score: buf = 8;
+tick_delay: buf = 8;
+last_tick: buf = 8;
+rand_seed: buf = 8;
+
+# Snake state
+snake_x: buf = 1600;
+snake_y: buf = 1600;
+snake_len: buf = 8;
+dir_x: buf = 8;
+dir_y: buf = 8;
+next_dir_x: buf = 8;
+next_dir_y: buf = 8;
+food_x: buf = 8;
+food_y: buf = 8;
+
+@CODE
+
+# --- Helper Functions ---
+func draw_rect(hdc: ptr, x1: i32, y1: i32, x2: i32, y2: i32, brush: ptr) -> i64 {
+    store32(cell_rect + 0, x1);
+    store32(cell_rect + 4, y1);
+    store32(cell_rect + 8, x2);
+    store32(cell_rect + 12, y2);
+    FillRect(hdc, cell_rect, brush);
+    return 0;
+}
+
+func draw_text_num(hdc: ptr, x: i32, y: i32, prefix: ptr, val: i64) -> i64 {
+    str_len = strlen(prefix);
+    memset(hud_str, 0, 64);
+    memcpy(hud_str, prefix, str_len);
+    nf_u64dec(val, hud_str + str_len);
+    TextOutA(hdc, x, y, hud_str, strlen(hud_str));
+    return 0;
+}
+
+func trigger_game_over() -> i64 {
+    store64(game_state, 2);
+    s = load64(score);
+    h = load64(high_score);
+    if s > h {
+        store64(high_score, s);
+    }
+    return 0;
+}
+
+func shift_segments(max_index: i64) -> i64 {
+    i = max_index;
+    while i > 0 {
+        store64(snake_x + i * 8, load64(snake_x + (i - 1) * 8));
+        store64(snake_y + i * 8, load64(snake_y + (i - 1) * 8));
+        i = i - 1;
+    }
+    return 0;
+}
+
+func spawn_food() -> i64 {
+    while 1 {
+        # Update LCG seed
+        seed = load64(rand_seed);
+        seed = seed * 2862933555777941757 + 3037000493;
+        store64(rand_seed, seed);
+        
+        rx = band(shr(seed, 32), 0xFFFF) % 20;
+        ry = band(shr(seed, 16), 0xFFFF) % 20;
+        
+        # Check if spawn matches snake
+        occupied = 0;
+        L = load64(snake_len);
+        i = 0;
+        while i < L {
+            if rx == load64(snake_x + i * 8) {
+                if ry == load64(snake_y + i * 8) {
+                    occupied = 1;
+                    break;
+                }
+            }
+            i = i + 1;
+        }
+        
+        if occupied == 0 {
+            store64(food_x, rx);
+            store64(food_y, ry);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+func game_start() -> i64 {
+    store64(score, 0);
+    store64(snake_len, 3);
+    
+    # Initialize centered segments (head at (10, 10))
+    store64(snake_x + 0 * 8, 10); store64(snake_y + 0 * 8, 10);
+    store64(snake_x + 1 * 8, 9);  store64(snake_y + 1 * 8, 10);
+    store64(snake_x + 2 * 8, 8);  store64(snake_y + 2 * 8, 10);
+    
+    store64(dir_x, 1);
+    store64(dir_y, 0);
+    store64(next_dir_x, 1);
+    store64(next_dir_y, 0);
+    
+    store64(tick_delay, 150); # 150ms start speed
+    
+    spawn_food();
+    store64(game_state, 1);
+    store64(last_tick, GetTickCount());
+    return 0;
+}
+
+func game_update() -> i64 {
+    if load64(game_state) != 1 { return 0; }
+    
+    # Apply direction updates
+    store64(dir_x, load64(next_dir_x));
+    store64(dir_y, load64(next_dir_y));
+    
+    dx = load64(dir_x);
+    dy = load64(dir_y);
+    
+    if dx == 0 {
+        if dy == 0 { return 0; }
+    }
+    
+    head_x = load64(snake_x) + dx;
+    head_y = load64(snake_y) + dy;
+    
+    # Check screen boundaries
+    if head_x < 0 { trigger_game_over(); return 0; }
+    if head_x >= 20 { trigger_game_over(); return 0; }
+    if head_y < 0 { trigger_game_over(); return 0; }
+    if head_y >= 20 { trigger_game_over(); return 0; }
+    
+    # Check self collision
+    L = load64(snake_len);
+    i = 0;
+    while i < L {
+        if head_x == load64(snake_x + i * 8) {
+            if head_y == load64(snake_y + i * 8) {
+                trigger_game_over();
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    
+    # Check food consumption
+    if head_x == load64(food_x) {
+        if head_y == load64(food_y) {
+            # Grow by shifting body down without truncating tail
+            shift_segments(L);
+            store64(snake_x, head_x);
+            store64(snake_y, head_y);
+            store64(snake_len, L + 1);
+            
+            s = load64(score) + 1;
+            store64(score, s);
+            if s > load64(high_score) { store64(high_score, s); }
+            
+            # Scale speed
+            cur_delay = load64(tick_delay);
+            if cur_delay > 50 {
+                store64(tick_delay, cur_delay - 2); # Acceleration steps
+            }
+            
+            spawn_food();
+            return 0;
+        }
+    }
+    
+    # Move normally (shifts body and truncates tail)
+    shift_segments(L - 1);
+    store64(snake_x, head_x);
+    store64(snake_y, head_y);
+    return 0;
+}
+
+func game_render(hdc: ptr) -> i64 {
+    GetClientRect(load64(hwnd), client_rect);
+    width = load32(client_rect + 8);
+    height = load32(client_rect + 12);
+    
+    # Canvas clear
+    draw_rect(hdc, 0, 0, width, height, load64(bg_brush));
+    
+    # HUD panel clear
+    draw_rect(hdc, 0, 0, width, 90, load64(hud_brush));
+    
+    SetBkMode(hdc, 1);
+    old_font = SelectObject(hdc, load64(hud_font));
+    
+    # Render Scores
+    SetTextColor(hdc, 0x00FF00); # Green Score
+    draw_text_num(hdc, 30, 30, "SCORE: ", load64(score));
+    
+    SetTextColor(hdc, 0x00D898); # Gold High Score
+    SetTextAlign(hdc, 2);                            # TA_RIGHT
+    draw_text_num(hdc, width - 30, 30, "HIGH SCORE: ", load64(high_score));
+    SetTextAlign(hdc, 0);                            # restore TA_LEFT
+
+    # Centered grid borders
+    start_x = (width - 400) / 2;
+    start_y = 120;
+    
+    draw_rect(hdc, start_x - 4, start_y - 4, start_x + 404, start_y + 404, load64(border_brush));
+    draw_rect(hdc, start_x, start_y, start_x + 400, start_y + 400, load64(board_brush));
+    
+    state = load64(game_state);
+    
+    if state == 0 {
+        # Start menu â€” centered neon layout
+        cx = start_x + 200;                              # board centre x
+        SetTextAlign(hdc, 6);                            # TA_CENTER
+
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x00FF00);                     # green
+        TextOutA(hdc, cx, start_y + 90, "NEON SNAKE", 10);
+        draw_rect(hdc, cx - 84, start_y + 140, cx + 84, start_y + 143, load64(head_brush));
+
+        SelectObject(hdc, load64(small_font));
+        SetTextColor(hdc, 0x8A8A8A);
+        TextOutA(hdc, cx, start_y + 154, "A NATIVE ANCL GAME", 18);
+
+        SetTextColor(hdc, 0x00A5FF);                     # orange
+        TextOutA(hdc, cx, start_y + 250, "ARROWS   STEER THE SNAKE", 24);
+
+        SelectObject(hdc, load64(hud_font));
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0xFFFFFF);
+            TextOutA(hdc, cx, start_y + 320, "PRESS SPACE TO PLAY", 19);
+        }
+
+        SetTextAlign(hdc, 0);                            # restore TA_LEFT
+    }
+    
+    if state == 1 {
+        # Render Food
+        fx = load64(food_x);
+        fy = load64(food_y);
+        draw_rect(hdc, start_x + fx * 20 + 2, start_y + fy * 20 + 2, start_x + fx * 20 + 18, start_y + fy * 20 + 18, load64(food_brush));
+        
+        # Render Snake Segments
+        L = load64(snake_len);
+        i = 0;
+        while i < L {
+            sx = load64(snake_x + i * 8);
+            sy = load64(snake_y + i * 8);
+            
+            brush = load64(snake_brush);
+            if i == 0 { brush = load64(head_brush); } # Different head brush
+            
+            draw_rect(hdc, start_x + sx * 20 + 1, start_y + sy * 20 + 1, start_x + sx * 20 + 19, start_y + sy * 20 + 19, brush);
+            i = i + 1;
+        }
+    }
+    
+    if state == 2 {
+        # Game Over UI
+        SelectObject(hdc, load64(title_font));
+        SetTextColor(hdc, 0x0000FF); # Bright Red
+        TextOutA(hdc, start_x + 90, start_y + 100, "GAME OVER", 9);
+        
+        SelectObject(hdc, load64(hud_font));
+        SetTextColor(hdc, 0xCCCCCC);
+        draw_text_num(hdc, start_x + 130, start_y + 180, "FINAL SCORE: ", load64(score));
+        
+        flash = band(shr(GetTickCount(), 9), 1);
+        if flash == 1 {
+            SetTextColor(hdc, 0x00FFFF); # Bright Yellow
+            TextOutA(hdc, start_x + 75, start_y + 260, "PRESS SPACE TO RESTART", 22);
+        }
+    }
+    
+    SelectObject(hdc, old_font);
+    return 0;
+}
+
+# --- Win32 Window Procedure ---
+func WindowProc(hwnd_val: i64, msg: i32, wParam: i64, lParam: i64) -> i64 {
+    if msg == 15 { # WM_PAINT (double-buffered: render off-screen, blit once â€” no flicker)
+        hdc = BeginPaint(hwnd_val, ps_buf);
+        GetClientRect(hwnd_val, client_rect);
+        db_w = load32(client_rect + 8);
+        db_h = load32(client_rect + 12);
+        db_dc = CreateCompatibleDC(hdc);
+        db_bmp = CreateCompatibleBitmap(hdc, db_w, db_h);
+        db_old = SelectObject(db_dc, db_bmp);
+        game_render(db_dc);
+        BitBlt(hdc, 0, 0, db_w, db_h, db_dc, 0, 0, 0x00CC0020);
+        SelectObject(db_dc, db_old);
+        DeleteObject(db_bmp);
+        DeleteDC(db_dc);
+        EndPaint(hwnd_val, ps_buf);
+        return 0;
+    }
+    
+    if msg == 20 { # WM_ERASEBKGND
+        return 1; # Bypass erase to reduce flicker
+    }
+    
+    if msg == 2 { # WM_DESTROY
+        PostQuitMessage(0);
+        return 0;
+    }
+    
+    if msg == 256 { # WM_KEYDOWN
+        state = load64(game_state);
+        
+        # Start & Restart triggers
+        if state == 0 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        if state == 2 {
+            if wParam == 32 { game_start(); return 0; } # Space
+            if wParam == 13 { game_start(); return 0; } # Enter
+        }
+        
+        if state == 1 {
+            curr_dx = load64(dir_x);
+            curr_dy = load64(dir_y);
+            
+            # Left (Arrow Left or A)
+            if wParam == 37 {
+                if curr_dx == 0 { store64(next_dir_x, 0 - 1); store64(next_dir_y, 0); }
+                return 0;
+            }
+            if wParam == 65 {
+                if curr_dx == 0 { store64(next_dir_x, 0 - 1); store64(next_dir_y, 0); }
+                return 0;
+            }
+            
+            # Right (Arrow Right or D)
+            if wParam == 39 {
+                if curr_dx == 0 { store64(next_dir_x, 1); store64(next_dir_y, 0); }
+                return 0;
+            }
+            if wParam == 68 {
+                if curr_dx == 0 { store64(next_dir_x, 1); store64(next_dir_y, 0); }
+                return 0;
+            }
+            
+            # Up (Arrow Up or W)
+            if wParam == 38 {
+                if curr_dy == 0 { store64(next_dir_x, 0); store64(next_dir_y, 0 - 1); }
+                return 0;
+            }
+            if wParam == 87 {
+                if curr_dy == 0 { store64(next_dir_x, 0); store64(next_dir_y, 0 - 1); }
+                return 0;
+            }
+            
+            # Down (Arrow Down or S)
+            if wParam == 40 {
+                if curr_dy == 0 { store64(next_dir_x, 0); store64(next_dir_y, 1); }
+                return 0;
+            }
+            if wParam == 83 {
+                if curr_dy == 0 { store64(next_dir_x, 0); store64(next_dir_y, 1); }
+                return 0;
+            }
+        }
+        return 0;
+    }
+    
+    return DefWindowProcA(hwnd_val, msg, wParam, lParam);
+}
+
+# --- Main Entry Point ---
+func main() -> i32 {
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512); # IDC_ARROW
+    
+    # Initialize GDI Resources
+    store64(bg_brush, CreateSolidBrush(0x1E1E1E));      # Dark gray canvas
+    store64(hud_brush, CreateSolidBrush(0x252525));     # HUD Panel
+    store64(board_brush, CreateSolidBrush(0x121212));   # Play area
+    store64(border_brush, CreateSolidBrush(0x444444));  # Play area border
+    
+    store64(head_brush, CreateSolidBrush(0x00FFFF));    # Neon Cyan Head
+    store64(snake_brush, CreateSolidBrush(0x00FF00));   # Neon Green Body
+    store64(food_brush, CreateSolidBrush(0xFF00FF));    # Neon Pink Food
+    
+    # Fonts
+    store64(title_font, CreateFontA(36, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(hud_font, CreateFontA(20, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    store64(small_font, CreateFontA(15, 0, 0, 0, 500, 0, 0, 0, 0, 0, 0, 5, 0, "Consolas"));
+    
+    # Initialize game variables
+    store64(game_state, 0);
+    store64(score, 0);
+    store64(high_score, 0);
+    store64(rand_seed, GetTickCount());
+    
+    # Initialize WNDCLASSEX
+    store32(wc_buf + 0, 80);
+    store32(wc_buf + 4, 3); # CS_HREDRAW | CS_VREDRAW
+    store64(wc_buf + 8, &WindowProc);
+    store32(wc_buf + 16, 0);
+    store32(wc_buf + 20, 0);
+    store64(wc_buf + 24, hinst);
+    store64(wc_buf + 32, 0);
+    store64(wc_buf + 40, cursor);
+    store64(wc_buf + 48, load64(bg_brush));
+    store64(wc_buf + 56, 0);
+    store64(wc_buf + 64, class_name);
+    store64(wc_buf + 72, 0);
+    RegisterClassExA(wc_buf);
+    
+    # Create overlapped window (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX)
+    hwnd_val = CreateWindowExA(0, class_name, window_title, 0x00CA0000, 200, 100, 600, 650, 0, 0, hinst, 0);
+    store64(hwnd, hwnd_val);
+    
+    if hwnd_val == 0 {
+        return 1;
+    }
+    
+    ShowWindow(hwnd_val, 1);
+    UpdateWindow(hwnd_val);
+    
+    store64(last_tick, GetTickCount());
+    
+    while 1 {
+        # Feed entropy continuously
+        store64(rand_seed, load64(rand_seed) * 2862933555777941757 + GetTickCount() + 13);
+        
+        has_msg = PeekMessageA(msg_buf, 0, 0, 0, 1);
+        if has_msg != 0 {
+            msg_id = load32(msg_buf + 8);
+            if msg_id == 18 { break; }
+            TranslateMessage(msg_buf);
+            DispatchMessageA(msg_buf);
+        } else {
+            Sleep(1);
+        }
+        
+        # Physics update or flash animation repaint request
+        if load64(game_state) == 1 {
+            current_tick = GetTickCount();
+            delay = load64(tick_delay);
+            if current_tick - load64(last_tick) >= delay {
+                game_update();
+                store64(last_tick, current_tick);
+                InvalidateRect(hwnd_val, 0, 0);
+            }
+        } else {
+            # Update screen at 60Hz on menus to drive flashing text redraws
+            current_tick = GetTickCount();
+            if current_tick - load64(last_tick) >= 16 {
+                store64(last_tick, current_tick);
+                InvalidateRect(hwnd_val, 0, 0);
+            }
+        }
+    }
+    
+    # Cleanup brush resources
+    DeleteObject(load64(bg_brush));
+    DeleteObject(load64(hud_brush));
+    DeleteObject(load64(board_brush));
+    DeleteObject(load64(border_brush));
+    DeleteObject(load64(head_brush));
+    DeleteObject(load64(snake_brush));
+    DeleteObject(load64(food_brush));
+    DeleteObject(load64(title_font));
+    DeleteObject(load64(hud_font));
+    DeleteObject(load64(small_font));
+    
+    return 0;
+}

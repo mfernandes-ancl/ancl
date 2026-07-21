@@ -1,0 +1,463 @@
+# =====================================================================
+#  pe_writer.ancl  -  PE32+ binary writer for anclc2
+#
+#  Assembles sections, resolves fixups, and writes a native Windows
+#  PE32+ executable (.exe) from the emitted code + data.
+#
+#  Sections: .text | .rdata | .data | .idata
+# =====================================================================
+import "codegen.ancl";
+import "../../../core_lib/win32_api.ancl";
+
+@DATA
+# Holds the entire output file image. file_size = text_raw + rdata_raw +
+# idata_raw (the zero-init .data section is NOT written to file, see below).
+# 4 MB comfortably holds the self-host image (~200 KB code + rdata + idata).
+g_pe_img:      buf = 4194304;
+g_pe_img_size: buf = 8;
+g_pe_nwritten: buf = 8;
+
+# Error strings
+pe_err_open:  str = "[pe] cannot open output file\n";
+pe_err_write: str = "[pe] write error\n";
+pe_ok:        str = "[pe] written OK\n";
+
+@CODE
+
+# ----------------------------------------------------------------
+#  pe_put_le(at, val, n)  -- write n bytes LE at offset in g_pe_img
+# ----------------------------------------------------------------
+func pe_put_le(at: i64, val: i64, n: i64) -> i64 {
+    i = 0;
+    while i < n {
+        store8(g_pe_img + at + i, val % 256);
+        val = shr(val, 8);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  pe_align(v, a) -- round v up to multiple of a (power of 2)
+# ----------------------------------------------------------------
+func pe_align(v: i64, a: i64) -> i64 {
+    if v % a == 0 { return v; }
+    return v + (a - v % a);
+}
+
+# ----------------------------------------------------------------
+#  pe_memcpy_to_img(dst_off, src, n)
+# ----------------------------------------------------------------
+func pe_memcpy_to_img(dst: i64, src: i64, n: i64) -> i64 {
+    i = 0;
+    while i < n {
+        store8(g_pe_img + dst + i, load8(src + i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+#  pe_write(path_ptr) -> 0 on success, -1 on error
+# ----------------------------------------------------------------
+func pe_write(path: i64) -> i64 {
+    SECT_ALIGN = 4096;
+    FILE_ALIGN = 512;
+    IMAGE_BASE = 5368709120;   # 0x140000000
+
+    # ---- collect rdata (string table) ----
+    # Strings are in g_strings[]; their offsets/lengths in g_str_off/g_str_len
+    rdata_base = 0;   # offset within rdata buffer
+    str_rva_table = alloc(512 * 8);   # rdata offset for each string
+    rdata_buf  = alloc(65536);
+    rdata_size = 0;
+    nstrs = load64(g_str_count);
+    i = 0;
+    while i < nstrs {
+        soff = load64(g_str_off + i * 8);
+        slen = load64(g_str_len + i * 8);
+        store64(str_rva_table + i * 8, rdata_size);
+        # copy string bytes + NUL
+        j = 0;
+        while j <= slen {
+            store8(rdata_buf + rdata_size + j, load8(g_strings + soff + j));
+            j = j + 1;
+        }
+        rdata_size = rdata_size + slen + 1;
+        i = i + 1;
+    }
+    if rdata_size == 0 { store8(rdata_buf, 0); rdata_size = 1; }
+
+    # ---- build idata (.idata section: IDT + ILT + IAT + hint-name table + dll names) ----
+    nimps = load64(g_imp_count);
+
+    # Group imports by DLL (preserving first-appearance order)
+    # Use parallel arrays: dll_name_off[], dll_func_start[], dll_func_count[]
+    MAX_DLLS = 16;
+    dll_name_off = alloc(MAX_DLLS * 8);
+    dll_name_len = alloc(MAX_DLLS * 8);
+    dll_func_list = alloc(nimps * 8);   # ordered list of import indices per dll
+    dll_func_off  = alloc(MAX_DLLS * 8);  # index into dll_func_list for each dll
+    dll_func_cnt  = alloc(MAX_DLLS * 8);
+    ndlls = 0;
+    dll_func_pos = 0;
+
+    # Pass 1: collect the distinct DLL names in first-seen order.
+    i = 0;
+    while i < nimps {
+        fn_dnoff  = load64(g_imp_dll    + i * 8);
+        fn_dnlen  = load64(g_imp_dlllen + i * 8);
+        di = 0 - 1;
+        j = 0;
+        while j < ndlls {
+            if cg_pool_cmp(load64(dll_name_off + j*8), load64(dll_name_len + j*8), fn_dnoff, fn_dnlen) == 1 {
+                di = j;
+            }
+            j = j + 1;
+        }
+        if di == 0 - 1 {
+            store64(dll_name_off + ndlls * 8, fn_dnoff);
+            store64(dll_name_len + ndlls * 8, fn_dnlen);
+            ndlls = ndlls + 1;
+        }
+        i = i + 1;
+    }
+
+    # Pass 2: for each DLL, append ALL its imports to dll_func_list
+    # contiguously.  This is robust to interleaved imports in g_imp_*
+    # (the previous single-pass packing overwrote later DLLs' regions when
+    # a DLL's functions were not contiguous, e.g. kernel32 externs declared
+    # after the ws2_32 builtins corrupted the ws2_32 import group).
+    dll_func_pos = 0;
+    di = 0;
+    while di < ndlls {
+        store64(dll_func_off + di * 8, dll_func_pos);
+        cnt_here = 0;
+        i = 0;
+        while i < nimps {
+            if cg_pool_cmp(load64(g_imp_dll + i*8), load64(g_imp_dlllen + i*8), load64(dll_name_off + di*8), load64(dll_name_len + di*8)) == 1 {
+                store64(dll_func_list + dll_func_pos * 8, i);
+                dll_func_pos = dll_func_pos + 1;
+                cnt_here = cnt_here + 1;
+            }
+            i = i + 1;
+        }
+        store64(dll_func_cnt + di * 8, cnt_here);
+        di = di + 1;
+    }
+
+    # Compute idata layout
+    idt_size   = (ndlls + 1) * 20;
+    ilt_total  = 0;
+    iat_total  = 0;
+    i = 0;
+    while i < ndlls {
+        cnt = load64(dll_func_cnt + i * 8);
+        ilt_total = ilt_total + (cnt + 1) * 8;
+        iat_total = iat_total + (cnt + 1) * 8;
+        i = i + 1;
+    }
+    ilt_base = idt_size;
+    iat_base = ilt_base + ilt_total;
+    hn_base  = iat_base + iat_total;
+
+    # Build hint-name entries and dll-name strings
+    hn_buf  = alloc(32768);
+    hn_size = 0;
+    hn_off_table = alloc(nimps * 8);   # idata offset of each hn entry
+    i = 0;
+    while i < nimps {
+        store64(hn_off_table + i * 8, hn_base + hn_size);
+        store8(hn_buf + hn_size, 0); store8(hn_buf + hn_size + 1, 0);  # hint=0
+        hn_size = hn_size + 2;
+        fn_noff = load64(g_imp_fn    + i * 8);
+        fn_nlen = load64(g_imp_fnlen + i * 8);
+        j = 0;
+        while j < fn_nlen {
+            store8(hn_buf + hn_size, load8(g_str_pool + fn_noff + j));
+            hn_size = hn_size + 1;
+            j = j + 1;
+        }
+        store8(hn_buf + hn_size, 0);
+        hn_size = hn_size + 1;
+        if hn_size % 2 != 0 { store8(hn_buf + hn_size, 0); hn_size = hn_size + 1; }
+        i = i + 1;
+    }
+
+    dllname_buf  = alloc(4096);
+    dllname_size = 0;
+    dllname_off_table = alloc(MAX_DLLS * 8);
+    i = 0;
+    while i < ndlls {
+        store64(dllname_off_table + i * 8, hn_base + hn_size + dllname_size);
+        dn_off = load64(dll_name_off + i * 8);
+        dn_len = load64(dll_name_len + i * 8);
+        j = 0;
+        while j < dn_len {
+            store8(dllname_buf + dllname_size, load8(g_str_pool + dn_off + j));
+            dllname_size = dllname_size + 1;
+            j = j + 1;
+        }
+        store8(dllname_buf + dllname_size, 0);
+        dllname_size = dllname_size + 1;
+        if dllname_size % 2 != 0 { store8(dllname_buf + dllname_size, 0); dllname_size = dllname_size + 1; }
+        i = i + 1;
+    }
+
+    idata_total = hn_base + hn_size + dllname_size;
+
+    # ---- section RVAs ----
+    code_size  = load64(g_code_len);
+    text_rva   = 4096;
+    rdata_rva  = pe_align(text_rva  + code_size,  SECT_ALIGN);
+    data_rva   = pe_align(rdata_rva + rdata_size,  SECT_ALIGN);
+    data_size  = load64(g_cg_data_size);
+    idata_rva  = pe_align(data_rva  + data_size,   SECT_ALIGN);
+    image_size = pe_align(idata_rva + idata_total,  SECT_ALIGN);
+
+    # ---- IAT slot RVAs (for fixup resolution) ----
+    iat_slot_rva = alloc(nimps * 8);
+    iat_cursor   = iat_base;
+    di2 = 0;
+    while di2 < ndlls {
+        fstart2 = load64(dll_func_off  + di2 * 8);
+        fcnt2   = load64(dll_func_cnt  + di2 * 8);
+        j = 0;
+        while j < fcnt2 {
+            gi = load64(dll_func_list + (fstart2 + j) * 8);
+            store64(iat_slot_rva + gi * 8, idata_rva + iat_cursor + j * 8);
+            j = j + 1;
+        }
+        iat_cursor = iat_cursor + (fcnt2 + 1) * 8;
+        di2 = di2 + 1;
+    }
+
+    # ---- resolve code fixups ----
+    nfix = load64(g_fixup_count);
+    i = 0;
+    while i < nfix {
+        fpos  = load64(g_fixup_pos  + i * 8);
+        fkind = load64(g_fixup_kind + i * 8);
+        ftgt  = load64(g_fixup_tgt  + i * 8);
+        disp  = 0;
+        if fkind == 0 {
+            # rel32 -> label
+            lbl_off = load64(g_labels + ftgt * 8);
+            disp = lbl_off - (fpos + 4);
+        }
+        if fkind == 1 {
+            # rip-relative to .rdata string
+            str_off_in_rdata = load64(str_rva_table + ftgt * 8);
+            tgt_rva = rdata_rva + str_off_in_rdata;
+            disp = tgt_rva - (text_rva + fpos + 4);
+        }
+        if fkind == 2 {
+            # rip-relative to .data offset
+            tgt_rva2 = data_rva + ftgt;
+            disp = tgt_rva2 - (text_rva + fpos + 4);
+        }
+        if fkind == 3 {
+            # rip-relative to IAT slot
+            iat_rva = load64(iat_slot_rva + ftgt * 8);
+            disp = iat_rva - (text_rva + fpos + 4);
+        }
+        # Write disp directly into g_code at fpos (4 bytes LE)
+        store8(g_code + fpos + 0, band(disp,       255));
+        store8(g_code + fpos + 1, band(shr(disp,  8), 255));
+        store8(g_code + fpos + 2, band(shr(disp, 16), 255));
+        store8(g_code + fpos + 3, band(shr(disp, 24), 255));
+        i = i + 1;
+    }
+
+    # ---- file offsets ----
+    # The .data section is entirely zero-initialised (ANCL @DATA holds only
+    # `buf` globals; int constants are inlined and `str` go to .rdata).  So we
+    # reserve NO raw file space for it (SizeOfRawData=0, PointerToRawData=0) and
+    # let the loader zero-fill it from VirtualSize.  This is essential for
+    # self-hosting: the compiler's own .data is tens of MB (it contains the
+    # output image buffer g_pe_img itself), and writing that to disk would make
+    # file_size exceed g_pe_img -> overflow.  .idata follows .rdata directly.
+    HDR_SIZE   = pe_align(64 + 4 + 20 + 240 + 4 * 40, FILE_ALIGN);
+    text_fp    = HDR_SIZE;
+    text_raw   = pe_align(code_size, FILE_ALIGN);
+    rdata_fp   = text_fp + text_raw;
+    rdata_raw  = pe_align(rdata_size, FILE_ALIGN);
+    data_fp    = 0;                                  # .data not present in file
+    data_raw   = 0;                                  # .data raw size = 0
+    idata_fp   = rdata_fp + rdata_raw;
+    idata_raw  = pe_align(idata_total, FILE_ALIGN);
+    file_size  = idata_fp + idata_raw;
+
+    # ---- zero image ----
+    memset(g_pe_img, 0, file_size);
+    store64(g_pe_img_size, file_size);
+
+    # ---- DOS stub ----
+    store8(g_pe_img + 0, 77);  store8(g_pe_img + 1, 90);   # 'MZ'
+    pe_put_le(60, 64, 4);                                   # e_lfanew = 0x40
+
+    # ---- PE signature ----
+    pe_off = 64;
+    store8(g_pe_img + pe_off + 0, 80); store8(g_pe_img + pe_off + 1, 69);  # 'PE'
+    store8(g_pe_img + pe_off + 2, 0);  store8(g_pe_img + pe_off + 3, 0);
+
+    # ---- File header ----
+    fh = pe_off + 4;
+    pe_put_le(fh + 0, 34404, 2);     # Machine = AMD64 = 0x8664
+    pe_put_le(fh + 2, 4, 2);         # NumberOfSections = 4
+    pe_put_le(fh + 4, 0, 4);         # TimeDateStamp
+    pe_put_le(fh + 8, 0, 4);
+    pe_put_le(fh + 12, 0, 4);
+    pe_put_le(fh + 16, 240, 2);      # SizeOfOptionalHeader
+    pe_put_le(fh + 18, 34, 2);       # Characteristics: EXECUTABLE|LARGE_ADDRESS_AWARE (0x22)
+
+    # ---- Optional header (PE32+) ----
+    oh = fh + 20;
+    pe_put_le(oh + 0, 523, 2);        # Magic PE32+ = 0x20B
+    store8(g_pe_img + oh + 2, 14);
+    pe_put_le(oh + 4,  text_raw, 4);
+    pe_put_le(oh + 8,  rdata_raw + data_raw + idata_raw, 4);
+    pe_put_le(oh + 12, 0, 4);
+
+    # AddressOfEntryPoint = text_rva + _start label pos
+    entry_off = load64(g_labels + load64(L_start) * 8);
+    pe_put_le(oh + 16, text_rva + entry_off, 4);
+    pe_put_le(oh + 20, text_rva, 4);
+    pe_put_le(oh + 24, IMAGE_BASE, 8);   # ImageBase
+    pe_put_le(oh + 32, SECT_ALIGN, 4);
+    pe_put_le(oh + 36, FILE_ALIGN, 4);
+    pe_put_le(oh + 40, 6, 2); pe_put_le(oh + 42, 0, 2);  # OS ver
+    pe_put_le(oh + 44, 0, 2); pe_put_le(oh + 46, 0, 2);
+    pe_put_le(oh + 48, 6, 2); pe_put_le(oh + 50, 0, 2);  # subsystem ver
+    pe_put_le(oh + 52, 0, 4);
+    pe_put_le(oh + 56, image_size, 4);
+    pe_put_le(oh + 60, HDR_SIZE, 4);
+    pe_put_le(oh + 64, 0, 4);  # checksum
+    pe_put_le(oh + 68, 3, 2);  # Subsystem: 3=CUI (console)
+    pe_put_le(oh + 70, 256, 2);  # DllCharacteristics NX_COMPAT
+    pe_put_le(oh + 72, 1048576, 8);  # SizeOfStackReserve
+    pe_put_le(oh + 80, 4096, 8);
+    pe_put_le(oh + 88, 1048576, 8);
+    pe_put_le(oh + 96, 4096, 8);
+    pe_put_le(oh + 104, 0, 4);
+    pe_put_le(oh + 108, 16, 4);  # NumberOfRvaAndSizes
+
+    # DataDirectory[16]
+    dd = oh + 112;
+    # [1] Import Directory
+    idt_rva_abs = idata_rva + 0;
+    idt_sz      = (ndlls + 1) * 20;
+    pe_put_le(dd + 1*8 + 0, idt_rva_abs, 4);
+    pe_put_le(dd + 1*8 + 4, idt_sz, 4);
+    # [12] IAT
+    iat_dir_rva = idata_rva + iat_base;
+    iat_dir_sz  = iat_total;
+    pe_put_le(dd + 12*8 + 0, iat_dir_rva, 4);
+    pe_put_le(dd + 12*8 + 4, iat_dir_sz, 4);
+
+    # ---- Section headers ----
+    sh = oh + 240;
+    # helper: write a section header
+    # .text
+    sh0 = sh + 0 * 40;
+    store8(g_pe_img + sh0 + 0, 46); store8(g_pe_img + sh0 + 1, 116); store8(g_pe_img + sh0 + 2, 101);
+    store8(g_pe_img + sh0 + 3, 120); store8(g_pe_img + sh0 + 4, 116); # ".text"
+    pe_put_le(sh0 + 8,  code_size, 4);
+    pe_put_le(sh0 + 12, text_rva,  4);
+    pe_put_le(sh0 + 16, text_raw,  4);
+    pe_put_le(sh0 + 20, text_fp,   4);
+    pe_put_le(sh0 + 36, 1610612768, 4);  # 0x60000020 CODE|EXEC|READ
+    # .rdata
+    sh1 = sh + 1 * 40;
+    store8(g_pe_img + sh1 + 0, 46); store8(g_pe_img + sh1 + 1, 114); store8(g_pe_img + sh1 + 2, 100);
+    store8(g_pe_img + sh1 + 3, 97); store8(g_pe_img + sh1 + 4, 116); store8(g_pe_img + sh1 + 5, 97); # ".rdata"
+    pe_put_le(sh1 + 8,  rdata_size, 4);
+    pe_put_le(sh1 + 12, rdata_rva,  4);
+    pe_put_le(sh1 + 16, rdata_raw,  4);
+    pe_put_le(sh1 + 20, rdata_fp,   4);
+    pe_put_le(sh1 + 36, 1073741888, 4);  # 0x40000040 IDATA|READ
+    # .data
+    sh2 = sh + 2 * 40;
+    store8(g_pe_img + sh2 + 0, 46); store8(g_pe_img + sh2 + 1, 100); store8(g_pe_img + sh2 + 2, 97);
+    store8(g_pe_img + sh2 + 3, 116); store8(g_pe_img + sh2 + 4, 97); # ".data"
+    pe_put_le(sh2 + 8,  data_size, 4);
+    pe_put_le(sh2 + 12, data_rva,  4);
+    pe_put_le(sh2 + 16, data_raw,  4);
+    pe_put_le(sh2 + 20, data_fp,   4);
+    pe_put_le(sh2 + 36, 3221225536, 4);  # 0xC0000040 IDATA|READ|WRITE
+    # .idata
+    sh3 = sh + 3 * 40;
+    store8(g_pe_img + sh3 + 0, 46); store8(g_pe_img + sh3 + 1, 105); store8(g_pe_img + sh3 + 2, 100);
+    store8(g_pe_img + sh3 + 3, 97); store8(g_pe_img + sh3 + 4, 116); store8(g_pe_img + sh3 + 5, 97); # ".idata"
+    pe_put_le(sh3 + 8,  idata_total, 4);
+    pe_put_le(sh3 + 12, idata_rva,   4);
+    pe_put_le(sh3 + 16, idata_raw,   4);
+    pe_put_le(sh3 + 20, idata_fp,    4);
+    pe_put_le(sh3 + 36, 3221225536, 4);  # 0xC0000040
+
+    # ---- Copy section data ----
+    # .text
+    pe_memcpy_to_img(text_fp, g_code, code_size);
+    # .rdata
+    pe_memcpy_to_img(rdata_fp, rdata_buf, rdata_size);
+    # .data is zero-initialised
+    # .idata: build in-place
+    idata_start = idata_fp;
+
+    # Write IDT
+    ilt_cursor2 = ilt_base;
+    iat_cursor2 = iat_base;
+    di3 = 0;
+    while di3 < ndlls {
+        fcnt3  = load64(dll_func_cnt + di3 * 8);
+        dname3 = load64(dllname_off_table + di3 * 8);
+        idt_at = idata_start + di3 * 20;
+        pe_put_le(idt_at + 0,  idata_rva + ilt_cursor2, 4);         # OriginalFirstThunk (ILT)
+        pe_put_le(idt_at + 4,  0, 4);
+        pe_put_le(idt_at + 8,  0, 4);
+        pe_put_le(idt_at + 12, idata_rva + dname3, 4);              # Name RVA (was missing idata_rva)
+        pe_put_le(idt_at + 16, idata_rva + iat_cursor2, 4);   # FirstThunk (IAT)
+        fstart3 = load64(dll_func_off + di3 * 8);
+        j = 0;
+        while j < fcnt3 {
+            gi2 = load64(dll_func_list + (fstart3 + j) * 8);
+            hn_rva = load64(hn_off_table + gi2 * 8);
+            pe_put_le(idata_start + ilt_cursor2 + j * 8, idata_rva + hn_rva, 8);  # ILT entry (RVA)
+            pe_put_le(idata_start + iat_cursor2 + j * 8, idata_rva + hn_rva, 8);  # IAT entry (RVA)
+            j = j + 1;
+        }
+        # null terminators
+        pe_put_le(idata_start + ilt_cursor2 + fcnt3 * 8, 0, 8);
+        pe_put_le(idata_start + iat_cursor2 + fcnt3 * 8, 0, 8);
+        ilt_cursor2 = ilt_cursor2 + (fcnt3 + 1) * 8;
+        iat_cursor2 = iat_cursor2 + (fcnt3 + 1) * 8;
+        di3 = di3 + 1;
+    }
+    # null IDT terminator
+    pe_put_le(idata_start + ndlls * 20, 0, 20);
+
+    # Copy hint-name table
+    pe_memcpy_to_img(idata_start + hn_base, hn_buf, hn_size);
+    # Copy dll name strings
+    pe_memcpy_to_img(idata_start + hn_base + hn_size, dllname_buf, dllname_size);
+
+    # ---- Write to disk ----
+    h = CreateFileA(path, 1073741824, 0, 0, 2, 128, 0);  # GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+    if h == 0 - 1 {
+        syscall 1, pe_err_open;
+        return 0 - 1;
+    }
+    WriteFile(h, g_pe_img, file_size, g_pe_nwritten, 0);
+    CloseHandle(h);
+
+    # Cleanup
+    free(str_rva_table);
+    free(rdata_buf);
+    free(dll_name_off); free(dll_name_len);
+    free(dll_func_list); free(dll_func_off); free(dll_func_cnt);
+    free(hn_buf); free(hn_off_table);
+    free(dllname_buf); free(dllname_off_table);
+    free(iat_slot_rva);
+
+    return 0;
+}

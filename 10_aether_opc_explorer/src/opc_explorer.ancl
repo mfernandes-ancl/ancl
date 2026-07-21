@@ -1,0 +1,3028 @@
+# ============================================================================
+#  opc_explorer.ancl  -  Aether OPC Explorer (DA + UA + XML-DA)
+#
+#  A unified native Win32 OPC client/explorer with NexusEdge dark theme.
+#  Phase 1: OPC UA Binary (TCP) â€” connect, browse, read, poll.
+#  Phase 2: OPC DA (COM/DCOM) â€” enumerate, connect, browse, read, poll.
+#  Phase 3: OPC XML-DA (HTTP/SOAP) â€” connect, browse, read.
+#
+#  Tabbed interface: [OPC UA] [OPC DA] [OPC XML]
+#  Left: Browse tree (SysTreeView32)
+#  Right: Value grid (SysListView32) + Poll controls
+#  Bottom: Log panel
+#
+#  100% CRT-free PE32+, GUI subsystem.
+# ============================================================================
+
+import "std.ancl";
+import "win32_api.ancl";
+import "win32_com.ancl";
+import "numfmt.ancl";
+
+extern "ws2_32.dll" connect;
+extern "gdi32.dll"  CreateFontA -> ptr;
+extern "user32.dll" PostMessageA;
+extern "kernel32.dll" GetSystemTimeAsFileTime;
+extern "comctl32.dll" InitCommonControlsEx;
+extern "dwmapi.dll" DwmSetWindowAttribute;
+extern "user32.dll" TrackMouseEvent;
+extern "gdi32.dll"  RoundRect;
+extern "user32.dll" DrawTextA;
+extern "user32.dll" GetWindowRect;
+extern "user32.dll" GetParent -> ptr;
+extern "user32.dll" SetCapture;
+extern "user32.dll" ReleaseCapture;
+extern "user32.dll" GetWindowLongA -> i64;
+extern "user32.dll" SetWindowLongA -> i64;
+extern "gdi32.dll"  GetStockObject -> ptr;
+extern "uxtheme.dll" SetWindowTheme -> i32;
+extern "user32.dll" DestroyWindow -> i32;
+extern "kernel32.dll" GetProcAddress -> ptr;
+
+@DATA
+
+# ---- Window setup ----
+clsname:    str = "AETHEROPCHEXPLORER";
+title:      str = "Aether OPC Explorer";
+title_draw: str = "AETHER OPC EXPLORER";
+cls_stat:   str = "STATIC";
+cls_btn:    str = "BUTTON";
+cls_edit:   str = "EDIT";
+cls_combo:  str = "COMBOBOX";
+cls_list:   str = "LISTBOX";
+cls_lv:     str = "SysListView32";
+cls_tree:   str = "SysTreeView32";
+gui_empty:  str = "";
+face_mono:  str = "Consolas";
+
+# ---- NexusEdge custom classes ----
+cls_glow_btn: str = "AETHER_GLOW_BTN";
+
+# ---- Tab labels ----
+tab_ua:     str = "OPC UA";
+tab_da:     str = "OPC DA";
+tab_xml:    str = "OPC XML";
+
+# ---- Labels ----
+lbl_ep:     str = "Endpoint:";
+lbl_log:    str = "Log:";
+lbl_status: str = "Status: Disconnected";
+lbl_nodeid: str = "Node:";
+lbl_interval: str = "Interval ms:";
+
+# ---- Buttons ----
+btn_conn:   str = "Connect";
+btn_disc:   str = "Disconnect";
+btn_browse: str = "Browse";
+btn_read:   str = "Read";
+btn_poll:   str = "Start Poll";
+btn_stop:   str = "Stop Poll";
+btn_back:   str = "Back";
+btn_clear:  str = "Clear";
+btn_save:   str = "Save";
+btn_write:  str = "Write";
+lbl_wrval:  str = "Value:";
+btn_enum:   str = "Enum Servers";
+btn_min:    str = "-";
+btn_close:  str = "X";
+
+# ---- ListView columns ----
+col_name:   str = "Display Name";
+col_val:    str = "Value";
+col_type:   str = "Type";
+col_node:   str = "Node ID";
+col_qual:   str = "Quality";
+
+# ---- Defaults ----
+def_ep:     str = "opc.tcp://127.0.0.1:4840";
+def_ep_da:  str = "Matrikon.OPC.Simulation.1";
+def_interval: str = "1000";
+def_nodeid: str = "0;2258";
+
+# ---- Connection status ----
+st_conn_ind: str = "* CONNECTED";
+st_disc_ind: str = "* DISCONNECTED";
+
+# ---- Log messages ----
+crlf:       str = "\r\n";
+m_hello:    str = "[ua] sending HELLO...\r\n";
+m_ack:      str = "[ua] received ACK.\r\n";
+m_conn_to:  str = "[ua] connecting to ";
+m_dots:     str = "...\r\n";
+m_conn_ok:  str = "[ua] connected!\r\n";
+m_conn_err: str = "[ua] connect failed.\r\n";
+m_disc:     str = "[ua] disconnected.\r\n";
+m_send_err: str = "[ua] send failed.\r\n";
+m_recv_err: str = "[ua] recv failed.\r\n";
+m_opn_send: str = "[ua] OpenSecureChannel...\r\n";
+m_opn_ok:   str = "[ua] SecureChannel opened.\r\n";
+m_opn_fail: str = "[ua] OpenSecureChannel FAILED.\r\n";
+m_cs_send:  str = "[ua] CreateSession...\r\n";
+m_cs_ok:    str = "[ua] Session created.\r\n";
+m_cs_fail:  str = "[ua] CreateSession FAILED.\r\n";
+m_pol_user: str = "[ua] server accepts UserName auth, PolicyId=";
+m_pol_sec:  str = " secpol=";
+m_pol_none: str = "[ua] server: UserName auth NOT advertised (anonymous only)\r\n";
+m_auth_user:str = "[ua] ActivateSession as user: ";
+m_auth_enc: str = "[ua] encrypting password (RSA-OAEP) with server cert\r\n";
+m_auth_plain:str = "[ua] sending password as plaintext (token policy = None)\r\n";
+m_auth_noenc:str = "[ua] WARN: secure user policy but no server cert/CNG fail; aborting auth\r\n";
+m_as_send:  str = "[ua] ActivateSession...\r\n";
+m_as_ok:    str = "[ua] Session ACTIVE.\r\n";
+m_as_fail:  str = "[ua] ActivateSession FAILED.\r\n";
+m_as_failc: str = "[ua] ActivateSession FAILED, status=";
+m_brw_send: str = "[ua] Browse...\r\n";
+m_brw_ok:   str = "[ua] Browse OK, refs = ";
+m_brw_fail: str = "[ua] Browse FAILED.\r\n";
+m_rd_send:  str = "[ua] Read...\r\n";
+m_rd_ok:    str = "[ua] Read OK: ";
+m_rd_fail:  str = "[ua] Read FAILED.\r\n";
+m_noconn:   str = "[ua] not connected.\r\n";
+m_poll_on:  str = "[ua] polling started (";
+m_poll_on2: str = "ms).\r\n";
+m_poll_off: str = "[ua] polling stopped.\r\n";
+m_poll_err: str = "[ua] poll error - stopped.\r\n";
+m_save_ok:  str = "[log] saved.\r\n";
+m_save_err: str = "[log] save failed.\r\n";
+nc_obj:     str = "Object";
+nc_var:     str = "Variable";
+nc_meth:    str = "Method";
+s_true:     str = "TRUE";
+s_false:    str = "FALSE";
+s_float:    str = "(float)";
+s_double:   str = "(double)";
+s_datetime: str = "(datetime)";
+m_colon:    str = ":";
+m_sp:       str = " ";
+
+# ---- GUI handles ----
+g_hinst:    buf = 8;
+g_hwnd:     buf = 8;
+g_ep_ed:    buf = 8;      # endpoint edit
+g_log:      buf = 8;      # log multiline edit
+g_status:   buf = 8;      # status label
+g_font:     buf = 8;      # Consolas font
+g_listview: buf = 8;      # ListView HWND
+g_treeview: buf = 8;      # TreeView HWND
+g_da_list:  buf = 8;     # DA server ListBox HWND
+g_btn_enum: buf = 8;    # Enum Servers button HWND
+g_btn_back: buf = 8;    # Back button HWND (UA only)
+g_write_ed: buf = 8;   # Write value edit HWND
+g_wrbuf:    buf = 64;  # Write value text
+g_interval_ed: buf = 8;   # interval edit HWND
+g_nodeid_ed: buf = 8;     # node id edit
+
+# ---- Win32 structs ----
+g_wndcls:   buf = 96;
+g_msg:      buf = 64;
+g_rect:     buf = 16;
+g_ps:       buf = 72;
+
+# ---- Winsock ----
+g_wsa:      buf = 512;
+g_addr:     buf = 16;
+g_sock:     buf = 8;
+
+# ---- OPC UA protocol buffers ----
+g_txbuf:    buf = 4096;
+g_rxbuf:    buf = 65536;
+g_hel:      buf = 256;
+
+# ---- URL parsing ----
+g_host:     buf = 256;
+g_port:     buf = 8;
+g_urlbuf:   buf = 512;
+
+# ---- Scratch ----
+g_numbuf:   buf = 32;
+g_hexbuf:   buf = 32;
+g_logbuf:   buf = 512;
+g_statbuf:  buf = 256;
+g_intbuf:   buf = 16;
+g_savebuf:  buf = 2048;
+g_logpath:  str = "opc_explorer_log.txt";
+
+# ---- OPC UA protocol state ----
+g_sc_id:        buf = 8;
+g_sc_token:     buf = 8;
+g_seq_num:      buf = 8;
+g_req_id:       buf = 8;
+g_auth_raw:     buf = 64;
+g_auth_raw_len: buf = 8;
+g_srv_nonce:    buf = 128;    # ServerNonce from CreateSessionResponse
+g_srv_nonce_len:buf = 8;
+g_srv_cert:     buf = 4096;   # ServerCertificate (DER X.509) from CreateSessionResponse
+g_srv_cert_len: buf = 8;
+g_user_polid:   buf = 128;    # PolicyId of the server's UserName user-token policy
+g_user_secpol:  buf = 128;    # SecurityPolicyUri of that policy ("...#None" => plaintext password)
+g_user_polfound:buf = 8;      # 1 if the server advertises a UserName token policy
+g_ua_user:      buf = 256;    # username parsed from opc.tcp://user:pass@host (empty => anonymous)
+g_ua_pass:      buf = 256;    # password parsed from the endpoint userinfo
+g_ep_secpol:    buf = 128;    # SecurityPolicyUri of the endpoint currently being parsed
+g_session_id:   buf = 8;
+g_filetime:     buf = 8;
+g_browse_id:    buf = 8;     # current browse node ID (85=Objects)
+
+# Tag storage (max 32 tags from browse)
+g_tag_data:     buf = 1536;  # 32 tags * 48 bytes each
+g_tag_names:    buf = 2048;  # pooled name strings
+g_tag_names_off: buf = 8;
+g_tag_count:    buf = 8;
+
+# OPC UA strings
+sec_none:   str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+cs_app_uri: str = "urn:ancl:opc:explorer";
+cs_app_name:str = "Aether OPC Explorer";
+cs_sess:    str = "AetherExplorer_Session";
+
+# ---- State ----
+g_active_tab: buf = 8;    # 0=UA, 1=DA, 2=XML
+g_trans_id: buf = 8;
+g_polling:  buf = 8;
+g_icc:      buf = 8;
+g_lvcol:    buf = 64;
+g_lvitem:   buf = 96;
+g_lv_txtbuf: buf = 256;
+g_tv_ins:   buf = 96;     # TVINSERTSTRUCTA
+
+# ---- GDI: NexusEdge ----
+g_bg_brush: buf = 8;
+g_edit_brush: buf = 8;
+
+# NexusEdge color palette (BGR)
+COL_BG:      i64 = 0x1C1008;
+COL_PANEL:   i64 = 0x060402;
+COL_TEXT:    i64 = 0xAB9687;
+COL_GREEN:   i64 = 0x53D339;
+COL_RED:     i64 = 0x703AF5;
+
+COLOR_BG_DEEP:     i64 = 0x1C1008;
+COLOR_BG_PANEL:    i64 = 0x060402;
+COLOR_BG_CARD:     i64 = 0x180D05;
+COLOR_BG_INPUT:    i64 = 0x080604;
+COLOR_BG_HOVER:    i64 = 0x301F0D;
+COLOR_TEXT_PRIMARY:i64 = 0xAB9687;
+COLOR_TEXT_BRIGHT: i64 = 0xFFFFFF;
+COLOR_NEON_BLUE:   i64 = 0xFFFF29;
+COLOR_BORDER:      i64 = 0x7C6543;
+COLOR_TAB_ACTIVE:  i64 = 0xFFFF29;
+COLOR_TAB_INACTIVE:i64 = 0x7C6543;
+
+# GDI objects
+g_brush_deep:   buf = 8;
+g_brush_panel:  buf = 8;
+g_brush_card:   buf = 8;
+g_brush_input:  buf = 8;
+g_brush_hover:  buf = 8;
+g_brush_neon:   buf = 8;
+g_pen_border:   buf = 8;
+g_pen_neon:     buf = 8;
+g_font_header:  buf = 8;
+g_track_mouse:  buf = 24;
+g_wndclass_btn: buf = 80;
+g_temp_text:    buf = 256;
+w_empty:        buf = 8;
+
+# ---- Dark mode ----
+thm_uxtheme:    str = "uxtheme.dll";
+thm_dm_exp_w:   buf = 40;
+thm_dm_exp_a:   str = "DarkMode_Explorer";
+thm_dm_cfd_w:   buf = 40;
+thm_dm_cfd_a:   str = "DarkMode_CFD";
+g_allowdark:    buf = 8;
+
+# ---- OPC DA COM state ----
+clsidEnum:  buf = 16;
+iidSrvList: buf = 16;
+catidDA20:  buf = 16;
+iidServer:  buf = 16;
+iidItemMgt: buf = 16;
+iidSyncIO:  buf = 16;
+iidBrowse:  buf = 16;
+
+g_pserver:  buf = 8;
+g_pitemmgt: buf = 8;
+g_psyncio:  buf = 8;
+g_da_conn:  buf = 8;
+h_srvgrp:   buf = 8;
+d_revrate:  buf = 8;
+g_da_tagcnt:buf = 8;
+g_da_taghnd:buf = 1024;
+
+g_csi:      buf = 32;
+g_mqi:      buf = 24;
+g_da_hostw: buf = 256;
+g_da_remote:buf = 8;
+g_srvclsids:buf = 4096;
+g_srvcount: buf = 8;
+
+w_group:    buf = 64;
+w_item:     buf = 1024;
+w_filter:   buf = 8;
+g_da_narrow:buf = 512;
+g_da_valbuf:buf = 64;
+g_da_typbuf:buf = 32;
+itemdef:    buf = 48;
+srv_h:      buf = 8;
+g_fetch:    buf = 8;
+pp_list:    buf = 8;
+pp_enum:    buf = 8;
+pp_progid:  buf = 8;
+pp_utype:   buf = 8;
+pp_server:  buf = 8;
+pp_itemmgt: buf = 8;
+pp_syncio:  buf = 8;
+pp_browse:  buf = 8;
+pp_enumstr: buf = 8;
+pp_str:     buf = 8;
+pp_results: buf = 8;
+pp_adderr:  buf = 8;
+pp_values:  buf = 8;
+pp_readerr: buf = 8;
+pp_rmerr:   buf = 8;
+
+da_grp_name: str = "AetherGrp";
+m_da_enum:   str = "[da] enumerating servers...\r\n";
+m_da_enum_e: str = "[da] OpcEnum failed, hr=";
+m_da_enum_n: str = "[da] found = ";
+m_da_conn_p: str = "[da] connecting...\r\n";
+m_da_conn_ok:str = "[da] connected!\r\n";
+m_da_conn_e: str = "[da] connect failed, hr=";
+m_da_byclsid:str = "[da] resolving endpoint as CLSID (no enum needed)\r\n";
+m_da_byprog: str = "[da] resolving endpoint as ProgID\r\n";
+m_da_byclsid_r:str = "[da] CLSID via remote DCOM host: ";
+m_da_disc:   str = "[da] disconnected.\r\n";
+m_da_brw:    str = "[da] browsing tags...\r\n";
+m_da_brw_n:  str = "[da] tags found = ";
+m_da_brw_e:  str = "[da] browse failed.\r\n";
+m_da_poll:   str = "[da] polling...\r\n";
+m_wr_ok:     str = "[write] OK.\r\n";
+m_wr_fail:   str = "[write] failed.\r\n";
+m_wr_nosel:  str = "[write] select a tag first.\r\n";
+da_v_dash:   str = "--";
+da_v_true:   str = "TRUE";
+da_v_false:  str = "FALSE";
+da_ty_i2:    str = "I2";
+da_ty_i4:    str = "I4";
+da_ty_r4:    str = "R4";
+da_ty_r8:    str = "R8";
+da_ty_bstr:  str = "BSTR";
+da_ty_bool:  str = "BOOL";
+da_ty_ui1:   str = "UI1";
+da_ty_ui2:   str = "UI2";
+da_ty_ui4:   str = "UI4";
+da_ty_i8:    str = "I8";
+da_ty_ui8:   str = "UI8";
+da_ty_date:  str = "DATE";
+da_ty_vt:    str = "VT=";
+da_ql_good:  str = "GOOD";
+da_ql_unc:   str = "UNCERTAIN";
+da_ql_bad:   str = "BAD";
+
+# ---- OPC XML-DA (HTTP/SOAP) ----
+g_xml_sock:  buf = 8;     # XML-DA TCP socket
+g_xml_conn:  buf = 8;     # 1=connected
+g_xml_host:  buf = 256;   # parsed host
+g_xml_port:  buf = 8;     # parsed port
+g_xml_path:  buf = 256;   # URL path (e.g. /OpcXmlDa)
+g_xml_rxbuf: buf = 8192;  # HTTP response buffer
+g_xml_txbuf: buf = 4096;  # HTTP request buffer
+g_xml_queue: buf = 8192;  # browse queue: 64 paths * 128 bytes
+g_xml_qhnd:  buf = 512;   # tree item handle per queue entry (64 * 8)
+g_xml_treepaths: buf = 16384;  # full path per tree node (128 nodes * 128)
+g_xml_griditems: buf = 16384;  # full path per displayed grid row (128 * 128)
+g_xml_tagcnt: buf = 8;
+
+# XML-DA endpoint default
+def_ep_xml: str = "http://127.0.0.1/xdagwss/OpcXmlDaServer.asmx";
+
+# SOAP templates (compact, single-line for easy construction)
+xml_hdr1:   str = "POST ";
+xml_hdr2:   str = " HTTP/1.1\r\nHost: ";
+xml_hdr3:   str = "\r\nContent-Type: text/xml; charset=utf-8\r\nSOAPAction: \"http://opcfoundation.org/webservices/XMLDA/1.0/";
+xml_hdr4:   str = "\"\r\nContent-Length: ";
+xml_hdr5:   str = "\r\n\r\n";
+
+xml_env1:   str = "<?xml version=\"1.0\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xda=\"http://opcfoundation.org/webservices/XMLDA/1.0/\"><soap:Body>";
+xml_env2:   str = "</soap:Body></soap:Envelope>";
+
+xml_getstatus: str = "<xda:GetStatus/>";
+xml_browse1:   str = "<xda:Browse ItemName=\"";
+xml_browse2:   str = "\" BrowseFilter=\"all\" MaxElementsReturned=\"100\"/>";
+xml_read1:     str = "<xda:Read><xda:Options ReturnItemName=\"true\"/><xda:ItemList><xda:Items ItemName=\"";
+xml_read2:     str = "\"/></xda:ItemList></xda:Read>";
+xml_write1:    str = "<xda:Write><xda:ItemList><xda:Items ItemName=\"";
+xml_write2:    str = "\"><xda:Value xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xsd:int\">";
+xml_write3:    str = "</xda:Value></xda:Items></xda:ItemList></xda:Write>";
+
+xml_sa_status: str = "GetStatus";
+xml_sa_browse: str = "Browse";
+xml_sa_read:   str = "Read";
+xml_sa_write:  str = "Write";
+attr_isitem:   str = "IsItem";
+attr_haschild: str = "HasChildren";
+
+m_xml_conn:  str = "[xml] connecting to ";
+m_xml_ok:    str = "[xml] connected!\r\n";
+m_xml_err:   str = "[xml] connect failed.\r\n";
+m_xml_disc:  str = "[xml] disconnected.\r\n";
+m_xml_brw:   str = "[xml] browsing...\r\n";
+m_xml_brw_n: str = "[xml] items found = ";
+m_xml_rd:    str = "[xml] reading...\r\n";
+m_xml_wr:    str = "[xml] writing...\r\n";
+
+# ---- GUI geometry ----
+WIN_W:      i64 = 1100;
+WIN_H:      i64 = 700;
+
+# ---- Control IDs ----
+ID_EP_EDIT:     i64 = 100;
+ID_BTN_CONN:    i64 = 101;
+ID_BTN_DISC:    i64 = 102;
+ID_TREEVIEW:    i64 = 103;
+ID_LISTVIEW:    i64 = 104;
+ID_LOG:         i64 = 105;
+ID_STATUS:      i64 = 106;
+ID_BTN_BROWSE:  i64 = 107;
+ID_BTN_READ:    i64 = 108;
+ID_BTN_POLL:    i64 = 109;
+ID_BTN_STOP:    i64 = 110;
+ID_BTN_BACK:    i64 = 111;
+ID_INTERVAL_ED: i64 = 112;
+ID_NODEID_ED:   i64 = 113;
+ID_BTN_CLEAR:   i64 = 114;
+ID_BTN_SAVE:    i64 = 115;
+ID_BTN_MIN:     i64 = 116;
+ID_BTN_CLOSE:   i64 = 117;
+ID_TAB_UA:      i64 = 118;
+ID_TAB_DA:      i64 = 119;
+ID_TAB_XML:     i64 = 120;
+ID_DA_LIST:     i64 = 121;
+ID_BTN_ENUM:    i64 = 122;
+ID_WRITE_ED:    i64 = 123;
+ID_BTN_WRITE:   i64 = 124;
+ID_TIMER_POLL:  i64 = 1;
+
+@CODE
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+func log_append(text: i64) -> i64 {
+    hwnd_log = load64(g_log);
+    if hwnd_log == 0 { return 0; }
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    SendMessageA(hwnd_log, 177, len, len);
+    SendMessageA(hwnd_log, 194, 0, text);
+    return 0;
+}
+
+func log_num(prefix: i64, val: i64) -> i64 {
+    log_append(prefix);
+    int_to_str(g_numbuf, val);
+    log_append(g_numbuf);
+    log_append(crlf);
+    return 0;
+}
+
+func do_clear_log() -> i64 {
+    SetWindowTextA(load64(g_log), gui_empty);
+    return 0;
+}
+
+func do_save_log() -> i64 {
+    hwnd_log = load64(g_log);
+    len = SendMessageA(hwnd_log, 14, 0, 0);
+    if len < 1 { return 0; }
+    if len > 2046 { len = 2046; }
+    SendMessageA(hwnd_log, 13, 2047, g_savebuf);
+    hf = CreateFileA(g_logpath, 0x40000000, 0, 0, 2, 128, 0);
+    if hf == 0 - 1 {
+        log_append(m_save_err);
+        return 0;
+    }
+    WriteFile(hf, g_savebuf, len, g_numbuf, 0);
+    CloseHandle(hf);
+    log_append(m_save_ok);
+    return 0;
+}
+
+# ============================================================================
+# TAB SWITCHING
+# ============================================================================
+
+func switch_tab(tab: i64) -> i64 {
+    store64(g_active_tab, tab);
+    if tab == 0 { SetWindowTextA(load64(g_ep_ed), def_ep); }
+    if tab == 1 { SetWindowTextA(load64(g_ep_ed), def_ep_da); }
+    if tab == 2 { SetWindowTextA(load64(g_ep_ed), def_ep_xml); }
+    # Show/hide TreeView vs DA ListBox
+    if tab == 0 { ShowWindow(load64(g_treeview), 1); ShowWindow(load64(g_da_list), 0); }
+    if tab == 1 { ShowWindow(load64(g_treeview), 0); ShowWindow(load64(g_da_list), 1); }
+    if tab == 2 { ShowWindow(load64(g_treeview), 1); ShowWindow(load64(g_da_list), 0); }
+    # Show/hide Enum (DA) vs Back (UA)
+    if tab == 0 { ShowWindow(load64(g_btn_enum), 0); ShowWindow(load64(g_btn_back), 1); }
+    if tab == 1 { ShowWindow(load64(g_btn_enum), 1); ShowWindow(load64(g_btn_back), 0); }
+    if tab == 2 { ShowWindow(load64(g_btn_enum), 0); ShowWindow(load64(g_btn_back), 0); }
+    # Clear grid on tab switch
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+# ============================================================================
+# DARK MODE
+# ============================================================================
+
+func a2w(dst: i64, src: i64) -> i64 {
+    i = 0;
+    while 1 {
+        c = load8(src + i);
+        store8(dst + i + i, c);
+        store8(dst + i + i + 1, 0);
+        if c == 0 { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func enable_dark_mode() -> i64 {
+    a2w(thm_dm_exp_w, thm_dm_exp_a);
+    a2w(thm_dm_cfd_w, thm_dm_cfd_a);
+    hm = LoadLibraryA(thm_uxtheme);
+    if hm != 0 {
+        fn = GetProcAddress(hm, 135);
+        if fn != 0 { callp(fn, 2); }
+        store64(g_allowdark, GetProcAddress(hm, 133));
+    }
+    return 0;
+}
+
+func dark_scroll(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_exp_w, 0);
+    return 0;
+}
+
+func dark_combo(hwnd: i64) -> i64 {
+    ad = load64(g_allowdark);
+    if ad != 0 { callp(ad, hwnd, 1); }
+    SetWindowTheme(hwnd, thm_dm_cfd_w, 0);
+    SendMessageA(hwnd, 0x031A, 0, 0);
+    return 0;
+}
+
+# ============================================================================
+# OPC DA COM FUNCTIONS
+# ============================================================================
+
+func da_init_iids() -> i64 {
+    store64(clsidEnum + 0, 0x11D2482113486D51);
+    store64(clsidEnum + 8, 0x0000C106B33C94A4);
+    store64(iidSrvList + 0, 0x11D2482113486D50);
+    store64(iidSrvList + 8, 0x0000C106B33C94A4);
+    store64(catidDA20 + 0, 0x11D1CFE463D5F432);
+    store64(catidDA20 + 8, 0xFBA13B086000C8B2);
+    store64(iidServer + 0, 0x11D0011E39C13A4D);
+    store64(iidServer + 8, 0xB3ADD8AF20007596);
+    store64(iidItemMgt + 0, 0x11D0011E39C13A54);
+    store64(iidItemMgt + 8, 0xB3ADD8AF20007596);
+    store64(iidSyncIO + 0, 0x11D0011E39C13A52);
+    store64(iidSyncIO + 8, 0xB3ADD8AF20007596);
+    store64(iidBrowse + 0, 0x11D0011E39C13A4F);
+    store64(iidBrowse + 8, 0xB3ADD8AF20007596);
+    return 0;
+}
+
+func da_com_create(clsidp: i64, iidp: i64, ppout: i64) -> i64 {
+    store64(ppout, 0);
+    store64(g_mqi + 0, iidp);
+    store64(g_mqi + 8, 0);
+    store32(g_mqi + 16, 0);
+    if load64(g_da_remote) != 0 {
+        # Remote DCOM activation. COSERVERINFO (x64, 32B): dwReserved1@+0, pwszName@+8,
+        # pAuthInfo@+16 (NULL = default auth), dwReserved2@+24. CLSCTX_REMOTE_SERVER=16.
+        memset(g_csi, 0, 32);
+        store64(g_csi + 8, g_da_hostw);
+        hr = CoCreateInstanceEx(clsidp, 0, 16, g_csi, 1, g_mqi);
+    } else {
+        hr = CoCreateInstanceEx(clsidp, 0, 7, 0, 1, g_mqi);
+    }
+    if hr < 0 { return hr; }
+    qihr = nf_sext32(load32(g_mqi + 16));
+    if qihr < 0 { return qihr; }
+    store64(ppout, load64(g_mqi + 8));
+    return hr;
+}
+
+func da_enum_servers() -> i64 {
+    log_append(m_da_enum);
+    store64(g_da_remote, 0);   # enum is always against the local OpcEnum
+    # Clear the listbox
+    SendMessageA(load64(g_da_list), 388, 0, 0);   # LB_RESETCONTENT
+    store64(g_srvcount, 0);
+    # Create OpcEnum (IOPCServerList)
+    store64(pp_list, 0);
+    hr = da_com_create(clsidEnum, iidSrvList, pp_list);
+    if hr < 0 { log_num(m_da_enum_e, hr); return 0; }
+    pList = load64(pp_list);
+    if pList == 0 { log_num(m_da_enum_e, 0); return 0; }
+    # EnumClassesOfCategories(1, catidDA20, 0, NULL, &ppEnum)
+    store64(pp_enum, 0);
+    hr = callp(vmeth(pList, 3), pList, 1, catidDA20, 0, 0, pp_enum);
+    if hr < 0 { log_num(m_da_enum_e, hr); com_release(pList); return 0; }
+    pEnum = load64(pp_enum);
+    if pEnum == 0 { com_release(pList); return 0; }
+    # Enumerate GUIDs
+    n = 0;
+    while 1 {
+        store32(g_fetch, 0);
+        callp(vmeth(pEnum, 3), pEnum, 1, g_srvclsids + n * 16, g_fetch);
+        if load32(g_fetch) != 1 { break; }
+        # Get ProgID for display
+        store64(pp_progid, 0);
+        store64(pp_utype, 0);
+        callp(vmeth(pList, 4), pList, g_srvclsids + n * 16, pp_progid, pp_utype);
+        wprog = load64(pp_progid);
+        if wprog != 0 {
+            w2a(g_da_narrow, wprog);
+            SendMessageA(load64(g_da_list), 384, 0, g_da_narrow);   # LB_ADDSTRING
+            CoTaskMemFree(wprog);
+            n = n + 1;
+        }
+        wut = load64(pp_utype);
+        if wut != 0 { CoTaskMemFree(wut); }
+        if n >= 256 { break; }
+    }
+    com_release(pEnum);
+    com_release(pList);
+    store64(g_srvcount, n);
+    log_num(m_da_enum_n, n);
+    return 0;
+}
+
+func da_disconnect() -> i64 {
+    # Stop poll
+    poll = load64(g_polling);
+    if poll != 0 { KillTimer(load64(g_hwnd), ID_TIMER_POLL); store64(g_polling, 0); }
+    # Remove items
+    c = load64(g_da_tagcnt);
+    if c > 0 {
+        pim = load64(g_pitemmgt);
+        if pim != 0 { store64(pp_rmerr, 0); callp(vmeth(pim, 5), pim, c, g_da_taghnd, pp_rmerr); prm = load64(pp_rmerr); if prm != 0 { CoTaskMemFree(prm); } }
+    }
+    # Clear grid
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    store64(g_da_tagcnt, 0);
+    # Release interfaces
+    psv = load64(g_pserver);
+    if psv != 0 { h = load32(h_srvgrp); if h != 0 { callp(vmeth(psv, 7), psv, h, 1); } }
+    com_release(load64(g_psyncio));
+    com_release(load64(g_pitemmgt));
+    com_release(psv);
+    store64(g_psyncio, 0);
+    store64(g_pitemmgt, 0);
+    store64(g_pserver, 0);
+    store32(h_srvgrp, 0);
+    store64(g_da_conn, 0);
+    log_append(m_da_disc);
+    SetWindowTextA(load64(g_status), lbl_status);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func da_connect() -> i64 {
+    if load64(g_da_conn) != 0 { return 0; }
+    log_append(m_da_conn_p);
+    store64(g_da_remote, 0);
+    GetWindowTextA(load64(g_ep_ed), g_da_narrow, 512);
+    # A raw "{CLSID}" in the endpoint field always wins: connect straight to that CLSID,
+    # no Enum Servers needed. This is the path for legacy DA servers whose ProgID isn't
+    # registered/usable (common on old windfarm OPC servers). An optional "@host" suffix,
+    # e.g. "{CLSID}@127.0.0.1", activates that server remotely over DCOM.
+    if load8(g_da_narrow) == 123 {
+        # Split off an optional "@host" remote-DCOM target (NUL-terminate the CLSID at '@').
+        hostp = 0;
+        sp = g_da_narrow;
+        while load8(sp) != 0 {
+            if load8(sp) == 64 { store8(sp, 0); hostp = sp + 1; break; }
+            sp = sp + 1;
+        }
+        a2w(w_item, g_da_narrow);
+        hr = CLSIDFromString(w_item, g_srvclsids);
+        if hr < 0 { log_num(m_da_conn_e, hr); return 0; }
+        if hostp != 0 {
+            a2w(g_da_hostw, hostp);
+            store64(g_da_remote, 1);
+            log_append(m_da_byclsid_r);
+            log_append(hostp);
+            log_append(crlf);
+        } else {
+            log_append(m_da_byclsid);
+        }
+        idx = 0;
+    } else {
+        # Otherwise prefer a server picked from the enum list; else treat endpoint as a ProgID.
+        idx = SendMessageA(load64(g_da_list), 392, 0, 0);   # LB_GETCURSEL
+        if idx < 0 {
+            log_append(m_da_byprog);
+            a2w(w_item, g_da_narrow);
+            hr = CLSIDFromProgID(w_item, g_srvclsids);
+            if hr < 0 { log_num(m_da_conn_e, hr); return 0; }
+            idx = 0;
+        } else {
+            # Capture the selected server's ProgID so the status line names the real server
+            SendMessageA(load64(g_da_list), 393, idx, g_da_narrow);
+        }
+    }
+    # Connect using the CLSID at the selected index
+    hr = da_com_create(g_srvclsids + idx * 16, iidServer, pp_server);
+    if hr < 0 { log_num(m_da_conn_e, hr); return 0; }
+    psv = load64(pp_server);
+    if psv == 0 { log_append(m_da_conn_e); return 0; }
+    store64(g_pserver, psv);
+    # AddGroup
+    a2w(w_group, da_grp_name);
+    store64(pp_itemmgt, 0);
+    store32(h_srvgrp, 0);
+    store32(d_revrate, 0);
+    hr = callp(vmeth(psv, 3), psv, w_group, 1, 1000, 1, 0, 0, 0, h_srvgrp, d_revrate, iidItemMgt, pp_itemmgt);
+    if hr < 0 { log_num(m_da_conn_e, hr); da_disconnect(); return 0; }
+    pim = load64(pp_itemmgt);
+    if pim == 0 { da_disconnect(); return 0; }
+    store64(g_pitemmgt, pim);
+    # QueryInterface IOPCSyncIO
+    store64(pp_syncio, 0);
+    hr = com_qi(pim, iidSyncIO, pp_syncio);
+    if hr < 0 { log_num(m_da_conn_e, hr); da_disconnect(); return 0; }
+    store64(g_psyncio, load64(pp_syncio));
+    store64(g_da_conn, 1);
+    log_append(m_da_conn_ok);
+    e = str_copy(g_statbuf, "Status: DA Connected to ");
+    str_copy(e, g_da_narrow);
+    SetWindowTextA(load64(g_status), g_statbuf);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func da_browse() -> i64 {
+    if load64(g_da_conn) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_da_brw);
+    # Stop poll + clear
+    poll = load64(g_polling);
+    if poll != 0 { KillTimer(load64(g_hwnd), ID_TIMER_POLL); store64(g_polling, 0); }
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    store64(g_da_tagcnt, 0);
+    # Get IOPCBrowseServerAddressSpace
+    store64(pp_browse, 0);
+    hr = com_qi(load64(g_pserver), iidBrowse, pp_browse);
+    if hr < 0 { log_append(m_da_brw_e); return 0; }
+    pBr = load64(pp_browse);
+    if pBr == 0 { log_append(m_da_brw_e); return 0; }
+    # BrowseOPCItemIDs(OPC_FLAT=3, filter="", VT_EMPTY=0, 0)
+    store64(pp_enumstr, 0);
+    hr = callp(vmeth(pBr, 5), pBr, 3, w_filter, 0, 0, pp_enumstr);
+    if hr < 0 { log_append(m_da_brw_e); com_release(pBr); return 0; }
+    pES = load64(pp_enumstr);
+    if pES == 0 { log_append(m_da_brw_e); com_release(pBr); return 0; }
+    n = 0;
+    while 1 {
+        store32(g_fetch, 0);
+        store64(pp_str, 0);
+        callp(vmeth(pES, 3), pES, 1, pp_str, g_fetch);
+        if load32(g_fetch) != 1 { break; }
+        wname = load64(pp_str);
+        if wname != 0 {
+            w2a(g_da_narrow, wname);
+            # Add to ListView
+            lv_add_tag(n, g_da_narrow);
+            lv_set_text(n, 1, da_v_dash);
+            lv_set_text(n, 2, da_v_dash);
+            # AddItems to group
+            memset(itemdef, 0, 48);
+            store64(itemdef + 0, w_filter);
+            store64(itemdef + 8, wname);
+            store32(itemdef + 16, 1);
+            store32(itemdef + 20, 1);
+            store64(pp_results, 0);
+            store64(pp_adderr, 0);
+            pim = load64(g_pitemmgt);
+            callp(vmeth(pim, 3), pim, 1, itemdef, pp_results, pp_adderr);
+            pres = load64(pp_results);
+            if pres != 0 { store32(g_da_taghnd + n * 4, load32(pres)); CoTaskMemFree(pres); }
+            perr = load64(pp_adderr);
+            if perr != 0 { CoTaskMemFree(perr); }
+            CoTaskMemFree(wname);
+            n = n + 1;
+        }
+        if n >= 250 { break; }
+    }
+    com_release(pES);
+    com_release(pBr);
+    store64(g_da_tagcnt, n);
+    log_num(m_da_brw_n, n);
+    return 0;
+}
+
+func da_poll_all() -> i64 {
+    psi = load64(g_psyncio);
+    if psi == 0 { return 0; }
+    c = load64(g_da_tagcnt);
+    if c == 0 { return 0; }
+    # Read all items: IOPCSyncIO::Read(source=OPC_DS_DEVICE=2, count, handles, &values, &errors)
+    store64(pp_values, 0);
+    store64(pp_readerr, 0);
+    hr = callp(vmeth(psi, 3), psi, 2, c, g_da_taghnd, pp_values, pp_readerr);
+    if hr < 0 { return 0; }
+    pvals = load64(pp_values);
+    prerr = load64(pp_readerr);
+    if pvals == 0 { return 0; }
+    # Parse OPCITEMSTATE array (stride = 40 bytes, verified from working opc_explorer)
+    # VT at +16, data at +24, quality at +12
+    i = 0;
+    while i < c {
+        pv = pvals + i * 40;
+        vt = load16(pv + 16);
+        # Format value
+        memset(g_da_valbuf, 0, 64);
+        if vt == 2 { int_to_str(g_da_valbuf, nf_sext16(load16(pv + 24))); }
+        if vt == 3 { int_to_str(g_da_valbuf, nf_sext32(load32(pv + 24))); }
+        if vt == 4 { nf_ftoa(load32(pv + 24), g_da_valbuf); }
+        if vt == 5 { nf_dtoa(load64(pv + 24), g_da_valbuf); }
+        if vt == 7 { nf_oadate(load64(pv + 24), g_da_valbuf); }
+        if vt == 8 { bstr = load64(pv + 24); if bstr != 0 { w2a(g_da_valbuf, bstr); } }
+        if vt == 11 { if load16(pv + 24) != 0 { str_copy(g_da_valbuf, da_v_true); } else { str_copy(g_da_valbuf, da_v_false); } }
+        if vt == 16 { int_to_str(g_da_valbuf, nf_sext8(load8(pv + 24))); }
+        if vt == 17 { int_to_str(g_da_valbuf, load8(pv + 24)); }
+        if vt == 18 { int_to_str(g_da_valbuf, load16(pv + 24)); }
+        if vt == 19 { int_to_str(g_da_valbuf, load32(pv + 24)); }
+        if vt == 20 { int_to_str(g_da_valbuf, load64(pv + 24)); }
+        if vt == 21 { int_to_str(g_da_valbuf, load64(pv + 24)); }
+        lv_set_text(i, 1, g_da_valbuf);
+        # Type name
+        memset(g_da_typbuf, 0, 32);
+        if vt == 2 { str_copy(g_da_typbuf, da_ty_i2); }
+        if vt == 3 { str_copy(g_da_typbuf, da_ty_i4); }
+        if vt == 4 { str_copy(g_da_typbuf, da_ty_r4); }
+        if vt == 5 { str_copy(g_da_typbuf, da_ty_r8); }
+        if vt == 7 { str_copy(g_da_typbuf, da_ty_date); }
+        if vt == 8 { str_copy(g_da_typbuf, da_ty_bstr); }
+        if vt == 11 { str_copy(g_da_typbuf, da_ty_bool); }
+        if vt == 16 { str_copy(g_da_typbuf, da_ty_i2); }
+        if vt == 17 { str_copy(g_da_typbuf, da_ty_ui1); }
+        if vt == 18 { str_copy(g_da_typbuf, da_ty_ui2); }
+        if vt == 19 { str_copy(g_da_typbuf, da_ty_ui4); }
+        if vt == 20 { str_copy(g_da_typbuf, da_ty_i8); }
+        if vt == 21 { str_copy(g_da_typbuf, da_ty_ui8); }
+        if load8(g_da_typbuf) == 0 {
+            e2 = str_copy(g_da_typbuf, da_ty_vt);
+            int_to_str(e2, vt);
+        }
+        lv_set_text(i, 2, g_da_typbuf);
+        # Quality (wQuality at pv + 12, bits 6-7: 00=bad, 01=uncertain, 11=good)
+        qual = load16(pv + 12);
+        qm = band(qual, 192);
+        if qm == 192 { lv_set_text(i, 3, da_ql_good); }
+        if qm == 64 { lv_set_text(i, 3, da_ql_unc); }
+        if qm == 0 { lv_set_text(i, 3, da_ql_bad); }
+        i = i + 1;
+    }
+    CoTaskMemFree(pvals);
+    if prerr != 0 { CoTaskMemFree(prerr); }
+    return 0;
+}
+
+# ============================================================================
+# OPC UA PROTOCOL
+# ============================================================================
+
+# Read one complete UA message chunk into g_rxbuf. UA framing = 3-byte MsgType +
+# 1-byte chunk flag + 4-byte MessageSize (total incl. header). A single recv() may
+# return a partial chunk (TCP segmentation) or a server may send up to its 64KB
+# buffer, so loop until the full MessageSize bytes are in. Returns total bytes, or
+# <=0 on socket error. (Multi-chunk 'C' reassembly across chunks is a later step.)
+func ua_recv_msg(s: i64) -> i64 {
+    got = 0;
+    while got < 8 {
+        n = recv(s, g_rxbuf + got, 8 - got, 0);
+        if n <= 0 { return 0; }
+        got = got + n;
+    }
+    total = load32(g_rxbuf + 4);
+    if total < 8 { return 0; }
+    if total > 65536 { total = 65536; }   # clamp to g_rxbuf capacity
+    while got < total {
+        n = recv(s, g_rxbuf + got, total - got, 0);
+        if n <= 0 { return 0; }
+        got = got + n;
+    }
+    return got;
+}
+
+# True if the string contains "None" (used to detect SecurityPolicy#None => plaintext token).
+func str_has_none(s: i64) -> i64 {
+    p = s;
+    while load8(p) != 0 {
+        if load8(p) == 78 { if load8(p + 1) == 111 { if load8(p + 2) == 110 { if load8(p + 3) == 101 { return 1; } } } }
+        p = p + 1;
+    }
+    return 0;
+}
+
+# ---- CreateSessionResponse decoding helpers (operate on g_rxbuf at roff) ----
+# Skip a UA String/ByteString (Int32 len, -1 = null). Returns new roff.
+func ua_skip_str(roff: i64) -> i64 {
+    len = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+    if len > 0 { roff = roff + len; }
+    return roff;
+}
+# Copy a UA String to dst (NUL-terminated, clamped to maxn). Returns roff past the field.
+func ua_copy_str(roff: i64, dst: i64, maxn: i64) -> i64 {
+    len = nf_sext32(load32(g_rxbuf + roff));
+    if len <= 0 { store8(dst, 0); return roff + 4; }
+    cl = len; if cl > maxn - 1 { cl = maxn - 1; }
+    memcpy(dst, g_rxbuf + roff + 4, cl);
+    store8(dst + cl, 0);
+    return roff + 4 + len;
+}
+# Skip a LocalizedText (1-byte mask + optional locale + optional text).
+func ua_skip_loctext(roff: i64) -> i64 {
+    mask = load8(g_rxbuf + roff); roff = roff + 1;
+    if band(mask, 1) != 0 { roff = ua_skip_str(roff); }
+    if band(mask, 2) != 0 { roff = ua_skip_str(roff); }
+    return roff;
+}
+# Skip a String[] array.
+func ua_skip_strarr(roff: i64) -> i64 {
+    cnt = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+    i = 0;
+    while i < cnt { roff = ua_skip_str(roff); i = i + 1; }
+    return roff;
+}
+# Parse the tail of CreateSessionResponse (roff just past AuthenticationToken):
+# RevisedSessionTimeout, ServerNonce, ServerCertificate, then ServerEndpoints[] to
+# discover the first UserName (TokenType=1) UserTokenPolicy. Stores to globals + logs.
+func ua_capture_session(roff: i64) -> i64 {
+    store64(g_srv_nonce_len, 0);
+    store64(g_srv_cert_len, 0);
+    store64(g_user_polfound, 0);
+    store8(g_user_polid, 0);
+    store8(g_user_secpol, 0);
+    roff = roff + 8;   # RevisedSessionTimeout (Double)
+    # ServerNonce (ByteString)
+    nl = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+    if nl > 0 {
+        cl = nl; if cl > 128 { cl = 128; }
+        memcpy(g_srv_nonce, g_rxbuf + roff, cl);
+        store64(g_srv_nonce_len, cl);
+        roff = roff + nl;
+    }
+    # ServerCertificate (ByteString, DER X.509)
+    cl2 = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+    if cl2 > 0 {
+        cc = cl2; if cc > 4096 { cc = 4096; }
+        memcpy(g_srv_cert, g_rxbuf + roff, cc);
+        store64(g_srv_cert_len, cc);
+        roff = roff + cl2;
+    }
+    # ServerEndpoints: EndpointDescription[]
+    epcnt = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+    ei = 0;
+    while ei < epcnt {
+        roff = ua_skip_str(roff);       # EndpointUrl
+        roff = ua_skip_str(roff);       # Server.ApplicationUri
+        roff = ua_skip_str(roff);       # Server.ProductUri
+        roff = ua_skip_loctext(roff);   # Server.ApplicationName
+        roff = roff + 4;                # Server.ApplicationType (enum)
+        roff = ua_skip_str(roff);       # Server.GatewayServerUri
+        roff = ua_skip_str(roff);       # Server.DiscoveryProfileUri
+        roff = ua_skip_strarr(roff);    # Server.DiscoveryUrls
+        roff = ua_skip_str(roff);       # ServerCertificate
+        roff = roff + 4;                # MessageSecurityMode (enum)
+        ep_secpol_off = roff;
+        roff = ua_skip_str(roff);       # endpoint SecurityPolicyUri
+        # We connect with a SecurityPolicy#None channel, so only user-token policies on the
+        # #None endpoint have a PolicyId valid for our session. Picking one from a secure
+        # endpoint yields Bad_IdentityTokenInvalid.
+        ua_copy_str(ep_secpol_off, g_ep_secpol, 128);
+        ep_none = str_has_none(g_ep_secpol);
+        utc = nf_sext32(load32(g_rxbuf + roff)); roff = roff + 4;
+        ui = 0;
+        while ui < utc {
+            polid_off = roff;
+            roff = ua_skip_str(roff);   # PolicyId
+            ttype = load32(g_rxbuf + roff); roff = roff + 4;   # TokenType (0=Anon,1=UserName,2=Cert)
+            roff = ua_skip_str(roff);   # IssuedTokenType
+            roff = ua_skip_str(roff);   # IssuerEndpointUrl
+            secpol_off = roff;
+            roff = ua_skip_str(roff);   # token SecurityPolicyUri
+            if ttype == 1 {
+                if ep_none != 0 {
+                    if load64(g_user_polfound) == 0 {
+                        ua_copy_str(polid_off, g_user_polid, 128);
+                        ua_copy_str(secpol_off, g_user_secpol, 128);
+                        # A null token SecurityPolicyUri inherits the endpoint's (here #None).
+                        if load8(g_user_secpol) == 0 { str_copy(g_user_secpol, g_ep_secpol); }
+                        store64(g_user_polfound, 1);
+                    }
+                }
+            }
+            ui = ui + 1;
+        }
+        roff = ua_skip_str(roff);       # TransportProfileUri
+        roff = roff + 1;                # SecurityLevel (Byte)
+        ei = ei + 1;
+    }
+    if load64(g_user_polfound) != 0 {
+        log_append(m_pol_user);
+        log_append(g_user_polid);
+        log_append(m_pol_sec);
+        log_append(g_user_secpol);
+        log_append(crlf);
+    } else {
+        log_append(m_pol_none);
+    }
+    return roff;
+}
+
+func ua_connect() -> i64 {
+    sock = load64(g_sock);
+    if sock != 0 { return 0; }
+
+    # Get endpoint URL
+    GetWindowTextA(load64(g_ep_ed), g_urlbuf, 512);
+    log_append(m_conn_to);
+    log_append(g_urlbuf);
+    log_append(m_dots);
+
+    # Parse host:port from opc.tcp://host:port
+    p = g_urlbuf;
+    while load8(p) != 0 {
+        if load8(p) == 58 {
+            if load8(p + 1) == 47 {
+                if load8(p + 2) == 47 {
+                    p = p + 3;
+                    break;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    # Optional userinfo "user:password@" (enables UserName auth; stripped from the URL so
+    # the EndpointUrl sent to the server stays clean and the password never leaves in it).
+    store8(g_ua_user, 0);
+    store8(g_ua_pass, 0);
+    u_start = p;
+    ap = p;
+    has_at = 0;
+    while load8(ap) != 0 {
+        ac = load8(ap);
+        if ac == 47 { break; }
+        if ac == 64 { has_at = 1; break; }
+        ap = ap + 1;
+    }
+    if has_at != 0 {
+        up = p; ui = 0;
+        while up < ap {
+            ac = load8(up);
+            if ac == 58 { break; }
+            store8(g_ua_user + ui, ac); ui = ui + 1;
+            up = up + 1;
+        }
+        store8(g_ua_user + ui, 0);
+        pj = 0;
+        if load8(up) == 58 {
+            up = up + 1;
+            while up < ap {
+                store8(g_ua_pass + pj, load8(up)); pj = pj + 1;
+                up = up + 1;
+            }
+        }
+        store8(g_ua_pass + pj, 0);
+        # remove "userinfo@" from g_urlbuf in place
+        src = ap + 1; dst = u_start;
+        while load8(src) != 0 { store8(dst, load8(src)); dst = dst + 1; src = src + 1; }
+        store8(dst, 0);
+        p = u_start;
+    }
+    hi = 0;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 58 { break; }
+        if c == 47 { break; }
+        store8(g_host + hi, c);
+        hi = hi + 1;
+        p = p + 1;
+    }
+    store8(g_host + hi, 0);
+    port = 4840;
+    if load8(p) == 58 {
+        p = p + 1;
+        port = 0;
+        while load8(p) != 0 {
+            c = load8(p);
+            if c == 47 { break; }
+            if c < 48 { break; }
+            if c > 57 { break; }
+            port = port * 10 + c - 48;
+            p = p + 1;
+        }
+    }
+
+    # Resolve IP + connect
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);
+    store16(g_addr + 2, htons(port));
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = g_host;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 {
+            ip = ip + shl(octet, shift);
+            shift = shift + 8;
+            octet = 0;
+        } else {
+            octet = octet * 10 + c - 48;
+        }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+
+    s = socket(2, 1, 6);
+    if s == 0 - 1 { log_append(m_conn_err); return 0; }
+    rc = connect(s, g_addr, 16);
+    if rc != 0 { closesocket(s); log_append(m_conn_err); return 0; }
+    store64(g_sock, s);
+    log_append(m_conn_ok);
+
+    # ---- OPC UA HELLO ----
+    log_append(m_hello);
+    memset(g_hel, 0, 256);
+    store8(g_hel + 0, 72);    # 'H'
+    store8(g_hel + 1, 69);    # 'E'
+    store8(g_hel + 2, 76);    # 'L'
+    store8(g_hel + 3, 70);    # 'F'
+    store32(g_hel + 8, 0);
+    store32(g_hel + 12, 65535);
+    store32(g_hel + 16, 65535);
+    store32(g_hel + 20, 0);
+    store32(g_hel + 24, 0);
+    url_len = strlen(g_urlbuf);
+    store32(g_hel + 28, url_len);
+    memcpy(g_hel + 32, g_urlbuf, url_len);
+    msg_size = 32 + url_len;
+    store32(g_hel + 4, msg_size);
+    n = send(s, g_hel, msg_size, 0);
+    if n <= 0 { log_append(m_send_err); ua_disconnect(); return 0; }
+
+    # Receive ACK
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_recv_err); ua_disconnect(); return 0; }
+    if load8(g_rxbuf + 0) != 65 { log_append(m_recv_err); ua_disconnect(); return 0; }
+    log_append(m_ack);
+
+    # ---- OpenSecureChannel ----
+    log_append(m_opn_send);
+    store64(g_seq_num, 0);
+    store64(g_req_id, 0);
+    store64(g_auth_raw_len, 0);
+    memset(g_txbuf, 0, 4096);
+    store8(g_txbuf + 0, 79);   # 'O'
+    store8(g_txbuf + 1, 80);   # 'P'
+    store8(g_txbuf + 2, 78);   # 'N'
+    store8(g_txbuf + 3, 70);   # 'F'
+    store32(g_txbuf + 8, 0);   # SecureChannelId = 0
+    # Security header
+    off = 12;
+    sec_len = strlen(sec_none);
+    store32(g_txbuf + off, sec_len); off = off + 4;
+    memcpy(g_txbuf + off, sec_none, sec_len); off = off + sec_len;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # SenderCert = empty
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # RecvThumb = empty
+    # Sequence header
+    store64(g_seq_num, 1);
+    store64(g_req_id, 1);
+    store32(g_txbuf + off, 1); off = off + 4;   # SeqNum
+    store32(g_txbuf + off, 1); off = off + 4;   # ReqId
+    # Body: OpenSecureChannelRequest (id=446)
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 446); off = off + 4;
+    # RequestHeader (null auth token)
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); off = off + 2;
+    store64(g_txbuf + off, 0); off = off + 8;   # Timestamp
+    store32(g_txbuf + off, 1); off = off + 4;   # RequestHandle
+    store32(g_txbuf + off, 0); off = off + 4;   # ReturnDiagnostics
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # AuditEntryId=null
+    store32(g_txbuf + off, 10000); off = off + 4;   # TimeoutHint
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); store8(g_txbuf + off + 2, 0); off = off + 3;
+    # OPN body
+    store32(g_txbuf + off, 0); off = off + 4;   # ClientProtocolVersion
+    store32(g_txbuf + off, 0); off = off + 4;   # RequestType=Issue
+    store32(g_txbuf + off, 1); off = off + 4;   # SecurityMode=None
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # ClientNonce=null
+    store32(g_txbuf + off, 3600000); off = off + 4; # Lifetime=1h
+    store32(g_txbuf + 4, off);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { log_append(m_opn_fail); ua_disconnect(); return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_opn_fail); ua_disconnect(); return 0; }
+    if load8(g_rxbuf + 0) != 79 { log_append(m_opn_fail); ua_disconnect(); return 0; }
+    # Extract SecureChannelId + TokenId
+    sc_id = load32(g_rxbuf + 8);
+    store64(g_sc_id, sc_id);
+    # Skip security header to find TokenId
+    roff = 12;
+    sp_len = load32(g_rxbuf + roff); roff = roff + 4 + sp_len;
+    sc_len = load32(g_rxbuf + roff);
+    if sc_len > 1000000 { roff = roff + 4; } else { roff = roff + 4 + sc_len; }
+    rc_len = load32(g_rxbuf + roff);
+    if rc_len > 1000000 { roff = roff + 4; } else { roff = roff + 4 + rc_len; }
+    roff = roff + 8;   # SeqNum + ReqId
+    roff = roff + 4;   # Response NodeId
+    roff = roff + 8 + 4;  # Timestamp + RequestHandle
+    svc_status = load32(g_rxbuf + roff); roff = roff + 4;
+    if svc_status != 0 { log_append(m_opn_fail); ua_disconnect(); return 0; }
+    roff = roff + 1 + 4 + 3;   # DiagInfo + StringTable + AdditionalHeader
+    roff = roff + 4;   # ServerProtocolVersion
+    roff = roff + 4;   # ChannelId
+    token_id = load32(g_rxbuf + roff);
+    store64(g_sc_token, token_id);
+    log_append(m_opn_ok);
+
+    # ---- CreateSession ----
+    log_append(m_cs_send);
+    off = ua_msg_start(sc_id, token_id);
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 461); off = off + 4;
+    off = ua_req_header(off);
+    # ApplicationDescription
+    off = ua_str(off, cs_app_uri, strlen(cs_app_uri));
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # ProductUri=null
+    store8(g_txbuf + off, 3); off = off + 1;        # LocalizedText has locale+text
+    store32(g_txbuf + off, 2); off = off + 4;       # locale="en"
+    store8(g_txbuf + off, 101); store8(g_txbuf + off + 1, 110); off = off + 2;
+    off = ua_str(off, cs_app_name, strlen(cs_app_name));
+    store32(g_txbuf + off, 1); off = off + 4;       # ApplicationType=Client
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # GatewayServerUri
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # DiscoveryProfileUri
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # DiscoveryUrls
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # ServerUri
+    off = ua_str(off, g_urlbuf, strlen(g_urlbuf));  # EndpointUrl
+    off = ua_str(off, cs_sess, strlen(cs_sess));    # SessionName
+    # ClientNonce (32 pseudo-random bytes)
+    store32(g_txbuf + off, 32); off = off + 4;
+    tick = GetTickCount();
+    i = 0;
+    while i < 32 { tick = tick * 1103515245 + 12345; store8(g_txbuf + off + i, band(shr(tick, 16), 255)); i = i + 1; }
+    off = off + 32;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;  # ClientCertificate=null
+    store32(g_txbuf + off, 0); store32(g_txbuf + off + 4, 0); off = off + 8;  # SessionTimeout=0
+    store32(g_txbuf + off, 0); off = off + 4;       # MaxResponseMessageSize=0
+    store32(g_txbuf + 4, off);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { log_append(m_cs_fail); ua_disconnect(); return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_cs_fail); ua_disconnect(); return 0; }
+    if load8(g_rxbuf) != 77 { log_append(m_cs_fail); ua_disconnect(); return 0; }
+    # Parse CreateSessionResponse
+    roff = 24 + 4;   # skip MSG header + response NodeId
+    roff = roff + 8 + 4;  # Timestamp + RequestHandle
+    svc_status = load32(g_rxbuf + roff); roff = roff + 4;
+    if svc_status != 0 { log_append(m_cs_fail); ua_disconnect(); return 0; }
+    roff = roff + 1 + 4 + 3;   # DiagInfo + StringTable + AdditionalHeader
+    # SessionId NodeId
+    enc = load8(g_rxbuf + roff);
+    if enc == 0 { roff = roff + 2; }
+    if enc == 1 { roff = roff + 4; }
+    if enc == 2 { roff = roff + 7; }
+    if enc == 3 { roff = roff + 7 + load32(g_rxbuf + roff + 3); }  # String NodeId: enc(1)+ns(2)+len(4)+bytes
+    if enc == 4 { roff = roff + 19; }
+    if enc == 5 { roff = roff + 7 + load32(g_rxbuf + roff + 3); }  # ByteString NodeId: enc(1)+ns(2)+len(4)+bytes
+    # AuthenticationToken - capture raw
+    enc2 = load8(g_rxbuf + roff);
+    tlen = 2;
+    if enc2 == 1 { tlen = 4; }
+    if enc2 == 2 { tlen = 7; }
+    if enc2 == 4 { tlen = 19; }
+    if enc2 == 3 { tlen = 7 + load32(g_rxbuf + roff + 3); }
+    if enc2 == 5 { tlen = 7 + load32(g_rxbuf + roff + 3); }
+    cap = tlen; if cap > 64 { cap = 64; }
+    memcpy(g_auth_raw, g_rxbuf + roff, cap);
+    store64(g_auth_raw_len, cap);
+    roff = roff + tlen;
+    # Capture ServerNonce / ServerCertificate / UserName token policy from the tail
+    roff = ua_capture_session(roff);
+    log_append(m_cs_ok);
+
+    # ---- ActivateSession ----
+    log_append(m_as_send);
+    off = ua_msg_start(sc_id, token_id);
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 467); off = off + 4;
+    off = ua_req_header(off);
+    # ClientSignature
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    # ClientSoftwareCertificates = empty array
+    store32(g_txbuf + off, 0); off = off + 4;
+    # LocaleIds = ["en"]
+    store32(g_txbuf + off, 1); off = off + 4;
+    store32(g_txbuf + off, 2); off = off + 4;
+    store8(g_txbuf + off, 101); store8(g_txbuf + off + 1, 110); off = off + 2;
+    # UserIdentityToken: Anonymous (id=321), or UserName (id=322) if creds were supplied.
+    if load8(g_ua_user) == 0 {
+        store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 321); off = off + 4;
+        store8(g_txbuf + off, 1); off = off + 1;       # has binary body
+        store32(g_txbuf + off, 4); off = off + 4;       # body length
+        store32(g_txbuf + off, 0 - 1); off = off + 4;   # PolicyId = null
+    } else {
+        log_append(m_auth_user); log_append(g_ua_user); log_append(crlf);
+        plaintext = 1;
+        if load64(g_user_polfound) != 0 { if str_has_none(g_user_secpol) == 0 { plaintext = 0; } }
+        if plaintext == 0 {
+            # Secure user-token policy: the password must be RSA-encrypted with the server's
+            # certificate (RSA-OAEP). Not implemented yet -> fail clearly rather than send a
+            # plaintext password the server will reject (or worse, accept unencrypted).
+            log_append(m_auth_noenc);
+            ua_disconnect();
+            return 0;
+        }
+        log_append(m_auth_plain);
+        # UserNameIdentityToken (id=322): PolicyId, UserName, Password (plaintext), EncryptionAlgorithm(null)
+        store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 322); off = off + 4;
+        store8(g_txbuf + off, 1); off = off + 1;        # has binary body
+        blen_pos = off; off = off + 4;                  # body-length placeholder (backpatched)
+        body_start = off;
+        off = ua_str(off, g_user_polid, strlen(g_user_polid));
+        off = ua_str(off, g_ua_user, strlen(g_ua_user));
+        off = ua_str(off, g_ua_pass, strlen(g_ua_pass));   # Password ByteString (plaintext, policy=None)
+        store32(g_txbuf + off, 0 - 1); off = off + 4;       # EncryptionAlgorithm = null
+        store32(g_txbuf + blen_pos, off - body_start);
+    }
+    # UserTokenSignature
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store32(g_txbuf + 4, off);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { log_append(m_as_fail); ua_disconnect(); return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_as_fail); ua_disconnect(); return 0; }
+    if load8(g_rxbuf) != 77 { log_append(m_as_fail); ua_disconnect(); return 0; }
+    roff = 24 + 4 + 8 + 4;
+    svc_status = load32(g_rxbuf + roff);
+    if svc_status != 0 { log_num(m_as_failc, svc_status); log_append(crlf); ua_disconnect(); return 0; }
+    log_append(m_as_ok);
+
+    # Update UI
+    e = str_copy(g_statbuf, "Status: Connected to ");
+    str_copy(e, g_urlbuf);
+    SetWindowTextA(load64(g_status), g_statbuf);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+# Helper: start a MSG frame
+func ua_msg_start(sc_id: i64, token_id: i64) -> i64 {
+    memset(g_txbuf, 0, 4096);
+    store8(g_txbuf + 0, 77); store8(g_txbuf + 1, 83); store8(g_txbuf + 2, 71); store8(g_txbuf + 3, 70);
+    store32(g_txbuf + 8, sc_id);
+    store32(g_txbuf + 12, token_id);
+    seq = load64(g_seq_num) + 1; store64(g_seq_num, seq); store32(g_txbuf + 16, seq);
+    rid = load64(g_req_id) + 1; store64(g_req_id, rid); store32(g_txbuf + 20, rid);
+    return 24;
+}
+
+# Helper: write RequestHeader with auth token
+func ua_req_header(off: i64) -> i64 {
+    alen = load64(g_auth_raw_len);
+    if alen > 0 { memcpy(g_txbuf + off, g_auth_raw, alen); off = off + alen; }
+    else { store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); off = off + 2; }
+    GetSystemTimeAsFileTime(g_filetime);
+    store32(g_txbuf + off, load32(g_filetime)); store32(g_txbuf + off + 4, load32(g_filetime + 4)); off = off + 8;
+    store32(g_txbuf + off, load64(g_req_id)); off = off + 4;
+    store32(g_txbuf + off, 0); off = off + 4;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    store32(g_txbuf + off, 10000); off = off + 4;
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); store8(g_txbuf + off + 2, 0); off = off + 3;
+    return off;
+}
+
+# Helper: write UA String
+func ua_str(off: i64, s: i64, slen: i64) -> i64 {
+    store32(g_txbuf + off, slen);
+    memcpy(g_txbuf + off + 4, s, slen);
+    return off + 4 + slen;
+}
+
+# ListView helpers
+func lv_add_tag(row: i64, name: i64) -> i64 {
+    lv = load64(g_listview);
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, row);
+    store32(g_lvitem + 8, 0);
+    store64(g_lvitem + 24, name);
+    SendMessageA(lv, 4103, 0, g_lvitem);
+    return 0;
+}
+
+func lv_set_text(row: i64, col: i64, text: i64) -> i64 {
+    lv = load64(g_listview);
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 8, col);
+    store64(g_lvitem + 24, text);
+    SendMessageA(lv, 4142, row, g_lvitem);
+    return 0;
+}
+
+# ============================================================================
+# OPC UA BROWSE
+# ============================================================================
+
+func ua_browse() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_brw_send);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = ua_msg_start(sc_id, token_id);
+
+    # BrowseRequest = ns=0, id=527
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 527); off = off + 4;
+    off = ua_req_header(off);
+
+    # View (null)
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); off = off + 2;
+    store64(g_txbuf + off, 0); off = off + 8;
+    store32(g_txbuf + off, 0); off = off + 4;
+
+    # RequestedMaxReferencesPerNode = 0
+    store32(g_txbuf + off, 0); off = off + 4;
+
+    # NodesToBrowse array (count=1)
+    store32(g_txbuf + off, 1); off = off + 4;
+
+    # BrowseDescription: NodeId = current browse target
+    cur_node = load64(g_browse_id);
+    if cur_node == 0 { cur_node = 85; }
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, cur_node); off = off + 4;
+    # BrowseDirection = Forward
+    store32(g_txbuf + off, 0); off = off + 4;
+    # ReferenceTypeId = null
+    store8(g_txbuf + off, 0); store8(g_txbuf + off + 1, 0); off = off + 2;
+    # IncludeSubtypes = true
+    store8(g_txbuf + off, 1); off = off + 1;
+    # NodeClassMask = 0 (all)
+    store32(g_txbuf + off, 0); off = off + 4;
+    # ResultMask = 63 (all fields)
+    store32(g_txbuf + off, 63); off = off + 4;
+
+    # Send
+    store32(g_txbuf + 4, off);
+    s = load64(g_sock);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { log_append(m_brw_fail); return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_brw_fail); return 0; }
+    if load8(g_rxbuf) != 77 { log_append(m_brw_fail); return 0; }
+
+    # Parse MSG response header
+    roff = 24 + 4;   # skip header + response NodeId
+    roff = roff + 8 + 4;  # Timestamp + RequestHandle
+    svc_status = load32(g_rxbuf + roff); roff = roff + 4;
+    if svc_status != 0 { log_append(m_brw_fail); return 0; }
+    roff = roff + 1 + 4 + 3;   # DiagInfo + StringTable + AdditionalHeader
+
+    # Results array
+    result_count = load32(g_rxbuf + roff); roff = roff + 4;
+    if result_count < 1 { log_append(m_brw_fail); return 0; }
+
+    # BrowseResult[0]: StatusCode + ContinuationPoint + References
+    roff = roff + 4;   # StatusCode
+    cp_len = load32(g_rxbuf + roff); roff = roff + 4;
+    if cp_len < 1000000 { roff = roff + cp_len; }
+    ref_count = load32(g_rxbuf + roff); roff = roff + 4;
+
+    log_num(m_brw_ok, ref_count);
+
+    # Reset tag storage + clear ListView + TreeView
+    store64(g_tag_count, 0);
+    store64(g_tag_names_off, 0);
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    SendMessageA(load64(g_treeview), 0x1101, 0, 0);   # TVM_DELETEITEM(TVI_ROOT=all)
+
+    # Parse ReferenceDescriptions
+    ri = 0;
+    while ri < ref_count {
+        # Skip ReferenceTypeId (NodeId)
+        enc_r = load8(g_rxbuf + roff);
+        if enc_r == 0 { roff = roff + 2; }
+        if enc_r == 1 { roff = roff + 4; }
+        if enc_r == 2 { roff = roff + 7; }
+        if enc_r == 3 { slen3 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen3; }
+        if enc_r == 4 { roff = roff + 19; }
+
+        # IsForward
+        roff = roff + 1;
+
+        # ExpandedNodeId (target node)
+        exp_enc = load8(g_rxbuf + roff);
+        nid_type = band(exp_enc, 0x0F);
+        ref_node_id = 0;
+        ref_ns = 0;
+        if nid_type == 0 { ref_node_id = load8(g_rxbuf + roff + 1); roff = roff + 2; }
+        if nid_type == 1 { ref_ns = load8(g_rxbuf + roff + 1); ref_node_id = load16(g_rxbuf + roff + 2); roff = roff + 4; }
+        if nid_type == 2 { ref_ns = load16(g_rxbuf + roff + 1); ref_node_id = load32(g_rxbuf + roff + 3); roff = roff + 7; }
+        if nid_type == 3 { ref_ns = load16(g_rxbuf + roff + 1); slen4 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen4; }
+        if nid_type == 4 { roff = roff + 19; }
+        if nid_type == 5 { ref_ns = load16(g_rxbuf + roff + 1); slen5 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen5; }
+        if band(exp_enc, 0x80) != 0 { nsuri_len = load32(g_rxbuf + roff); roff = roff + 4; if nsuri_len < 1000000 { roff = roff + nsuri_len; } }
+        if band(exp_enc, 0x40) != 0 { roff = roff + 4; }
+
+        # BrowseName (QualifiedName): ns(2) + name(String)
+        roff = roff + 2;
+        bn_len = load32(g_rxbuf + roff); roff = roff + 4;
+        if bn_len < 1000000 { roff = roff + bn_len; }
+
+        # DisplayName (LocalizedText)
+        lt_enc = load8(g_rxbuf + roff); roff = roff + 1;
+        if band(lt_enc, 1) != 0 { loc_len = load32(g_rxbuf + roff); roff = roff + 4; if loc_len < 1000000 { roff = roff + loc_len; } }
+        dn_ptr = 0;
+        dn_len = 0;
+        if band(lt_enc, 2) != 0 { dn_len = load32(g_rxbuf + roff); roff = roff + 4; dn_ptr = g_rxbuf + roff; if dn_len < 1000000 { roff = roff + dn_len; } }
+
+        # NodeClass
+        node_class = load32(g_rxbuf + roff); roff = roff + 4;
+
+        # TypeDefinition (ExpandedNodeId) - skip
+        td_enc = load8(g_rxbuf + roff);
+        td_type = band(td_enc, 0x0F);
+        if td_type == 0 { roff = roff + 2; }
+        if td_type == 1 { roff = roff + 4; }
+        if td_type == 2 { roff = roff + 7; }
+        if td_type == 3 { slen6 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen6; }
+        if td_type == 4 { roff = roff + 19; }
+        if td_type == 5 { slen7 = load32(g_rxbuf + roff + 3); roff = roff + 7 + slen7; }
+        if band(td_enc, 0x80) != 0 { tduri_len = load32(g_rxbuf + roff); roff = roff + 4; if tduri_len < 1000000 { roff = roff + tduri_len; } }
+        if band(td_enc, 0x40) != 0 { roff = roff + 4; }
+
+        # Store tag and add to ListView (Objects + Variables)
+        if dn_len > 0 {
+            if dn_len < 200 {
+                tag_idx = load64(g_tag_count);
+                if tag_idx < 32 {
+                    # Store name in pool
+                    pool_off = load64(g_tag_names_off);
+                    memcpy(g_tag_names + pool_off, dn_ptr, dn_len);
+                    store8(g_tag_names + pool_off + dn_len, 0);
+                    # Store tag data
+                    base = tag_idx * 48;
+                    store64(g_tag_data + base + 0, ref_ns);     # namespace from ExpandedNodeId
+                    store64(g_tag_data + base + 8, nid_type);   # encoding type
+                    store64(g_tag_data + base + 16, ref_node_id); # numeric ID
+                    store64(g_tag_data + base + 24, pool_off);  # name offset
+                    store64(g_tag_data + base + 32, dn_len);    # name length
+                    store64(g_tag_data + base + 40, node_class); # node class
+                    store64(g_tag_names_off, pool_off + dn_len + 1);
+                    # Add to ListView
+                    lv_add_tag(tag_idx, g_tag_names + pool_off);
+                    # Col 3: Node ID
+                    int_to_str(g_lv_txtbuf, ref_node_id);
+                    lv_set_text(tag_idx, 3, g_lv_txtbuf);
+                    # Col 2: Node class
+                    if node_class == 1 { str_copy(g_lv_txtbuf, nc_obj); }
+                    if node_class == 2 { str_copy(g_lv_txtbuf, nc_var); }
+                    if node_class == 4 { str_copy(g_lv_txtbuf, nc_meth); }
+                    lv_set_text(tag_idx, 2, g_lv_txtbuf);
+                    # Add to TreeView
+                    memset(g_tv_ins, 0, 96);
+                    store64(g_tv_ins + 0, 0 - 65536);   # hParent = TVI_ROOT
+                    store64(g_tv_ins + 8, 0 - 65534);   # hInsertAfter = TVI_LAST
+                    store32(g_tv_ins + 16, 1);           # mask = TVIF_TEXT
+                    store64(g_tv_ins + 40, g_tag_names + pool_off);  # pszText
+                    SendMessageA(load64(g_treeview), 0x1100, 0, g_tv_ins);
+                    store64(g_tag_count, tag_idx + 1);
+                }
+            }
+        }
+        ri = ri + 1;
+    }
+    return 0;
+}
+
+# ============================================================================
+# OPC UA READ (read all Variable tags and update Value column)
+# ============================================================================
+
+func ua_read_tag(tag_idx: i64) -> i64 {
+    if load64(g_sock) == 0 { return 0; }
+    base = tag_idx * 48;
+    node_class = load64(g_tag_data + base + 40);
+    if node_class != 2 { return 0; }   # only read Variables
+    name_off = load64(g_tag_data + base + 24);
+    name_len = load64(g_tag_data + base + 32);
+    nid_enc = load64(g_tag_data + base + 8);
+    num_id = load64(g_tag_data + base + 16);
+
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = ua_msg_start(sc_id, token_id);
+
+    # ReadRequest = ns=0, id=631
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 631); off = off + 4;
+    off = ua_req_header(off);
+
+    # MaxAge=0 (Double)
+    store32(g_txbuf + off, 0); store32(g_txbuf + off + 4, 0); off = off + 8;
+    # TimestampsToReturn = 2 (Neither)
+    store32(g_txbuf + off, 2); off = off + 4;
+    # NodesToRead array (count=1)
+    store32(g_txbuf + off, 1); off = off + 4;
+
+    # ReadValueId: NodeId + AttributeId(13) + IndexRange(null) + DataEncoding(null)
+    # Use string NodeId with the display name as identifier
+    rd_ns = load64(g_tag_data + base + 0);
+    store8(g_txbuf + off, 3);          # encoding = String
+    store16(g_txbuf + off + 1, rd_ns); # namespace from browse
+    store32(g_txbuf + off + 3, name_len);
+    memcpy(g_txbuf + off + 7, g_tag_names + name_off, name_len);
+    off = off + 7 + name_len;
+    # AttributeId = 13 (Value)
+    store32(g_txbuf + off, 13); off = off + 4;
+    # IndexRange = null string
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    # DataEncoding = null QualifiedName: ns(2) + name(-1)
+    store16(g_txbuf + off, 0); off = off + 2;
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    s = load64(g_sock);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { return 0; }
+    if load8(g_rxbuf) != 77 { return 0; }
+
+    # Parse response
+    roff = 24 + 4 + 8 + 4;   # header + NodeId + Timestamp + RequestHandle
+    svc_status = load32(g_rxbuf + roff); roff = roff + 4;
+    if svc_status != 0 { return 0; }
+    roff = roff + 1 + 4 + 3;   # DiagInfo + StringTable + AdditionalHeader
+
+    # Results array
+    dv_count = load32(g_rxbuf + roff); roff = roff + 4;
+    if dv_count < 1 { return 0; }
+
+    # DataValue encoding mask
+    dv_enc = load8(g_rxbuf + roff); roff = roff + 1;
+    if band(dv_enc, 1) == 0 { return 0; }   # no value
+
+    # Variant type byte
+    vt = load8(g_rxbuf + roff); roff = roff + 1;
+    vtype = band(vt, 0x3F);
+
+    # Decode value to string
+    memset(g_lv_txtbuf, 0, 256);
+    if vtype == 1 { bv = load8(g_rxbuf + roff); if bv != 0 { str_copy(g_lv_txtbuf, s_true); } else { str_copy(g_lv_txtbuf, s_false); } }
+    if vtype == 2 { sxb = load8(g_rxbuf + roff); if sxb >= 128 { sxb = sxb - 256; } int_to_str(g_lv_txtbuf, sxb); }
+    if vtype == 3 { int_to_str(g_lv_txtbuf, load8(g_rxbuf + roff)); }
+    if vtype == 4 { sxh = load16(g_rxbuf + roff); if sxh >= 32768 { sxh = sxh - 65536; } int_to_str(g_lv_txtbuf, sxh); }
+    if vtype == 5 { int_to_str(g_lv_txtbuf, load16(g_rxbuf + roff)); }
+    if vtype == 6 { sxw = load32(g_rxbuf + roff); if sxw >= 2147483648 { sxw = sxw - 4294967296; } int_to_str(g_lv_txtbuf, sxw); }
+    if vtype == 7 { int_to_str(g_lv_txtbuf, load32(g_rxbuf + roff)); }
+    if vtype == 8 { int_to_str(g_lv_txtbuf, load64(g_rxbuf + roff)); }
+    if vtype == 9 { int_to_str(g_lv_txtbuf, load64(g_rxbuf + roff)); }
+    if vtype == 10 { nf_ftoa(load32(g_rxbuf + roff), g_lv_txtbuf); }
+    if vtype == 11 { nf_dtoa(load64(g_rxbuf + roff), g_lv_txtbuf); }
+    if vtype == 12 { slen = load32(g_rxbuf + roff); roff = roff + 4; if slen > 0 { if slen < 200 { memcpy(g_lv_txtbuf, g_rxbuf + roff, slen); store8(g_lv_txtbuf + slen, 0); } } }
+    if vtype == 13 {
+        # DateTime (FILETIME: 100ns since 1601-01-01)
+        ft_lo = load32(g_rxbuf + roff);
+        ft_hi = load32(g_rxbuf + roff + 4);
+        ft_sec = ft_hi * 429 + (ft_hi * 4967296 + ft_lo) / 10000000;
+        unix_sec = ft_sec - 11644473600;
+        if unix_sec > 0 {
+            days = unix_sec / 86400;
+            rem = unix_sec % 86400;
+            hh = rem / 3600;
+            mm = (rem % 3600) / 60;
+            ss = rem % 60;
+            # Days since 1970-01-01 -> year/month/day (simplified)
+            y = 1970;
+            while days >= 365 {
+                leap = 0;
+                if y % 4 == 0 { leap = 1; }
+                if y % 100 == 0 { leap = 0; }
+                if y % 400 == 0 { leap = 1; }
+                yd = 365 + leap;
+                if days < yd { break; }
+                days = days - yd;
+                y = y + 1;
+            }
+            # Month
+            leap2 = 0;
+            if y % 4 == 0 { leap2 = 1; }
+            if y % 100 == 0 { leap2 = 0; }
+            if y % 400 == 0 { leap2 = 1; }
+            mon = 1;
+            if days >= 31 { days = days - 31; mon = 2; }
+            feb = 28 + leap2;
+            if mon == 2 { if days >= feb { days = days - feb; mon = 3; } }
+            if mon == 3 { if days >= 31 { days = days - 31; mon = 4; } }
+            if mon == 4 { if days >= 30 { days = days - 30; mon = 5; } }
+            if mon == 5 { if days >= 31 { days = days - 31; mon = 6; } }
+            if mon == 6 { if days >= 30 { days = days - 30; mon = 7; } }
+            if mon == 7 { if days >= 31 { days = days - 31; mon = 8; } }
+            if mon == 8 { if days >= 31 { days = days - 31; mon = 9; } }
+            if mon == 9 { if days >= 30 { days = days - 30; mon = 10; } }
+            if mon == 10 { if days >= 31 { days = days - 31; mon = 11; } }
+            if mon == 11 { if days >= 30 { days = days - 30; mon = 12; } }
+            day = days + 1;
+            # Format YYYY-MM-DD HH:MM:SS
+            w = g_lv_txtbuf;
+            int_to_str(w, y); w = w + strlen(w);
+            store8(w, 45); w = w + 1;
+            if mon < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, mon); w = str_copy(w, g_numbuf);
+            store8(w, 45); w = w + 1;
+            if day < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, day); w = str_copy(w, g_numbuf);
+            store8(w, 32); w = w + 1;
+            if hh < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, hh); w = str_copy(w, g_numbuf);
+            store8(w, 58); w = w + 1;
+            if mm < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, mm); w = str_copy(w, g_numbuf);
+            store8(w, 58); w = w + 1;
+            if ss < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, ss); w = str_copy(w, g_numbuf);
+            store8(w, 0);
+        } else {
+            # Time-only (small FILETIME = time of day since 1601-01-01)
+            day_sec = ft_sec % 86400;
+            hh = day_sec / 3600;
+            mm = (day_sec % 3600) / 60;
+            ss = day_sec % 60;
+            w = g_lv_txtbuf;
+            if hh < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, hh); w = str_copy(w, g_numbuf);
+            store8(w, 58); w = w + 1;
+            if mm < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, mm); w = str_copy(w, g_numbuf);
+            store8(w, 58); w = w + 1;
+            if ss < 10 { store8(w, 48); w = w + 1; }
+            int_to_str(g_numbuf, ss); w = str_copy(w, g_numbuf);
+            store8(w, 0);
+        }
+    }
+
+    # Update Value column
+    lv_set_text(tag_idx, 1, g_lv_txtbuf);
+    return 0;
+}
+
+func ua_read_all() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_rd_send);
+    count = load64(g_tag_count);
+    i = 0;
+    while i < count {
+        ua_read_tag(i);
+        i = i + 1;
+    }
+    log_append(m_rd_ok);
+    log_append(crlf);
+    return 0;
+}
+
+func ua_start_poll() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_noconn); return 0; }
+    if load64(g_tag_count) == 0 { return 0; }
+    poll = load64(g_polling);
+    if poll != 0 { return 0; }
+    GetWindowTextA(load64(g_interval_ed), g_intbuf, 16);
+    interval = str_to_int(g_intbuf);
+    if interval < 100 { interval = 100; }
+    store64(g_polling, 1);
+    SetTimer(load64(g_hwnd), ID_TIMER_POLL, interval, 0);
+    log_append(m_poll_on);
+    int_to_str(g_numbuf, interval);
+    log_append(g_numbuf);
+    log_append(m_poll_on2);
+    return 0;
+}
+
+func ua_stop_poll() -> i64 {
+    poll = load64(g_polling);
+    if poll == 0 { return 0; }
+    KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+    store64(g_polling, 0);
+    log_append(m_poll_off);
+    return 0;
+}
+
+func ua_poll_tick() -> i64 {
+    if load64(g_sock) == 0 { ua_stop_poll(); return 0; }
+    count = load64(g_tag_count);
+    i = 0;
+    while i < count {
+        ua_read_tag(i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ============================================================================
+# OPC UA WRITE (write Int32 to selected tag)
+# ============================================================================
+
+func ua_write() -> i64 {
+    if load64(g_sock) == 0 { log_append(m_noconn); return 0; }
+    # Get selected row
+    lv = load64(g_listview);
+    sel = SendMessageA(lv, 4108, 0 - 1, 2);   # LVM_GETNEXTITEM(-1, LVNI_SELECTED)
+    if sel < 0 { log_append(m_wr_nosel); return 0; }
+    if sel >= 32 { return 0; }
+    # Get tag info
+    base = sel * 48;
+    name_off = load64(g_tag_data + base + 24);
+    name_len = load64(g_tag_data + base + 32);
+    rd_ns = load64(g_tag_data + base + 0);
+    # Get write value
+    GetWindowTextA(load64(g_write_ed), g_wrbuf, 64);
+    write_val = str_to_int(g_wrbuf);
+    # Build WriteRequest (NodeId=673)
+    sc_id = load64(g_sc_id);
+    token_id = load64(g_sc_token);
+    off = ua_msg_start(sc_id, token_id);
+    store8(g_txbuf + off, 1); store8(g_txbuf + off + 1, 0); store16(g_txbuf + off + 2, 673); off = off + 4;
+    off = ua_req_header(off);
+    # NodesToWrite: array count=1
+    store32(g_txbuf + off, 1); off = off + 4;
+    # WriteValue[0]: NodeId (string)
+    store8(g_txbuf + off, 3); store16(g_txbuf + off + 1, rd_ns);
+    store32(g_txbuf + off + 3, name_len);
+    memcpy(g_txbuf + off + 7, g_tag_names + name_off, name_len);
+    off = off + 7 + name_len;
+    # AttributeId=13 (Value)
+    store32(g_txbuf + off, 13); off = off + 4;
+    # IndexRange=null
+    store32(g_txbuf + off, 0 - 1); off = off + 4;
+    # DataValue: encoding=0x01 (has value)
+    store8(g_txbuf + off, 1); off = off + 1;
+    # Variant: Int32 (type=6)
+    store8(g_txbuf + off, 6); off = off + 1;
+    store32(g_txbuf + off, write_val); off = off + 4;
+    # Send + receive
+    store32(g_txbuf + 4, off);
+    s = load64(g_sock);
+    n = send(s, g_txbuf, off, 0);
+    if n <= 0 { log_append(m_wr_fail); return 0; }
+    n = ua_recv_msg(s);
+    if n <= 0 { log_append(m_wr_fail); return 0; }
+    if load8(g_rxbuf) != 77 { log_append(m_wr_fail); return 0; }
+    # Check status
+    roff = 24 + 4 + 8 + 4;
+    svc_status = load32(g_rxbuf + roff);
+    if svc_status != 0 { log_append(m_wr_fail); return 0; }
+    log_append(m_wr_ok);
+    return 0;
+}
+
+# ============================================================================
+# OPC DA WRITE (write to selected tag)
+# ============================================================================
+
+func da_write() -> i64 {
+    if load64(g_da_conn) == 0 { log_append(m_noconn); return 0; }
+    psi = load64(g_psyncio);
+    if psi == 0 { return 0; }
+    # Get selected row
+    lv = load64(g_listview);
+    sel = SendMessageA(lv, 4108, 0 - 1, 2);
+    if sel < 0 { log_append(m_wr_nosel); return 0; }
+    c = load64(g_da_tagcnt);
+    if sel >= c { return 0; }
+    # Get value
+    GetWindowTextA(load64(g_write_ed), g_wrbuf, 64);
+    write_val = str_to_int(g_wrbuf);
+    # Build OPCITEMSTATE-like write array: just a VARIANT (VT_I4 + value)
+    # IOPCSyncIO::Write(count, handles, values)  values = array of VARIANT
+    # VARIANT: vt(2) + pad(6) + data(8) + pad(8) = 24 bytes
+    memset(g_wrbuf, 0, 64);
+    store16(g_wrbuf + 0, 3);       # VT_I4
+    store32(g_wrbuf + 8, write_val);
+    # Get handle for this item
+    hitem = load32(g_da_taghnd + sel * 4);
+    store32(srv_h, hitem);
+    # IOPCSyncIO::Write = vtable slot 4
+    store64(pp_readerr, 0);
+    hr = callp(vmeth(psi, 4), psi, 1, srv_h, g_wrbuf, pp_readerr);
+    prerr = load64(pp_readerr);
+    if prerr != 0 { CoTaskMemFree(prerr); }
+    if hr < 0 { log_append(m_wr_fail); return 0; }
+    log_append(m_wr_ok);
+    return 0;
+}
+
+# ============================================================================
+# OPC XML-DA (HTTP/SOAP)
+# ============================================================================
+
+# Parse http://host:port/path from the endpoint URL
+func xml_parse_url() -> i64 {
+    GetWindowTextA(load64(g_ep_ed), g_xml_txbuf, 512);
+    # Skip "http://"
+    p = g_xml_txbuf;
+    while load8(p) != 0 {
+        if load8(p) == 47 { if load8(p + 1) == 47 { p = p + 2; break; } }
+        p = p + 1;
+    }
+    # Copy host until : or /
+    hi = 0;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 58 { break; }
+        if c == 47 { break; }
+        store8(g_xml_host + hi, c);
+        hi = hi + 1;
+        p = p + 1;
+    }
+    store8(g_xml_host + hi, 0);
+    # Port
+    port = 80;
+    if load8(p) == 58 {
+        p = p + 1;
+        port = 0;
+        while load8(p) != 0 {
+            c = load8(p);
+            if c == 47 { break; }
+            if c < 48 { break; }
+            if c > 57 { break; }
+            port = port * 10 + c - 48;
+            p = p + 1;
+        }
+    }
+    store64(g_xml_port, port);
+    # Path (everything from / onwards)
+    hi = 0;
+    if load8(p) == 47 {
+        while load8(p) != 0 {
+            store8(g_xml_path + hi, load8(p));
+            hi = hi + 1;
+            p = p + 1;
+        }
+    }
+    if hi == 0 { store8(g_xml_path, 47); hi = 1; }
+    store8(g_xml_path + hi, 0);
+    return 0;
+}
+
+# Build HTTP POST request in g_xml_txbuf with given SOAP body and action
+# Returns total request length
+func xml_build_request(soap_body: i64, body_len: i64, action: i64) -> i64 {
+    w = g_xml_txbuf;
+    # "POST /path HTTP/1.1\r\nHost: host\r\nContent-Type...SOAPAction: ...action...\r\nContent-Length: N\r\n\r\n"
+    w = str_copy(w, xml_hdr1);              # "POST "
+    w = str_copy(w, g_xml_path);            # "/xdagwss/..."
+    w = str_copy(w, xml_hdr2);              # " HTTP/1.1\r\nHost: "
+    w = str_copy(w, g_xml_host);            # "127.0.0.1"
+    w = str_copy(w, xml_hdr3);              # "\r\nContent-Type...SOAPAction: \"http://opc.../
+    w = str_copy(w, action);                # "Read" etc
+    w = str_copy(w, xml_hdr4);              # "\"\r\nContent-Length: "
+    # Calculate content length = envelope + body
+    env1_len = strlen(xml_env1);
+    env2_len = strlen(xml_env2);
+    content_len = env1_len + body_len + env2_len;
+    int_to_str(g_numbuf, content_len);
+    w = str_copy(w, g_numbuf);
+    w = str_copy(w, xml_hdr5);              # "\r\n\r\n"
+    # Body
+    w = str_copy(w, xml_env1);
+    memcpy(w, soap_body, body_len);
+    w = w + body_len;
+    w = str_copy(w, xml_env2);
+    return w - g_xml_txbuf;
+}
+
+# Send HTTP request and receive response. Returns bytes received (0 on failure).
+func xml_send_recv(req_len: i64) -> i64 {
+    s = load64(g_xml_sock);
+    if s == 0 { return 0; }
+    n = send(s, g_xml_txbuf, req_len, 0);
+    if n <= 0 { return 0; }
+    # Receive (may need multiple recv for large responses)
+    total = 0;
+    memset(g_xml_rxbuf, 0, 8192);
+    n = recv(s, g_xml_rxbuf, 8190, 0);
+    if n <= 0 { return 0; }
+    total = n;
+    # Try a second recv if the first one filled up (non-blocking would be better but this works)
+    return total;
+}
+
+# Find a substring in the rx buffer. Returns pointer or 0.
+func xml_find(haystack: i64, hlen: i64, needle: i64, nlen: i64) -> i64 {
+    i = 0;
+    limit = hlen - nlen;
+    while i <= limit {
+        j = 0;
+        match = 1;
+        while j < nlen {
+            if load8(haystack + i + j) != load8(needle + j) { match = 0; j = nlen; }
+            j = j + 1;
+        }
+        if match == 1 { return haystack + i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Extract text between two tags. Writes to dst, returns length.
+func xml_extract(start_tag: i64, stlen: i64, end_tag: i64, etlen: i64, dst: i64) -> i64 {
+    p = xml_find(g_xml_rxbuf, 8190, start_tag, stlen);
+    if p == 0 { return 0; }
+    p = p + stlen;
+    # Find end tag from p
+    e = xml_find(p, 4000, end_tag, etlen);
+    if e == 0 { return 0; }
+    len = e - p;
+    if len > 200 { len = 200; }
+    if len > 0 { memcpy(dst, p, len); }
+    store8(dst + len, 0);
+    return len;
+}
+
+func xml_connect() -> i64 {
+    if load64(g_xml_conn) != 0 { return 0; }
+    xml_parse_url();
+    log_append(m_xml_conn);
+    log_append(g_xml_host);
+    log_append(crlf);
+    # TCP connect
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);
+    port = load64(g_xml_port);
+    store16(g_addr + 2, htons(port));
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = g_xml_host;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 { ip = ip + shl(octet, shift); shift = shift + 8; octet = 0; }
+        else { octet = octet * 10 + c - 48; }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+    s = socket(2, 1, 6);
+    if s == 0 - 1 { log_append(m_xml_err); return 0; }
+    rc = connect(s, g_addr, 16);
+    if rc != 0 { closesocket(s); log_append(m_xml_err); return 0; }
+    store64(g_xml_sock, s);
+    store64(g_xml_conn, 1);
+    log_append(m_xml_ok);
+    SetWindowTextA(load64(g_status), "Status: XML-DA Connected");
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+func xml_disconnect() -> i64 {
+    s = load64(g_xml_sock);
+    if s != 0 { closesocket(s); }
+    store64(g_xml_sock, 0);
+    store64(g_xml_conn, 0);
+    log_append(m_xml_disc);
+    SetWindowTextA(load64(g_status), lbl_status);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+# Check if attr="true" appears within g_xml_rxbuf[s..e]. attr is the attribute name.
+func xml_attr_true(s: i64, e: i64, attr: i64, alen: i64) -> i64 {
+    i = s;
+    limit = e - alen - 6;   # need room for 'attr="true'
+    while i <= limit {
+        # Match attr name
+        j = 0;
+        ok = 1;
+        while j < alen {
+            if load8(g_xml_rxbuf + i + j) != load8(attr + j) { ok = 0; j = alen; }
+            j = j + 1;
+        }
+        if ok == 1 {
+            # After attr, expect =" then true
+            p = i + alen;
+            if load8(g_xml_rxbuf + p) == 61 {       # '='
+                if load8(g_xml_rxbuf + p + 1) == 34 {  # '"'
+                    if load8(g_xml_rxbuf + p + 2) == 116 {  # 't'
+                        if load8(g_xml_rxbuf + p + 3) == 114 {  # 'r'
+                            if load8(g_xml_rxbuf + p + 4) == 117 {  # 'u'
+                                if load8(g_xml_rxbuf + p + 5) == 101 {  # 'e'
+                                    return 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Insert a tree item under parent handle with lParam=node index. Returns new HTREEITEM.
+func xml_tree_insert(parent_h: i64, name_ptr: i64, lparam: i64) -> i64 {
+    memset(g_tv_ins, 0, 96);
+    store64(g_tv_ins + 0, parent_h);     # hParent
+    store64(g_tv_ins + 8, 0 - 65534);    # hInsertAfter = TVI_LAST
+    store32(g_tv_ins + 16, 5);           # mask = TVIF_TEXT | TVIF_PARAM
+    store64(g_tv_ins + 40, name_ptr);    # pszText
+    store64(g_tv_ins + 64, lparam);      # lParam = node index
+    return SendMessageA(load64(g_treeview), 0x1100, 0, g_tv_ins);   # TVM_INSERTITEMA
+}
+
+# Get the last segment of a dotted path (after the last '.') into dst.
+# e.g. "Static.Analog Types.Int" -> "Int"
+func xml_leaf_name(src: i64, dst: i64) -> i64 {
+    # find last '.'
+    last = 0 - 1;
+    i = 0;
+    while load8(src + i) != 0 {
+        if load8(src + i) == 46 { last = i; }
+        i = i + 1;
+    }
+    s = last + 1;
+    j = 0;
+    while load8(src + s + j) != 0 {
+        store8(dst + j, load8(src + s + j));
+        j = j + 1;
+    }
+    store8(dst + j, 0);
+    return 0;
+}
+
+func xml_browse() -> i64 {
+    if load64(g_xml_conn) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_xml_brw);
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    SendMessageA(load64(g_treeview), 0x1101, 0, 0);   # TVM_DELETEITEM all
+    store64(g_xml_tagcnt, 0);
+
+    # BFS queue of branch paths. Entry 0 = root (empty string).
+    store8(g_xml_queue, 0);
+    store64(g_xml_qhnd + 0, 0 - 65536);   # root tree handle = TVI_ROOT
+    q_count = 1;
+    q_pos = 0;
+    node_idx = 0;   # unique index per tree node (for lParam + path lookup)
+
+    while q_pos < q_count {
+        xml_reconnect();
+        if load64(g_xml_sock) == 0 { break; }
+        browse_path = g_xml_queue + q_pos * 128;
+        parent_h = load64(g_xml_qhnd + q_pos * 8);
+        w = g_logbuf;
+        w = str_copy(w, xml_browse1);
+        w = str_copy(w, browse_path);
+        w = str_copy(w, xml_browse2);
+        body_len = w - g_logbuf;
+        req_len = xml_build_request(g_logbuf, body_len, xml_sa_browse);
+        n = xml_send_recv(req_len);
+        if n > 0 {
+            i = 0;
+            while i < n {
+                if load8(g_xml_rxbuf + i) == 73 {       # 'I'
+                    if load8(g_xml_rxbuf + i + 4) == 78 {  # 'N' (ItemN)
+                        if load8(g_xml_rxbuf + i + 8) == 61 {  # '='
+                            if load8(g_xml_rxbuf + i + 9) == 34 {  # '"'
+                                cs = i + 10;
+                                ce = cs;
+                                while ce < n { if load8(g_xml_rxbuf + ce) == 34 { break; } ce = ce + 1; }
+                                clen = ce - cs;
+                                te = ce;
+                                while te < n { if load8(g_xml_rxbuf + te) == 62 { break; } te = te + 1; }
+                                has_child = xml_attr_true(cs, te, attr_haschild, 11);
+                                if clen > 0 {
+                                    if clen < 120 {
+                                        if node_idx < 128 {
+                                            # Store full path for this node
+                                            poff = node_idx * 128;
+                                            memcpy(g_xml_treepaths + poff, g_xml_rxbuf + cs, clen);
+                                            store8(g_xml_treepaths + poff + clen, 0);
+                                            # Leaf display name
+                                            xml_leaf_name(g_xml_treepaths + poff, g_da_narrow);
+                                            # Insert tree node with lParam = node_idx
+                                            new_h = xml_tree_insert(parent_h, g_da_narrow, node_idx);
+                                            # If it has children, queue it for deeper browse
+                                            if has_child == 1 {
+                                                if q_count < 60 {
+                                                    qoff = q_count * 128;
+                                                    memcpy(g_xml_queue + qoff, g_xml_treepaths + poff, clen);
+                                                    store8(g_xml_queue + qoff + clen, 0);
+                                                    store64(g_xml_qhnd + q_count * 8, new_h);
+                                                    q_count = q_count + 1;
+                                                }
+                                            }
+                                            node_idx = node_idx + 1;
+                                        }
+                                    }
+                                }
+                                i = ce;
+                            }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        q_pos = q_pos + 1;
+    }
+    log_num(m_xml_brw_n, node_idx);
+    # Default: show top-level (root) children in the grid
+    xml_fill_grid(w_filter);   # w_filter is empty string => root
+    return 0;
+}
+
+# Fill the grid with the immediate children of folder_path (readable items + sub-items)
+func xml_fill_grid(folder_path: i64) -> i64 {
+    if load64(g_xml_conn) == 0 { return 0; }
+    xml_reconnect();
+    if load64(g_xml_sock) == 0 { return 0; }
+    w = g_logbuf;
+    w = str_copy(w, xml_browse1);
+    w = str_copy(w, folder_path);
+    w = str_copy(w, xml_browse2);
+    body_len = w - g_logbuf;
+    req_len = xml_build_request(g_logbuf, body_len, xml_sa_browse);
+    n = xml_send_recv(req_len);
+    SendMessageA(load64(g_listview), 4105, 0, 0);
+    grid_n = 0;
+    if n > 0 {
+        i = 0;
+        while i < n {
+            if load8(g_xml_rxbuf + i) == 73 {
+                if load8(g_xml_rxbuf + i + 4) == 78 {
+                    if load8(g_xml_rxbuf + i + 8) == 61 {
+                        if load8(g_xml_rxbuf + i + 9) == 34 {
+                            cs = i + 10;
+                            ce = cs;
+                            while ce < n { if load8(g_xml_rxbuf + ce) == 34 { break; } ce = ce + 1; }
+                            clen = ce - cs;
+                            if clen > 0 {
+                                if clen < 120 {
+                                    if grid_n < 100 {
+                                        # Store full path for polling
+                                        goff = grid_n * 128;
+                                        memcpy(g_xml_griditems + goff, g_xml_rxbuf + cs, clen);
+                                        store8(g_xml_griditems + goff + clen, 0);
+                                        # Display leaf name in grid
+                                        xml_leaf_name(g_xml_griditems + goff, g_lv_txtbuf);
+                                        lv_add_tag(grid_n, g_lv_txtbuf);
+                                        lv_set_text(grid_n, 1, da_v_dash);
+                                        grid_n = grid_n + 1;
+                                    }
+                                }
+                            }
+                            i = ce;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    store64(g_xml_tagcnt, grid_n);
+    return 0;
+}
+
+# TreeView selection changed -> fill grid with selected folder's children
+func xml_on_tree_select() -> i64 {
+    if load64(g_active_tab) != 2 { return 0; }
+    tree = load64(g_treeview);
+    hsel = SendMessageA(tree, 0x110A, 9, 0);   # TVM_GETNEXTITEM, TVGN_CARET
+    if hsel == 0 { return 0; }
+    # Get the node's lParam (path index)
+    memset(g_tv_ins, 0, 96);
+    store32(g_tv_ins + 0, 4);        # mask = TVIF_PARAM
+    store64(g_tv_ins + 8, hsel);     # hItem
+    SendMessageA(tree, 0x110C, 0, g_tv_ins);   # TVM_GETITEMA
+    idx = load64(g_tv_ins + 48);     # lParam
+    if idx < 0 { return 0; }
+    if idx >= 128 { return 0; }
+    xml_fill_grid(g_xml_treepaths + idx * 128);
+    return 0;
+}
+
+# Reconnect (HTTP is not persistent by default, need new socket per request for some servers)
+func xml_reconnect() -> i64 {
+    s = load64(g_xml_sock);
+    if s != 0 { closesocket(s); }
+    store64(g_xml_sock, 0);
+    # Reconnect
+    memset(g_addr, 0, 16);
+    store16(g_addr + 0, 2);
+    port = load64(g_xml_port);
+    store16(g_addr + 2, htons(port));
+    ip = 0;
+    shift = 0;
+    octet = 0;
+    p = g_xml_host;
+    while load8(p) != 0 {
+        c = load8(p);
+        if c == 46 { ip = ip + shl(octet, shift); shift = shift + 8; octet = 0; }
+        else { octet = octet * 10 + c - 48; }
+        p = p + 1;
+    }
+    ip = ip + shl(octet, shift);
+    store32(g_addr + 4, ip);
+    s = socket(2, 1, 6);
+    if s == 0 - 1 { store64(g_xml_conn, 0); return 0; }
+    rc = connect(s, g_addr, 16);
+    if rc != 0 { closesocket(s); store64(g_xml_conn, 0); return 0; }
+    store64(g_xml_sock, s);
+    return 0;
+}
+
+func xml_read_item(item_name: i64) -> i64 {
+    if load64(g_xml_conn) == 0 { return 0; }
+    xml_reconnect();
+    if load64(g_xml_sock) == 0 { return 0; }
+    # Build Read SOAP body
+    w = g_logbuf;
+    w = str_copy(w, xml_read1);
+    w = str_copy(w, item_name);
+    w = str_copy(w, xml_read2);
+    body_len = w - g_logbuf;
+    req_len = xml_build_request(g_logbuf, body_len, xml_sa_read);
+    n = xml_send_recv(req_len);
+    if n == 0 { return 0; }
+    # Find value in response. OPC XML-DA returns:
+    # <Items ... Value="xxx"> or <Value xsi:type="...">xxx</Value>
+    # Strategy: look for ">xxx</" pattern after "Value" (handles both attribute and element)
+    # First try element form: find "Value" then ">" then extract until "<"
+    i = 0;
+    found = 0;
+    while i < n {
+        if load8(g_xml_rxbuf + i) == 60 {      # '<'
+            # Check for <Value or </Value - skip closing tags
+            if load8(g_xml_rxbuf + i + 1) != 47 {  # not '</'
+                # Check if this tag contains "Value"
+                if load8(g_xml_rxbuf + i + 1) == 86 {  # 'V'
+                    if load8(g_xml_rxbuf + i + 2) == 97 { # 'a'
+                        if load8(g_xml_rxbuf + i + 3) == 108 { # 'l'
+                            # Found <Val... - skip to closing >
+                            j = i + 4;
+                            while j < n {
+                                if load8(g_xml_rxbuf + j) == 62 { break; }
+                                j = j + 1;
+                            }
+                            j = j + 1;
+                            # Extract text until '<'
+                            k = j;
+                            while k < n {
+                                if load8(g_xml_rxbuf + k) == 60 { break; }
+                                k = k + 1;
+                            }
+                            len = k - j;
+                            if len > 200 { len = 200; }
+                            if len >= 0 { memcpy(g_lv_txtbuf, g_xml_rxbuf + j, len); }
+                            store8(g_lv_txtbuf + len, 0);
+                            found = 1;
+                            i = n;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if found == 0 { store8(g_lv_txtbuf, 0); }
+    return found;
+}
+
+func xml_read_all() -> i64 {
+    if load64(g_xml_conn) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_xml_rd);
+    c = load64(g_xml_tagcnt);
+    i = 0;
+    while i < c {
+        # Read using the stored full path for this grid row
+        xml_read_item(g_xml_griditems + i * 128);
+        lv_set_text(i, 1, g_lv_txtbuf);
+        i = i + 1;
+    }
+    return 0;
+}
+
+func xml_write() -> i64 {
+    if load64(g_xml_conn) == 0 { log_append(m_noconn); return 0; }
+    log_append(m_xml_wr);
+    # Get selected row name
+    lv = load64(g_listview);
+    sel = SendMessageA(lv, 4108, 0 - 1, 2);
+    if sel < 0 { log_append(m_wr_nosel); return 0; }
+    memset(g_lvitem, 0, 96);
+    store32(g_lvitem + 0, 1);
+    store32(g_lvitem + 4, sel);
+    store32(g_lvitem + 8, 0);
+    store64(g_lvitem + 24, g_da_narrow);
+    store32(g_lvitem + 48, 200);
+    SendMessageA(lv, 4141, sel, g_lvitem);
+    # Get write value
+    GetWindowTextA(load64(g_write_ed), g_wrbuf, 64);
+    # Build Write SOAP
+    xml_reconnect();
+    w = g_logbuf;
+    w = str_copy(w, xml_write1);
+    w = str_copy(w, g_da_narrow);
+    w = str_copy(w, xml_write2);
+    w = str_copy(w, g_wrbuf);
+    w = str_copy(w, xml_write3);
+    body_len = w - g_logbuf;
+    req_len = xml_build_request(g_logbuf, body_len, xml_sa_write);
+    n = xml_send_recv(req_len);
+    if n == 0 { log_append(m_wr_fail); return 0; }
+    log_append(m_wr_ok);
+    return 0;
+}
+
+func ua_disconnect() -> i64 {
+    sock = load64(g_sock);
+    if sock == 0 { return 0; }
+    # Stop poll
+    poll = load64(g_polling);
+    if poll != 0 {
+        KillTimer(load64(g_hwnd), ID_TIMER_POLL);
+        store64(g_polling, 0);
+    }
+    closesocket(sock);
+    store64(g_sock, 0);
+    log_append(m_disc);
+    SetWindowTextA(load64(g_status), lbl_status);
+    InvalidateRect(load64(g_hwnd), 0, 1);
+    return 0;
+}
+
+# ============================================================================
+# WINDOW CLASS REGISTRATION
+# ============================================================================
+
+func register_class(wndclass: ptr, clsname_arg: str, wndproc_fn: ptr, hinst: i64, cursor: i64, brush: i64) -> i64 {
+    store32(wndclass + 0, 80);
+    store32(wndclass + 4, 3);
+    store64(wndclass + 8, wndproc_fn);
+    store32(wndclass + 16, 0);
+    store32(wndclass + 20, 0);
+    store64(wndclass + 24, hinst);
+    store64(wndclass + 32, 0);
+    store64(wndclass + 40, cursor);
+    store64(wndclass + 48, brush);
+    store64(wndclass + 56, 0);
+    store64(wndclass + 64, clsname_arg);
+    store64(wndclass + 72, 0);
+    return RegisterClassExA(wndclass);
+}
+
+# ============================================================================
+# GLOWBUTTON CONTROL
+# ============================================================================
+
+func GlowButtonWndProc(hwnd: i64, msg: i64, wParam: i64, lParam: i64) -> i64 {
+    if msg == 1 {
+        SetWindowLongA(hwnd, 0 - 21, 0);
+        return 0;
+    }
+    if msg == 512 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        if hover == 0 {
+            pressed = band(state, 2);
+            new_state = bor(pressed, 1);
+            SetWindowLongA(hwnd, 0 - 21, new_state);
+            InvalidateRect(hwnd, 0, 1);
+            store32(g_track_mouse + 0, 24);
+            store32(g_track_mouse + 4, 2);
+            store64(g_track_mouse + 8, hwnd);
+            store64(g_track_mouse + 16, 0);
+            TrackMouseEvent(g_track_mouse);
+        }
+        return 0;
+    }
+    if msg == 675 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        SetWindowLongA(hwnd, 0 - 21, pressed);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 513 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        new_state = bor(hover, 2);
+        SetWindowLongA(hwnd, 0 - 21, new_state);
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, 0, 1);
+        return 0;
+    }
+    if msg == 514 {
+        state = GetWindowLongA(hwnd, 0 - 21);
+        pressed = band(state, 2);
+        if pressed == 2 {
+            ReleaseCapture();
+            hover = band(state, 1);
+            SetWindowLongA(hwnd, 0 - 21, hover);
+            InvalidateRect(hwnd, 0, 1);
+            if hover == 1 {
+                parent = GetParent(hwnd);
+                id = GetWindowLongA(hwnd, 0 - 12);
+                SendMessageA(parent, 273, id, hwnd);
+            }
+        }
+        return 0;
+    }
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        l = load32(g_rect + 0);
+        t = load32(g_rect + 4);
+        r = load32(g_rect + 8);
+        b = load32(g_rect + 12);
+        state = GetWindowLongA(hwnd, 0 - 21);
+        hover = band(state, 1);
+        pressed = band(state, 2);
+        br = load64(g_brush_card);
+        if pressed == 2 { br = load64(g_brush_input); }
+        if hover == 1 { br = load64(g_brush_hover); }
+        old_brush = SelectObject(hdc, br);
+        pen = load64(g_pen_border);
+        if pressed == 2 { pen = load64(g_pen_neon); }
+        if hover == 1 { pen = load64(g_pen_neon); }
+        old_pen = SelectObject(hdc, pen);
+        RoundRect(hdc, l, t, r, b, 8, 8);
+        SetBkMode(hdc, 1);
+        if hover == 1 { SetTextColor(hdc, COLOR_TEXT_BRIGHT); }
+        else { if pressed == 2 { SetTextColor(hdc, COLOR_TEXT_BRIGHT); }
+        else { SetTextColor(hdc, COLOR_TEXT_PRIMARY); } }
+        SelectObject(hdc, load64(g_font));
+        GetWindowTextA(hwnd, g_temp_text, 128);
+        DrawTextA(hdc, g_temp_text, 0 - 1, g_rect, 37);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+# ============================================================================
+# MAIN WINDOW PROCEDURE
+# ============================================================================
+
+func wndproc(hwnd: i64, msg: i64, wp: i64, lp: i64) -> i64 {
+    if msg == 1 {
+        store64(g_hwnd, hwnd);
+        hinst = load64(g_hinst);
+        store64(g_font, CreateFontA(0 - 14, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 49, face_mono));
+
+        # ---- Title bar buttons ----
+        CreateWindowExA(0, cls_glow_btn, btn_min, 0x50000000, 1040, 8, 26, 26, hwnd, ID_BTN_MIN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_close, 0x50000000, 1068, 8, 26, 26, hwnd, ID_BTN_CLOSE, hinst, 0);
+
+        # ---- Protocol tabs (Y=50) ----
+        CreateWindowExA(0, cls_glow_btn, tab_ua, 0x50000000, 12, 50, 70, 26, hwnd, ID_TAB_UA, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, tab_da, 0x50000000, 88, 50, 70, 26, hwnd, ID_TAB_DA, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, tab_xml, 0x50000000, 164, 50, 75, 26, hwnd, ID_TAB_XML, hinst, 0);
+
+        # ---- Connection row (Y=84) ----
+        CreateWindowExA(0, cls_stat, lbl_ep, 0x50000000, 12, 88, 60, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_ep, 0x50000080, 78, 86, 400, 24, hwnd, ID_EP_EDIT, hinst, 0);
+        store64(g_ep_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        # Enum Servers (DA only, hidden initially)
+        h = CreateWindowExA(0, cls_glow_btn, btn_enum, 0x50000000, 488, 84, 100, 28, hwnd, ID_BTN_ENUM, hinst, 0);
+        store64(g_btn_enum, h);
+        ShowWindow(h, 0);
+        # Connect / Disconnect / Browse / Back
+        CreateWindowExA(0, cls_glow_btn, btn_conn, 0x50000000, 598, 84, 80, 28, hwnd, ID_BTN_CONN, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_disc, 0x50000000, 684, 84, 90, 28, hwnd, ID_BTN_DISC, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_browse, 0x50000000, 784, 84, 70, 28, hwnd, ID_BTN_BROWSE, hinst, 0);
+        h = CreateWindowExA(0, cls_glow_btn, btn_back, 0x50000000, 860, 84, 55, 28, hwnd, ID_BTN_BACK, hinst, 0);
+        store64(g_btn_back, h);
+
+        # ---- Node read row (Y=118) ----
+        CreateWindowExA(0, cls_stat, lbl_nodeid, 0x50000000, 12, 120, 40, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_nodeid, 0x50000080, 55, 118, 180, 24, hwnd, ID_NODEID_ED, hinst, 0);
+        store64(g_nodeid_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        CreateWindowExA(0, cls_glow_btn, btn_read, 0x50000000, 245, 116, 55, 28, hwnd, ID_BTN_READ, hinst, 0);
+
+        # Poll controls
+        CreateWindowExA(0, cls_stat, lbl_interval, 0x50000000, 320, 120, 80, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, def_interval, 0x50000080, 405, 118, 55, 24, hwnd, ID_INTERVAL_ED, hinst, 0);
+        store64(g_interval_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        CreateWindowExA(0, cls_glow_btn, btn_poll, 0x50000000, 470, 116, 80, 28, hwnd, ID_BTN_POLL, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_stop, 0x50000000, 556, 116, 75, 28, hwnd, ID_BTN_STOP, hinst, 0);
+
+        # Write controls
+        CreateWindowExA(0, cls_stat, lbl_wrval, 0x50000000, 650, 120, 42, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50000080, 694, 118, 100, 24, hwnd, ID_WRITE_ED, hinst, 0);
+        store64(g_write_ed, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        CreateWindowExA(0, cls_glow_btn, btn_write, 0x50000000, 800, 116, 55, 28, hwnd, ID_BTN_WRITE, hinst, 0);
+
+        # ---- TreeView (left, Y=150) ----
+        h = CreateWindowExA(0, cls_tree, gui_empty, 0x50000027, 12, 150, 280, 350, hwnd, ID_TREEVIEW, hinst, 0);
+        store64(g_treeview, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        SendMessageA(h, 0x111D, 0, COLOR_BG_CARD);
+        SendMessageA(h, 0x111E, 0, COLOR_TEXT_PRIMARY);
+        dark_scroll(h);
+
+        # ---- DA Server ListBox (same position as TreeView, initially hidden) ----
+        # WS_CHILD | WS_VSCROLL | LBS_NOTIFY = 0x50200001
+        h = CreateWindowExA(0, cls_list, gui_empty, 0x50200001, 12, 150, 280, 350, hwnd, ID_DA_LIST, hinst, 0);
+        store64(g_da_list, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+        # Hide it initially (UA tab is default)
+        ShowWindow(h, 0);
+
+        # ---- ListView (right of tree, Y=150) - no native header ----
+        h = CreateWindowExA(0, cls_lv, gui_empty, 0x5000C04D, 300, 174, 785, 326, hwnd, ID_LISTVIEW, hinst, 0);
+        store64(g_listview, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        SendMessageA(h, 4150, 0x20, 0x20);
+        SendMessageA(h, 4097, 0, COLOR_BG_CARD);
+        SendMessageA(h, 4132, 0, COLOR_TEXT_PRIMARY);
+        SendMessageA(h, 4134, 0, COLOR_BG_CARD);
+        dark_scroll(h);
+
+        # ListView columns
+        memset(g_lvcol, 0, 64);
+        store32(g_lvcol + 0, 15);
+        store32(g_lvcol + 4, 0);
+        store32(g_lvcol + 8, 250);
+        store64(g_lvcol + 16, col_name);
+        SendMessageA(h, 4123, 0, g_lvcol);
+        store32(g_lvcol + 8, 180);
+        store64(g_lvcol + 16, col_val);
+        store32(g_lvcol + 24, 1);
+        SendMessageA(h, 4123, 1, g_lvcol);
+        store32(g_lvcol + 8, 80);
+        store64(g_lvcol + 16, col_type);
+        store32(g_lvcol + 24, 2);
+        SendMessageA(h, 4123, 2, g_lvcol);
+        store32(g_lvcol + 8, 220);
+        store64(g_lvcol + 16, col_node);
+        store32(g_lvcol + 24, 3);
+        SendMessageA(h, 4123, 3, g_lvcol);
+
+        # ---- Log (bottom) ----
+        CreateWindowExA(0, cls_stat, lbl_log, 0x50000000, 12, 510, 50, 20, hwnd, 0, hinst, 0);
+        h = CreateWindowExA(0, cls_edit, gui_empty, 0x50200044, 12, 530, 1070, 110, hwnd, ID_LOG, hinst, 0);
+        store64(g_log, h);
+        SendMessageA(h, 48, load64(g_font), 1);
+        dark_scroll(h);
+
+        # Clear / Save
+        CreateWindowExA(0, cls_glow_btn, btn_clear, 0x50000000, 968, 508, 55, 22, hwnd, ID_BTN_CLEAR, hinst, 0);
+        CreateWindowExA(0, cls_glow_btn, btn_save, 0x50000000, 1027, 508, 55, 22, hwnd, ID_BTN_SAVE, hinst, 0);
+
+        # ---- Status bar ----
+        h = CreateWindowExA(0, cls_stat, lbl_status, 0x50000000, 12, 650, 1070, 20, hwnd, ID_STATUS, hinst, 0);
+        store64(g_status, h);
+
+        return 0;
+    }
+
+    # WM_PAINT (custom title bar + tabs)
+    if msg == 15 {
+        hdc = BeginPaint(hwnd, g_ps);
+        GetClientRect(hwnd, g_rect);
+        r = load32(g_rect + 8);
+
+        # Title bar background
+        store32(g_rect + 0, 0);
+        store32(g_rect + 4, 0);
+        store32(g_rect + 8, r);
+        store32(g_rect + 12, 42);
+        FillRect(hdc, g_rect, load64(g_brush_panel));
+
+        # Neon line at Y=42
+        old_pen = SelectObject(hdc, load64(g_pen_neon));
+        MoveToEx(hdc, 0, 42, 0);
+        LineTo(hdc, r, 42);
+        SelectObject(hdc, old_pen);
+
+        # Title text
+        SetBkMode(hdc, 1);
+        SetTextColor(hdc, COLOR_NEON_BLUE);
+        SelectObject(hdc, load64(g_font_header));
+        TextOutA(hdc, 15, 12, title_draw, 19);
+
+        # Connection indicator
+        sock = load64(g_sock);
+        da_c = load64(g_da_conn);
+        if sock != 0 {
+            SetTextColor(hdc, COL_GREEN);
+            TextOutA(hdc, 260, 12, st_conn_ind, 11);
+        } else if da_c != 0 {
+            SetTextColor(hdc, COL_GREEN);
+            TextOutA(hdc, 260, 12, st_conn_ind, 11);
+        } else {
+            SetTextColor(hdc, COL_RED);
+            TextOutA(hdc, 260, 12, st_disc_ind, 14);
+        }
+
+        # Active tab indicator (neon underline)
+        active_tab = load64(g_active_tab);
+        old_pen3 = SelectObject(hdc, load64(g_pen_neon));
+        if active_tab == 0 { MoveToEx(hdc, 12, 76, 0); LineTo(hdc, 82, 76); }
+        if active_tab == 1 { MoveToEx(hdc, 88, 76, 0); LineTo(hdc, 158, 76); }
+        if active_tab == 2 { MoveToEx(hdc, 164, 76, 0); LineTo(hdc, 239, 76); }
+        SelectObject(hdc, old_pen3);
+
+        # Custom flat ListView column headers (dark)
+        old_brush = SelectObject(hdc, load64(g_edit_brush));
+        old_pen2 = SelectObject(hdc, load64(g_pen_border));
+
+        # Col 0: Display Name (300..550, 150..174)
+        Rectangle(hdc, 300, 150, 550, 174);
+        # Col 1: Value (550..730, 150..174)
+        Rectangle(hdc, 550, 150, 730, 174);
+        # Col 2: Type (730..810, 150..174)
+        Rectangle(hdc, 730, 150, 810, 174);
+        # Col 3: Node ID (810..1085, 150..174)
+        Rectangle(hdc, 810, 150, 1085, 174);
+
+        # Header text
+        SetTextColor(hdc, COLOR_TEXT_PRIMARY);
+        SelectObject(hdc, load64(g_font));
+        TextOutA(hdc, 310, 154, col_name, 12);
+        TextOutA(hdc, 560, 154, col_val, 5);
+        TextOutA(hdc, 740, 154, col_type, 4);
+        active_tab2 = load64(g_active_tab);
+        if active_tab2 == 1 { TextOutA(hdc, 820, 154, col_qual, 7); }
+        else { TextOutA(hdc, 820, 154, col_node, 7); }
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen2);
+
+        EndPaint(hwnd, g_ps);
+        return 0;
+    }
+
+    # WM_COMMAND
+    if msg == 273 {
+        cmd_id = band(wp, 0xFFFF);
+        if cmd_id == ID_BTN_MIN   { ShowWindow(hwnd, 6); return 0; }
+        if cmd_id == ID_BTN_CLOSE { DestroyWindow(hwnd); return 0; }
+        if cmd_id == ID_TAB_UA    { switch_tab(0); }
+        if cmd_id == ID_TAB_DA    { switch_tab(1); }
+        if cmd_id == ID_TAB_XML   { switch_tab(2); }
+        if cmd_id == ID_BTN_CONN  {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_connect(); }
+            if tab == 1 { da_connect(); }
+            if tab == 2 { xml_connect(); }
+        }
+        if cmd_id == ID_BTN_DISC  {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_disconnect(); }
+            if tab == 1 { da_disconnect(); }
+            if tab == 2 { xml_disconnect(); }
+        }
+        if cmd_id == ID_BTN_BROWSE {
+            tab = load64(g_active_tab);
+            if tab == 0 { store64(g_browse_id, 85); ua_browse(); }
+            if tab == 1 { da_browse(); }
+            if tab == 2 { xml_browse(); }
+        }
+        if cmd_id == ID_BTN_READ  {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_read_all(); }
+            if tab == 1 { da_poll_all(); }
+            if tab == 2 { xml_read_all(); }
+        }
+        if cmd_id == ID_BTN_POLL  {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_start_poll(); }
+            if tab == 1 {
+                if load64(g_da_conn) == 0 { log_append(m_noconn); }
+                if load64(g_da_conn) != 0 {
+                    poll = load64(g_polling);
+                    if poll == 0 {
+                        GetWindowTextA(load64(g_interval_ed), g_intbuf, 16);
+                        interval = str_to_int(g_intbuf);
+                        if interval < 100 { interval = 100; }
+                        store64(g_polling, 1);
+                        SetTimer(load64(g_hwnd), ID_TIMER_POLL, interval, 0);
+                        log_append(m_da_poll);
+                    }
+                }
+            }
+            if tab == 2 {
+                if load64(g_xml_conn) != 0 {
+                    poll = load64(g_polling);
+                    if poll == 0 {
+                        GetWindowTextA(load64(g_interval_ed), g_intbuf, 16);
+                        interval = str_to_int(g_intbuf);
+                        if interval < 500 { interval = 500; }
+                        store64(g_polling, 1);
+                        SetTimer(load64(g_hwnd), ID_TIMER_POLL, interval, 0);
+                        log_append(m_xml_rd);
+                    }
+                }
+            }
+        }
+        if cmd_id == ID_BTN_STOP  {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_stop_poll(); }
+            if tab == 1 {
+                poll = load64(g_polling);
+                if poll != 0 { KillTimer(load64(g_hwnd), ID_TIMER_POLL); store64(g_polling, 0); log_append(m_poll_off); }
+            }
+        }
+        if cmd_id == ID_BTN_CLEAR { do_clear_log(); }
+        if cmd_id == ID_BTN_SAVE  { do_save_log(); }
+        if cmd_id == ID_BTN_ENUM  { da_enum_servers(); }
+        if cmd_id == ID_BTN_WRITE {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_write(); }
+            if tab == 1 { da_write(); }
+            if tab == 2 { xml_write(); }
+        }
+        return 0;
+    }
+
+    # WM_NOTIFY (TreeView selection + ListView custom draw)
+    if msg == 78 {
+        code = load32(lp + 16);
+        # Sign-extend the 32-bit notification code
+        if code >= 2147483648 { code = code - 4294967296; }
+        # TVN_SELCHANGEDA = -402, TVN_SELCHANGEDW = -451
+        if code == 0 - 402 { xml_on_tree_select(); return 0; }
+        if code == 0 - 451 { xml_on_tree_select(); return 0; }
+        # NM_CUSTOMDRAW = -12 (ListView dark draw)
+        if code == 0 - 12 {
+            draw_stage = load32(lp + 24);
+            if draw_stage == 1 { return 32; }
+            if draw_stage == 65537 {
+                hdc2 = load64(lp + 32);
+                SetTextColor(hdc2, COLOR_TEXT_PRIMARY);
+                SetBkColor(hdc2, COLOR_BG_CARD);
+                return 2;
+            }
+        }
+        return 0;
+    }
+
+    # WM_TIMER (polling)
+    if msg == 275 {
+        if band(wp, 0xFFFF) == ID_TIMER_POLL {
+            tab = load64(g_active_tab);
+            if tab == 0 { ua_poll_tick(); }
+            if tab == 1 { da_poll_all(); }
+            if tab == 2 { xml_read_all(); }
+        }
+        return 0;
+    }
+
+    # WM_NCHITTEST (draggable title bar)
+    if msg == 132 {
+        GetWindowRect(hwnd, g_rect);
+        wl = load32(g_rect + 0);
+        wt = load32(g_rect + 4);
+        mx = band(lp, 65535);
+        my = shr(lp, 16);
+        cx = mx - wl;
+        cy = my - wt;
+        if cy < 42 {
+            if cx >= 1040 { if cx < 1094 { if cy >= 8 { if cy < 34 { return 1; } } } }
+            return 2;
+        }
+        return 1;
+    }
+
+    # WM_CTLCOLORSTATIC
+    if msg == 312 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_BG);
+        return load64(g_bg_brush);
+    }
+
+    # WM_CTLCOLOREDIT
+    if msg == 307 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_PANEL);
+        return load64(g_edit_brush);
+    }
+
+    # WM_CTLCOLORLISTBOX
+    if msg == 308 {
+        SetTextColor(wp, COL_TEXT);
+        SetBkColor(wp, COL_PANEL);
+        return load64(g_edit_brush);
+    }
+
+    # WM_ERASEBKGND
+    if msg == 20 {
+        GetClientRect(hwnd, g_rect);
+        FillRect(wp, g_rect, load64(g_bg_brush));
+        return 1;
+    }
+
+    # WM_DESTROY
+    if msg == 2 {
+        ua_disconnect();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+func main() -> i32 {
+    rc = WSAStartup(514, g_wsa);
+    if rc != 0 { return 1; }
+
+    store64(g_sock, 0);
+    store64(g_active_tab, 0);
+    store64(g_polling, 0);
+    store64(g_browse_id, 85);
+    store64(g_tag_count, 0);
+    store64(g_tag_names_off, 0);
+    store64(g_da_conn, 0);
+    store64(g_da_tagcnt, 0);
+    store64(g_xml_sock, 0);
+    store64(g_xml_conn, 0);
+    store64(g_xml_tagcnt, 0);
+
+    # Initialize COM + OPC DA GUIDs
+    CoInitializeEx(0, 2);
+    da_init_iids();
+
+    hinst = GetModuleHandleA(0);
+    store64(g_hinst, hinst);
+    cursor = LoadCursorA(0, 32512);
+
+    enable_dark_mode();
+
+    # Brushes/pens
+    store64(g_bg_brush, CreateSolidBrush(COL_BG));
+    store64(g_edit_brush, CreateSolidBrush(COL_PANEL));
+    store64(g_brush_deep, CreateSolidBrush(COLOR_BG_DEEP));
+    store64(g_brush_panel, CreateSolidBrush(COLOR_BG_PANEL));
+    store64(g_brush_card, CreateSolidBrush(COLOR_BG_CARD));
+    store64(g_brush_input, CreateSolidBrush(COLOR_BG_INPUT));
+    store64(g_brush_hover, CreateSolidBrush(COLOR_BG_HOVER));
+    store64(g_brush_neon, CreateSolidBrush(COLOR_NEON_BLUE));
+    store64(g_pen_border, CreatePen(0, 1, COLOR_BORDER));
+    store64(g_pen_neon, CreatePen(0, 2, COLOR_NEON_BLUE));
+    store64(g_font_header, CreateFontA(16, 0, 0, 0, 700, 0, 0, 0, 0, 0, 0, 0, 0, face_mono));
+
+    # Init common controls (ListView + TreeView)
+    store32(g_icc + 0, 8);
+    store32(g_icc + 4, 3);    # ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES
+    InitCommonControlsEx(g_icc);
+
+    # Register GlowButton
+    register_class(g_wndclass_btn, cls_glow_btn, &GlowButtonWndProc, hinst, cursor, load64(g_brush_card));
+
+    # Register main window
+    memset(g_wndcls, 0, 96);
+    store32(g_wndcls + 0, 80);
+    store32(g_wndcls + 4, 0);
+    store64(g_wndcls + 8, &wndproc);
+    store64(g_wndcls + 24, hinst);
+    store64(g_wndcls + 40, cursor);
+    store64(g_wndcls + 48, load64(g_bg_brush));
+    store64(g_wndcls + 64, clsname);
+    RegisterClassExA(g_wndcls);
+
+    # Create window (WS_POPUP | WS_VISIBLE)
+    hwnd = CreateWindowExA(0, clsname, title, 0x90000000, 60, 40, WIN_W, WIN_H, 0, 0, hinst, 0);
+    ShowWindow(hwnd, 1);
+    UpdateWindow(hwnd);
+
+    # Message loop
+    while GetMessageA(g_msg, 0, 0, 0) != 0 {
+        TranslateMessage(g_msg);
+        DispatchMessageA(g_msg);
+    }
+    return 0;
+}
