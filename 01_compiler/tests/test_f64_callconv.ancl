@@ -1,0 +1,227 @@
+# =====================================================================
+#  test_f64_callconv.ancl  -  proves the f64 Win64 XMM calling convention.
+#  f64 params ride XMM0-3 POSITIONALLY (arg k in XMMk iff float, GP reg k
+#  otherwise), f64 returns come back in XMM0, args 5+ travel on the stack
+#  as raw bits. Conversions converge args/returns onto the declared kind:
+#  int -> f64 promotes (cvtsi2sd), f64 -> int truncates (cvttsd2si).
+#  Floats cannot be printed yet (numfmt hookup is a later f64 task), so
+#  every check verifies through f64 compares / int conversion.
+#    [1]  f64 params + f64 return            avg(4.0, 6.0) == 5.0
+#    [2]  positional int/float interleave    mix(1, 2.5, 3, 4.0) == 14.0
+#    [3]  int arg promoted to an f64 param   avg(3, 4.0) == 3.5
+#    [4]  f64 return into an i64 func        tr7() == 7
+#    [5]  float args truncated to i64 params iadd(2.9, 3.9) == 5
+#    [6]  six f64 args (5th/6th on stack)    six(1..6.0) == 21.0
+#    [7]  f64 recursion                      geom(3, 1.5) == 12.0
+#    [8]  callee declared AFTER the caller   fwd(2.0) == 8.0
+#    [9]  float-local inference via a call + int RHS into an f64 slot
+#    [10] nested f64 calls as args           avg(avg(1,3), avg(5,7)) == 4.0
+#    [11] f64 fallthrough returns 0.0
+#    [12] extern "-> f64": msvcrt pow(2.0,10.0) == 1024.0 (TWO float args
+#         in XMM0/XMM1 + GP mirrors, XMM0 return from a DLL; exact)
+#    [13] native sqrtsd intrinsic         sqrt(2.25)==1.5, sqrt(16)==4.0
+#    [14] conversion/bit intrinsics       ftoi/itof/fbits/ffrombits
+#    [15] @DATA f64 consts                bits in ival, folded init exprs
+#    [16] float PRINTING composition      nf_dtoa(fbits(x), buf) -> text
+# =====================================================================
+import "../core_lib/numfmt.ancl";
+
+@if windows
+# msvcrt is the C runtime. It appears in this tree ONLY here and in
+# test_f64_callconv, purely to have an extern that returns f64 -- never in
+# shipping code. Gated so the rest of the file is portable.
+extern "msvcrt.dll" pow -> f64;
+@end
+
+@DATA
+t_hdr:  str = "[test_f64_callconv] Win64 XMM calling-convention checks";
+t_c1:   str = "  [1] avg(4.0,6.0)";
+t_c2:   str = "  [2] mix(1,2.5,3,4.0)";
+t_c3:   str = "  [3] avg(3,4.0) int->f64 promote";
+t_c4:   str = "  [4] tr7() f64->i64 return = ";
+t_c5:   str = "  [5] iadd(2.9,3.9) f64->i64 args = ";
+t_c6:   str = "  [6] six(1.0..6.0) stack f64 args";
+t_c7:   str = "  [7] geom(3,1.5) recursion";
+t_c8:   str = "  [8] fwd(2.0) forward ref";
+t_c9:   str = "  [9] inference + int into f64 slot";
+t_c10:  str = "  [10] nested f64 call args";
+t_c11:  str = "  [11] f64 fallthrough 0.0";
+t_c12:  str = "  [12] extern pow(2.0,10.0)";
+t_c13:  str = "  [13] sqrt intrinsic (sqrtsd)";
+t_c14:  str = "  [14] ftoi/itof/fbits/ffrombits";
+t_c15:  str = "  [15] @DATA f64 consts";
+t_c16:  str = "  [16] nf_dtoa(fbits(x)) print = ";
+t_pass: str = "  -> PASS";
+t_fail: str = "  -> FAIL";
+t_res:  str = "[test_f64_callconv] RESULT: ";
+nl:     str = "\n";
+half:   f64 = 0.5;
+quart:  f64 = 1.0 / 4.0;
+n15:    f64 = 0.0 - 1.5;
+dquart: f64 = half * half;
+x16:    str = "2.500000";
+x16n:   str = "-1.500000";
+fb:     buf = 64;
+
+@CODE
+func avg(a: f64, b: f64) -> f64 {
+    return (a + b) / 2.0;
+}
+
+func mix(a: i64, x: f64, b: i64, y: f64) -> f64 {
+    return x * y + a + b;
+}
+
+func tr7() -> i64 {
+    return 7.9;
+}
+
+func iadd(n: i64, m: i64) -> i64 {
+    return n + m;
+}
+
+func six(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> f64 {
+    return a + b + c + d + e + f;
+}
+
+func geom(n: i64, x: f64) -> f64 {
+    if n == 0 { return x; }
+    return 2.0 * geom(n - 1, x);
+}
+
+# no `return` at all: an f64 function that falls off the end must yield 0.0.
+# TWO shapes, because they reach the implicit return by different paths: an
+# EMPTY body, and a body that executes a statement first. The second used to
+# be a bare `t = 0;`, which the unread-local warning correctly flagged as a
+# value computed and thrown away -- so the filler now reads what it writes.
+func fz() -> f64 {
+}
+func fz2() -> f64 {
+    t = 0;
+    if t != 0 { return 1.0; }
+}
+
+func main() -> i32 {
+    syscall 1, t_hdr, nl;
+    ok = 1;
+
+    # [1] both params + return in XMM
+    syscall 1, t_c1;
+    if avg(4.0, 6.0) == 5.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [2] positional: a->RCX, x->XMM1, b->R8, y->XMM3; 2.5*4.0 + 1 + 3 = 14.0
+    syscall 1, t_c2;
+    if mix(1, 2.5, 3, 4.0) == 14.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [3] int literal 3 promotes to 3.0 at the call site
+    syscall 1, t_c3;
+    if avg(3, 4.0) == 3.5 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [4] returning 7.9 from an i64 func truncates to 7
+    r4 = tr7();
+    syscall 1, t_c4, r4;
+    if r4 == 7 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [5] float args truncate into i64 params: 2.9->2, 3.9->3
+    r5 = iadd(2.9, 3.9);
+    syscall 1, t_c5, r5;
+    if r5 == 5 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [6] args 5 and 6 travel on the stack as raw f64 bits
+    syscall 1, t_c6;
+    if six(1.0, 2.0, 3.0, 4.0, 5.0, 6.0) == 21.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [7] mixed int/f64 recursion: 2^3 * 1.5 = 12.0
+    syscall 1, t_c7;
+    if geom(3, 1.5) == 12.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [8] fwd() is declared after main: the post-parse pass resolves it
+    syscall 1, t_c8;
+    if fwd(2.0) == 8.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [9] v infers f64 from the call; x converts the int 5 into its f64 slot
+    v = avg(1.0, 2.0);
+    v2 = v + 0.5;
+    x = 3.0;
+    x = 5;
+    r9 = 0;
+    if v2 == 2.0 { if x == 5.0 { r9 = 1; } }
+    syscall 1, t_c9;
+    if r9 == 1 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [10] f64 results feeding f64 params: avg(2.0, 6.0) = 4.0
+    syscall 1, t_c10;
+    if avg(avg(1.0, 3.0), avg(5.0, 7.0)) == 4.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [11] an f64 func with no return falls through to 0.0
+    syscall 1, t_c11;
+    if fz() == 0.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+    if fz2() == 0.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [12] a real DLL double: two float args (XMM0/XMM1 + GP mirrors), XMM0 return
+@if windows
+    # ⚠ WINDOWS-ONLY BY NATURE, not by accident. This case exists to exercise the
+    # `extern "-> f64"` calling convention with TWO float arguments, and the only
+    # such extern available is msvcrt's pow -- a C-runtime import, which this
+    # project bans everywhere except here. There is no CRT-free equivalent to point
+    # it at on Linux, and swapping in a pure-ANCL pow would delete the very thing
+    # the case tests (the extern ABI, not the arithmetic). So the CASE is gated,
+    # rather than the whole file being skipped -- every other f64 case below is
+    # perfectly portable and now runs under --target=linux too.
+    syscall 1, t_c12;
+    if pow(2.0, 10.0) == 1024.0 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+@end
+
+    # [13] native sqrtsd, no DLL; an int arg promotes first
+    r13 = 0;
+    if sqrt(2.25) == 1.5 { if sqrt(16) == 4.0 { r13 = 1; } }
+    syscall 1, t_c13;
+    if r13 == 1 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [14] ftoi truncates, itof promotes, fbits/ffrombits round-trip raw IEEE-754;
+    #      fbits(1.0) is the known constant 0x3FF0000000000000
+    r14 = 0;
+    if ftoi(7.9) == 7 {
+        if itof(3) == 3.0 {
+            if ffrombits(fbits(2.5)) == 2.5 {
+                if fbits(1.0) == 0x3FF0000000000000 { r14 = 1; }
+            }
+        }
+    }
+    syscall 1, t_c14;
+    if r14 == 1 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [15] @DATA f64 consts: literal, folded /, folded unary-negative, ref to an earlier f64 const
+    r15 = 0;
+    if half == 0.5 {
+        if quart == 0.25 {
+            if n15 + 1.5 == 0.0 {
+                if dquart == 0.25 { r15 = 1; }
+            }
+        }
+    }
+    syscall 1, t_c15;
+    if r15 == 1 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    # [16] the float-printing story: raw bits via fbits -> numfmt's integer-only
+    #      dtoa -> text. Prints "2.500000" and checks both strings exactly.
+    r16 = 0;
+    nf_dtoa(fbits(2.5), fb);
+    syscall 1, t_c16;
+    puts_cstr(fb);
+    if strcmp(fb, x16) == 0 {
+        nf_dtoa(fbits(n15), fb);
+        if strcmp(fb, x16n) == 0 { r16 = 1; }
+    }
+    if r16 == 1 { syscall 1, t_pass, nl; } else { syscall 1, t_fail, nl; ok = 0; }
+
+    if ok == 1 { syscall 1, t_res, t_pass, nl; return 0; }
+    syscall 1, t_res, t_fail, nl;
+    return 1;
+}
+
+# declared AFTER its caller on purpose: proves call-site float stamping
+# does not depend on declaration order
+func fwd(x: f64) -> f64 {
+    return x * 4.0;
+}

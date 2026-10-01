@@ -1,0 +1,67 @@
+# =====================================================================
+#  test_f64_struct.ancl  -  f64 STRUCT FIELDS (silent-failure audit #17).
+#
+#  A struct field declared f64 was compiled as an integer by BOTH compilers:
+#  the load/store intrinsic is chosen by field WIDTH, and f64 is 8 bytes, so
+#  `p.x` became a plain load64 whose node was never stamped as a float. The
+#  read therefore left the value in RAX instead of XMM0, and `p.x = <f64 expr>`
+#  stored whatever integer happened to be in RAX while the real result sat in
+#  XMM0. The reported symptom was `return p.x` printing 4611686018427387904 --
+#  the raw IEEE-754 bits of 2.0 -- with the compiler reporting success.
+#
+#  Nothing in the tree used an f64 struct field, so nothing caught it; this
+#  test exists so that stays true by construction rather than by luck.
+#  Deterministic, admin-free, no I/O. Values are chosen to be exact in binary
+#  floating point, so the comparisons below are exact, not epsilon-based.
+# =====================================================================
+@DATA
+m_read:   str = "[FAIL] f64 field read (p.x should be 2.5)\n";
+m_write:  str = "[FAIL] f64 field write-back (p.x * 4.0 should be 10.0)\n";
+m_two:    str = "[FAIL] two f64 fields (p.x + p.y should be 11.25)\n";
+m_bits:   str = "[FAIL] f64 field is not stored as raw IEEE-754 bits\n";
+m_mixed:  str = "[FAIL] mixed int/f64 fields in one struct\n";
+m_pass:   str = "[PASS] test_f64_struct: f64 struct fields load/store through XMM (read, write-back, mixed with i64)\n";
+
+@CODE
+
+struct V   { x: f64; y: f64; }
+struct Mix { tag: i64; w: f64; n: i32; }
+
+func main() -> i32 {
+    p: *V = alloc(sizeof(V));
+
+    # ---- 1. plain read: the field must come back as a FLOAT, not its bits ----
+    p.x = 2.5;
+    p.y = 8.75;
+    if ftoi(p.x * 2.0) != 5 { syscall 1, m_read; return 1; }
+
+    # ---- 2. write-back through an f64 expression (the exact audit repro) ----
+    #        p.x = p.x * 4.0  ->  10.0.  Before the fix this stored RAX garbage.
+    p.x = p.x * 4.0;
+    if ftoi(p.x) != 10 { syscall 1, m_write; return 1; }
+
+    # ---- 3. both fields participate in one expression ----
+    s = p.x + p.y;                      # 10.0 + 8.75 = 18.75
+    if ftoi(s * 100.0) != 1875 { syscall 1, m_two; return 1; }
+    p.x = 2.5;
+    if ftoi((p.x + p.y) * 100.0) != 1125 { syscall 1, m_two; return 1; }
+
+    # ---- 4. the stored 8 bytes really are the IEEE-754 bits ----
+    #        (load64 on the same address must equal fbits of the value)
+    if load64(p + V.x) != fbits(2.5) { syscall 1, m_bits; return 1; }
+
+    # ---- 5. an f64 field sitting between integer fields: neither corrupts the other ----
+    m: *Mix = alloc(sizeof(Mix));
+    m.tag = 99999;
+    m.w   = 1.5;
+    m.n   = 7;
+    if m.tag != 99999 { syscall 1, m_mixed; return 1; }
+    if m.n   != 7     { syscall 1, m_mixed; return 1; }
+    if ftoi(m.w * 8.0) != 12 { syscall 1, m_mixed; return 1; }
+    m.w = m.w + 0.5;                    # 2.0
+    if ftoi(m.w) != 2     { syscall 1, m_mixed; return 1; }
+    if m.tag    != 99999  { syscall 1, m_mixed; return 1; }
+
+    syscall 1, m_pass;
+    return 0;
+}

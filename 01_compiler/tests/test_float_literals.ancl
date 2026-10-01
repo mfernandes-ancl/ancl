@@ -1,0 +1,104 @@
+# =====================================================================
+#  test_float_literals.ancl  -  f64 LITERAL LEXING, bit-exact.
+#
+#  The self-hosted lexer accumulated a float literal's digits into an i64
+#  mantissa with NO overflow guard, so any literal carrying 19 or more
+#  significant digits WRAPPED and produced a wildly wrong double -- silently,
+#  and with the wrong sign as often as not. The bootstrap uses strtod and was
+#  always right, so this was a pure bootstrap/self-hosted divergence that no
+#  existing gate could see: the self-host FIXPOINT only proves anclc2
+#  reproduces itself, and nothing ever compared the two compilers' RUNTIME
+#  behaviour.
+#
+#  It was not academic. The Aether Engine prunes a token by storing
+#      0.0 - 1000000000000000000000000000000.0
+#  into its logit; under the self-hosted compiler that sentinel came out as
+#  about -4.57e17 instead of -1e30, so pruned tokens were never actually
+#  suppressed and the sampler returned the wrong argmax. 150 literals across
+#  29 files were affected, pi-to-21-digits and 1/24 among them.
+#
+#  Every expected value below is the exact IEEE-754 bit pattern of the literal,
+#  so this test pins the CONVERSION, not merely "it is roughly right". The
+#  interesting rows are the last five: >= 19 significant digits, which is where
+#  the old accumulator wrapped.
+# =====================================================================
+@DATA
+m_fail: str = "[FAIL] float literal #";
+m_got:  str = "  got ";
+m_want: str = "  want ";
+m_pass: str = "[PASS] test_float_literals: f64 literals lex bit-exactly (incl. >= 19 significant digits)\n";
+nl:     str = "\n";
+
+@CODE
+
+# Returns 1 on success, 0 on failure. Deliberately NOT ExitProcess: that is a
+# Windows import, and this test must also compile with --target=linux -- the
+# defect it guards lives in the shared lexer and hits the ELF path identically.
+func chk(idx: i64, got: i64, want: i64) -> i64 {
+    if got == want { return 1; }
+    syscall 1, m_fail, idx, nl;
+    syscall 1, m_got,  got,  nl;
+    syscall 1, m_want, want, nl;
+    return 0;
+}
+
+# Same, but tolerating a last-bit difference. For two positive normals the
+# integer distance between their bit patterns IS their distance in ULPs.
+func chk_ulp(idx: i64, got: i64, want: i64) -> i64 {
+    d = got - want;
+    if d < 0 { d = 0 - d; }
+    if d <= 1 { return 1; }
+    syscall 1, m_fail, idx, nl;
+    syscall 1, m_got,  got,  nl;
+    syscall 1, m_want, want, nl;
+    return 0;
+}
+
+func main() -> i32 {
+    ok = 1;
+    # ---- ordinary literals: these always worked, and must not regress ----
+    if chk(1, fbits(0.5), 4602678819172646912) == 0 { ok = 0; }
+    if chk(2, fbits(1.5), 4609434218613702656) == 0 { ok = 0; }
+    if chk(3, fbits(0.1), 4591870180066957722) == 0 { ok = 0; }          # not exact in binary; single correctly-rounded divide
+    if chk(4, fbits(2e10), 4761044086503243776) == 0 { ok = 0; }          # exponent form, no fraction
+    if chk(5, fbits(1.5e-8), 4490118700684568875) == 0 { ok = 0; }        # negative exponent
+
+    # ---- >= 19 significant digits: the wrap zone ----
+    if chk(6, fbits(3.14159265358979323846), 4614256656552045848) == 0 { ok = 0; }      # pi, 21 digits
+    if chk(7, fbits(0.041666666666666664), 4586165620538955093) == 0 { ok = 0; }        # 1/24, 19 fraction digits
+    if chk(8, fbits(0.0001984126984126984), 4551452160554016794) == 0 { ok = 0; }       # 1/5040
+    if chk(9, fbits(1.00000005960464477539), 4607182419068452864) == 0 { ok = 0; }      # f32 epsilon-ish, 21 digits
+
+    # ---- the engine's token-kill sentinel: 31 integer digits ----
+    #      This is the one that broke sampling. Under the old lexer it came back
+    #      NEGATIVE-exponent-wrong (about -4.57e17), so `logit = -1e30` did not
+    #      push the token below its rivals.
+    if chk(10, fbits(1000000000000000000000000000000.0), 5055640609639927018) == 0 { ok = 0; }
+
+    # ---- magnitude preserved when precision cannot be ----
+    #      24 integer digits + a fraction: the mantissa saturates and the dropped
+    #      digits must survive as exponent, not vanish.
+    #
+    #      ⚠ DOCUMENTED LIMIT, asserted honestly as "within 1 ULP" rather than
+    #      exact. Beyond 19 significant digits the self-hosted lexer rounds TWICE
+    #      -- once turning the saturated i64 mantissa into a double (it exceeds
+    #      2^53), once scaling by the power of ten -- where strtod rounds once.
+    #      Matching strtod bit-for-bit here needs big-integer arithmetic, which is
+    #      not worth carrying in the lexer. 1 ULP at 1e23 is ~1.7e7 in absolute
+    #      terms but ~1.1e-16 relative, i.e. the last representable digit.
+    #      Everything at or under 19 significant digits IS bit-exact, which covers
+    #      every literal in this tree.
+    if chk_ulp(11, fbits(123456789012345678901234.5), 4952310988906995821) == 0 { ok = 0; }
+
+    # ---- a fraction so long the mantissa fills mid-way through it ----
+    if chk(12, fbits(0.0000000000000000001), 4322756117994590892) == 0 { ok = 0; }
+
+    # ---- and the sentinel actually behaves like minus-infinity-ish in context ----
+    kill: f64 = 0.0 - 1000000000000000000000000000000.0;
+    best: f64 = 0.0 - 1.0;
+    if kill > best { syscall 1, m_fail, 13, nl; ok = 0; }
+
+    if ok == 0 { return 1; }
+    syscall 1, m_pass;
+    return 0;
+}

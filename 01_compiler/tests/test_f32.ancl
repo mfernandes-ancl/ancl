@@ -1,0 +1,79 @@
+# =====================================================================
+#  tests/test_f32.ancl -- f32 as a STORAGE type (2026-08-05).
+#
+#  The design in one line: f32 is a 4-byte single-precision STORAGE width;
+#  every value COMPUTES as f64 (the language's one float compute type) --
+#  loads widen with cvtss2sd, stores narrow with cvtsd2ss (round-to-nearest).
+#
+#  What each block pins:
+#    A  exact round-trip: 1.5 is representable in single, so store+load is lossless
+#    B  ROUNDING is real: 0.1 is NOT representable -- the reloaded value must
+#       differ from the f64 literal in its BITS yet stay numerically ~0.1
+#       (a broken narrow would return either the exact double or garbage)
+#    C  the 4-byte store stays 4 bytes: an f32 field at offset 4 must not
+#       clobber the i64 neighbour at offset 8 (an 8-byte store would)
+#    D  *f32 typed-pointer indexing: a[i] over a buf, stride 4
+#    E  f32 arithmetic happens in f64: the sum of two stored singles equals
+#       the sum of their widened values exactly
+#
+#  Output is byte-identical on every target (verdict lines only).
+# =====================================================================
+struct FV { x: f32; y: f32; n: i64; }
+
+@DATA
+g_s:   buf = 64;
+g_arr: buf = 64;
+m_pass: str = "[PASS] f32 storage: round-trip, rounding, layout, indexing, f64 compute\n";
+m_fail: str = "[FAIL] f32 block ";
+m_nl:   str = "\n";
+
+@CODE
+func fail_at(k: i64) -> i64 {
+    syscall 1, m_fail; syscall 1, k; syscall 1, m_nl;
+    return 0;
+}
+
+func main() -> i32 {
+    bad = 0;
+    p: *FV = g_s;
+
+    # --- A: exact round-trip ---
+    p.x = 1.5;
+    if fbits(p.x) != fbits(1.5) { fail_at(1); bad = 1; }
+
+    # --- B: rounding is real ---
+    p.y = 0.1;
+    if fbits(p.y) == fbits(0.1) { fail_at(2); bad = 1; }     # must have narrowed
+    if p.y < 0.0999 { fail_at(3); bad = 1; }
+    if p.y > 0.1001 { fail_at(4); bad = 1; }
+
+    # --- C: the 4-byte store did not clobber the neighbour ---
+    p.n = 777;
+    p.y = 2.5;
+    if p.n != 777 { fail_at(5); bad = 1; }
+    if fbits(p.y) != fbits(2.5) { fail_at(6); bad = 1; }
+
+    # --- D: *f32 indexing over a buffer, stride 4 ---
+    a: *f32 = g_arr;
+    i = 0;
+    while i < 8 { a[i] = itof(i) + 0.5; i = i + 1; }
+    if fbits(a[0]) != fbits(0.5) { fail_at(7); bad = 1; }
+    if fbits(a[7]) != fbits(7.5) { fail_at(8); bad = 1; }
+    if load32(g_arr + 0) == load32(g_arr + 4) { fail_at(9); bad = 1; }   # distinct singles, 4 bytes apart
+
+    # --- E: compute stays f64 ---
+    s = p.x + p.y;                       # 1.5 + 2.5, both exact singles
+    if fbits(s) != fbits(4.0) { fail_at(10); bad = 1; }
+
+    # --- F: *f64 indexing -- the LATENT twin this work exposed. Indexed loads
+    # carried NO float stamp at all, so d[0] handed the double's raw bits to the
+    # integer path; nothing in the tree indexed floats, so nothing ever noticed.
+    d: *f64 = g_s;                       # reuse the struct buffer, done with it
+    d[0] = 0.25;
+    d[1] = d[0] + 0.5;
+    if fbits(d[0]) != fbits(0.25) { fail_at(11); bad = 1; }
+    if fbits(d[1]) != fbits(0.75) { fail_at(12); bad = 1; }
+
+    if bad == 0 { syscall 1, m_pass; return 0; }
+    return 1;
+}
