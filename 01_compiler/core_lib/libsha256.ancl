@@ -1,0 +1,321 @@
+# =====================================================================
+#  libsha256.ancl  -  pure-ANCL SHA-256 / HMAC-SHA256 / HKDF  (Linux/core_lib)  [L5/S1]
+#
+#  FIPS 180-4 SHA-256 + RFC 2104 HMAC + RFC 5869 HKDF + the RFC 8446 s7.1
+#  HkdfLabel form (hkdf_expand_label), written as PURE COMPUTE over caller
+#  buffers: ZERO externs, ZERO syscalls, ZERO imports. Compiles under the
+#  Windows PE target and both ELF targets unchanged, so it is promotable to
+#  the Windows engine later (D4).
+#
+#  Context = a caller-owned SHA256_CTX_BYTES (144) byte region (buf/alloc):
+#      struct {h: i64[8]; block: i8[64]; fill: i64; total: i64}
+#  All u32 math rides i64 with an & 0xFFFFFFFF mask after every add chain;
+#  infix >> on i64 is LOGICAL, so rotr32 is shifts+or+mask (probe-verified).
+#  Re-init IS the reset: after sha256_final, call sha256_init on the same ctx
+#  (cheap - the pull.ancl redirect-restart contract).
+#
+#  Digests are FIPS byte order: digest32 = H0..H7 each stored big-endian.
+#  sha256_hex emits EXACTLY 64 lowercase hex chars + NUL (byte-exact compare
+#  downstream - the hex is load-bearing as a blob filename in the store).
+#
+#  NOT REENTRANT: hmac_*/hkdf_*/sha256_bytes use module-level scratch bufs
+#  (single-threaded like the rest of the engine). sha256_init/update/final
+#  themselves touch only the caller ctx + one shared schedule buf (sha_wbuf),
+#  so distinct contexts may be interleaved call-by-call, not concurrently.
+# =====================================================================
+
+struct Sha256Ctx {
+    h:     i64[8];     # working state H0..H7 (u32 each, in i64 slots)
+    block: i8[64];     # pending partial block
+    fill:  i64;        # bytes pending in block (0..63)
+    total: i64;        # total message bytes hashed
+}
+
+@DATA
+SHA256_CTX_BYTES: i64 = 144;          # == sizeof(Sha256Ctx), probe-verified
+
+# ---- FIPS 180-4 round constants (fractional parts of cbrt of primes 2..311) ----
+sha_K: i64[64] = { 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+                   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+                   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+                   0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+                   0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+                   0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+                   0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+
+# ---- module scratch (see NOT REENTRANT note in the header) ----
+sha_wbuf:   buf = 512;     # 64x i64 message schedule (compress scratch)
+sha_osctx:  buf = 144;     # sha256_bytes one-shot ctx
+sha_osdig:  buf = 32;      # sha256_bytes one-shot digest
+hm_ctx:     buf = 144;     # HMAC inner/outer sha ctx
+hm_kblk:    buf = 64;      # HMAC normalized key block
+hm_pad:     buf = 64;      # HMAC key^ipad / key^opad scratch
+hm_inner:   buf = 32;      # HMAC inner digest
+hk_t:       buf = 32;      # HKDF T(i) block
+hk_ctrb:    buf = 8;       # HKDF counter byte
+hk_lbl:     buf = 544;     # HkdfLabel scratch (2+1+255+1+255 max)
+hk_pfx:     str = "tls13 ";
+
+@CODE
+# =====================================================================
+#  SHA-256 core
+# =====================================================================
+
+# reset ctx to a fresh hash (FIPS H0 init values); also the re-init/reset path
+func sha256_init(ctx: ptr) -> i64 {
+    c: *Sha256Ctx = ctx;
+    c.fill = 0;
+    c.total = 0;
+    hs: *i64 = ctx + Sha256Ctx.h;
+    hs[0] = 0x6a09e667; hs[1] = 0xbb67ae85; hs[2] = 0x3c6ef372; hs[3] = 0xa54ff53a;
+    hs[4] = 0x510e527f; hs[5] = 0x9b05688c; hs[6] = 0x1f83d9ab; hs[7] = 0x5be0cd19;
+    return 0;
+}
+
+# one 64-byte block through the compression function (internal)
+func sha256_compress(ctx: ptr, blk: ptr) -> i64 {
+    w: *i64 = sha_wbuf;
+    # 16 big-endian message words
+    i = 0;
+    while i < 16 {
+        p = blk + i * 4;
+        w[i] = (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+        i = i + 1;
+    }
+    # 48 schedule extensions: w[i] = w[i-16] + s0(w[i-15]) + w[i-7] + s1(w[i-2])
+    i = 16;
+    while i < 64 {
+        x = w[i - 15];
+        s0 = (((x >> 7) | (x << 25)) ^ ((x >> 18) | (x << 14)) ^ (x >> 3)) & 0xFFFFFFFF;
+        y = w[i - 2];
+        s1 = (((y >> 17) | (y << 15)) ^ ((y >> 19) | (y << 13)) ^ (y >> 10)) & 0xFFFFFFFF;
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    # 64 rounds
+    hs: *i64 = ctx + Sha256Ctx.h;
+    a = hs[0]; b = hs[1]; c = hs[2]; d = hs[3];
+    e = hs[4]; f = hs[5]; g = hs[6]; h = hs[7];
+    kt: *i64 = sha_K;
+    i = 0;
+    while i < 64 {
+        S1 = (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))) & 0xFFFFFFFF;
+        ch = ((e & f) ^ ((e ^ 0xFFFFFFFF) & g)) & 0xFFFFFFFF;
+        t1 = (h + S1 + ch + kt[i] + w[i]) & 0xFFFFFFFF;
+        S0 = (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) & 0xFFFFFFFF;
+        mj = ((a & b) ^ (a & c) ^ (b & c)) & 0xFFFFFFFF;
+        t2 = (S0 + mj) & 0xFFFFFFFF;
+        h = g; g = f; f = e;
+        e = (d + t1) & 0xFFFFFFFF;
+        d = c; c = b; b = a;
+        a = (t1 + t2) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    # feedback
+    hs[0] = (hs[0] + a) & 0xFFFFFFFF; hs[1] = (hs[1] + b) & 0xFFFFFFFF;
+    hs[2] = (hs[2] + c) & 0xFFFFFFFF; hs[3] = (hs[3] + d) & 0xFFFFFFFF;
+    hs[4] = (hs[4] + e) & 0xFFFFFFFF; hs[5] = (hs[5] + f) & 0xFFFFFFFF;
+    hs[6] = (hs[6] + g) & 0xFFFFFFFF; hs[7] = (hs[7] + h) & 0xFFFFFFFF;
+    return 0;
+}
+
+# absorb n bytes (any n incl 0; called per-fragment with arbitrary sizes).
+# Full 64-byte runs are compressed straight from the caller's buffer (no copy);
+# only partial-block bytes go through ctx.block.
+func sha256_update(ctx: ptr, data: ptr, n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    c: *Sha256Ctx = ctx;
+    c.total = c.total + n;
+    f = c.fill;
+    i = 0;
+    # top up a pending partial block first
+    if f > 0 {
+        while f < 64 && i < n {
+            store8(ctx + Sha256Ctx.block + f, load8(data + i));
+            f = f + 1; i = i + 1;
+        }
+        if f == 64 { sha256_compress(ctx, ctx + Sha256Ctx.block); f = 0; }
+    }
+    # bulk: whole blocks direct from the source
+    while n - i >= 64 {
+        sha256_compress(ctx, data + i);
+        i = i + 64;
+    }
+    # tail into the pending block
+    while i < n {
+        store8(ctx + Sha256Ctx.block + f, load8(data + i));
+        f = f + 1; i = i + 1;
+    }
+    c.fill = f;
+    return 0;
+}
+
+# pad + close the hash; digest32 = 32 bytes, H0..H7 each big-endian (FIPS).
+# ctx is dead afterwards until the next sha256_init (re-init = cheap reset).
+func sha256_final(ctx: ptr, digest32: ptr) -> i64 {
+    c: *Sha256Ctx = ctx;
+    blk = ctx + Sha256Ctx.block;
+    bits = c.total * 8;
+    f = c.fill;
+    store8(blk + f, 0x80);
+    f = f + 1;
+    if f > 56 {                       # no room for the length -> flush a pad block
+        while f < 64 { store8(blk + f, 0); f = f + 1; }
+        sha256_compress(ctx, blk);
+        f = 0;
+    }
+    while f < 56 { store8(blk + f, 0); f = f + 1; }
+    store8(blk + 56, (bits >> 56) & 0xFF);   # 64-bit big-endian bit length
+    store8(blk + 57, (bits >> 48) & 0xFF);
+    store8(blk + 58, (bits >> 40) & 0xFF);
+    store8(blk + 59, (bits >> 32) & 0xFF);
+    store8(blk + 60, (bits >> 24) & 0xFF);
+    store8(blk + 61, (bits >> 16) & 0xFF);
+    store8(blk + 62, (bits >> 8) & 0xFF);
+    store8(blk + 63, bits & 0xFF);
+    sha256_compress(ctx, blk);
+    hs: *i64 = ctx + Sha256Ctx.h;
+    j = 0;
+    while j < 8 {
+        v = hs[j];
+        store8(digest32 + j * 4,     (v >> 24) & 0xFF);
+        store8(digest32 + j * 4 + 1, (v >> 16) & 0xFF);
+        store8(digest32 + j * 4 + 2, (v >> 8) & 0xFF);
+        store8(digest32 + j * 4 + 3, v & 0xFF);
+        j = j + 1;
+    }
+    return 0;
+}
+
+# hex nibble -> ASCII lowercase (internal)
+func sha_hexch(v: i64) -> i64 {
+    if v < 10 { return 48 + v; }      # '0'..'9'
+    return 87 + v;                    # 'a'..'f'
+}
+
+# digest32 -> EXACTLY 64 lowercase hex chars + NUL at out_hex[64]
+func sha256_hex(digest32: ptr, out_hex: ptr) -> i64 {
+    i = 0;
+    while i < 32 {
+        v = load8(digest32 + i);
+        store8(out_hex + i * 2,     sha_hexch((v >> 4) & 0xF));
+        store8(out_hex + i * 2 + 1, sha_hexch(v & 0xF));
+        i = i + 1;
+    }
+    store8(out_hex + 64, 0);
+    return 0;
+}
+
+# one-shot convenience: init+update+final+hex over module scratch
+func sha256_bytes(data: ptr, n: i64, out_hex: ptr) -> i64 {
+    sha256_init(sha_osctx);
+    sha256_update(sha_osctx, data, n);
+    sha256_final(sha_osctx, sha_osdig);
+    sha256_hex(sha_osdig, out_hex);
+    return 0;
+}
+
+# =====================================================================
+#  HMAC-SHA256 (RFC 2104 / RFC 4231)
+#  Streaming internals (hmac_begin/feed/done) exist so HKDF can feed a
+#  multi-part message (T(i-1) | info | counter) without a concat buffer.
+# =====================================================================
+
+# start MAC: normalize the key (hash if > blocksize, zero-pad to 64) and
+# open the inner hash with key^ipad
+func hmac_begin(key: ptr, klen: i64) -> i64 {
+    i = 0;
+    if klen > 64 {                    # RFC 2104: oversize key -> hash it first
+        sha256_init(hm_ctx);
+        sha256_update(hm_ctx, key, klen);
+        sha256_final(hm_ctx, hm_kblk);
+        i = 32;
+    } else {
+        while i < klen { store8(hm_kblk + i, load8(key + i)); i = i + 1; }
+    }
+    while i < 64 { store8(hm_kblk + i, 0); i = i + 1; }
+    j = 0;
+    while j < 64 { store8(hm_pad + j, load8(hm_kblk + j) ^ 0x36); j = j + 1; }
+    sha256_init(hm_ctx);
+    sha256_update(hm_ctx, hm_pad, 64);
+    return 0;
+}
+
+# absorb message bytes into the inner hash (any n incl 0)
+func hmac_feed(data: ptr, n: i64) -> i64 {
+    return sha256_update(hm_ctx, data, n);
+}
+
+# close: mac32 = H(key^opad | H(key^ipad | msg))
+func hmac_done(mac32: ptr) -> i64 {
+    sha256_final(hm_ctx, hm_inner);
+    j = 0;
+    while j < 64 { store8(hm_pad + j, load8(hm_kblk + j) ^ 0x5c); j = j + 1; }
+    sha256_init(hm_ctx);
+    sha256_update(hm_ctx, hm_pad, 64);
+    sha256_update(hm_ctx, hm_inner, 32);
+    sha256_final(hm_ctx, mac32);
+    return 0;
+}
+
+# one-shot HMAC-SHA256; klen may exceed the 64-byte block (hashed per RFC)
+func hmac_sha256(key: ptr, klen: i64, msg: ptr, mlen: i64, mac32: ptr) -> i64 {
+    hmac_begin(key, klen);
+    hmac_feed(msg, mlen);
+    return hmac_done(mac32);
+}
+
+# =====================================================================
+#  HKDF (RFC 5869) + the TLS 1.3 HkdfLabel form (RFC 8446 s7.1)
+# =====================================================================
+
+# PRK = HMAC(salt, IKM). slen == 0 is the RFC "no salt" case: a zero-length
+# key zero-pads to the same block as HashLen zero bytes, so it is correct as-is.
+func hkdf_extract(salt: ptr, slen: i64, ikm: ptr, ilen: i64, prk32: ptr) -> i64 {
+    return hmac_sha256(salt, slen, ikm, ilen, prk32);
+}
+
+# OKM = T(1)|T(2)|... with T(i) = HMAC(PRK, T(i-1)|info|i). outlen <= 255*32.
+func hkdf_expand(prk32: ptr, info: ptr, ilen: i64, out: ptr, outlen: i64) -> i64 {
+    if outlen > 8160 { return 0 - 1; }        # RFC 5869: L <= 255*HashLen
+    done = 0;
+    ctr = 1;
+    while done < outlen {
+        hmac_begin(prk32, 32);
+        if ctr > 1 { hmac_feed(hk_t, 32); }
+        hmac_feed(info, ilen);
+        store8(hk_ctrb, ctr);
+        hmac_feed(hk_ctrb, 1);
+        hmac_done(hk_t);
+        take = outlen - done;
+        if take > 32 { take = 32; }
+        j = 0;
+        while j < take { store8(out + done + j, load8(hk_t + j)); j = j + 1; }
+        done = done + take;
+        ctr = ctr + 1;
+    }
+    return 0;
+}
+
+# HKDF-Expand-Label(secret, label, context, length) with the RFC 8446 s7.1
+# HkdfLabel: u16 length (BE) | u8 lablen | "tls13 "+label | u8 ctxlen | context.
+# NOTE (Derive-Secret): the TLS context is the TRANSCRIPT HASH (e.g. SHA256("")
+# for an empty transcript), never raw zero bytes - the caller supplies it.
+func hkdf_expand_label(secret32: ptr, label: ptr, llen: i64, context: ptr, clen: i64, out: ptr, outlen: i64) -> i64 {
+    if llen > 249 { return 0 - 1; }           # 6-byte "tls13 " prefix + label <= 255
+    if clen > 255 { return 0 - 1; }
+    store8(hk_lbl,     (outlen >> 8) & 0xFF);
+    store8(hk_lbl + 1, outlen & 0xFF);
+    store8(hk_lbl + 2, 6 + llen);
+    p = 3;
+    j = 0;
+    while j < 6 { store8(hk_lbl + p, load8(hk_pfx + j)); p = p + 1; j = j + 1; }
+    j = 0;
+    while j < llen { store8(hk_lbl + p, load8(label + j)); p = p + 1; j = j + 1; }
+    store8(hk_lbl + p, clen);
+    p = p + 1;
+    j = 0;
+    while j < clen { store8(hk_lbl + p, load8(context + j)); p = p + 1; j = j + 1; }
+    return hkdf_expand(secret32, hk_lbl, p, out, outlen);
+}

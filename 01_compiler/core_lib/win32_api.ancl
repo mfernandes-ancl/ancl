@@ -23,6 +23,10 @@ extern "kernel32.dll" CreateFileA -> ptr;       # HANDLE CreateFileA(name, acces
 extern "kernel32.dll" CloseHandle;              # BOOL   CloseHandle(HANDLE)
 extern "kernel32.dll" GetCommandLineA -> ptr;   # LPSTR  GetCommandLineA(void)
 extern "kernel32.dll" GetModuleFileNameA;       # DWORD  GetModuleFileNameA(hModule, lpFilename, nSize)
+extern "kernel32.dll" CreateMutexA -> ptr;      # HANDLE CreateMutexA(sa, bInitialOwner, name)
+extern "kernel32.dll" GetLastError;             # DWORD  GetLastError(void)  (183 = ERROR_ALREADY_EXISTS)
+extern "kernel32.dll" CreateEventA -> ptr;      # HANDLE CreateEventA(sa, bManualReset, bInitialState, name)
+extern "kernel32.dll" SetEvent;                 # BOOL   SetEvent(HANDLE)
 
 # ---- Kernel32: directory enumeration (Aether Studio IDE file tree) --
 extern "kernel32.dll" FindFirstFileA -> ptr;    # HANDLE FindFirstFileA(lpFileName, &WIN32_FIND_DATAA)  (-1 on failure)
@@ -86,6 +90,7 @@ extern "gdi32.dll"    Rectangle;               # BOOL    Rectangle(hdc, l, t, r,
 extern "gdi32.dll"    Ellipse;                  # BOOL    Ellipse(hdc, l, t, r, b)
 extern "gdi32.dll"    TextOutA;                 # BOOL    TextOutA(hdc, x, y, lpString, cch)
 extern "gdi32.dll"    SetBkMode;                # int     SetBkMode(hdc, mode)
+extern "gdi32.dll"    GetTextExtentPoint32A;    # BOOL    GetTextExtentPoint32A(hdc, str, len, &SIZE)
 
 # GDI32: off-screen double-buffering (Phase 6.9 flicker-free WM_PAINT)
 extern "gdi32.dll"    CreateCompatibleDC -> ptr;     # HDC     CreateCompatibleDC(hdc)
@@ -95,4 +100,19 @@ extern "gdi32.dll"    DeleteDC;                      # BOOL    DeleteDC(hdc)
 
 # ---- Shell32: shell operations (help guide launch) -----------------
 extern "shell32.dll"  ShellExecuteA -> ptr;     # HINSTANCE ShellExecuteA(hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd)
+extern "shell32.dll"  SHBrowseForFolderA -> ptr; # LPITEMIDLIST SHBrowseForFolderA(&BROWSEINFO)
+extern "shell32.dll"  SHGetPathFromIDListA;     # BOOL SHGetPathFromIDListA(pidl, lpszPath)
+
+# ---- Advapi32: service status, service host and system helpers ----
+extern "advapi32.dll" OpenSCManagerA -> ptr;    # SC_HANDLE OpenSCManagerA(machine, database, access)
+extern "advapi32.dll" OpenServiceA -> ptr;      # SC_HANDLE OpenServiceA(hSCM, name, access)
+extern "advapi32.dll" QueryServiceStatus;       # BOOL      QueryServiceStatus(hService, &SERVICE_STATUS)
+extern "advapi32.dll" CloseServiceHandle;       # BOOL      CloseServiceHandle(SC_HANDLE)
+extern "advapi32.dll" QueryServiceConfigA;      # BOOL      QueryServiceConfigA(hService, QUERY_SERVICE_CONFIGA*, cb, &needed)
+extern "advapi32.dll" StartServiceCtrlDispatcherA;   # BOOL BOOL StartServiceCtrlDispatcherA(&SERVICE_TABLE_ENTRY)
+extern "advapi32.dll" RegisterServiceCtrlHandlerA -> ptr;  # SERVICE_STATUS_HANDLE (name, &HandlerProc)
+extern "advapi32.dll" SetServiceStatus;              # BOOL SetServiceStatus(hStatus, &SERVICE_STATUS)
+# RtlGenRandom: system cryptographic random-byte generation.
+extern "advapi32.dll" SystemFunction036;             # BOOLEAN SystemFunction036(buf, len)
+extern "advapi32.dll" GetUserNameA;                  # BOOL GetUserNameA(buf, &DWORD size)
 

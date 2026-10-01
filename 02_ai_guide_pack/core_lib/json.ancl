@@ -5,14 +5,18 @@
 #  accessor API (object member lookup, array iteration, typed scalar
 #  reads). No CRT, no allocator beyond a fixed node pool + string arena.
 #  Tolerant: unknown keys are ignored by the reader, extra whitespace ok.
-#  Numbers are parsed as int64 (fraction/exponent are skipped for now).
+#  Numbers keep an int64 value (json_int) AND remember their source-token
+#  start, so a caller can read the true f64 (json_num_bits) or re-emit the
+#  literal verbatim (json_num_copy) -- an integer re-emit would turn 0.5 into 0.
 #
 #  Node record (48 bytes): type@0, child@8, sibling@16, sptr@24, ival@32, vidx@40
 #    OBJ  child = first key node
 #    ARR  child = first element node
 #    key  node (a STR used as an object key): sptr = key, vidx = value node, sibling = next key
+#    NUM  node: ival = int value, vidx = frac flag, sptr = token start in j_src
 #    element node: any type, sibling = next element
 # =====================================================================
+
 
 @DATA
 J_OBJ:  i64 = 1;
@@ -22,19 +26,53 @@ J_NUM:  i64 = 4;
 J_BOOL: i64 = 5;
 J_NUL:  i64 = 6;
 
-J_MAXNODES: i64 = 4096;
-j_nodes:  buf = 196608;    # 4096 * 48
-j_arena:  buf = 131072;    # string arena
+J_MAXNODES: i64 = 32768;   # DEFAULT node-pool size (json_reserve grows it)
+J_ARENA:  i64 = 786432;    # DEFAULT string-arena capacity (json_reserve grows it)
+j_nodes:  buf = 8;         # -> alloc(j_maxnodes * 48) on first parse
+j_arena:  buf = 8;         # -> alloc(j_arenacap)
+j_maxnodes: buf = 8;       # current node-pool capacity (0 = not allocated yet)
+j_arenacap: buf = 8;       # current arena capacity
 j_src:    buf = 8;
 j_pos:    buf = 8;
 j_ncount: buf = 8;
+# Set when the node pool or the string arena runs dry. Every allocation path
+# checks it, parsing unwinds, and json_parse returns -1 -- WITHOUT it, an
+# exhausted pool returned node index -1, callers wrote through j_node(-1),
+# and an over-long text walked off the end of j_arena straight through j_pv,
+# the function pointer j_parse_arr/j_parse_obj invoke via callp. That made a
+# JSON *text* able to choose an indirect call target, and this parser is fed
+# network data elsewhere in the tree (HTTP response bodies).
+j_fail:   buf = 8;
 j_apos:   buf = 8;
 j_pv:     buf = 8;         # function pointer to j_parse_value (set at parse time; enables the obj/arr <-> value recursion)
 j_emptystr: str = "";
 
 @CODE
 func j_empty() -> i64 { return j_emptystr; }
-func j_node(idx: i64) -> i64 { return j_nodes + idx * 48; }
+# The pools live on the heap so a caller can size them for the document
+# size. Static buffers would sit inside every executable
+# that imports this file. json_reserve(nodes, bytes) grows either pool
+# before a parse; previous DOM/string references must then be discarded.
+func j_pools() -> i64 {
+    if load64(j_nodes) == 0 { store64(j_maxnodes, J_MAXNODES); store64(j_nodes, alloc(J_MAXNODES * 48)); }
+    if load64(j_arena) == 0 { store64(j_arenacap, J_ARENA); store64(j_arena, alloc(J_ARENA)); }
+    if load64(j_nodes) == 0 || load64(j_arena) == 0 { return 0; }
+    return 1;
+}
+func json_reserve(nodes: i64, bytes: i64) -> i64 {
+    j_pools();
+    if nodes > 192153584101141162 { return 0; } # avoid overflow in nodes * 48
+    if nodes > load64(j_maxnodes) {
+        b = alloc(nodes * 48);
+        if b != 0 { free(load64(j_nodes)); store64(j_nodes, b); store64(j_maxnodes, nodes); }
+    }
+    if bytes > load64(j_arenacap) {
+        b = alloc(bytes);
+        if b != 0 { free(load64(j_arena)); store64(j_arena, b); store64(j_arenacap, bytes); }
+    }
+    return 0;
+}
+func j_node(idx: i64) -> i64 { return load64(j_nodes) + idx * 48; }
 func json_type(idx: i64) -> i64 { if idx < 0 { return 0; } return load64(j_node(idx) + 0); }
 func json_child(idx: i64) -> i64 { return load64(j_node(idx) + 8); }
 func json_next(idx: i64)  -> i64 { return load64(j_node(idx) + 16); }
@@ -50,12 +88,23 @@ func j_streq(a: i64, b: i64) -> i64 {
 
 func j_alloc(type: i64) -> i64 {
     i = load64(j_ncount);
-    if i >= J_MAXNODES { return 0 - 1; }
+    if i >= load64(j_maxnodes) { store64(j_fail, 1); return 0 - 1; }
     n = j_node(i);
     store64(n + 0, type); store64(n + 8, 0 - 1); store64(n + 16, 0 - 1);
     store64(n + 24, 0); store64(n + 32, 0); store64(n + 40, 0 - 1);
     store64(j_ncount, i + 1);
     return i;
+}
+
+# Append one byte to the string arena. Refuses past the end (and latches
+# j_fail) instead of writing past it -- j_apos was previously unbounded at
+# every call site below.
+func j_putc(c: i64) -> i64 {
+    a = load64(j_apos);
+    if a >= load64(j_arenacap) { store64(j_fail, 1); return 0; }
+    store8(load64(j_arena) + a, c);
+    store64(j_apos, a + 1);
+    return 0;
 }
 
 func j_peek() -> i64 { return load8(load64(j_src) + load64(j_pos)); }
@@ -70,9 +119,50 @@ func j_ws() -> i64 {
 }
 
 # parse a string (also used for object keys). Copies into the arena, null-terminated.
+# one hex digit at src+off (-1 when it is not hex)
+func j_hex1(src: i64, off: i64) -> i64 {
+    c = load8(src + off);
+    if c >= 48 { if c <= 57 { return c - 48; } }
+    if c >= 97 { if c <= 102 { return c - 87; } }
+    if c >= 65 { if c <= 70 { return c - 55; } }
+    return 0 - 1;
+}
+# the 4 hex digits of a \uXXXX escape (0 when malformed)
+func j_hex4(src: i64, off: i64) -> i64 {
+    v = 0; i = 0;
+    while i < 4 {
+        d = j_hex1(src, off + i);
+        if d < 0 { return 0; }
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+# append a code point as UTF-8 (the encoding JSON text is already in, so the
+# writer can emit these bytes back out verbatim)
+func j_putu8(cp: i64) -> i64 {
+    if cp < 0x80 { j_putc(cp); return 0; }
+    if cp < 0x800 {
+        j_putc(0xC0 + cp / 64);
+        j_putc(0x80 + band(cp, 63));
+        return 0;
+    }
+    if cp < 0x10000 {
+        j_putc(0xE0 + cp / 4096);
+        j_putc(0x80 + band(cp / 64, 63));
+        j_putc(0x80 + band(cp, 63));
+        return 0;
+    }
+    j_putc(0xF0 + cp / 262144);
+    j_putc(0x80 + band(cp / 4096, 63));
+    j_putc(0x80 + band(cp / 64, 63));
+    j_putc(0x80 + band(cp, 63));
+    return 0;
+}
+
 func j_parse_str() -> i64 {
     j_adv();                                  # skip opening quote
-    start = j_arena + load64(j_apos);
+    start = load64(j_arena) + load64(j_apos);
     src = load64(j_src);
     while 1 {
         c = load8(src + load64(j_pos));
@@ -87,28 +177,48 @@ func j_parse_str() -> i64 {
             if e == 114 { o = 13; }            # \r
             if e == 98 { o = 8; }              # \b
             if e == 102 { o = 12; }            # \f
-            if e == 117 {                      # \uXXXX -> emit '?' and skip 4 hex
-                store8(j_arena + load64(j_apos), 63); store64(j_apos, load64(j_apos) + 1);
+            if e == 117 {                      # \uXXXX -> decode to UTF-8
+                # This used to emit a literal '?', which silently corrupted
+                # every non-ASCII character in a config: an accented site
+                # description or a degree sign came back mangled and was then
+                # written to disk that way.
+                cp = j_hex4(src, load64(j_pos) + 1);
                 store64(j_pos, load64(j_pos) + 5);
+                if cp >= 0xD800 { if cp <= 0xDBFF {
+                    # surrogate pair: consume the low half if it is there
+                    if load8(src + load64(j_pos)) == 92 {
+                        if load8(src + load64(j_pos) + 1) == 117 {
+                            lo = j_hex4(src, load64(j_pos) + 2);
+                            if lo >= 0xDC00 { if lo <= 0xDFFF {
+                                cp = 0x10000 + (cp - 0xD800) * 1024 + (lo - 0xDC00);
+                                store64(j_pos, load64(j_pos) + 6);
+                            } }
+                        }
+                    }
+                } }
+                j_putu8(cp);
                 o = 0 - 1;
             }
             if o != (0 - 1) {
-                store8(j_arena + load64(j_apos), o); store64(j_apos, load64(j_apos) + 1);
+                j_putc(o);
                 j_adv();
             }
         } else {
-            store8(j_arena + load64(j_apos), c); store64(j_apos, load64(j_apos) + 1);
+            j_putc(c);
             j_adv();
         }
+        if load64(j_fail) == 1 { return 0 - 1; }
     }
-    store8(j_arena + load64(j_apos), 0); store64(j_apos, load64(j_apos) + 1);
+    j_putc(0);
     idx = j_alloc(J_STR);
+    if idx < 0 { return 0 - 1; }
     store64(j_node(idx) + 24, start);
     return idx;
 }
 
 func j_parse_num() -> i64 {
     src = load64(j_src);
+    start = load64(j_pos);                          # first byte of the token (incl. sign)
     neg = 0;
     if load8(src + load64(j_pos)) == 45 { neg = 1; j_adv(); }
     v = 0;
@@ -119,24 +229,150 @@ func j_parse_num() -> i64 {
         v = v * 10 + c - 48;
         j_adv();
     }
-    # skip any fraction / exponent (value read as int for now)
+    # skip any fraction / exponent (integer value kept for json_int), but REMEMBER
+    # it was there (json_num_frac) AND remember where the whole token began so a
+    # caller can re-emit or re-parse it exactly: an integer re-emit would turn
+    # 0.5 into 0. The token text lives in the source buffer, which stays alive
+    # for the life of the parse -- json_num_copy / json_num_bits read it back.
+    # âš  e/E/+/- MUST be tested before the digit range: 'e' (101) and 'E' (69)
+    # are >= 48, so the old "if c >= 48" digit branch caught them, hit its
+    # "else break", and stopped mid-number AT the 'e'. The object parser then
+    # aborted on that stray char and silently DROPPED every following member.
+    # (Latent: no config used exponent notation. Caught by a fractional-scale
+    # test. tests/test_json.ancl covers an exponent and following members.)
+    frac = 0;
     while 1 {
         c = load8(src + load64(j_pos));
-        if c == 46 { j_adv(); }
+        if c == 46 { frac = 1; j_adv(); }
+        else { if c == 101 { frac = 1; j_adv(); }
+        else { if c == 69 { frac = 1; j_adv(); }
+        else { if c == 43 { j_adv(); }
+        else { if c == 45 { j_adv(); }
         else { if c >= 48 { if c <= 57 { j_adv(); } else { break; } }
-               else { if c == 101 { j_adv(); } else { if c == 69 { j_adv(); } else { if c == 43 { j_adv(); } else { if c == 45 { j_adv(); } else { break; } } } } } }
+               else { break; } } } } } }
     }
     idx = j_alloc(J_NUM);
+    if idx < 0 { return 0 - 1; }
     if neg == 1 { v = 0 - v; }
     store64(j_node(idx) + 32, v);
+    store64(j_node(idx) + 40, frac);
+    store64(j_node(idx) + 24, start);               # token start offset in j_src (sptr, unused for NUM)
     return idx;
+}
+
+# one past the last byte of a number token starting at `off` in `base`.
+func j_num_end(base: i64, off: i64) -> i64 {
+    p = off;
+    while 1 {
+        c = load8(base + p);
+        if c == 43 { p = p + 1; }                   # + - . 0-9 e E : the number alphabet
+        else { if c == 45 { p = p + 1; }
+        else { if c == 46 { p = p + 1; }
+        else { if c == 101 { p = p + 1; }
+        else { if c == 69 { p = p + 1; }
+        else { if c >= 48 { if c <= 57 { p = p + 1; } else { break; } } else { break; } } } } } }
+    }
+    return p;
+}
+
+# 10^n as f64. 10^k is EXACT in f64 for k <= 22, so build the positive power by
+# multiply and take a SINGLE reciprocal for n < 0 (one rounding) rather than
+# dividing repeatedly (which compounds error: 0.0015 came out 0.001499).
+func j_pow10f(n: i64) -> f64 {
+    m = n; if m < 0 { m = 0 - m; }
+    if m > 309 { m = 309; } # bound work for extreme input exponents
+    r = 1.0; i = 0;
+    while i < m { r = r * 10.0; i = i + 1; }
+    if n < 0 { return 1.0 / r; }
+    return r;
+}
+
+# Parse a decimal token [off, end) in `base` to f64 BITS. Handles sign,
+# fraction, and an e/E exponent. Digits past ~17 are dropped (a scaleFactor is
+# short); this is exact for the nice decimals industrial configs use.
+func j_dec_f64bits(base: i64, off: i64, endp: i64) -> i64 {
+    sign = 1; p = off;
+    if load8(base + p) == 45 { sign = 0 - 1; p = p + 1; }
+    else { if load8(base + p) == 43 { p = p + 1; } }
+    mant = 0; dexp = 0; seen = 0;
+    # integer part
+    while p < endp {
+        c = load8(base + p);
+        if c < 48 { break; }
+        if c > 57 { break; }
+        if seen < 17 { mant = mant * 10 + c - 48; seen = seen + 1; }
+        else { dexp = dexp + 1; }                   # count magnitude of dropped int digits
+        p = p + 1;
+    }
+    # fraction
+    if p < endp { if load8(base + p) == 46 {
+        p = p + 1;
+        while p < endp {
+            c = load8(base + p);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            if seen < 17 { mant = mant * 10 + c - 48; dexp = dexp - 1; seen = seen + 1; }
+            p = p + 1;
+        }
+    } }
+    # exponent
+    if p < endp { if load8(base + p) == 101 { p = p + 1; } else { if load8(base + p) == 69 { p = p + 1; } } }
+    # (p now at exponent digits if there was an e/E; otherwise at endp)
+    if p < endp {
+        esign = 1;
+        if load8(base + p) == 45 { esign = 0 - 1; p = p + 1; }
+        else { if load8(base + p) == 43 { p = p + 1; } }
+        eval = 0;
+        while p < endp {
+            c = load8(base + p);
+            if c < 48 { break; }
+            if c > 57 { break; }
+            if eval < 10000 { eval = eval * 10 + c - 48; } # saturate exponent magnitude
+            p = p + 1;
+        }
+        dexp = dexp + esign * eval;
+    }
+    if mant == 0 { return fbits(0.0); }
+    val = itof(sign * mant) * j_pow10f(dexp);
+    return fbits(val);
+}
+
+# The verbatim token of a NUM node, its f64 bits, or a bounded copy of it.
+func json_num_bits(idx: i64) -> i64 {
+    if idx < 0 { return fbits(0.0); }
+    if json_type(idx) != J_NUM { return fbits(0.0); }
+    base = load64(j_src); off = load64(j_node(idx) + 24);
+    return j_dec_f64bits(base, off, j_num_end(base, off));
+}
+func json_num_copy(idx: i64, dst: i64, cap: i64) -> i64 {
+    if cap <= 0 { return 0; } # cap includes the terminating NUL
+    if idx < 0 { store8(dst, 0); return 0; }
+    if json_type(idx) != J_NUM { store8(dst, 0); return 0; }
+    base = load64(j_src); off = load64(j_node(idx) + 24);
+    endp = j_num_end(base, off);
+    n = endp - off; if n >= cap { n = cap - 1; }
+    i = 0; while i < n { store8(dst + i, load8(base + off + i)); i = i + 1; }
+    store8(dst + n, 0);
+    return n;
+}
+# object member as f64 bits (dfltbits when the key is absent / not a number)
+func json_obj_f64bits(obj: i64, key: i64, dfltbits: i64) -> i64 {
+    v = json_obj_get(obj, key);
+    if v < 0 { return dfltbits; }
+    if json_type(v) != J_NUM { return dfltbits; }
+    return json_num_bits(v);
+}
+# parse a standalone NUL-terminated decimal string to f64 bits (for UI input)
+func json_parse_f64bits(s: i64) -> i64 {
+    n = 0; while load8(s + n) != 0 { n = n + 1; }
+    return j_dec_f64bits(s, 0, n);
 }
 
 func j_parse_lit() -> i64 {
     src = load64(j_src);
     c = load8(src + load64(j_pos));
-    if c == 116 { store64(j_pos, load64(j_pos) + 4); idx = j_alloc(J_BOOL); store64(j_node(idx) + 32, 1); return idx; }  # true
-    if c == 102 { store64(j_pos, load64(j_pos) + 5); idx = j_alloc(J_BOOL); store64(j_node(idx) + 32, 0); return idx; }  # false
+    if c == 116 { store64(j_pos, load64(j_pos) + 4); idx = j_alloc(J_BOOL); if idx < 0 { return 0 - 1; } store64(j_node(idx) + 32, 1); return idx; }  # true
+    if c == 102 { store64(j_pos, load64(j_pos) + 5); idx = j_alloc(J_BOOL); if idx < 0 { return 0 - 1; } store64(j_node(idx) + 32, 0); return idx; }  # false
     store64(j_pos, load64(j_pos) + 4);                                                                                   # null
     return j_alloc(J_NUL);
 }
@@ -144,11 +380,13 @@ func j_parse_lit() -> i64 {
 func j_parse_arr() -> i64 {
     j_adv();                                   # skip [
     node = j_alloc(J_ARR);
+    if node < 0 { return 0 - 1; }
     j_ws();
     if j_peek() == 93 { j_adv(); return node; }   # ]
     last = 0 - 1;
     while 1 {
         child = callp(load64(j_pv));
+        if child < 0 { return 0 - 1; }         # pool/arena dry -> unwind, never store through j_node(-1)
         if last == (0 - 1) { store64(j_node(node) + 8, child); }
         else { store64(j_node(last) + 16, child); }
         last = child;
@@ -163,15 +401,18 @@ func j_parse_arr() -> i64 {
 func j_parse_obj() -> i64 {
     j_adv();                                   # skip {
     node = j_alloc(J_OBJ);
+    if node < 0 { return 0 - 1; }
     j_ws();
     if j_peek() == 125 { j_adv(); return node; }  # }
     last = 0 - 1;
     while 1 {
         j_ws();
         key = j_parse_str();
+        if key < 0 { return 0 - 1; }
         j_ws();
         j_adv();                                # skip :
         val = callp(load64(j_pv));
+        if val < 0 { return 0 - 1; }
         store64(j_node(key) + 40, val);         # key.vidx = value
         if last == (0 - 1) { store64(j_node(node) + 8, key); }
         else { store64(j_node(last) + 16, key); }
@@ -196,17 +437,28 @@ func j_parse_value() -> i64 {
     return j_parse_num();
 }
 
-# Parse a JSON text; returns the root node index (or -1 on empty).
+# Parse a JSON text; returns the root node index, or -1 when the text is empty
+# OR TOO LARGE for the node pool / string arena. A -1 here means "no usable
+# document" -- callers must not treat a partial parse as success.
 func json_parse(src: i64) -> i64 {
+    if j_pools() == 0 { store64(j_fail, 1); return 0 - 1; }
     store64(j_src, src);
     store64(j_pos, 0);
     if load8(src + 0) == 0xEF { if load8(src + 1) == 0xBB { if load8(src + 2) == 0xBF { store64(j_pos, 3); } } }  # skip UTF-8 BOM
 
     store64(j_ncount, 0);
     store64(j_apos, 0);
+    store64(j_fail, 0);
     store64(j_pv, &j_parse_value);
-    return j_parse_value();
+    r = j_parse_value();
+    if load64(j_fail) == 1 { return 0 - 1; }
+    return r;
 }
+
+# 1 when the last json_parse ran out of nodes or arena (as opposed to being
+# handed a malformed document). Lets a caller report "config too large" rather
+# than "parse failed".
+func json_exhausted() -> i64 { return load64(j_fail); }
 
 # ---- reader API ----
 # object member lookup -> value node index (or -1)
@@ -235,6 +487,26 @@ func json_obj_int(obj: i64, key: i64, dflt: i64) -> i64 {
     if t == J_BOOL { return json_int(v); }
     return dflt;
 }
+# ---- generic object-member walk -------------------------------------
+# An object's child chain is its KEY nodes: each carries the key string, the
+# value node index, and the next key. This lets a caller iterate members it
+# has no schema for -- which is how a config editor can PRESERVE fields it
+# does not model instead of deleting them on save.
+func json_obj_first(obj: i64) -> i64 {
+    if obj < 0 { return 0 - 1; }
+    if json_type(obj) != J_OBJ { return 0 - 1; }
+    return json_child(obj);
+}
+func json_key(k: i64) -> i64 { if k < 0 { return j_empty(); } return json_str(k); }
+func json_val(k: i64) -> i64 { if k < 0 { return 0 - 1; } return load64(j_node(k) + 40); }
+# 1 when a J_NUM's literal carried a '.' or an exponent, i.e. json_int has
+# LOST information and re-emitting it as an integer would change the value.
+func json_num_frac(idx: i64) -> i64 {
+    if idx < 0 { return 0; }
+    if json_type(idx) != J_NUM { return 0; }
+    return load64(j_node(idx) + 40);
+}
+
 func json_arr_first(arr: i64) -> i64 {
     if arr < 0 { return 0 - 1; }
     if json_type(arr) != J_ARR { return 0 - 1; }

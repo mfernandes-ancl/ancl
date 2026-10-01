@@ -1,0 +1,39 @@
+import "../core_lib/json.ancl";
+@DATA
+doc: str = "{\"v\":0.5,\"e\":1.25e2,\"s\":\"\\u00e9\\uD83D\\uDE00\",\"a\":[true,null,3]}";
+kv: str = "v";
+ke: str = "e";
+ks: str = "s";
+ka: str = "a";
+half: str = "0.5";
+huge: str = "1e99999999999999999999999999999999";
+out: buf = 32;
+pass: str = "[PASS] JSON: decimals, exponent, UTF-8, surrogate pair, member walk, reserve, exhaustion\n";
+@CODE
+func main() -> i32 {
+    root = json_parse(doc); if root < 0 { return 1; }
+    v = json_obj_get(root, kv);
+    if json_num_frac(v) != 1 { return 2; }
+    if ftoi(ffrombits(json_num_bits(v)) * 2.0) != 1 { return 3; }
+    if ftoi(ffrombits(json_obj_f64bits(root, ke, 0))) != 125 { return 4; }
+    if json_num_copy(v, out, 32) != 3 || strcmp(out, half) != 0 { return 5; }
+    store8(out + 2, 99);
+    if json_num_copy(v, out, 2) != 1 || load8(out + 1) != 0 || load8(out + 2) != 99 { return 14; }
+    store8(out, 99); if json_num_copy(v, out, 0) != 0 || load8(out) != 99 { return 15; }
+    if band(shr(json_parse_f64bits(huge), 52), 2047) != 2047 { return 16; }
+    s = json_obj_str(root, ks);
+    if strlen(s) != 6 || load8(s) != 0xC3 || load8(s + 2) != 0xF0 { return 6; }
+    if json_arr_count(json_obj_get(root, ka)) != 3 { return 7; }
+    count = 0; k = json_obj_first(root);
+    while k >= 0 { if json_val(k) < 0 { return 8; } count = count + 1; k = json_next(k); }
+    if count != 4 { return 9; }
+    json_reserve(65536, 1048576);
+    if json_parse(doc) < 0 { return 10; }
+    store64(j_maxnodes, 1);
+    if json_parse(doc) != (0 - 1) || json_exhausted() != 1 { return 11; }
+    store64(j_maxnodes, 65536); store64(j_arenacap, 1);
+    if json_parse(doc) != (0 - 1) || json_exhausted() != 1 { return 12; }
+    store64(j_arenacap, 1048576);
+    if json_parse(doc) < 0 || json_exhausted() != 0 { return 13; }
+    syscall 1, pass; return 0;
+}

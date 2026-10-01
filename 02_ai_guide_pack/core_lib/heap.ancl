@@ -1,0 +1,154 @@
+# =====================================================================
+#  heap.ancl  -  a real allocator: first-fit, splitting, coalescing, with a
+#                `free` that actually frees.  (core_lib)  [OS rung M5]
+#
+#  WHY THIS IS NOT IN libbare.ancl. It has NO target dependency -- no outb, no
+#  __mb_info, no syscall. It is arithmetic over a region someone hands it. That is
+#  deliberate: it lets the SAME allocator run hosted and bare, so the torture test
+#  can assert that both produce identical LOGICAL results. An allocator that could
+#  only be exercised on bare metal would be an allocator tested once.
+#
+#  WHAT IT REPLACES. The compiler's built-in `alloc` on --target=bare is a bump
+#  pointer: it adds, stores, and returns. `free()` is a documented no-op. That is
+#  fine for a boot probe and useless for a kernel that runs for more than a moment
+#  -- every freed byte is lost until reboot.
+#
+#  BLOCK LAYOUT. One 8-byte header, no footer:
+#      +0  size  -- TOTAL bytes including this header, always 16-aligned, so the
+#                   low bit is free for the in-use flag
+#      +8  payload (what the caller gets)
+#
+#  ⚠ COALESCING IS A FULL PASS, O(n) IN BLOCKS, AND THAT IS A DELIBERATE CHOICE
+#  RATHER THAN AN OVERSIGHT. Merging with the PREVIOUS block needs either a
+#  boundary footer on every block (8 more bytes each) or a walk from the start.
+#  For a kernel allocating device buffers and protocol frames, a walk is cheap and
+#  a footer on every 32-byte block is not. If a future workload makes this hot,
+#  the fix is a footer -- measure first.
+# =====================================================================
+
+@DATA
+HEAP_HDR:   i64 = 8;         # bytes of header per block
+HEAP_MIN:   i64 = 32;        # smallest block worth splitting off
+g_hp_base:  buf = 8;
+g_hp_end:   buf = 8;
+g_hp_ok:    buf = 8;         # 1 once heap_init has run
+
+@CODE
+func hp_align16(n: i64) -> i64 { return band(n + 15, 0 - 16); }
+
+func hp_size(b: i64) -> i64 { return band(load64(b), 0 - 2); }     # mask off the flag
+func hp_used(b: i64) -> i64 { return band(load64(b), 1); }
+func hp_set(b: i64, size: i64, used: i64) -> i64 { store64(b, bor(size, used)); return 0; }
+func hp_next(b: i64) -> i64 { return b + hp_size(b); }
+
+# Take ownership of [base, base+size). The region is not touched beyond its first
+# header until something is allocated.
+func heap_init(base: i64, size: i64) -> i64 {
+    b = hp_align16(base);
+    e = band(base + size, 0 - 16);
+    if e <= b + HEAP_MIN { store64(g_hp_ok, 0); return 0; }
+    store64(g_hp_base, b);
+    store64(g_hp_end, e);
+    hp_set(b, e - b, 0);
+    store64(g_hp_ok, 1);
+    return e - b;
+}
+
+# First fit. Returns 0 when nothing fits -- the same contract HeapAlloc and mmap
+# have, and the one the bare bump allocator broke until M2.
+func heap_alloc(n: i64) -> i64 {
+    if load64(g_hp_ok) == 0 { return 0; }
+    if n <= 0 { return 0; }
+    need = hp_align16(n + HEAP_HDR);
+    b = load64(g_hp_base);
+    e = load64(g_hp_end);
+    while b < e {
+        if hp_used(b) == 0 {
+            sz = hp_size(b);
+            if sz >= need {
+                rest = sz - need;
+                if rest >= HEAP_MIN {
+                    hp_set(b, need, 1);
+                    hp_set(b + need, rest, 0);
+                } else {
+                    hp_set(b, sz, 1);            # too small to split; hand over the slack
+                }
+                return b + HEAP_HDR;
+            }
+        }
+        b = hp_next(b);
+    }
+    return 0;
+}
+
+# Merge every run of adjacent free blocks into one. Called after each free.
+func heap_coalesce() -> i64 {
+    b = load64(g_hp_base);
+    e = load64(g_hp_end);
+    merged = 0;
+    while b < e {
+        if hp_used(b) == 0 {
+            n = hp_next(b);
+            while n < e {
+                if hp_used(n) != 0 { n = e; }
+                else {
+                    hp_set(b, hp_size(b) + hp_size(n), 0);
+                    merged = merged + 1;
+                    n = hp_next(b);
+                }
+            }
+        }
+        b = hp_next(b);
+    }
+    return merged;
+}
+
+# Free a pointer heap_alloc returned. Returns 1 if it was freed, 0 if the pointer
+# is not one of ours -- a wrong pointer is refused rather than corrupting the heap.
+func heap_free(p: i64) -> i64 {
+    if load64(g_hp_ok) == 0 { return 0; }
+    if p == 0 { return 0; }
+    b = p - HEAP_HDR;
+    if b < load64(g_hp_base) { return 0; }
+    if b >= load64(g_hp_end) { return 0; }
+    # Walk the block list and require p to be a real block start. This is what
+    # makes a bogus or double free safe instead of silently poisonous.
+    w = load64(g_hp_base);
+    e = load64(g_hp_end);
+    found = 0;
+    while w < e {
+        if w == b { found = 1; w = e; }
+        else { w = hp_next(w); }
+    }
+    if found == 0 { return 0; }
+    if hp_used(b) == 0 { return 0; }              # double free: refused, not repeated
+    hp_set(b, hp_size(b), 0);
+    heap_coalesce();
+    return 1;
+}
+
+# Totals, for tests and for a status line. Bytes are PAYLOAD bytes; headers count
+# as overhead and are in neither.
+func heap_used_bytes() -> i64 {
+    t = 0; b = load64(g_hp_base); e = load64(g_hp_end);
+    while b < e { if hp_used(b) == 1 { t = t + hp_size(b) - HEAP_HDR; } b = hp_next(b); }
+    return t;
+}
+func heap_free_bytes() -> i64 {
+    t = 0; b = load64(g_hp_base); e = load64(g_hp_end);
+    while b < e { if hp_used(b) == 0 { t = t + hp_size(b) - HEAP_HDR; } b = hp_next(b); }
+    return t;
+}
+func heap_blocks() -> i64 {
+    n = 0; b = load64(g_hp_base); e = load64(g_hp_end);
+    while b < e { n = n + 1; b = hp_next(b); }
+    return n;
+}
+# The whole region must always be accounted for: every byte is in exactly one
+# block. A test asserts this after every operation, which is what catches a split
+# or merge that loses or duplicates space.
+func heap_span() -> i64 {
+    t = 0; b = load64(g_hp_base); e = load64(g_hp_end);
+    while b < e { t = t + hp_size(b); b = hp_next(b); }
+    return t;
+}

@@ -20,6 +20,9 @@
 extern "ole32.dll" CoInitializeEx;     # HRESULT CoInitializeEx(pvReserved, dwCoInit)
 extern "ole32.dll" CoUninitialize;     # void    CoUninitialize(void)
 extern "ole32.dll" CoCreateInstance;   # HRESULT CoCreateInstance(rclsid, pUnkOuter, dwClsCtx, riid, ppv)
+extern "ole32.dll" CoInitializeSecurity; # HRESULT CoInitializeSecurity(pSecDesc, cAuthSvc, asAuthSvc, pRes1, dwAuthnLevel, dwImpLevel, pAuthList, dwCaps, pRes3) -- ONCE per process
+extern "ole32.dll" CoQueryProxyBlanket;  # HRESULT CoQueryProxyBlanket(pProxy, *authnSvc, *authzSvc, *pPrincName, *authnLevel, *impLevel, *pAuthInfo, *caps)
+extern "ole32.dll" CoSetProxyBlanket;    # HRESULT CoSetProxyBlanket(pProxy, authnSvc, authzSvc, pPrincName, authnLevel, impLevel, pAuthInfo, caps) -- per INTERFACE proxy
 extern "ole32.dll" CoCreateInstanceEx; # HRESULT CoCreateInstanceEx(rclsid, pUnkOuter, dwClsCtx, COSERVERINFO*, cmq, MULTI_QI*) -- remote DCOM
 extern "ole32.dll" CLSIDFromProgID;    # HRESULT CLSIDFromProgID(lpszProgID(LPCWSTR), pclsid)
 extern "ole32.dll" CLSIDFromString;    # HRESULT CLSIDFromString(lpsz(LPCWSTR "{guid}"), pclsid) -- for legacy servers w/o usable ProgID

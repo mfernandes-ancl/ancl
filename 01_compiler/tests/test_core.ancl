@@ -1,0 +1,73 @@
+import "../core_lib/std.ancl";
+import "../core_lib/heap.ancl";
+import "../core_lib/libsha256.ancl";
+import "../core_lib/numfmt.ancl";
+import "test_helper.ancl";
+extern "kernel32.dll" GetSystemTime;
+extern "kernel32.dll" GetLastError -> i32;
+extern "kernel32.dll" CreateThread -> ptr;
+extern "kernel32.dll" WaitForSingleObject -> i32;
+extern "kernel32.dll" CloseHandle -> i32;
+extern "kernel32.dll" CreateFileA -> ptr;
+extern "kernel32.dll" ReadFile -> i32;
+extern "kernel32.dll" WriteFile -> i32;
+extern "kernel32.dll" DeleteFileA -> i32;
+
+struct Record { n: i64; kind: i32; }
+@DATA
+mem: buf = 4096;
+rec: buf = 32;
+digest: buf = 65;
+out: buf = 128;
+got: buf = 8;
+clock: buf = 16;
+thread_value: buf = 8;
+tid: buf = 8;
+file_name: str = "ancl-test-file.tmp";
+missing: str = "ancl-test-missing/no-such-file";
+payload: str = "ANCL file test";
+abc: str = "abc";
+sha_abc: str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+small: str = "0.0003";
+fixed: str = "0.001499";
+single: str = "23.7";
+pass: str = "[PASS] core: syntax, imports, structs, files, errors, UTC time, threads, heap, SHA-256, formatting\n";
+@CODE
+func worker(arg: i64) -> i64 { store64(thread_value, helper_add(arg, 1)); return 0; }
+func main() -> i32 {
+    p: *Record = rec; p.n = 42; p.kind = 3;
+    if p.n != 42 || p.kind != 3 { return 1; }
+    if clamp(helper_add(2, 3), 0, 4) != 4 { return 2; }
+    span = heap_init(mem, 4096); if span == 0 { return 3; }
+    a = heap_alloc(120); b = heap_alloc(240);
+    if a == 0 || b == 0 { return 4; }
+    if heap_free(a) != 1 || heap_free(a) != 0 { return 5; }
+    if heap_free(b) != 1 || heap_blocks() != 1 || heap_span() != span { return 6; }
+    if heap_free(mem + 15) != 0 { return 7; }
+    sha256_bytes(abc, 3, digest);
+    if strcmp(digest, sha_abc) != 0 { return 8; }
+    nf_f64_shortish(fbits(0.0003), out);
+    if strcmp(out, small) != 0 { return 9; }
+    nf_dtoa(fbits(0.0015), out);
+    if strcmp(out, fixed) != 0 { return 10; }
+    nf_f32_g(0x41BD999A, out);
+    if strcmp(out, single) != 0 { return 19; }
+    h = CreateFileA(file_name, 0x40000000, 0, 0, 2, 0x80, 0);
+    if h == (0 - 1) { return 11; }
+    ok = WriteFile(h, payload, strlen(payload), got, 0); CloseHandle(h);
+    if ok == 0 || load32(got) != strlen(payload) { return 12; }
+    h = CreateFileA(file_name, 0x80000000, 1, 0, 3, 0x80, 0);
+    if h == (0 - 1) { return 13; }
+    ok = ReadFile(h, out, 127, got, 0); CloseHandle(h);
+    store8(out + load32(got), 0); DeleteFileA(file_name);
+    if ok == 0 || strcmp(out, payload) != 0 { return 14; }
+    h = CreateFileA(missing, 0x80000000, 0, 0, 3, 0x80, 0);
+    if h != (0 - 1) || GetLastError() == 0 { return 15; }
+    GetSystemTime(clock);
+    if load16(clock) < 2020 || load16(clock + 2) < 1 || load16(clock + 2) > 12 { return 16; }
+    h = CreateThread(0, 0, &worker, 41, 0, tid);
+    if h == 0 { return 17; }
+    ok = WaitForSingleObject(h, 5000); CloseHandle(h);
+    if ok != 0 || load64(thread_value) != 42 { return 18; }
+    syscall 1, pass; return 0;
+}

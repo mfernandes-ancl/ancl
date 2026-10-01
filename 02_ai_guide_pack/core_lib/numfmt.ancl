@@ -8,6 +8,7 @@
 
 @DATA
 nf_tmp:  buf = 32;   # scratch for decimal reversal
+nf_dig7: buf = 24;   # the 7 significant digits of a float, before placement (nf_f32_g)
 d_inf:   str = "inf";
 d_nan:   str = "nan";
 d_big:   str = "(big)";
@@ -84,15 +85,64 @@ func nf_dtoa(bits: i64, dst: ptr) -> i64 {
     e = nf_u64dec(shr(m, kk), p);                   # integer part
     store8(e, 46); e = e + 1;                       # '.'
     frac = band(m, mask);
+    # cap the digit state at 58 bits: after masking, frac can hold up to
+    # kk bits, and for kk >= 61 the *10 below wrapped 2^64 and published
+    # CORRUPTED digits for |v| in ~[0.0005, 0.002). Dropping the low
+    # (kk-58) bits costs < 1e-11 at the 6th digit -- invisible.
+    fkk = kk;
+    if fkk > 58 { frac = shr(frac, fkk - 58); fkk = 58; }
+    fmask = shl(1, fkk) - 1;
     d = 0;
     while d < 6 {
         frac = frac * 10;
-        store8(e, 48 + shr(frac, kk));
-        frac = band(frac, mask);
+        store8(e, 48 + shr(frac, fkk));
+        frac = band(frac, fmask);
         e = e + 1;
         d = d + 1;
     }
     store8(e, 0);
+    return 0;
+}
+
+# ---- bounded-precision decimal rendering ----
+# Round to nine fractional digits and strip trailing zeros. This is not a
+# general shortest-roundtrip formatter; large values use nf_dtoa instead.
+func nf_shstrip(dst: ptr) -> i64 {                  # strip trailing 0s + lone '.'
+    dot = 0 - 1; i = 0;
+    while load8(dst + i) != 0 { if load8(dst + i) == 46 { dot = i; } i = i + 1; }
+    if dot < 0 { return 0; }
+    e = i - 1;
+    while e > dot { if load8(dst + e) == 48 { e = e - 1; } else { break; } }
+    if e == dot { e = e - 1; }
+    store8(dst + e + 1, 0);
+    return 0;
+}
+func nf_f64_shortish(bits: i64, dst: ptr) -> i64 {
+    exp = band(shr(bits, 52), 2047);
+    if exp == 2047 { nf_dtoa(bits, dst); return 0; }        # inf / nan
+    v = ffrombits(bits);
+    neg = 0;
+    if v < 0.0 { neg = 1; v = 0.0 - v; }
+    if v >= 9000000000.0 { nf_dtoa(bits, dst); nf_shstrip(dst); return 0; }   # out of fixed-point range
+    scaled = ftoi(v * 1000000000.0 + 0.5);                  # round-half-up to 9 decimals
+    ip = scaled / 1000000000;
+    fp = scaled - ip * 1000000000;
+    p = dst;
+    if neg == 1 { if scaled != 0 { store8(p, 45); p = p + 1; } }   # '-', never "-0"
+    p = nf_u64dec(ip, p);                                   # integer part
+    if fp != 0 {
+        store8(p, 46); p = p + 1;                           # '.'
+        d = 100000000;                                      # 1e8 down to 1: 9 digits
+        while d >= 1 {
+            store8(p, 48 + (fp / d) % 10);
+            p = p + 1;
+            d = d / 10;
+        }
+        e = p - 1;                                          # strip trailing zeros
+        while load8(e) == 48 { e = e - 1; }
+        p = e + 1;
+    }
+    store8(p, 0);
     return 0;
 }
 
@@ -154,6 +204,61 @@ func nf_oadate(bits: i64, dst: ptr) -> i64 {
     p = nf_2d(hh, p);  store8(p, 58); p = p + 1;    # 'HH:'
     p = nf_2d(mm, p);  store8(p, 58); p = p + 1;    # 'MM:'
     p = nf_2d(ss, p);
+    store8(p, 0);
+    return 0;
+}
+
+# ---- f32 bit-pattern rendering with seven significant digits ----
+# This bounded-precision formatter is not a general shortest-roundtrip algorithm.
+# Subnormals are treated as zero; very large/small values use the f64 fallback.
+func nf_f32_to_f64bits(b: i64) -> i64 {
+    sgn = band(shr(b, 31), 1);
+    exp = band(shr(b, 23), 255);
+    mant = band(b, 8388607);
+    if exp == 0 { return shl(sgn, 63); }                       # zero / subnormal ~ 0
+    de = exp - 127 + 1023;
+    if exp == 255 { de = 2047; }
+    return shl(sgn, 63) + shl(de, 52) + shl(mant, 29);
+}
+func nf_f32_g(b: i64, dst: ptr) -> i64 {
+    bits = nf_f32_to_f64bits(b);
+    if band(shr(bits, 52), 2047) == 2047 { nf_dtoa(bits, dst); return 0; }   # inf / nan
+    v = ffrombits(bits);
+    neg = 0;
+    if v < 0.0 { neg = 1; v = 0.0 - v; }
+    if v == 0.0 { store8(dst, 48); store8(dst + 1, 0); return 0; }
+    k = 0; guard = 0;
+    while v >= 10000000.0 { v = v / 10.0; k = k - 1; guard = guard + 1; if guard > 60 { break; } }
+    while v < 1000000.0 { v = v * 10.0; k = k + 1; guard = guard + 1; if guard > 60 { break; } }
+    if guard > 60 { nf_f64_shortish(bits, dst); return 0; }
+    n = ftoi(v + 0.5);                                         # exactly 7 digits
+    if n >= 10000000 { n = n / 10; k = k - 1; }                # rounding carried into an 8th
+    if k < 0 - 6 { nf_f64_shortish(bits, dst); return 0; }     # >= 1e13: let the double path render it
+    if k > 20 { nf_f64_shortish(bits, dst); return 0; }        # tiny: same
+    p = dst;
+    if neg == 1 { store8(p, 45); p = p + 1; }
+    if k <= 0 {
+        p = nf_u64dec(n, p);
+        z = k;
+        while z < 0 { store8(p, 48); p = p + 1; z = z + 1; }   # trailing zeros, no point
+        store8(p, 0);
+        return 0;
+    }
+    # k > 0: the point sits k digits from the right of the 7-digit n
+    store8(nf_u64dec(n, nf_dig7), 0);                          # always 7 chars
+    if k < 7 {
+        i = 0;
+        while i < 7 - k { store8(p, load8(nf_dig7 + i)); p = p + 1; i = i + 1; }
+    } else {
+        store8(p, 48); p = p + 1;                              # "0"
+    }
+    store8(p, 46); p = p + 1;                                  # '.'
+    z = k - 7;
+    while z > 0 { store8(p, 48); p = p + 1; z = z - 1; }       # leading zeros after the point
+    i = 7 - k; if i < 0 { i = 0; }
+    while i < 7 { store8(p, load8(nf_dig7 + i)); p = p + 1; i = i + 1; }
+    while p > dst { if load8(p - 1) == 48 { p = p - 1; } else { break; } }   # strip trailing zeros
+    if load8(p - 1) == 46 { p = p - 1; }                       # and a bare point
     store8(p, 0);
     return 0;
 }

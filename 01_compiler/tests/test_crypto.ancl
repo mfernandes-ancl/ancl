@@ -1,0 +1,32 @@
+import "../core_lib/libsha256.ancl";
+@DATA
+key: buf = 32;
+salt: buf = 16;
+info: buf = 16;
+prk: buf = 32;
+mac: buf = 32;
+okm: buf = 42;
+hex: buf = 85;
+msg: str = "Hi There";
+hmac_expected: str = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+prk_expected: str = "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5";
+okm_expected: str = "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865";
+pass: str = "[PASS] HMAC-SHA256 and HKDF published test vectors\n";
+@CODE
+func hex_bytes(src: i64, n: i64, dst: i64) -> i64 {
+    i = 0; while i < n { b = load8(src + i); store8(dst + i * 2, sha_hexch(shr(b, 4))); store8(dst + i * 2 + 1, sha_hexch(band(b, 15))); i = i + 1; }
+    store8(dst + n * 2, 0); return 0;
+}
+func main() -> i32 {
+    i = 0; while i < 22 { store8(key + i, 11); i = i + 1; }
+    hmac_sha256(key, 20, msg, 8, mac); hex_bytes(mac, 32, hex);
+    if strcmp(hex, hmac_expected) != 0 { return 1; }
+    i = 0; while i < 13 { store8(salt + i, i); i = i + 1; }
+    i = 0; while i < 10 { store8(info + i, 240 + i); i = i + 1; }
+    hkdf_extract(salt, 13, key, 22, prk); hex_bytes(prk, 32, hex);
+    if strcmp(hex, prk_expected) != 0 { return 2; }
+    if hkdf_expand(prk, info, 10, okm, 42) != 0 { return 3; }
+    hex_bytes(okm, 42, hex); if strcmp(hex, okm_expected) != 0 { return 4; }
+    if hkdf_expand(prk, info, 10, okm, 8161) != (0 - 1) { return 5; }
+    syscall 1, pass; return 0;
+}

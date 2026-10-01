@@ -1,0 +1,16 @@
+import "../core_lib/win32_api.ancl";
+import "../core_lib/win32_com.ancl";
+@DATA
+name: str = "Local\\ANCLValidationMutex";
+random_bytes: buf = 16;
+pass: str = "[PASS] Win32/COM imports and process-local synchronization\n";
+@CODE
+func main() -> i32 {
+    h = CreateMutexA(0, 0, name); if h == 0 { return 1; } CloseHandle(h);
+    e = CreateEventA(0, 1, 0, 0); if e == 0 { return 2; }
+    if SetEvent(e) == 0 { CloseHandle(e); return 3; }
+    CloseHandle(e);
+    if SystemFunction036(random_bytes, 16) == 0 { return 4; }
+    hr = CoInitializeEx(0, 0); if hr < 0 { return 5; } CoUninitialize();
+    syscall 1, pass; return 0;
+}
