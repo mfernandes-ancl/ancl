@@ -421,3 +421,23 @@ task after this guide. Prefer importing existing core helpers instead of recreat
 When generating ANCL, first decide whether the program is a console tool, a Win32 GUI tool, a
 protocol/network tool, or a process/database utility, then import the closest core library. Keep the
 answer complete and compilable, and always re-check it against Section 12 before final output.
+
+## 15. Compiler feature differences and updated core helpers
+
+The preserved self-hosted release compiler and optional `01_compiler/bootstrap/anclc.cpp`
+are not feature-equivalent. The newer bootstrap supports f32 storage/FFI widened to f64
+computations and fixes typed floating-point struct/array accesses. Do not apply that feature
+set to an arbitrary older executable. The baseline release fails the new f64-struct/f32
+regressions even though it reproduces its own self-host fixpoint.
+
+The compiler/AI-guide core bundles include `heap.ancl` (caller-region allocation) and
+`libsha256.ancl` (SHA-256, HMAC, HKDF), plus JSON number-token, Unicode, member-walk and
+capacity helpers. `json_num_bits` returns f64 bits; `json_num_copy` capacity includes the
+terminating NUL. Keep the source document alive for number-token APIs; parse/reserve
+invalidates previous shared DOM/arena state. This JSON reader is permissive, not a strict
+malformed-input validator. Shared scratch helpers are not automatically thread-safe.
+
+For precise APIs, dependency exceptions and compiler selection, see
+`01_compiler/DEVELOPER_REFERENCE.md`, `CAPABILITIES.md` and `VALIDATION.md` in the repository.
+These are unversioned source/core improvements; they do not replace the release executables
+or claim production hardening. Compilation and runtime assertions settle syntax validity.

@@ -28,3 +28,12 @@ powershell -ExecutionPolicy Bypass -File src\verify_selfhost.ps1
 The script builds the ANCL compiler from its included ANCL source, self-compiles it twice, and verifies that the final two binaries are byte-identical.
 
 See `README.md`, `ABOUT.md`, and each component's help file for setup, scope, and known limitations.
+
+## Unversioned source/core update
+
+- Add the optional C++17 bootstrap source alongside the self-hosted compiler, with floating-point storage/FFI regressions and explicit feature-parity limits.
+- Update compiler/AI-guide JSON helpers for decimal tokens, Unicode, member iteration, capacity exhaustion, portable allocation and bounded copying.
+- Add generic region allocation and SHA-256/HMAC/HKDF helpers; improve numeric formatting and Win32/COM imports.
+- Add developer/capability references and reproducible Windows core/self-host validation.
+
+The original release executables and component-specific library copies are preserved. This update assigns no new release version and makes no production-hardening claim. See `01_compiler/VALIDATION.md` for executed tests and unsupported/unverified paths.

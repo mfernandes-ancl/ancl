@@ -73,6 +73,11 @@ device, and what you expected vs. what happened.
 
 ## Status & maturity — read this
 
+For coding and toolchain selection, see the [developer reference](01_compiler/DEVELOPER_REFERENCE.md),
+[capability matrix](01_compiler/CAPABILITIES.md) and [core validation report](01_compiler/VALIDATION.md).
+An [optional newer bootstrap source](01_compiler/bootstrap/README.md) supports floating-point
+storage fixes that are not yet present in the preserved self-hosted release executable.
+
 ANCL is a **self-hosting native systems language** with an unusually broad set of real software
 built on top. It is also **young**: shaped largely by one developer (with AI collaborators),
 low-level, x86-64-first, and without the optimizer maturity, package ecosystem, platform breadth,
