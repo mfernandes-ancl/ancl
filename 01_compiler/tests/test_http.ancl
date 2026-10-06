@@ -1,0 +1,41 @@
+extern "winhttp.dll" WinHttpOpen -> ptr;
+extern "winhttp.dll" WinHttpConnect -> ptr;
+extern "winhttp.dll" WinHttpOpenRequest -> ptr;
+extern "winhttp.dll" WinHttpSetTimeouts -> i32;
+extern "winhttp.dll" WinHttpSendRequest -> i32;
+extern "winhttp.dll" WinHttpReceiveResponse -> i32;
+extern "winhttp.dll" WinHttpReadData -> i32;
+extern "winhttp.dll" WinHttpCloseHandle -> i32;
+@DATA
+agent: str = "ANCL validation";
+host: str = "127.0.0.1";
+verb: str = "GET";
+path: str = "/";
+ua: buf = 64;
+whost: buf = 64;
+wverb: buf = 16;
+wpath: buf = 16;
+body: buf = 256;
+got: buf = 8;
+expected: str = "ANCL loopback HTTP";
+pass: str = "[PASS] loopback HTTP client through WinHTTP\n";
+@CODE
+func wide(src: i64, dst: i64) -> i64 {
+    i = 0; while load8(src + i) != 0 { store16(dst + i * 2, load8(src + i)); i = i + 1; }
+    store16(dst + i * 2, 0); return dst;
+}
+func main() -> i32 {
+    s = WinHttpOpen(wide(agent, ua), 1, 0, 0, 0); if s == 0 { return 1; }
+    WinHttpSetTimeouts(s, 3000, 3000, 3000, 3000);
+    c = WinHttpConnect(s, wide(host, whost), 18943, 0); if c == 0 { WinHttpCloseHandle(s); return 2; }
+    r = WinHttpOpenRequest(c, wide(verb, wverb), wide(path, wpath), 0, 0, 0, 0);
+    if r == 0 { WinHttpCloseHandle(c); WinHttpCloseHandle(s); return 3; }
+    ok = WinHttpSendRequest(r, 0, 0, 0, 0, 0, 0);
+    if ok != 0 { ok = WinHttpReceiveResponse(r, 0); }
+    if ok != 0 { ok = WinHttpReadData(r, body, 255, got); }
+    WinHttpCloseHandle(r); WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    if ok == 0 { return 4; }
+    store8(body + load32(got), 0);
+    if strcmp(body, expected) != 0 { return 5; }
+    syscall 1, pass; return 0;
+}

@@ -139,3 +139,18 @@ sources + a one-shot `verify_selfhost.ps1`), `core_lib/` (standard library), and
 ## 7. License
 
 MIT © Mário Fernandes. See `LICENSE`.
+
+## 8. Optional newer bootstrap and core validation
+
+`bootstrap/anclc.cpp` provides an additional, source-buildable compiler path with newer
+floating-point storage/FFI fixes. See `bootstrap/README.md` for its C++17 build command.
+The existing self-hosted executable is preserved and is not feature-equivalent: it fails
+the new typed f64-struct and f32 regressions. Use the rebuilt bootstrap for those features,
+or verify explicit raw-bit access with the selected compiler. The self-host fixpoint still
+passes through both toolchains.
+
+`DEVELOPER_REFERENCE.md`, `CAPABILITIES.md`, and `VALIDATION.md` describe API contracts,
+evidence, dependency exceptions and remaining limits. The compiler/AI-guide core bundles
+now include generic region allocation, SHA-256/HMAC/HKDF, JSON decimal/Unicode/capacity
+helpers, numeric formatting fixes and extra Win32/COM imports. Older component-specific
+library copies remain paired with their shipped applications.

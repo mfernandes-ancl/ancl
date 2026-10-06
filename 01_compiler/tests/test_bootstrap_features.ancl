@@ -1,0 +1,17 @@
+@if windows
+import "test_helper.ancl";
+import "./test_helper.ancl";
+@else
+import "./test_helper.ancl";
+@end
+@DATA
+number: buf = 32;
+minimum: str = "-9223372036854775808";
+pass: str = "[PASS] target conditionals, canonical imports, INT64_MIN formatting\n";
+@CODE
+func main() -> i32 {
+    int_to_str(number, 0 - 9223372036854775807 - 1);
+    if strcmp(number, minimum) != 0 { return 1; }
+    if helper_add(20, 22) != 42 { return 2; }
+    syscall 1, pass; return 0;
+}
